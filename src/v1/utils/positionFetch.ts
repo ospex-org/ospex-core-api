@@ -113,13 +113,26 @@ export async function fetchCategorizedPositions(
   const sb = getSupabase();
   const lowerAddress = address.toLowerCase();
 
-  // Step 1: query unclaimed positions
+  // Step 1: query unclaimed positions with non-zero stake.
+  //
+  // `risk_amount > 0` is critical: the secondary-market transfer
+  // handler in the indexer subtracts transferred amounts and leaves
+  // the sender's row at `risk_amount=0, claimed=false`. Without this
+  // filter, those zero-risk rows would land in `active` (no skin in
+  // the game) for any open speculation — a misleading "active"
+  // position. Filtering at the DB layer also prevents historical
+  // transferred-out rows from competing against real positions for
+  // the 200-row cap when a maker uses the secondary market heavily.
+  // (Closed-speculation zero-risk rows are already filtered later,
+  // by the `riskWei6 === 0n || payoutWei6 === 0n` check that mirrors
+  // PositionModule.sol:367-370.)
   const posRes = await sb
     .from('positions')
     .select('speculation_id, user_address, position_type, risk_amount, profit_amount, claimed, position_created_at')
     .eq('network', config.network)
     .eq('user_address', lowerAddress)
     .eq('claimed', false)
+    .gt('risk_amount', 0)
     .order('position_created_at', { ascending: false, nullsFirst: false })
     .limit(POSITION_QUERY_LIMIT);
 
