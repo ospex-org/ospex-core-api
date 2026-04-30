@@ -1,5 +1,6 @@
 import { isAddress } from 'ethers';
 import { logger } from './logger.js';
+import type { ScorerAddresses } from './speculation.js';
 
 export type Network = 'polygon' | 'amoy';
 export type ChainId = 137 | 80002;
@@ -7,11 +8,15 @@ export type ChainId = 137 | 80002;
 /**
  * Required vars are validated at boot and always present on Config.
  *
- * Optional vars (alchemyRpcUrl, matchingModuleAddress) are reserved for
- * endpoints that haven't migrated yet. They're validated when set, but
- * absence is allowed so the scaffold can boot in environments that don't
- * yet have those secrets. Routes that consume them must check presence
- * at use site (or upgrade them to required as they land).
+ * Optional vars are reserved for endpoints that haven't migrated yet.
+ * They're format-validated when set, but absence is allowed so the
+ * scaffold can boot in environments that don't yet have those secrets.
+ * Consumers must check presence at use site (or upgrade them to
+ * required as they land).
+ *
+ * `matchingModuleAddress` and `scorers` are jointly required for any
+ * endpoint that verifies / persists EIP-712 commitments — see
+ * `eip712Auth` and `postCommitmentHandler`.
  */
 export interface Config {
   port: number;
@@ -22,6 +27,7 @@ export interface Config {
   supabaseServiceRoleKey: string;
   alchemyRpcUrl?: string;
   matchingModuleAddress?: string;
+  scorers?: ScorerAddresses;
 }
 
 function requireEnv(name: string): string {
@@ -36,6 +42,39 @@ function requireEnv(name: string): string {
 function optionalEnv(name: string): string | undefined {
   const value = process.env[name];
   return value === undefined || value === '' ? undefined : value;
+}
+
+/**
+ * Read the first env var that's set, in priority order. Logs a deprecation
+ * warning if a non-canonical name is used so operators can migrate.
+ */
+function aliasedEnv(canonical: string, ...legacy: string[]): string | undefined {
+  const value = optionalEnv(canonical);
+  if (value !== undefined) return value;
+  for (const name of legacy) {
+    const v = optionalEnv(name);
+    if (v !== undefined) {
+      logger.warn(
+        { used: name, canonical },
+        'env var alias used — set the canonical name and remove the alias',
+      );
+      return v;
+    }
+  }
+  return undefined;
+}
+
+function validateAddress(name: string, value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  if (!isAddress(value)) {
+    logger.fatal({ var: name, value }, `${name} is set but is not a valid Ethereum address`);
+    process.exit(1);
+  }
+  return value;
+}
+
+function optionalAddressEnv(name: string): string | undefined {
+  return validateAddress(name, optionalEnv(name));
 }
 
 let cached: Config | undefined;
@@ -63,11 +102,38 @@ export function loadConfig(): Config {
   const supabaseServiceRoleKey = requireEnv('SUPABASE_SERVICE_ROLE_KEY');
 
   const alchemyRpcUrl = optionalEnv('ALCHEMY_RPC_URL');
-  const matchingModuleAddress = optionalEnv('MATCHING_MODULE_ADDRESS');
-  if (matchingModuleAddress !== undefined && !isAddress(matchingModuleAddress)) {
+  const matchingModuleAddress = optionalAddressEnv('MATCHING_MODULE_ADDRESS');
+
+  // Scorer addresses — accept the canonical name first, fall back to the
+  // ospex-agent-server legacy name so a copied-over Heroku env still works.
+  const scorerMoneyline = validateAddress(
+    'SCORER_MONEYLINE_ADDRESS',
+    aliasedEnv('SCORER_MONEYLINE_ADDRESS', 'MONEYLINE_SCORER_ADDRESS'),
+  );
+  const scorerSpread = validateAddress(
+    'SCORER_SPREAD_ADDRESS',
+    aliasedEnv('SCORER_SPREAD_ADDRESS', 'SPREAD_SCORER_ADDRESS'),
+  );
+  const scorerTotal = validateAddress(
+    'SCORER_TOTAL_ADDRESS',
+    aliasedEnv('SCORER_TOTAL_ADDRESS', 'TOTAL_SCORER_ADDRESS'),
+  );
+
+  // Scorers are an all-or-nothing bundle. Partial config is almost
+  // certainly a misconfiguration, not "we deliberately set one of
+  // three" — fail loud.
+  let scorers: ScorerAddresses | undefined;
+  const setCount = [scorerMoneyline, scorerSpread, scorerTotal].filter((v) => v !== undefined).length;
+  if (setCount === 3) {
+    scorers = {
+      moneyline: scorerMoneyline as string,
+      spread: scorerSpread as string,
+      total: scorerTotal as string,
+    };
+  } else if (setCount !== 0) {
     logger.fatal(
-      { address: matchingModuleAddress },
-      'MATCHING_MODULE_ADDRESS is set but is not a valid Ethereum address',
+      { moneyline: !!scorerMoneyline, spread: !!scorerSpread, total: !!scorerTotal },
+      'SCORER_*_ADDRESS env vars must all be set together (or all unset)',
     );
     process.exit(1);
   }
@@ -81,6 +147,7 @@ export function loadConfig(): Config {
     supabaseServiceRoleKey,
     ...(alchemyRpcUrl !== undefined ? { alchemyRpcUrl } : {}),
     ...(matchingModuleAddress !== undefined ? { matchingModuleAddress } : {}),
+    ...(scorers !== undefined ? { scorers } : {}),
   };
   return cached;
 }
