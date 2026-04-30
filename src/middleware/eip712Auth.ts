@@ -47,7 +47,54 @@ type ActionValidator = (raw: Record<string, unknown>) =>
 
 const validators: Record<ActionType, ActionValidator> = {
   OspexCommitment: validateOspexCommitment,
+  CancelCommitment: validateCancelCommitment,
 };
+
+/**
+ * Off-chain cancel action — `{ commitmentHash, expiry }`. Maker is NOT
+ * in the typed data; the recovered signer must match the looked-up
+ * commitment's maker (handler-side check). The middleware validates
+ * shape + expiry only.
+ *
+ * Cancel signatures are short-lived (1 hour cap). They authorize a
+ * one-shot action, not a standing order, so a year-long replay window
+ * has no upside. 1 hour is generous for human signing latency without
+ * leaving a stale signature lying around.
+ */
+const CANCEL_MAX_EXPIRY_OFFSET_SEC = 60n * 60n;
+
+function validateCancelCommitment(raw: Record<string, unknown>): ReturnType<ActionValidator> {
+  // commitmentHash — 0x-prefixed 32-byte hash
+  const rawHash = raw['commitmentHash'];
+  if (typeof rawHash !== 'string') {
+    return { ok: false, status: 400, error: err('commitmentHash must be a string.', 'INVALID_PARAM') };
+  }
+  if (!/^0x[0-9a-fA-F]{64}$/.test(rawHash)) {
+    return { ok: false, status: 400, error: err('commitmentHash must be a 0x-prefixed 32-byte hex string.', 'INVALID_PARAM') };
+  }
+  const commitmentHash = rawHash.toLowerCase();
+
+  // expiry — unix seconds; in the future, ≤ 1 hour out
+  let expiry: bigint;
+  try {
+    expiry = BigInt(raw['expiry'] as string | number);
+  } catch {
+    return { ok: false, status: 400, error: err('expiry must be a unix-seconds integer.', 'INVALID_PARAM') };
+  }
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  if (expiry <= nowSec) {
+    return { ok: false, status: 400, error: err('Cancel signature has already expired.', 'INVALID_PARAM') };
+  }
+  if (expiry > nowSec + CANCEL_MAX_EXPIRY_OFFSET_SEC) {
+    return {
+      ok: false,
+      status: 400,
+      error: err('Cancel expiry is more than 1 hour in the future; pick a closer expiry.', 'INVALID_PARAM'),
+    };
+  }
+
+  return { ok: true, message: { commitmentHash, expiry } };
+}
 
 function err(error: string, code: string): ApiError {
   return { error, code };
@@ -238,13 +285,20 @@ export function eip712Auth(action: ActionType) {
       return;
     }
     const { recoveredAddress, hash } = result;
-    if (recoveredAddress.toLowerCase() !== String(message['maker']).toLowerCase()) {
-      logger.warn(
-        { claimed: message['maker'], recovered: recoveredAddress },
-        'eip712Auth: recovered signer does not match claimed maker',
-      );
-      res.status(401).json(err('Signature does not match the claimed signer.', 'AUTH_INVALID'));
-      return;
+    // Some action types (e.g. CancelCommitment) bind the signer's
+    // identity entirely through the recovered address — they don't
+    // include `maker` in the typed data, and the handler does the
+    // authoritative match against a looked-up row. Only enforce the
+    // claimed-maker comparison when the action declares one.
+    if (message['maker'] !== undefined) {
+      if (recoveredAddress.toLowerCase() !== String(message['maker']).toLowerCase()) {
+        logger.warn(
+          { claimed: message['maker'], recovered: recoveredAddress },
+          'eip712Auth: recovered signer does not match claimed maker',
+        );
+        res.status(401).json(err('Signature does not match the claimed signer.', 'AUTH_INVALID'));
+        return;
+      }
     }
 
     const augmented = req as AuthenticatedRequest;
