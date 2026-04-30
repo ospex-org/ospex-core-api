@@ -6,7 +6,18 @@ This repo replaces the API surface that used to live inside `ospex-agent-server`
 
 ## Status
 
-In progress. Working today: `/healthz` (liveness), `/readyz` (readiness), `POST /v1/commitments` (EIP-712 commitment relay). Read endpoints migrate in subsequent batches.
+In progress. Working today:
+
+- `/healthz` (liveness), `/readyz` (readiness)
+- `POST /v1/commitments` — EIP-712 commitment relay
+- `GET /v1/commitments` — list with filters / pagination
+- `GET /v1/markets`, `GET /v1/markets/:contestId` — market list / detail
+- `GET /v1/protocol/info` — static protocol metadata
+- `GET /v1/positions/:address` — wallet position history
+- `GET /v1/leaderboard` — current active leaderboard
+- `GET /v1/schedule?sport=` — upcoming games
+
+Out of scope for the current batch: all `/v1/analytics/*` endpoints (deep helper stack — separate batch), the position helpers (`/claim-params`, `/withdraw-params`, `/status` — need a Firestore→Supabase rewrite), `/v1/current-odds*` (Firebase-only).
 
 ## Stack
 
@@ -39,9 +50,11 @@ curl http://localhost:3000/readyz    # readiness — 200 only if Supabase is rea
 
 ## Endpoints
 
+All read endpoints share `readRateLimit` (600 req/min per IP); the write endpoint has its own tighter limit.
+
 ### `POST /v1/commitments`
 
-Accepts a signed EIP-712 `OspexCommitment` from a maker, persists it to Supabase as `status: 'open'`, and returns the stored row. Idempotent on `commitment_hash`: a duplicate post returns 200 with the existing row instead of 409.
+Accepts a signed EIP-712 `OspexCommitment` from a maker, persists it to Supabase as `status: 'open'`, and returns the stored row. Idempotent on `commitment_hash`: a duplicate post returns 200 with the existing row instead of 409. If a row exists from the indexer (no signature yet), the API enriches it with the maker's signature, full risk amount, nonce, expiry, and speculation key.
 
 Body shape:
 
@@ -71,14 +84,61 @@ Notes:
 - `expiry` is unix seconds; must be in the future and within ~1 year of now (the upper bound prevents JS `Date` overflow on pathological values).
 - `positionType`: 0 = upper (away/over), 1 = lower (home/under).
 - Rate-limited at 60 requests/minute per IP.
+- The API also pre-checks `maker_nonce_floors` and rejects commitments with `nonce < min_nonce` as `400 NONCE_TOO_LOW` so unfillable orders never reach the open feed.
 
-Responses:
-- `201 Created` — new commitment stored.
-- `200 OK` — duplicate; same body shape, returns the existing row.
-- `400` — schema / structural validation failure (`code: INVALID_PARAM`).
-- `401` — signature failed to recover, or recovered ≠ claimed maker (`code: AUTH_INVALID`).
-- `429` — rate limited (`code: RATE_LIMIT_EXCEEDED`).
-- `500` — server misconfigured (missing `MATCHING_MODULE_ADDRESS` / scorer addresses) or DB error.
+Responses: `201 Created` on new, `200 OK` on duplicate, `400` for validation, `401 AUTH_INVALID` on signature mismatch, `429`, `500`.
+
+### `GET /v1/commitments`
+
+List open commitments, sorted by `expiry ASC, commitment_hash ASC` (the table doesn't have a `created_at` column today; expiry is the next-most-useful temporal axis and tie-breaks on hash for paginate determinism).
+
+Query params:
+| Param | Notes |
+|---|---|
+| `maker` | optional — filter by maker address |
+| `contestId` | optional — filter by contest |
+| `scorer` | optional — filter by scorer address |
+| `status` | optional, default `open` (one of `open`, `partially_filled`, `filled`, `cancelled`) |
+| `limit` | optional, default 100, max 1000 |
+| `offset` | optional, default 0 |
+
+Response: `{ commitments: CommitmentBody[], pagination: { limit, offset, total, hasMore } }`. Each `CommitmentBody` has the full canonical shape including `signature`, `speculationKey`, `nonceInvalidated`, etc.
+
+### `GET /v1/markets`
+
+List upcoming markets within a configurable time window (default 72h, max 168h).
+
+Query params: `sport` (one of `nba`, `nhl`, `ncaab`, `nfl`, `mlb`), `status`, `window` (hours), `limit` (max 200), `offset`.
+
+Response: `{ markets: MarketListItem[], pagination }`. Each market has `contestId`, team names, sport, `matchTime`, status, and a list of speculations (each with `type`, `theNumber`, `line`, etc.).
+
+### `GET /v1/markets/:contestId`
+
+Single market detail. Returns the same shape as a list item, plus an `orderbook: []` array on each speculation (currently empty — populating from `commitments` is a future-batch task; until then, callers should query `GET /v1/commitments?contestId=...` for the open book).
+
+### `GET /v1/protocol/info`
+
+Static metadata: name, network, chainId, contract addresses (matchingModule, scorers), supported sports, fees.
+
+### `GET /v1/positions/:address`
+
+Paginated position history for a wallet. Returns positions with `riskAmountUSDC`, `profitAmountUSDC`, `claimed`, `positionType` (0|1), and totals (`totalCount`, `totalRiskUSDC`, `totalProfitUSDC`, `activeCount`).
+
+Query params: `limit` (max 200), `offset`.
+
+Out of scope: `/claim-params`, `/withdraw-params`, `/status` — depend on the agent-server's `fetchCategorizedPositions` helper which queries Firestore. Will be ported in a follow-up batch with a Supabase rewrite.
+
+### `GET /v1/leaderboard`
+
+Current active leaderboard (the soonest-ending one whose start has passed) with paginated, descending-by-bankroll registrations.
+
+Query params: `limit` (max 500), `offset`.
+
+### `GET /v1/schedule?sport=`
+
+Upcoming games within `windowHours` (default 36, max 168). Returns games with team names resolved from the `teams` table.
+
+Out of scope for this batch: best-effort merge with on-chain `contests` (so each game can flag whether it has a contest). Needs the `resolveTeam` alias resolver from agent-server's `db/supabase/queries.ts`. Until then, callers can cross-check by team-name against `GET /v1/markets`.
 
 ## Scripts
 
@@ -142,5 +202,10 @@ src/
     rateLimit.ts       # express-rate-limit instances
   v1/
     router.ts          # versioned router
-    commitments.ts     # POST /v1/commitments handler
+    commitments.ts     # POST + GET /v1/commitments
+    markets.ts         # GET /v1/markets, GET /v1/markets/:contestId
+    protocol.ts        # GET /v1/protocol/info
+    positions.ts       # GET /v1/positions/:address
+    leaderboard.ts     # GET /v1/leaderboard
+    schedule.ts        # GET /v1/schedule
 ```
