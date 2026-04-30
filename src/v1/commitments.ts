@@ -286,6 +286,14 @@ const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 1000;
 const VALID_STATUSES = new Set(['open', 'partially_filled', 'filled', 'cancelled']);
 
+function parseBoolQuery(value: unknown): boolean | null {
+  if (value === undefined) return false;
+  const s = String(value).toLowerCase();
+  if (s === 'true' || s === '1') return true;
+  if (s === 'false' || s === '0') return false;
+  return null;
+}
+
 interface ListResponse {
   commitments: CommitmentBody[];
   pagination: {
@@ -318,10 +326,49 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
     return;
   }
 
-  const status = req.query.status ? String(req.query.status).toLowerCase() : 'open';
-  if (!VALID_STATUSES.has(status)) {
+  // Status: comma-separated list. Default `open,partially_filled` because
+  // both are still-fillable liquidity (a partially_filled commitment has
+  // remaining_risk_amount > 0 and can be matched again). The previous
+  // single-value default of `open` silently hid valid takeable orders.
+  let statuses: string[];
+  if (req.query.status !== undefined) {
+    const raw = String(req.query.status).toLowerCase();
+    statuses = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+    if (statuses.length === 0) {
+      res.status(400).json({
+        error: 'status must be a non-empty comma-separated list.',
+        code: 'INVALID_PARAM',
+      } satisfies ApiError);
+      return;
+    }
+    for (const s of statuses) {
+      if (!VALID_STATUSES.has(s)) {
+        res.status(400).json({
+          error: `Invalid status "${s}". Must be one of: ${[...VALID_STATUSES].join(', ')}.`,
+          code: 'INVALID_PARAM',
+        } satisfies ApiError);
+        return;
+      }
+    }
+  } else {
+    statuses = ['open', 'partially_filled'];
+  }
+
+  // Boolean opt-outs for the default "matchable open book" filters.
+  // Defaults exclude nonce-invalidated rows (the contract will reject
+  // matchCommitment) and expired rows. Power users can opt back in.
+  const includeInvalidated = parseBoolQuery(req.query.includeInvalidated);
+  if (req.query.includeInvalidated !== undefined && includeInvalidated === null) {
     res.status(400).json({
-      error: `Invalid status "${status}". Must be one of: ${[...VALID_STATUSES].join(', ')}.`,
+      error: 'includeInvalidated must be true|false|1|0.',
+      code: 'INVALID_PARAM',
+    } satisfies ApiError);
+    return;
+  }
+  const includeExpired = parseBoolQuery(req.query.includeExpired);
+  if (req.query.includeExpired !== undefined && includeExpired === null) {
+    res.status(400).json({
+      error: 'includeExpired must be true|false|1|0.',
       code: 'INVALID_PARAM',
     } satisfies ApiError);
     return;
@@ -374,11 +421,20 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
     .from('commitments')
     .select(COMMITMENT_COLUMNS, { count: 'exact' })
     .eq('network', config.network)
-    .eq('status', status);
+    .in('status', statuses);
 
   if (maker !== undefined) q = q.eq('maker', maker);
   if (scorer !== undefined) q = q.eq('scorer', scorer);
   if (contestId !== undefined) q = q.eq('contest_id', contestId);
+  if (!includeInvalidated) q = q.eq('nonce_invalidated', false);
+  if (!includeExpired) {
+    // Postgres `>` returns false (not true, not null) for NULL operands,
+    // so this naturally excludes rows with NULL expiry. That's the right
+    // behavior here: NULL expiry only appears on indexer-cancel-only rows
+    // (per migration 028), which already have status='cancelled' and
+    // wouldn't pass the default status filter anyway.
+    q = q.gt('expiry', new Date().toISOString());
+  }
 
   q = q
     .order('created_at', { ascending: false })

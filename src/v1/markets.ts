@@ -13,11 +13,15 @@ import type { Request, Response } from 'express';
 import { loadConfig } from '../lib/env.js';
 import { logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
-import { scorerToType, theNumberToLine, type MarketType } from '../lib/speculation.js';
+import { scorerToType, lineTicksToLine, type MarketType } from '../lib/speculation.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 
 const VALID_SPORTS = new Set(['nba', 'nhl', 'ncaab', 'nfl', 'mlb']);
-const VALID_STATUSES = new Set(['unverified', 'verified', 'scored', 'scored_manually']);
+// Mirrors what `ospex-indexer/src/handlers/contests.ts` writes today
+// (unverified/verified/scored/voided) plus `scored_manually` from
+// agent / ops paths. Keep in sync with the indexer's contest-status
+// emissions.
+const VALID_STATUSES = new Set(['unverified', 'verified', 'scored', 'scored_manually', 'voided']);
 
 const DEFAULT_WINDOW_HOURS = 72;
 const MAX_WINDOW_HOURS = 168;
@@ -27,10 +31,10 @@ const MAX_LIMIT = 200;
 interface MarketSpeculation {
   speculationId: string;
   type: MarketType;
-  theNumber: number | null;
-  line: number | null;
-  awayLine?: number;        // spread only
-  homeLine?: number;        // spread only
+  lineTicks: number | null;   // raw int32 (10x format, 0 for moneyline)
+  line: number | null;        // human-readable: lineTicks / 10
+  awayLine?: number;          // spread only
+  homeLine?: number;          // spread only
   speculationStatus: number;  // 0 = active, 1 = closed
 }
 
@@ -67,13 +71,13 @@ interface SpecRow {
 function specRowToBase(spec: SpecRow, scorers: { moneyline: string; spread: string; total: string }): MarketSpeculation | null {
   const type = scorerToType(spec.speculation_scorer ?? '', scorers);
   if (!type) return null;
-  const theNumber = spec.line_ticks ?? null;
-  const line = theNumberToLine(type, theNumber);
+  const lineTicks = spec.line_ticks ?? null;
+  const line = lineTicksToLine(type, lineTicks);
   const status = spec.speculation_status === 'closed' ? 1 : 0;
   const base: MarketSpeculation = {
     speculationId: String(spec.speculation_id),
     type,
-    theNumber,
+    lineTicks,
     line,
     speculationStatus: status,
   };

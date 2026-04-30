@@ -41,15 +41,21 @@ export function typeToScorer(marketType: MarketType, scorers: ScorerAddresses): 
 }
 
 /**
- * Convert a contract `theNumber` (or `line_ticks`) value to a
+ * Convert R4 `line_ticks` (10x-scaled int32, 0 for moneyline) to a
  * human-readable line.
- *   spread: theNumber + 0.5
- *   total:  theNumber - 0.5
- *   moneyline: null
+ *
+ *   spread:    -35  →  -3.5
+ *   total:     2250 →  225.0
+ *   moneyline: 0    →  null
+ *
+ * The 10x scale is documented in the contract interfaces
+ * (`IPositionModule.sol`, `IScorerModule.sol`, `ISpeculationModule.sol`):
+ * "The line number (10x format, 0 for moneyline)". A previous version of
+ * this helper used R3's half-integer convention (`+ 0.5` / `- 0.5`)
+ * which produced wrong values for R4 data — fixed.
  */
-export function theNumberToLine(type: MarketType, theNumber: number | null): number | null {
-  if (theNumber === null) return null;
-  if (type === 'spread') return theNumber + 0.5;
-  if (type === 'total') return theNumber - 0.5;
-  return null;
+export function lineTicksToLine(type: MarketType, lineTicks: number | null): number | null {
+  if (lineTicks === null) return null;
+  if (type === 'moneyline') return null;
+  return lineTicks / 10;
 }

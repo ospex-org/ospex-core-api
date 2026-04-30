@@ -92,17 +92,21 @@ Responses: `201 Created` on new, `200 OK` on duplicate, `400` for validation, `4
 
 List commitments, sorted by `created_at DESC, commitment_hash ASC` (newest first; tie-break on hash so offset-based pagination is deterministic — note that rows backfilled by indexer migration 039 share a timestamp).
 
+The default response is **the matchable open book**: still-fillable commitments that a taker could `matchCommitment` against right now. Power users can opt back into invalidated / expired / non-default-status rows via the flags below.
+
 Query params:
 | Param | Notes |
 |---|---|
 | `maker` | optional — filter by maker address |
 | `contestId` | optional — filter by contest |
 | `scorer` | optional — filter by scorer address |
-| `status` | optional, default `open` (one of `open`, `partially_filled`, `filled`, `cancelled`) |
+| `status` | optional, comma-separated. Default `open,partially_filled` (both are still fillable — `partially_filled` rows have `remaining_risk_amount > 0`). Any of `open`, `partially_filled`, `filled`, `cancelled`. |
+| `includeInvalidated` | optional bool, default `false`. By default, rows where the maker has raised `s_minNonces[maker][speculationKey]` past this commitment's nonce (`nonce_invalidated = true`) are excluded — the contract would reject `matchCommitment` on them. Set `true` to include. |
+| `includeExpired` | optional bool, default `false`. By default, rows whose `expiry` has passed are excluded. Set `true` to include. |
 | `limit` | optional, default 100, max 1000 |
 | `offset` | optional, default 0 |
 
-Response: `{ commitments: CommitmentBody[], pagination: { limit, offset, total, hasMore } }`. Each `CommitmentBody` has the full canonical shape including `signature`, `speculationKey`, `nonceInvalidated`, etc.
+Response: `{ commitments: CommitmentBody[], pagination: { limit, offset, total, hasMore } }`. Each `CommitmentBody` has the full canonical shape including `signature`, `speculationKey`, `nonceInvalidated`, `createdAt`, etc.
 
 ### `GET /v1/markets`
 
@@ -110,7 +114,7 @@ List upcoming markets within a configurable time window (default 72h, max 168h).
 
 Query params: `sport` (one of `nba`, `nhl`, `ncaab`, `nfl`, `mlb`), `status`, `window` (hours), `limit` (max 200), `offset`.
 
-Response: `{ markets: MarketListItem[], pagination }`. Each market has `contestId`, team names, sport, `matchTime`, status, and a list of speculations (each with `type`, `theNumber`, `line`, etc.).
+Response: `{ markets: MarketListItem[], pagination }`. Each market has `contestId`, team names, sport, `matchTime`, status, and a list of speculations. Each speculation has `type` (`moneyline`/`spread`/`total`), `lineTicks` (raw int32, 10x format per the contracts), `line` (`lineTicks / 10`), and for spread also `awayLine` / `homeLine`.
 
 ### `GET /v1/markets/:contestId`
 
