@@ -9,7 +9,16 @@ import { asyncHandler } from './middleware/asyncHandler.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { v1Router } from './v1/router.js';
 
-interface HealthResponse {
+interface LivenessResponse {
+  ok: true;
+  service: 'ospex-core-api';
+  network: 'polygon' | 'amoy';
+  chainId: 137 | 80002;
+  uptimeSeconds: number;
+  timestamp: string;
+}
+
+interface ReadinessResponse {
   ok: boolean;
   service: 'ospex-core-api';
   network: 'polygon' | 'amoy';
@@ -52,11 +61,30 @@ function buildApp(config: ReturnType<typeof loadConfig>): express.Express {
   app.use(compression());
   app.use(express.json({ limit: '1mb' }));
 
+  // Liveness — process is up. No dependency checks. Always 200 while the
+  // event loop can answer. Heroku/uptime monitors should hit this; restarting
+  // the dyno doesn't fix Supabase, so we don't fail liveness when Supabase is
+  // down.
+  app.get('/healthz', (_req: Request, res: Response) => {
+    const body: LivenessResponse = {
+      ok: true,
+      service: 'ospex-core-api',
+      network: config.network,
+      chainId: config.chainId,
+      uptimeSeconds: Math.round(process.uptime()),
+      timestamp: new Date().toISOString(),
+    };
+    res.status(200).json(body);
+  });
+
+  // Readiness — process is up AND its required dependencies are reachable.
+  // Returns 503 if Supabase is unreachable so traffic routers / smoke tests
+  // can avoid sending requests that would fail.
   app.get(
-    '/healthz',
+    '/readyz',
     asyncHandler(async (_req: Request, res: Response) => {
       const supabase = await checkSupabase();
-      const body: HealthResponse = {
+      const body: ReadinessResponse = {
         ok: supabase.connected,
         service: 'ospex-core-api',
         network: config.network,
