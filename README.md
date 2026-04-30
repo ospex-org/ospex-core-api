@@ -14,10 +14,14 @@ In progress. Working today:
 - `GET /v1/markets`, `GET /v1/markets/:contestId` — market list / detail
 - `GET /v1/protocol/info` — static protocol metadata
 - `GET /v1/positions/:address` — wallet position history
+- `GET /v1/positions/:address/status` — categorized active / claimable
+- `GET /v1/positions/:address/claim-params` — txParams for claim calls
+- `GET /v1/positions/by-tx/:txHash` — parse `PositionFilled` from a tx
+- `GET /v1/positions/claim-result/:txHash` — parse `PositionClaimed` from a tx
 - `GET /v1/leaderboard` — current active leaderboard
 - `GET /v1/schedule?sport=` — upcoming games
 
-Out of scope for the current batch: all `/v1/analytics/*` endpoints (deep helper stack — separate batch), the position helpers (`/claim-params`, `/withdraw-params`, `/status` — need a Firestore→Supabase rewrite), `/v1/current-odds*` (Firebase-only).
+Not ported (no R4 analog — see "Position helpers" section below): `/withdraw-params`, `/withdraw-result/:txHash`. Not ported in any batch yet (deferred or out of scope): `/v1/analytics/*`, `/v1/current-odds*`.
 
 ## Stack
 
@@ -124,13 +128,43 @@ Single market detail. Returns the same shape as a list item, plus an `orderbook:
 
 Static metadata: name, network, chainId, contract addresses (matchingModule, scorers), supported sports, fees.
 
-### `GET /v1/positions/:address`
+### Position helpers
+
+#### `GET /v1/positions/:address`
 
 Paginated position history for a wallet. Returns positions with `riskAmountUSDC`, `profitAmountUSDC`, `claimed`, `positionType` (0|1), and totals (`totalCount`, `totalRiskUSDC`, `totalProfitUSDC`, `activeCount`).
 
 Query params: `limit` (max 200), `offset`.
 
-Out of scope: `/claim-params`, `/withdraw-params`, `/status` — depend on the agent-server's `fetchCategorizedPositions` helper which queries Firestore. Will be ported in a follow-up batch with a Supabase rewrite.
+#### `GET /v1/positions/:address/status`
+
+Returns the wallet's unclaimed positions split into `active` (speculation still open) and `claimable` (speculation closed, position has positive expected payout). Each entry has `positionId`, `speculationId`, `positionType`, `team`, `opponent`, `market`, `oddsDecimal`, `riskAmountUSDC`, `profitAmountUSDC`. Claimable entries also have `result` (`won`/`push`/`void`) and `estimatedPayoutUSDC`. Capped at 200 unclaimed positions per address (matches agent-server behavior).
+
+Lost positions and positions that would dust-revert (estimated payout < $0.01) are filtered out. There is no `withdrawable` bucket — see note below.
+
+#### `GET /v1/positions/:address/claim-params`
+
+Returns ready-to-sign tx params for every claimable position. R4 `claimPosition` takes `(speculationId, positionType)` — no `oddsPairId` (the R3 field is gone in R4 since positions are uniquely identified by `(speculationId, user, positionType)`).
+
+Response: `{ address, positions: [{ positionId, speculationId, description, txParams: { method: 'claimPosition', args: { speculationId, positionType } } }, …] }`.
+
+#### `GET /v1/positions/by-tx/:txHash`
+
+Parses the R4 `PositionFilled(speculationId, maker, taker, makerPositionType, takerPositionType, makerRisk, takerRisk)` event from a tx receipt. Each fill creates **two** position rows (maker + taker) so the response returns both as a single array. If `POSITION_MODULE_ADDRESS` is set, only logs from that contract are decoded; otherwise any log matching the event topic is decoded.
+
+Requires `ALCHEMY_RPC_URL`.
+
+#### `GET /v1/positions/claim-result/:txHash`
+
+Parses `PositionClaimed(speculationId, user, positionType, payout)`. Returns the speculation, user, position type, and payout (both as wei6 string and USDC float).
+
+Requires `ALCHEMY_RPC_URL`.
+
+#### Not ported — `/withdraw-params`, `/withdraw-result/:txHash`
+
+R4 has no `adjustUnmatchedPair` method or `PositionAdjusted` event. The R3 helper let a user pull back an unmatched stake on a position; in R4 positions are always fully matched at fill time and "unmatched" lives on the `commitments` table instead.
+
+The R4 analog of "withdraw your unfilled stake" is "cancel your open commitment" via `MatchingModule.cancelCommitment(commitment)`. Consumers can build that call directly from the existing `GET /v1/commitments?maker=…` response — every commitment row carries the 9 fields needed. So no helper endpoint is required. A future `GET /v1/commitments/cancel-result/:txHash` (parsing `CommitmentCancelled`) could be added if needed.
 
 ### `GET /v1/leaderboard`
 
@@ -166,8 +200,9 @@ See `.env.example`. Required values are validated at boot — missing vars exit 
 | `NETWORK` | no | `polygon` or `amoy`, defaults to `polygon` |
 | `SUPABASE_URL` | **yes** | |
 | `SUPABASE_SERVICE_ROLE_KEY` | **yes** | Bypasses RLS — see conventions |
-| `ALCHEMY_RPC_URL` | not yet | Reserved; required when on-chain endpoints land |
+| `ALCHEMY_RPC_URL` | for `/v1/positions/by-tx/:txHash` and `/v1/positions/claim-result/:txHash` | Polygon RPC endpoint for tx-receipt parsing |
 | `MATCHING_MODULE_ADDRESS` | for `POST /v1/commitments` | EIP-712 `verifyingContract`. Format-validated when set. |
+| `POSITION_MODULE_ADDRESS` | optional | Defensive log-source filter for tx parsers. When set, by-tx / claim-result only decode logs from this address. Format-validated when set. |
 | `SCORER_MONEYLINE_ADDRESS` | for `POST /v1/commitments` | All-or-nothing; partial config rejected at boot |
 | `SCORER_SPREAD_ADDRESS` | for `POST /v1/commitments` | |
 | `SCORER_TOTAL_ADDRESS` | for `POST /v1/commitments` | |
@@ -194,10 +229,11 @@ src/
     supabase.ts        # lazy-init Supabase client
     logger.ts          # pino
     eip712.ts          # R4 OspexCommitment schema, domain, verify, hash
+    rpc.ts             # lazy ethers JsonRpcProvider
     sanitize.ts        # wei6ToUSDC, toISOString
     parseOdds.ts       # American / line parsers
     slugs.ts           # toSlug / fromSlug
-    speculation.ts     # scorer ↔ market_type (pure)
+    speculation.ts     # scorer ↔ market_type, lineTicksToLine (pure)
     txParams.ts        # numeric primitives for on-chain tx building
   middleware/
     asyncHandler.ts    # error-forwarding wrapper
@@ -209,7 +245,10 @@ src/
     commitments.ts     # POST + GET /v1/commitments
     markets.ts         # GET /v1/markets, GET /v1/markets/:contestId
     protocol.ts        # GET /v1/protocol/info
-    positions.ts       # GET /v1/positions/:address
+    positions.ts       # GET /v1/positions/:address + /status, /claim-params,
+                       #   /by-tx/:txHash, /claim-result/:txHash
     leaderboard.ts     # GET /v1/leaderboard
     schedule.ts        # GET /v1/schedule
+    utils/
+      positionFetch.ts # categorize active/claimable (Supabase-only)
 ```

@@ -27,6 +27,7 @@ export interface Config {
   supabaseServiceRoleKey: string;
   alchemyRpcUrl?: string;
   matchingModuleAddress?: string;
+  positionModuleAddress?: string;
   scorers?: ScorerAddresses;
 }
 
@@ -103,6 +104,7 @@ export function loadConfig(): Config {
 
   const alchemyRpcUrl = optionalEnv('ALCHEMY_RPC_URL');
   const matchingModuleAddress = optionalAddressEnv('MATCHING_MODULE_ADDRESS');
+  const positionModuleAddress = optionalAddressEnv('POSITION_MODULE_ADDRESS');
 
   // Scorer addresses — accept the canonical name first, fall back to the
   // ospex-agent-server legacy name so a copied-over Heroku env still works.
@@ -147,6 +149,7 @@ export function loadConfig(): Config {
     supabaseServiceRoleKey,
     ...(alchemyRpcUrl !== undefined ? { alchemyRpcUrl } : {}),
     ...(matchingModuleAddress !== undefined ? { matchingModuleAddress } : {}),
+    ...(positionModuleAddress !== undefined ? { positionModuleAddress } : {}),
     ...(scorers !== undefined ? { scorers } : {}),
   };
   return cached;

@@ -5,7 +5,13 @@ import { commitmentsRateLimit, readRateLimit } from '../middleware/rateLimit.js'
 import { getCommitmentsHandler, postCommitmentHandler } from './commitments.js';
 import { getMarketByIdHandler, getMarketsHandler } from './markets.js';
 import { getProtocolInfoHandler } from './protocol.js';
-import { getPositionsByAddressHandler } from './positions.js';
+import {
+  getClaimParamsHandler,
+  getClaimResultHandler,
+  getPositionByTxHandler,
+  getPositionStatusHandler,
+  getPositionsByAddressHandler,
+} from './positions.js';
 import { getLeaderboardHandler } from './leaderboard.js';
 import { getScheduleHandler } from './schedule.js';
 
@@ -36,6 +42,12 @@ v1Router.get('/markets/:contestId', readRateLimit, asyncHandler(getMarketByIdHan
 
 v1Router.get('/protocol/info', readRateLimit, (req, res) => getProtocolInfoHandler(req, res));
 
+// Static-prefix tx parsers MUST come before `/positions/:address`
+// so Express doesn't match `by-tx` / `claim-result` as an address.
+v1Router.get('/positions/by-tx/:txHash', readRateLimit, asyncHandler(getPositionByTxHandler));
+v1Router.get('/positions/claim-result/:txHash', readRateLimit, asyncHandler(getClaimResultHandler));
+v1Router.get('/positions/:address/claim-params', readRateLimit, asyncHandler(getClaimParamsHandler));
+v1Router.get('/positions/:address/status', readRateLimit, asyncHandler(getPositionStatusHandler));
 v1Router.get('/positions/:address', readRateLimit, asyncHandler(getPositionsByAddressHandler));
 
 v1Router.get('/leaderboard', readRateLimit, asyncHandler(getLeaderboardHandler));
