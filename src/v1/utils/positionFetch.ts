@@ -34,12 +34,10 @@
 
 import { getSupabase } from '../../lib/supabase.js';
 import { wei6ToUSDC } from '../../lib/sanitize.js';
-import { scorerToType, type MarketType, type ScorerAddresses } from '../../lib/speculation.js';
+import type { MarketType } from '../../lib/speculation.js';
 import { loadConfig } from '../../lib/env.js';
 
 const POSITION_QUERY_LIMIT = 200;
-/** Below this payout we treat the position as not-worth-claiming (claim would dust-revert anyway). */
-const MIN_CLAIM_PAYOUT_USDC = 0.01;
 
 const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower: 1 };
 const POSITION_TYPE_FROM_INT: Record<0 | 1, 'upper' | 'lower'> = { 0: 'upper', 1: 'lower' };
@@ -59,6 +57,7 @@ export interface PositionBase {
 export interface ClaimablePosition extends PositionBase {
   result: 'won' | 'push' | 'void';
   estimatedPayoutUSDC: number;
+  estimatedPayoutWei6: string;
 }
 
 export interface PositionFetchResult {
@@ -78,8 +77,8 @@ interface PositionRow {
 
 interface SpeculationRow {
   speculation_id: number;
-  contest_id: number;
-  speculation_scorer: string;
+  contest_id: number | null;
+  market_type: MarketType | null;
   speculation_status: 'open' | 'closed';
   win_side: 'tbd' | 'away' | 'home' | 'over' | 'under' | 'push' | 'void';
 }
@@ -128,49 +127,60 @@ export async function fetchCategorizedPositions(
   const positions = (posRes.data ?? []) as unknown as PositionRow[];
   if (positions.length === 0) return { active: [], claimable: [] };
 
-  // Step 2: batch-fetch related speculations
+  // Step 2: batch-fetch related speculations.
+  // `market_type` is read straight from the column (populated by the
+  // indexer per migration 027) — no scorer-address lookup needed, so
+  // this read path doesn't depend on SCORER_*_ADDRESS env config.
   const specIds = [...new Set(positions.map((p) => p.speculation_id))];
-  const specRes = await sb
-    .from('speculations')
-    .select('speculation_id, contest_id, speculation_scorer, speculation_status, win_side')
-    .eq('network', config.network)
-    .in('speculation_id', specIds);
-
-  if (specRes.error) throw new Error(`fetchCategorizedPositions speculations: ${specRes.error.message}`);
-  const specs = (specRes.data ?? []) as unknown as SpeculationRow[];
   const specById = new Map<number, SpeculationRow>();
-  for (const s of specs) specById.set(s.speculation_id, s);
-
-  // Step 3: batch-fetch contests for team-name lookup
-  const contestIds = [...new Set(specs.map((s) => s.contest_id))];
-  const contestRes = await sb
-    .from('contests')
-    .select('contest_id, away_team, home_team')
-    .eq('network', config.network)
-    .in('contest_id', contestIds);
-
-  if (contestRes.error) throw new Error(`fetchCategorizedPositions contests: ${contestRes.error.message}`);
-  const contests = (contestRes.data ?? []) as unknown as ContestRow[];
-  const contestById = new Map<number, ContestRow>();
-  for (const c of contests) contestById.set(c.contest_id, c);
-
-  // Step 4: scorer addresses (required to map scorer → market_type)
-  if (!config.scorers) {
-    throw new Error('fetchCategorizedPositions: SCORER_*_ADDRESS env vars are not configured');
+  if (specIds.length > 0) {
+    const specRes = await sb
+      .from('speculations')
+      .select('speculation_id, contest_id, market_type, speculation_status, win_side')
+      .eq('network', config.network)
+      .in('speculation_id', specIds);
+    if (specRes.error) throw new Error(`fetchCategorizedPositions speculations: ${specRes.error.message}`);
+    const specs = (specRes.data ?? []) as unknown as SpeculationRow[];
+    for (const s of specs) specById.set(s.speculation_id, s);
   }
-  const scorers: ScorerAddresses = config.scorers;
 
-  // Step 5: categorize
+  // Step 3: batch-fetch contests for team-name lookup. Only run the
+  // query if there are contest_ids to look up — Supabase / PostgREST
+  // builds `contest_id=in.()` from an empty list, which is malformed.
+  const contestIds = [
+    ...new Set(
+      [...specById.values()]
+        .map((s) => s.contest_id)
+        .filter((id): id is number => id != null),
+    ),
+  ];
+  const contestById = new Map<number, ContestRow>();
+  if (contestIds.length > 0) {
+    const contestRes = await sb
+      .from('contests')
+      .select('contest_id, away_team, home_team')
+      .eq('network', config.network)
+      .in('contest_id', contestIds);
+    if (contestRes.error) throw new Error(`fetchCategorizedPositions contests: ${contestRes.error.message}`);
+    const contests = (contestRes.data ?? []) as unknown as ContestRow[];
+    for (const c of contests) contestById.set(c.contest_id, c);
+  }
+
+  // Step 4: categorize.
+  // Payout filter mirrors PositionModule.sol:367-370 exactly:
+  // `claimPosition` reverts only when `riskAmount == 0 || payout == 0`.
+  // We do the comparison in wei6 (bigint) so sub-cent payouts (which
+  // ARE claimable on-chain) aren't filtered by USDC-float rounding.
   const active: PositionBase[] = [];
   const claimable: ClaimablePosition[] = [];
 
   for (const p of positions) {
     const spec = specById.get(p.speculation_id);
-    if (!spec) continue; // shouldn't happen, but skip orphans defensively
+    if (!spec) continue; // shouldn't happen; skip orphans defensively
 
-    const contest = contestById.get(spec.contest_id);
+    const contest = spec.contest_id != null ? contestById.get(spec.contest_id) : undefined;
     const positionType = POSITION_TYPE_TO_INT[p.position_type];
-    const market: MarketType = scorerToType(spec.speculation_scorer, scorers) ?? 'moneyline';
+    const market: MarketType = spec.market_type ?? 'moneyline';
 
     const team = contest
       ? (positionType === 0 ? contest.away_team : contest.home_team) ?? 'Unknown'
@@ -179,10 +189,8 @@ export async function fetchCategorizedPositions(
       ? (positionType === 0 ? contest.home_team : contest.away_team) ?? 'Unknown'
       : 'Unknown';
 
-    const riskBig = BigInt(String(p.risk_amount));
-    const profitBig = p.profit_amount != null ? BigInt(String(p.profit_amount)) : 0n;
-    const riskUSDC = wei6ToUSDC(p.risk_amount);
-    const profitUSDC = wei6ToUSDC(p.profit_amount);
+    const riskWei6 = BigInt(String(p.risk_amount));
+    const profitWei6 = p.profit_amount != null ? BigInt(String(p.profit_amount)) : 0n;
 
     const base: PositionBase = {
       positionId: `${p.speculation_id}_${lowerAddress}_${positionType}`,
@@ -191,35 +199,37 @@ export async function fetchCategorizedPositions(
       team,
       opponent,
       market,
-      oddsDecimal: impliedOddsDecimal(riskBig, profitBig),
-      riskAmountUSDC: riskUSDC,
-      profitAmountUSDC: profitUSDC,
+      oddsDecimal: impliedOddsDecimal(riskWei6, profitWei6),
+      riskAmountUSDC: wei6ToUSDC(p.risk_amount),
+      profitAmountUSDC: wei6ToUSDC(p.profit_amount),
     };
 
     if (spec.speculation_status === 'closed') {
       let result: ClaimablePosition['result'];
-      let payoutUSDC: number;
+      let payoutWei6: bigint;
       if (didWin(positionType, spec.win_side)) {
         result = 'won';
-        payoutUSDC = riskUSDC + profitUSDC;
+        payoutWei6 = riskWei6 + profitWei6;
       } else if (spec.win_side === 'push') {
         result = 'push';
-        payoutUSDC = riskUSDC;
+        payoutWei6 = riskWei6;
       } else if (spec.win_side === 'void') {
         result = 'void';
-        payoutUSDC = riskUSDC;
+        payoutWei6 = riskWei6;
       } else if (spec.win_side === 'tbd') {
         // closed but win_side not yet set — shouldn't happen, treat as not claimable
         continue;
       } else {
-        // lost: contract would revert with NoPayout
+        // lost: contract reverts with NoPayout
         continue;
       }
-      if (payoutUSDC < MIN_CLAIM_PAYOUT_USDC) continue;
+      // Match contract: reject only riskAmount==0 || payout==0.
+      if (riskWei6 === 0n || payoutWei6 === 0n) continue;
       claimable.push({
         ...base,
         result,
-        estimatedPayoutUSDC: Math.round(payoutUSDC * 100) / 100,
+        estimatedPayoutUSDC: wei6ToUSDC(payoutWei6.toString()),
+        estimatedPayoutWei6: payoutWei6.toString(),
       });
     } else {
       active.push(base);

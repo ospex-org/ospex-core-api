@@ -138,15 +138,19 @@ Query params: `limit` (max 200), `offset`.
 
 #### `GET /v1/positions/:address/status`
 
-Returns the wallet's unclaimed positions split into `active` (speculation still open) and `claimable` (speculation closed, position has positive expected payout). Each entry has `positionId`, `speculationId`, `positionType`, `team`, `opponent`, `market`, `oddsDecimal`, `riskAmountUSDC`, `profitAmountUSDC`. Claimable entries also have `result` (`won`/`push`/`void`) and `estimatedPayoutUSDC`. Capped at 200 unclaimed positions per address (matches agent-server behavior).
+Returns the wallet's unclaimed positions split into `active` (speculation still open) and `claimable` (speculation closed, position has non-zero expected payout). Each entry has `positionId`, `speculationId`, `positionType`, `team`, `opponent`, `market`, `oddsDecimal`, `riskAmountUSDC`, `profitAmountUSDC`. Claimable entries also have `result` (`won`/`push`/`void`), `estimatedPayoutUSDC` (full precision, no rounding), and `estimatedPayoutWei6` (raw uint256-as-string). Totals at the top level mirror this — `estimatedPayoutUSDC` plus `estimatedPayoutWei6` aggregated in bigint to avoid float-rounding loss across many claimable rows. Capped at 200 unclaimed positions per address (matches agent-server behavior).
 
-Lost positions and positions that would dust-revert (estimated payout < $0.01) are filtered out. There is no `withdrawable` bucket — see note below.
+Filtering matches the contract exactly: `claimPosition` reverts only when `riskAmount == 0 || payout == 0` (`PositionModule.sol:367-370`). The filter is done in wei6 (bigint), so sub-cent payouts that ARE claimable on-chain still appear in the response. Lost positions are excluded (the contract would revert with `NoPayout`); positions on still-open speculations go in `active`. There is no `withdrawable` bucket — see note below.
+
+This endpoint reads `speculations.market_type` directly (populated by the indexer per migration 027) and does not depend on the `SCORER_*_ADDRESS` env vars — those are only required for `POST /v1/commitments`.
 
 #### `GET /v1/positions/:address/claim-params`
 
 Returns ready-to-sign tx params for every claimable position. R4 `claimPosition` takes `(speculationId, positionType)` — no `oddsPairId` (the R3 field is gone in R4 since positions are uniquely identified by `(speculationId, user, positionType)`).
 
-Response: `{ address, positions: [{ positionId, speculationId, description, txParams: { method: 'claimPosition', args: { speculationId, positionType } } }, …] }`.
+Same filter / market_type semantics as `/status` above.
+
+Response: `{ address, positions: [{ positionId, speculationId, description, txParams: { method: 'claimPosition', args: { speculationId, positionType } } }, …] }`. The `description` field shows `"<$0.01"` for sub-cent expected payouts so it doesn't misleadingly round to `$0.00`.
 
 #### `GET /v1/positions/by-tx/:txHash`
 

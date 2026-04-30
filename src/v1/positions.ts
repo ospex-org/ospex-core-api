@@ -180,7 +180,12 @@ interface StatusResponse {
   address: string;
   active: PositionBase[];
   claimable: ClaimablePosition[];
-  totals: { activeCount: number; claimableCount: number; estimatedPayoutUSDC: number };
+  totals: {
+    activeCount: number;
+    claimableCount: number;
+    estimatedPayoutUSDC: number;
+    estimatedPayoutWei6: string;
+  };
 }
 
 export async function getPositionStatusHandler(req: Request, res: Response): Promise<void> {
@@ -199,8 +204,9 @@ export async function getPositionStatusHandler(req: Request, res: Response): Pro
     return;
   }
 
-  let estimatedPayoutUSDC = 0;
-  for (const p of result.claimable) estimatedPayoutUSDC += p.estimatedPayoutUSDC;
+  // Sum in wei6 (bigint) so sub-cent payouts aggregate without rounding loss.
+  let estimatedPayoutWei6 = 0n;
+  for (const p of result.claimable) estimatedPayoutWei6 += BigInt(p.estimatedPayoutWei6);
 
   const body: StatusResponse = {
     address,
@@ -209,7 +215,8 @@ export async function getPositionStatusHandler(req: Request, res: Response): Pro
     totals: {
       activeCount: result.active.length,
       claimableCount: result.claimable.length,
-      estimatedPayoutUSDC: Math.round(estimatedPayoutUSDC * 100) / 100,
+      estimatedPayoutUSDC: wei6ToUSDC(estimatedPayoutWei6.toString()),
+      estimatedPayoutWei6: estimatedPayoutWei6.toString(),
     },
   };
   res.status(200).json(body);
@@ -261,10 +268,17 @@ export async function getClaimParamsHandler(req: Request, res: Response): Promis
       p.result === 'won' ? 'Won'
       : p.result === 'push' ? 'Push'
       : 'Void';
+    // Sub-cent payouts round to "$0.00" with toFixed(2) — surface them
+    // honestly as "<$0.01" so the description doesn't mislead. The
+    // structured fields (estimatedPayoutUSDC, estimatedPayoutWei6) carry
+    // full precision regardless.
+    const payoutDisplay = p.estimatedPayoutUSDC >= 0.01
+      ? `$${p.estimatedPayoutUSDC.toFixed(2)}`
+      : '<$0.01';
     return {
       positionId: p.positionId,
       speculationId: p.speculationId,
-      description: `${p.team} ${MARKET_LABEL[p.market] ?? p.market} — ${resultLabel} (≈ $${p.estimatedPayoutUSDC.toFixed(2)})`,
+      description: `${p.team} ${MARKET_LABEL[p.market] ?? p.market} — ${resultLabel} (≈ ${payoutDisplay})`,
       txParams: {
         method: 'claimPosition',
         args: { speculationId: p.speculationId, positionType: p.positionType },
