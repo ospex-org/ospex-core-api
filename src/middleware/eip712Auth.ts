@@ -123,15 +123,28 @@ function validateOspexCommitment(raw: Record<string, unknown>): ReturnType<Actio
   if (nonce < 0n) {
     return { ok: false, status: 400, error: err('nonce must be non-negative.', 'INVALID_PARAM') };
   }
-  // expiry — unix seconds; must be in the future
+  // expiry — unix seconds; must be in the future, but bounded above so a
+  // signed 2^255-1 (or anything beyond JS Date / Postgres timestamptz range)
+  // can't reach `new Date(Number(expiry) * 1000).toISOString()` and throw a
+  // RangeError that would leak as a 500. 1 year is well past any realistic
+  // sports market and well below Number.MAX_SAFE_INTEGER seconds.
   let expiry: bigint;
   try {
     expiry = BigInt(raw['expiry'] as string | number);
   } catch {
     return { ok: false, status: 400, error: err('expiry must be a unix-seconds integer.', 'INVALID_PARAM') };
   }
-  if (expiry <= BigInt(Math.floor(Date.now() / 1000))) {
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  if (expiry <= nowSec) {
     return { ok: false, status: 400, error: err('Commitment has already expired.', 'INVALID_PARAM') };
+  }
+  const MAX_EXPIRY_OFFSET_SEC = 366n * 24n * 60n * 60n;
+  if (expiry > nowSec + MAX_EXPIRY_OFFSET_SEC) {
+    return {
+      ok: false,
+      status: 400,
+      error: err('expiry is more than 1 year in the future; pick a closer expiry.', 'INVALID_PARAM'),
+    };
   }
 
   return {

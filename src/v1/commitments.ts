@@ -105,11 +105,18 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
 
   // ── Idempotency check ─────────────────────────────────────────────────
   // If a row already exists for this hash, return 200. Two cases:
-  //   1. Row was indexer-created (source='indexer') OR has no signature —
-  //      we have the off-chain truth (signature, full risk_amount, nonce,
-  //      expiry, speculation_key) the indexer didn't, so enrich it.
-  //   2. Row was already API-enriched (signature present, source='agent')
-  //      — return as-is. This makes the POST safely retryable.
+  //   1. Existing row has no `signature` — either the indexer created it
+  //      from a CANCEL/MATCH event (source='indexer', signature=NULL by
+  //      migration 027), or some legacy path inserted a signature-less
+  //      row. Either way, we hold the off-chain truth (signature,
+  //      risk_amount, nonce, expiry, speculation_key) and write it.
+  //   2. Existing row already has a signature — return as-is.
+  //
+  // Gate on `!signature` rather than `source === 'indexer' || !signature`:
+  // we don't flip `source` during enrichment (it's provenance — the row
+  // really did originate at the indexer), so testing source here makes
+  // every retry of an enriched row run the UPDATE again. Signature
+  // presence is the right "needs enrichment" signal.
   const existing = await sb
     .from('commitments')
     .select(COMMITMENT_RETURN_COLUMNS)
@@ -124,7 +131,7 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
   }
   if (existing.data) {
     const existingRow = existing.data as CommitmentRow;
-    if (existingRow.source === 'indexer' || !existingRow.signature) {
+    if (!existingRow.signature) {
       const enriched = await sb
         .from('commitments')
         .update({
@@ -143,6 +150,10 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
         res.status(500).json({ error: 'Failed to enrich existing commitment.', code: 'INTERNAL_ERROR' } satisfies ApiError);
         return;
       }
+      logger.info(
+        { commitmentHash, priorSource: existingRow.source },
+        'commitments: enriched signature-less row',
+      );
       res.status(200).json(rowToBody(enriched.data as CommitmentRow));
       return;
     }

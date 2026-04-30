@@ -68,7 +68,7 @@ Notes:
 - `verifyingContract` of the EIP-712 domain is the **MatchingModule**, not OspexCore.
 - `riskAmount` must be a multiple of 100 (lot-size aligned).
 - `oddsTick` ∈ [101, 10100].
-- `expiry` is unix seconds and must be in the future at submit time.
+- `expiry` is unix seconds; must be in the future and within ~1 year of now (the upper bound prevents JS `Date` overflow on pathological values).
 - `positionType`: 0 = upper (away/over), 1 = lower (home/under).
 - Rate-limited at 60 requests/minute per IP.
 
