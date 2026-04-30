@@ -6,7 +6,7 @@ This repo replaces the API surface that used to live inside `ospex-agent-server`
 
 ## Status
 
-Empty scaffold. Only `/healthz` works today. Endpoints are migrating in batches.
+Empty scaffold. Only `/healthz` (liveness) and `/readyz` (readiness) work today. Endpoints are migrating in batches.
 
 ## Stack
 
@@ -20,7 +20,7 @@ Empty scaffold. Only `/healthz` works today. Endpoints are migrating in batches.
 
 ```bash
 yarn install
-cp .env.example .env  # fill in SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, ALCHEMY_RPC_URL, MATCHING_MODULE_ADDRESS
+cp .env.example .env  # fill in SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY
 yarn typecheck
 yarn dev
 ```
@@ -28,8 +28,14 @@ yarn dev
 Then:
 
 ```bash
-curl http://localhost:3000/healthz
+curl http://localhost:3000/healthz   # liveness — always 200 if process is up
+curl http://localhost:3000/readyz    # readiness — 200 only if Supabase is reachable
 ```
+
+## Health endpoints
+
+- `/healthz` — **liveness**. The process is up and the event loop is responsive. Always returns 200. Heroku/uptime monitors should target this — restarting the dyno doesn't fix a downstream outage, so we don't fail liveness when Supabase is down.
+- `/readyz` — **readiness**. The process is up *and* its required dependencies are reachable. Returns 503 if Supabase is unreachable so traffic routers / smoke tests can avoid sending requests that would fail.
 
 ## Scripts
 
@@ -43,7 +49,18 @@ curl http://localhost:3000/healthz
 
 ## Environment
 
-See `.env.example`. All required values are validated at boot — missing vars exit with `code 1` immediately, not on first request.
+See `.env.example`. Required values are validated at boot — missing vars exit with `code 1` immediately, not on first request.
+
+| Var | Required | Notes |
+|---|---|---|
+| `PORT` | no | Defaults to 3000 |
+| `NODE_ENV` | no | Defaults to `development` |
+| `LOG_LEVEL` | no | Defaults to `info` (pino levels) |
+| `NETWORK` | no | `polygon` or `amoy`, defaults to `polygon` |
+| `SUPABASE_URL` | **yes** | |
+| `SUPABASE_SERVICE_ROLE_KEY` | **yes** | Bypasses RLS — see conventions |
+| `ALCHEMY_RPC_URL` | not yet | Reserved; required when on-chain endpoints land |
+| `MATCHING_MODULE_ADDRESS` | not yet | Reserved; format-validated when set; required when EIP-712 endpoints land |
 
 ## Deployment
 
@@ -54,6 +71,7 @@ Heroku app target: `ospex-core-api`. Procfile uses `web: node dist/server.js`. B
 - **Supabase only** — no Firebase, no Firestore, no `firebase-admin`. The `package.json` has zero firebase deps and any PR adding one should be rejected at review.
 - **No data-source smuggling** — handlers and their helpers must read from the same data layer. Don't repeat the `positionFetch.ts` pattern from `ospex-agent-server` where a Supabase-looking handler quietly called a Firestore helper.
 - **Network-scoped queries** — every Supabase query that hits a network-partitioned table must filter `eq('network', NETWORK)`. The indexer skill in `.claude/skills/indexer/` has the canonical list.
+- **Service-role key bypasses RLS** — the server uses `SUPABASE_SERVICE_ROLE_KEY`, which sees every column on every row. Handlers must explicitly select the public columns they intend to expose (`.select('id, name, ...')` not `.select('*')`) and never echo a row directly to the response. Treat raw row shape as private by default.
 - **Strict TypeScript** — `any` is an error, unused vars are errors, console is an error (use the pino `logger`). Run `yarn typecheck` before merging.
 
 ## Layout
