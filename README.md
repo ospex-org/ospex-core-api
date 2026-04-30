@@ -213,7 +213,34 @@ See `.env.example`. Required values are validated at boot — missing vars exit 
 
 ## Deployment
 
-Heroku app target: `ospex-core-api`. Procfile uses `web: node dist/server.js`. Build runs via `tsc` on slug compile (Heroku auto-runs `yarn build` for Node apps with a `build` script).
+Heroku app: `ospex-core-api`. Production URL: `https://ospex-core-api-195f635df864.herokuapp.com/`.
+
+Procfile: `web: node dist/server.js`. Heroku auto-runs `yarn build` (`tsc` → `dist/`) on slug compile.
+
+### Required Heroku config vars
+
+Set via `heroku config:set <var>=<value> --app ospex-core-api`. Mirrors `.env.example`:
+
+- `NETWORK` — `polygon` for production, `amoy` for testnet
+- `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
+- `ALCHEMY_RPC_URL` — Polygon mainnet RPC (PAYG-tier — required by `/v1/positions/by-tx` and `/v1/positions/claim-result`)
+- `MATCHING_MODULE_ADDRESS` — R4 matching module (required by `POST /v1/commitments`)
+- `SCORER_MONEYLINE_ADDRESS`, `SCORER_SPREAD_ADDRESS`, `SCORER_TOTAL_ADDRESS` — required by `POST /v1/commitments` (all-or-nothing; partial config is rejected at boot)
+- `POSITION_MODULE_ADDRESS` — optional defensive log-source filter for tx parsers
+
+`NODE_ENV=production` and `LOG_LEVEL=info` are recommended. **Do not set `PORT`** — Heroku injects it; setting it as a config var creates a binding mismatch.
+
+### Post-deploy smoke test
+
+```bash
+URL=https://ospex-core-api-195f635df864.herokuapp.com
+curl -s "$URL/healthz"            # 200 + service / network / chainId
+curl -s "$URL/readyz"              # 200 only when supabase.connected and commitments.configured
+curl -s "$URL/v1/protocol/info"    # mainnet contract addresses
+curl -s "$URL/v1/markets"          # paginated list (empty until indexer ingests data)
+```
+
+`/readyz` is the canonical "everything wired" check — both Supabase reachability and EIP-712 relay env config are surfaced in the JSON.
 
 ## Project conventions
 
