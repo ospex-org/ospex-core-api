@@ -1,17 +1,23 @@
 /**
- * POST /v1/commitments — accept a signed EIP-712 OspexCommitment from
- * a maker, persist it to Supabase as `status: 'open'`, and return the
- * stored row. Idempotent on `commitment_hash`: a duplicate post returns
- * 200 with the existing row instead of 409 / a duplicate insert.
+ * /v1/commitments — write + read for the EIP-712 commitment relay.
  *
- * The signature has already been verified by `eip712Auth`. The handler
- * just needs to map the verified message → DB columns, derive
- * `market_type` from the scorer, derive `speculation_key`, check the
- * maker's on-chain nonce floor, and INSERT (or enrich an
- * indexer-created row if one already exists for this hash).
+ *   POST /v1/commitments  — accept a signed OspexCommitment and persist it.
+ *                           Idempotent on commitment_hash; if an indexer-only
+ *                           row exists, enrich it. Returns the canonical
+ *                           commitment body.
+ *
+ *   GET  /v1/commitments  — list commitments with filters (maker,
+ *                           contestId, scorer, status) and pagination
+ *                           (limit, offset). Sorted by
+ *                           `created_at DESC, commitment_hash ASC` —
+ *                           newest first; tie-break on hash so
+ *                           offset-based pagination is deterministic
+ *                           across ties (rows backfilled by indexer
+ *                           migration 039 share a timestamp).
  */
 
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
+import { isAddress } from 'ethers';
 import { loadConfig } from '../lib/env.js';
 import { logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
@@ -20,48 +26,100 @@ import { scorerToType, type MarketType } from '../lib/speculation.js';
 import type { AuthenticatedRequest } from '../middleware/eip712Auth.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 
-interface CommitmentResponseBody {
+// ────────────────────────────────────────────────────────────────────────
+// Canonical commitment body
+//
+// Same shape used by POST and GET responses so consumers don't have to
+// branch on which endpoint produced a row. snake_case columns from
+// Supabase are normalized to camelCase here.
+// ────────────────────────────────────────────────────────────────────────
+
+interface CommitmentBody {
   commitmentHash: string;
-  status: string;
-  riskAmount: string;
+  maker: string;
+  contestId: string | null;
+  scorer: string | null;
+  lineTicks: number | null;
+  positionType: 0 | 1 | null;     // 0 = upper (away/over), 1 = lower (home/under)
+  oddsTick: number | null;
+  marketType: MarketType | null;
+  riskAmount: string;             // uint256 as string
   filledRiskAmount: string;
-  remainingRiskAmount: string;
-  expiry: string;
+  remainingRiskAmount: string;    // computed: max(0, risk - filled)
+  nonce: string;
+  expiry: string | null;
+  speculationKey: string | null;
+  signature: string | null;
+  status: string;
   source: string;
   network: string;
+  nonceInvalidated: boolean;
+  createdAt: string;              // ISO 8601 — filled by DB default `now()`
 }
 
-const POSITION_TYPE_LABEL: Record<number, 'upper' | 'lower'> = { 0: 'upper', 1: 'lower' };
-
-const COMMITMENT_RETURN_COLUMNS =
-  'commitment_hash, status, risk_amount, filled_risk_amount, expiry, source, network, signature';
+const COMMITMENT_COLUMNS =
+  'commitment_hash, maker, contest_id, scorer, line_ticks, position_type, ' +
+  'odds_tick, market_type, risk_amount, filled_risk_amount, nonce, expiry, ' +
+  'speculation_key, signature, status, source, network, nonce_invalidated, ' +
+  'created_at';
 
 interface CommitmentRow {
   commitment_hash: string;
-  status: string;
-  risk_amount: string;
-  filled_risk_amount: string;
+  maker: string;
+  contest_id: string | number | null;
+  scorer: string | null;
+  line_ticks: number | null;
+  position_type: 'upper' | 'lower' | null;
+  odds_tick: number | null;
+  market_type: MarketType | null;
+  risk_amount: string | number | null;
+  filled_risk_amount: string | number | null;
+  nonce: string | number | null;
   expiry: string | null;
+  speculation_key: string | null;
+  signature: string | null;
+  status: string;
   source: string;
   network: string;
-  signature: string | null;
+  nonce_invalidated: boolean | null;
+  created_at: string;
 }
 
-function rowToBody(row: CommitmentRow): CommitmentResponseBody {
-  const risk = BigInt(row.risk_amount);
-  const filled = BigInt(row.filled_risk_amount);
-  const remaining = risk - filled;
+const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower: 1 };
+
+function rowToBody(row: CommitmentRow): CommitmentBody {
+  const risk = row.risk_amount != null ? BigInt(String(row.risk_amount)) : 0n;
+  const filled = row.filled_risk_amount != null ? BigInt(String(row.filled_risk_amount)) : 0n;
+  const remaining = risk > filled ? risk - filled : 0n;
   return {
     commitmentHash: row.commitment_hash,
-    status: row.status,
+    maker: row.maker,
+    contestId: row.contest_id != null ? String(row.contest_id) : null,
+    scorer: row.scorer,
+    lineTicks: row.line_ticks,
+    positionType: row.position_type ? POSITION_TYPE_TO_INT[row.position_type] : null,
+    oddsTick: row.odds_tick,
+    marketType: row.market_type,
     riskAmount: risk.toString(),
     filledRiskAmount: filled.toString(),
-    remainingRiskAmount: (remaining < 0n ? 0n : remaining).toString(),
-    expiry: row.expiry ?? '',
+    remainingRiskAmount: remaining.toString(),
+    nonce: row.nonce != null ? String(row.nonce) : '0',
+    expiry: row.expiry,
+    speculationKey: row.speculation_key,
+    signature: row.signature,
+    status: row.status,
     source: row.source,
     network: row.network,
+    nonceInvalidated: Boolean(row.nonce_invalidated),
+    createdAt: row.created_at,
   };
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// POST /v1/commitments
+// ────────────────────────────────────────────────────────────────────────
+
+const POSITION_TYPE_LABEL: Record<number, 'upper' | 'lower'> = { 0: 'upper', 1: 'lower' };
 
 export async function postCommitmentHandler(req: AuthenticatedRequest, res: Response): Promise<void> {
   const config = loadConfig();
@@ -88,7 +146,6 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
   const nonce = message['nonce'] as bigint;
   const expiry = message['expiry'] as bigint;
 
-  // Derive market_type from scorer address.
   const marketType: MarketType | null = scorerToType(scorer, scorers);
   if (!marketType) {
     res.status(400).json({
@@ -103,23 +160,11 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
   const sb = getSupabase();
   const signature = (req.body as { signature: string }).signature;
 
-  // ── Idempotency check ─────────────────────────────────────────────────
-  // If a row already exists for this hash, return 200. Two cases:
-  //   1. Existing row has no `signature` — either the indexer created it
-  //      from a CANCEL/MATCH event (source='indexer', signature=NULL by
-  //      migration 027), or some legacy path inserted a signature-less
-  //      row. Either way, we hold the off-chain truth (signature,
-  //      risk_amount, nonce, expiry, speculation_key) and write it.
-  //   2. Existing row already has a signature — return as-is.
-  //
-  // Gate on `!signature` rather than `source === 'indexer' || !signature`:
-  // we don't flip `source` during enrichment (it's provenance — the row
-  // really did originate at the indexer), so testing source here makes
-  // every retry of an enriched row run the UPDATE again. Signature
-  // presence is the right "needs enrichment" signal.
+  // Idempotency / enrichment lookup. Gate enrichment on `!signature` only
+  // (provenance preserved — see review feedback comments in PR #2).
   const existing = await sb
     .from('commitments')
-    .select(COMMITMENT_RETURN_COLUMNS)
+    .select(COMMITMENT_COLUMNS)
     .eq('network', config.network)
     .eq('commitment_hash', commitmentHash)
     .maybeSingle();
@@ -130,7 +175,7 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
     return;
   }
   if (existing.data) {
-    const existingRow = existing.data as CommitmentRow;
+    const existingRow = existing.data as unknown as CommitmentRow;
     if (!existingRow.signature) {
       const enriched = await sb
         .from('commitments')
@@ -143,7 +188,7 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
         })
         .eq('network', config.network)
         .eq('commitment_hash', commitmentHash)
-        .select(COMMITMENT_RETURN_COLUMNS)
+        .select(COMMITMENT_COLUMNS)
         .single();
       if (enriched.error) {
         logger.error({ err: enriched.error.message }, 'commitments: enrichment update failed');
@@ -154,20 +199,16 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
         { commitmentHash, priorSource: existingRow.source },
         'commitments: enriched signature-less row',
       );
-      res.status(200).json(rowToBody(enriched.data as CommitmentRow));
+      res.status(200).json(rowToBody(enriched.data as unknown as CommitmentRow));
       return;
     }
     res.status(200).json(rowToBody(existingRow));
     return;
   }
 
-  // ── Nonce floor check ─────────────────────────────────────────────────
-  // The contract rejects matchCommitment if nonce < s_minNonces[maker][specKey].
-  // Without this pre-check the API would accept commitments that no taker
-  // can ever fill — and the indexer's MIN_NONCE_UPDATED handler only flips
-  // `nonce_invalidated=true` on rows that already exist when the event
-  // fires, so a stale-nonce commitment posted *after* the floor was raised
-  // would remain discoverable as `status='open' AND nonce_invalidated=false`.
+  // Nonce-floor pre-check. The contract rejects matchCommitment with
+  // NonceTooLow if nonce < s_minNonces[maker][specKey]. Without this
+  // pre-check the API would accept commitments no taker can fill.
   const floor = await sb
     .from('maker_nonce_floors')
     .select('min_nonce')
@@ -192,7 +233,6 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
     }
   }
 
-  // ── Insert ────────────────────────────────────────────────────────────
   const insert = await sb
     .from('commitments')
     .insert({
@@ -214,21 +254,19 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
       status: 'open',
       source: 'agent',
     })
-    .select(COMMITMENT_RETURN_COLUMNS)
+    .select(COMMITMENT_COLUMNS)
     .single();
 
   if (insert.error) {
-    // Race: another request inserted the same hash between our SELECT and
-    // INSERT. Re-read and return the existing row.
     if (insert.error.code === '23505') {
       const reread = await sb
         .from('commitments')
-        .select(COMMITMENT_RETURN_COLUMNS)
+        .select(COMMITMENT_COLUMNS)
         .eq('network', config.network)
         .eq('commitment_hash', commitmentHash)
         .maybeSingle();
       if (!reread.error && reread.data) {
-        res.status(200).json(rowToBody(reread.data as CommitmentRow));
+        res.status(200).json(rowToBody(reread.data as unknown as CommitmentRow));
         return;
       }
     }
@@ -237,5 +275,188 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
     return;
   }
 
-  res.status(201).json(rowToBody(insert.data as CommitmentRow));
+  res.status(201).json(rowToBody(insert.data as unknown as CommitmentRow));
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// GET /v1/commitments
+// ────────────────────────────────────────────────────────────────────────
+
+const DEFAULT_LIMIT = 100;
+const MAX_LIMIT = 1000;
+const VALID_STATUSES = new Set(['open', 'partially_filled', 'filled', 'cancelled']);
+
+function parseBoolQuery(value: unknown): boolean | null {
+  if (value === undefined) return false;
+  const s = String(value).toLowerCase();
+  if (s === 'true' || s === '1') return true;
+  if (s === 'false' || s === '0') return false;
+  return null;
+}
+
+interface ListResponse {
+  commitments: CommitmentBody[];
+  pagination: {
+    limit: number;
+    offset: number;
+    total: number;
+    hasMore: boolean;
+  };
+}
+
+export async function getCommitmentsHandler(req: Request, res: Response): Promise<void> {
+  const config = loadConfig();
+  const sb = getSupabase();
+
+  // ── Parse + validate query params ─────────────────────────────────────
+  const limitRaw = req.query.limit ? Number(req.query.limit) : DEFAULT_LIMIT;
+  if (!Number.isInteger(limitRaw) || limitRaw < 1 || limitRaw > MAX_LIMIT) {
+    res.status(400).json({
+      error: `limit must be an integer between 1 and ${MAX_LIMIT}.`,
+      code: 'INVALID_PARAM',
+    } satisfies ApiError);
+    return;
+  }
+  const offsetRaw = req.query.offset ? Number(req.query.offset) : 0;
+  if (!Number.isInteger(offsetRaw) || offsetRaw < 0) {
+    res.status(400).json({
+      error: 'offset must be a non-negative integer.',
+      code: 'INVALID_PARAM',
+    } satisfies ApiError);
+    return;
+  }
+
+  // Status: comma-separated list. Default `open,partially_filled` because
+  // both are still-fillable liquidity (a partially_filled commitment has
+  // remaining_risk_amount > 0 and can be matched again). The previous
+  // single-value default of `open` silently hid valid takeable orders.
+  let statuses: string[];
+  if (req.query.status !== undefined) {
+    const raw = String(req.query.status).toLowerCase();
+    statuses = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+    if (statuses.length === 0) {
+      res.status(400).json({
+        error: 'status must be a non-empty comma-separated list.',
+        code: 'INVALID_PARAM',
+      } satisfies ApiError);
+      return;
+    }
+    for (const s of statuses) {
+      if (!VALID_STATUSES.has(s)) {
+        res.status(400).json({
+          error: `Invalid status "${s}". Must be one of: ${[...VALID_STATUSES].join(', ')}.`,
+          code: 'INVALID_PARAM',
+        } satisfies ApiError);
+        return;
+      }
+    }
+  } else {
+    statuses = ['open', 'partially_filled'];
+  }
+
+  // Boolean opt-outs for the default "matchable open book" filters.
+  // Defaults exclude nonce-invalidated rows (the contract will reject
+  // matchCommitment) and expired rows. Power users can opt back in.
+  const includeInvalidated = parseBoolQuery(req.query.includeInvalidated);
+  if (req.query.includeInvalidated !== undefined && includeInvalidated === null) {
+    res.status(400).json({
+      error: 'includeInvalidated must be true|false|1|0.',
+      code: 'INVALID_PARAM',
+    } satisfies ApiError);
+    return;
+  }
+  const includeExpired = parseBoolQuery(req.query.includeExpired);
+  if (req.query.includeExpired !== undefined && includeExpired === null) {
+    res.status(400).json({
+      error: 'includeExpired must be true|false|1|0.',
+      code: 'INVALID_PARAM',
+    } satisfies ApiError);
+    return;
+  }
+
+  // Lowercase first so mixed-case input passes (see positions.ts comment).
+  let maker: string | undefined;
+  if (req.query.maker !== undefined) {
+    const lowered = String(req.query.maker).trim().toLowerCase();
+    if (!isAddress(lowered)) {
+      res.status(400).json({
+        error: 'maker must be a valid Ethereum address.',
+        code: 'INVALID_PARAM',
+      } satisfies ApiError);
+      return;
+    }
+    maker = lowered;
+  }
+
+  let scorer: string | undefined;
+  if (req.query.scorer !== undefined) {
+    const lowered = String(req.query.scorer).trim().toLowerCase();
+    if (!isAddress(lowered)) {
+      res.status(400).json({
+        error: 'scorer must be a valid Ethereum address.',
+        code: 'INVALID_PARAM',
+      } satisfies ApiError);
+      return;
+    }
+    scorer = lowered;
+  }
+
+  let contestId: string | undefined;
+  if (req.query.contestId !== undefined) {
+    try {
+      const v = BigInt(String(req.query.contestId));
+      if (v < 0n) throw new Error();
+      contestId = v.toString();
+    } catch {
+      res.status(400).json({
+        error: 'contestId must be a non-negative integer.',
+        code: 'INVALID_PARAM',
+      } satisfies ApiError);
+      return;
+    }
+  }
+
+  // ── Build query ───────────────────────────────────────────────────────
+  let q = sb
+    .from('commitments')
+    .select(COMMITMENT_COLUMNS, { count: 'exact' })
+    .eq('network', config.network)
+    .in('status', statuses);
+
+  if (maker !== undefined) q = q.eq('maker', maker);
+  if (scorer !== undefined) q = q.eq('scorer', scorer);
+  if (contestId !== undefined) q = q.eq('contest_id', contestId);
+  if (!includeInvalidated) q = q.eq('nonce_invalidated', false);
+  if (!includeExpired) {
+    // Postgres `>` returns false (not true, not null) for NULL operands,
+    // so this naturally excludes rows with NULL expiry. That's the right
+    // behavior here: NULL expiry only appears on indexer-cancel-only rows
+    // (per migration 028), which already have status='cancelled' and
+    // wouldn't pass the default status filter anyway.
+    q = q.gt('expiry', new Date().toISOString());
+  }
+
+  q = q
+    .order('created_at', { ascending: false })
+    .order('commitment_hash', { ascending: true })
+    .range(offsetRaw, offsetRaw + limitRaw - 1);
+
+  const { data, count, error } = await q;
+  if (error) {
+    logger.error({ err: error.message }, 'commitments: list query failed');
+    res.status(500).json({ error: 'Failed to list commitments.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+    return;
+  }
+
+  const total = count ?? 0;
+  const body: ListResponse = {
+    commitments: (data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow)),
+    pagination: {
+      limit: limitRaw,
+      offset: offsetRaw,
+      total,
+      hasMore: offsetRaw + (data?.length ?? 0) < total,
+    },
+  };
+  res.status(200).json(body);
 }
