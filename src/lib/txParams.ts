@@ -17,11 +17,18 @@ export function usdcToOnChain(usdc: number): string {
   return String(Math.round(usdc * 1_000_000));
 }
 
-/** Odds tick scale used by the contracts. */
-const ODDS_TICK_SCALE = 10_000_000;
+/**
+ * R4 odds tick scale. `MatchingModule` constant `ODDS_SCALE = 100`
+ * (`ospex-foundry-matched-pairs/src/modules/MatchingModule.sol:59`).
+ * Decimal odds 1.91 → tick 191. The on-chain `oddsTick` field is uint16
+ * with valid range 101..10100. The legacy R3 codebase used 10_000_000
+ * for a different (now-defunct) odds-pair scaling — do NOT carry that
+ * constant forward.
+ */
+const ODDS_SCALE = 100;
 
-export function decimalOddsToScaled(decimalOdds: number): string {
-  return String(Math.round(decimalOdds * ODDS_TICK_SCALE));
+export function decimalOddsToTick(decimalOdds: number): number {
+  return Math.round(decimalOdds * ODDS_SCALE);
 }
 
 /**

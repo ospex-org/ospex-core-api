@@ -6,7 +6,9 @@
  *
  * The signature has already been verified by `eip712Auth`. The handler
  * just needs to map the verified message → DB columns, derive
- * `market_type` from the scorer, derive `speculation_key`, and INSERT.
+ * `market_type` from the scorer, derive `speculation_key`, check the
+ * maker's on-chain nonce floor, and INSERT (or enrich an
+ * indexer-created row if one already exists for this hash).
  */
 
 import type { Response } from 'express';
@@ -31,6 +33,9 @@ interface CommitmentResponseBody {
 
 const POSITION_TYPE_LABEL: Record<number, 'upper' | 'lower'> = { 0: 'upper', 1: 'lower' };
 
+const COMMITMENT_RETURN_COLUMNS =
+  'commitment_hash, status, risk_amount, filled_risk_amount, expiry, source, network, signature';
+
 interface CommitmentRow {
   commitment_hash: string;
   status: string;
@@ -39,6 +44,7 @@ interface CommitmentRow {
   expiry: string | null;
   source: string;
   network: string;
+  signature: string | null;
 }
 
 function rowToBody(row: CommitmentRow): CommitmentResponseBody {
@@ -97,10 +103,16 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
   const sb = getSupabase();
   const signature = (req.body as { signature: string }).signature;
 
-  // Idempotency: if a row with this hash already exists, return it as 200.
+  // ── Idempotency check ─────────────────────────────────────────────────
+  // If a row already exists for this hash, return 200. Two cases:
+  //   1. Row was indexer-created (source='indexer') OR has no signature —
+  //      we have the off-chain truth (signature, full risk_amount, nonce,
+  //      expiry, speculation_key) the indexer didn't, so enrich it.
+  //   2. Row was already API-enriched (signature present, source='agent')
+  //      — return as-is. This makes the POST safely retryable.
   const existing = await sb
     .from('commitments')
-    .select('commitment_hash, status, risk_amount, filled_risk_amount, expiry, source, network')
+    .select(COMMITMENT_RETURN_COLUMNS)
     .eq('network', config.network)
     .eq('commitment_hash', commitmentHash)
     .maybeSingle();
@@ -111,10 +123,65 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
     return;
   }
   if (existing.data) {
-    res.status(200).json(rowToBody(existing.data as CommitmentRow));
+    const existingRow = existing.data as CommitmentRow;
+    if (existingRow.source === 'indexer' || !existingRow.signature) {
+      const enriched = await sb
+        .from('commitments')
+        .update({
+          signature,
+          risk_amount: riskAmount.toString(),
+          nonce: nonce.toString(),
+          expiry: expiryISO,
+          speculation_key: speculationKey,
+        })
+        .eq('network', config.network)
+        .eq('commitment_hash', commitmentHash)
+        .select(COMMITMENT_RETURN_COLUMNS)
+        .single();
+      if (enriched.error) {
+        logger.error({ err: enriched.error.message }, 'commitments: enrichment update failed');
+        res.status(500).json({ error: 'Failed to enrich existing commitment.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+        return;
+      }
+      res.status(200).json(rowToBody(enriched.data as CommitmentRow));
+      return;
+    }
+    res.status(200).json(rowToBody(existingRow));
     return;
   }
 
+  // ── Nonce floor check ─────────────────────────────────────────────────
+  // The contract rejects matchCommitment if nonce < s_minNonces[maker][specKey].
+  // Without this pre-check the API would accept commitments that no taker
+  // can ever fill — and the indexer's MIN_NONCE_UPDATED handler only flips
+  // `nonce_invalidated=true` on rows that already exist when the event
+  // fires, so a stale-nonce commitment posted *after* the floor was raised
+  // would remain discoverable as `status='open' AND nonce_invalidated=false`.
+  const floor = await sb
+    .from('maker_nonce_floors')
+    .select('min_nonce')
+    .eq('network', config.network)
+    .eq('maker', maker)
+    .eq('speculation_key', speculationKey)
+    .maybeSingle();
+
+  if (floor.error) {
+    logger.error({ err: floor.error.message }, 'commitments: nonce floor lookup failed');
+    res.status(500).json({ error: 'Failed to check nonce floor.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+    return;
+  }
+  if (floor.data) {
+    const minNonce = BigInt(String(floor.data.min_nonce));
+    if (nonce < minNonce) {
+      res.status(400).json({
+        error: `Commitment nonce (${nonce.toString()}) is below the maker's current nonce floor (${minNonce.toString()}). Read maker_nonce_floors before signing.`,
+        code: 'NONCE_TOO_LOW',
+      } satisfies ApiError);
+      return;
+    }
+  }
+
+  // ── Insert ────────────────────────────────────────────────────────────
   const insert = await sb
     .from('commitments')
     .insert({
@@ -136,15 +203,16 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
       status: 'open',
       source: 'agent',
     })
-    .select('commitment_hash, status, risk_amount, filled_risk_amount, expiry, source, network')
+    .select(COMMITMENT_RETURN_COLUMNS)
     .single();
 
   if (insert.error) {
-    // Race: another request inserted the same hash between our SELECT and INSERT.
+    // Race: another request inserted the same hash between our SELECT and
+    // INSERT. Re-read and return the existing row.
     if (insert.error.code === '23505') {
       const reread = await sb
         .from('commitments')
-        .select('commitment_hash, status, risk_amount, filled_risk_amount, expiry, source, network')
+        .select(COMMITMENT_RETURN_COLUMNS)
         .eq('network', config.network)
         .eq('commitment_hash', commitmentHash)
         .maybeSingle();

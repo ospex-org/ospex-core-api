@@ -44,14 +44,37 @@ function optionalEnv(name: string): string | undefined {
   return value === undefined || value === '' ? undefined : value;
 }
 
-function optionalAddressEnv(name: string): string | undefined {
-  const value = optionalEnv(name);
+/**
+ * Read the first env var that's set, in priority order. Logs a deprecation
+ * warning if a non-canonical name is used so operators can migrate.
+ */
+function aliasedEnv(canonical: string, ...legacy: string[]): string | undefined {
+  const value = optionalEnv(canonical);
+  if (value !== undefined) return value;
+  for (const name of legacy) {
+    const v = optionalEnv(name);
+    if (v !== undefined) {
+      logger.warn(
+        { used: name, canonical },
+        'env var alias used — set the canonical name and remove the alias',
+      );
+      return v;
+    }
+  }
+  return undefined;
+}
+
+function validateAddress(name: string, value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
   if (!isAddress(value)) {
     logger.fatal({ var: name, value }, `${name} is set but is not a valid Ethereum address`);
     process.exit(1);
   }
   return value;
+}
+
+function optionalAddressEnv(name: string): string | undefined {
+  return validateAddress(name, optionalEnv(name));
 }
 
 let cached: Config | undefined;
@@ -81,9 +104,20 @@ export function loadConfig(): Config {
   const alchemyRpcUrl = optionalEnv('ALCHEMY_RPC_URL');
   const matchingModuleAddress = optionalAddressEnv('MATCHING_MODULE_ADDRESS');
 
-  const scorerMoneyline = optionalAddressEnv('SCORER_MONEYLINE_ADDRESS');
-  const scorerSpread = optionalAddressEnv('SCORER_SPREAD_ADDRESS');
-  const scorerTotal = optionalAddressEnv('SCORER_TOTAL_ADDRESS');
+  // Scorer addresses — accept the canonical name first, fall back to the
+  // ospex-agent-server legacy name so a copied-over Heroku env still works.
+  const scorerMoneyline = validateAddress(
+    'SCORER_MONEYLINE_ADDRESS',
+    aliasedEnv('SCORER_MONEYLINE_ADDRESS', 'MONEYLINE_SCORER_ADDRESS'),
+  );
+  const scorerSpread = validateAddress(
+    'SCORER_SPREAD_ADDRESS',
+    aliasedEnv('SCORER_SPREAD_ADDRESS', 'SPREAD_SCORER_ADDRESS'),
+  );
+  const scorerTotal = validateAddress(
+    'SCORER_TOTAL_ADDRESS',
+    aliasedEnv('SCORER_TOTAL_ADDRESS', 'TOTAL_SCORER_ADDRESS'),
+  );
 
   // Scorers are an all-or-nothing bundle. Partial config is almost
   // certainly a misconfiguration, not "we deliberately set one of

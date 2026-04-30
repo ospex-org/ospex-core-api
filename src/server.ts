@@ -24,8 +24,19 @@ interface ReadinessResponse {
   network: 'polygon' | 'amoy';
   chainId: 137 | 80002;
   supabase: { connected: boolean; error?: string };
+  commitments: { configured: boolean; missing?: string[] };
   uptimeSeconds: number;
   timestamp: string;
+}
+
+function checkCommitmentsConfig(
+  config: ReturnType<typeof loadConfig>,
+): { configured: boolean; missing?: string[] } {
+  const missing: string[] = [];
+  if (!config.matchingModuleAddress) missing.push('MATCHING_MODULE_ADDRESS');
+  if (!config.scorers) missing.push('SCORER_*_ADDRESS');
+  if (missing.length === 0) return { configured: true };
+  return { configured: false, missing };
 }
 
 async function checkSupabase(): Promise<{ connected: boolean; error?: string }> {
@@ -77,23 +88,27 @@ function buildApp(config: ReturnType<typeof loadConfig>): express.Express {
     res.status(200).json(body);
   });
 
-  // Readiness — process is up AND its required dependencies are reachable.
-  // Returns 503 if Supabase is unreachable so traffic routers / smoke tests
-  // can avoid sending requests that would fail.
+  // Readiness — process is up AND its required dependencies are reachable
+  // AND its mounted endpoints have the env they need. Returns 503 if any
+  // of those is missing so traffic routers / smoke tests can avoid sending
+  // requests that would fail.
   app.get(
     '/readyz',
     asyncHandler(async (_req: Request, res: Response) => {
       const supabase = await checkSupabase();
+      const commitments = checkCommitmentsConfig(config);
+      const ok = supabase.connected && commitments.configured;
       const body: ReadinessResponse = {
-        ok: supabase.connected,
+        ok,
         service: 'ospex-core-api',
         network: config.network,
         chainId: config.chainId,
         supabase,
+        commitments,
         uptimeSeconds: Math.round(process.uptime()),
         timestamp: new Date().toISOString(),
       };
-      res.status(supabase.connected ? 200 : 503).json(body);
+      res.status(ok ? 200 : 503).json(body);
     }),
   );
 
