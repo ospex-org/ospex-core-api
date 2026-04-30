@@ -6,18 +6,14 @@
  *                           row exists, enrich it. Returns the canonical
  *                           commitment body.
  *
- *   GET  /v1/commitments  — list open commitments. Supports filters
- *                           (maker, contestId, scorer, status) and
- *                           pagination (limit, offset). Sorted by
- *                           `expiry ASC, commitment_hash ASC`.
- *
- *   The default sort would normally be `created_at DESC`, but the
- *   commitments table has no created_at column today (only the indexer's
- *   migrations are visible to this repo, and those don't add one).
- *   `expiry ASC` is the next most useful temporal axis: closest-to-
- *   expiring commitments are the most urgent for takers to fill, and
- *   for makers to monitor or replace. Tie-break on `commitment_hash`
- *   so offset-based pagination is deterministic across ties.
+ *   GET  /v1/commitments  — list commitments with filters (maker,
+ *                           contestId, scorer, status) and pagination
+ *                           (limit, offset). Sorted by
+ *                           `created_at DESC, commitment_hash ASC` —
+ *                           newest first; tie-break on hash so
+ *                           offset-based pagination is deterministic
+ *                           across ties (rows backfilled by indexer
+ *                           migration 039 share a timestamp).
  */
 
 import type { Request, Response } from 'express';
@@ -58,12 +54,14 @@ interface CommitmentBody {
   source: string;
   network: string;
   nonceInvalidated: boolean;
+  createdAt: string;              // ISO 8601 — filled by DB default `now()`
 }
 
 const COMMITMENT_COLUMNS =
   'commitment_hash, maker, contest_id, scorer, line_ticks, position_type, ' +
   'odds_tick, market_type, risk_amount, filled_risk_amount, nonce, expiry, ' +
-  'speculation_key, signature, status, source, network, nonce_invalidated';
+  'speculation_key, signature, status, source, network, nonce_invalidated, ' +
+  'created_at';
 
 interface CommitmentRow {
   commitment_hash: string;
@@ -84,6 +82,7 @@ interface CommitmentRow {
   source: string;
   network: string;
   nonce_invalidated: boolean | null;
+  created_at: string;
 }
 
 const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower: 1 };
@@ -112,6 +111,7 @@ function rowToBody(row: CommitmentRow): CommitmentBody {
     source: row.source,
     network: row.network,
     nonceInvalidated: Boolean(row.nonce_invalidated),
+    createdAt: row.created_at,
   };
 }
 
@@ -381,7 +381,7 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
   if (contestId !== undefined) q = q.eq('contest_id', contestId);
 
   q = q
-    .order('expiry', { ascending: true, nullsFirst: false })
+    .order('created_at', { ascending: false })
     .order('commitment_hash', { ascending: true })
     .range(offsetRaw, offsetRaw + limitRaw - 1);
 

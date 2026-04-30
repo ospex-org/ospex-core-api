@@ -90,7 +90,7 @@ Responses: `201 Created` on new, `200 OK` on duplicate, `400` for validation, `4
 
 ### `GET /v1/commitments`
 
-List open commitments, sorted by `expiry ASC, commitment_hash ASC` (the table doesn't have a `created_at` column today; expiry is the next-most-useful temporal axis and tie-breaks on hash for paginate determinism).
+List commitments, sorted by `created_at DESC, commitment_hash ASC` (newest first; tie-break on hash so offset-based pagination is deterministic — note that rows backfilled by indexer migration 039 share a timestamp).
 
 Query params:
 | Param | Notes |
