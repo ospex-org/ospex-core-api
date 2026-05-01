@@ -63,6 +63,15 @@ export function getActionFields(action: ActionType): TypedDataField[] {
   return ACTION_FIELDS[action];
 }
 
+/**
+ * Full registry — used by `/v1/auth/domain` to surface every signable
+ * action's schema for client introspection. Returned as a Readonly view
+ * so callers can serialize but not mutate the underlying record.
+ */
+export function getAllActionFields(): Readonly<Record<ActionType, TypedDataField[]>> {
+  return ACTION_FIELDS;
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Domain
 // ────────────────────────────────────────────────────────────────────
