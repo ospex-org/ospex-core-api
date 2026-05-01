@@ -60,7 +60,29 @@ function snapToHalfLine(raw: unknown, kind: 'spread' | 'total'): number | undefi
 interface SidedSnapshot {
   capturedAt: string | null;
   moneyline?: { awayOdds: number; homeOdds: number };
-  spread?: { line: number; awayOdds: number; homeOdds: number };
+  /**
+   * Spread is exposed from BOTH perspectives explicitly — `homeLine`
+   * and `awayLine` (always negations of each other). The underlying
+   * `odds_history.line` column is stored from the home perspective
+   * (the fdb writer pulls `PointSpreadHome` / `sportspage.spread.open.home`
+   * — see `ospex-fdb/src/oddsHistory.ts:134,218`). Returning a single
+   * un-labelled `line` would let a caller misalign with `/v1/markets`,
+   * which exposes both `homeLine`/`awayLine` from the speculation row.
+   * Convention: negative homeLine = home favored.
+   */
+  spread?: {
+    homeLine: number;
+    awayLine: number;
+    awayOdds: number;
+    homeOdds: number;
+  };
+  /**
+   * Total is perspective-neutral (over/under don't have a home/away
+   * orientation). `overOdds`/`underOdds` are explicit; the upstream
+   * writer maps Over→away_odds, Under→home_odds for storage (see
+   * `ospex-fdb/src/oddsHistory.ts:166-169`), but consumers don't need
+   * to know that — the field names speak for themselves.
+   */
   total?: { line: number; overOdds: number; underOdds: number };
 }
 
@@ -74,9 +96,16 @@ interface OddsHistoryResponse {
    * BOTH opener and current snapshots exist for that market. Always
    * present as an object so callers can do `lineMovement.spread &&
    * ...` without first null-checking the parent.
+   *
+   * For spread, both `home` and `away` perspectives are returned (the
+   * `moved` values are negations of each other). Total movement is
+   * perspective-neutral.
    */
   lineMovement: {
-    spread?: { opened: number; current: number; moved: number };
+    spread?: {
+      home: { opened: number; current: number; moved: number };
+      away: { opened: number; current: number; moved: number };
+    };
     total?: { opened: number; current: number; moved: number };
   };
 }
@@ -104,9 +133,10 @@ const HISTORY_COLUMNS =
  * the snapshot's timestamp; markets missing valid odds (null fields
  * or weird-fraction lines) are silently omitted.
  *
- * Over=away, Under=home for total markets — same convention used by
- * the indexer's projection of speculations into the protocol's
- * upper/lower position types.
+ * Spread perspective: the writer stores `line` from the home team's
+ * perspective. We expose both `homeLine` (the raw value) and
+ * `awayLine` (the negation) so callers don't need to know which side
+ * was canonical at storage time. See SidedSnapshot.spread doc.
  */
 function rowsToSnapshot(rows: OddsHistoryRow[]): SidedSnapshot {
   const snap: SidedSnapshot = { capturedAt: null };
@@ -119,8 +149,10 @@ function rowsToSnapshot(rows: OddsHistoryRow[]): SidedSnapshot {
     if (row.market === 'moneyline') {
       snap.moneyline = { awayOdds: away, homeOdds: home };
     } else if (row.market === 'spread' && row.line !== null) {
-      const line = snapToHalfLine(row.line, 'spread');
-      if (line !== undefined) snap.spread = { line, awayOdds: away, homeOdds: home };
+      const homeLine = snapToHalfLine(row.line, 'spread');
+      if (homeLine !== undefined) {
+        snap.spread = { homeLine, awayLine: -homeLine, awayOdds: away, homeOdds: home };
+      }
     } else if (row.market === 'total' && row.line !== null) {
       const line = snapToHalfLine(row.line, 'total');
       if (line !== undefined) snap.total = { line, overOdds: away, underOdds: home };
@@ -229,10 +261,18 @@ export async function getOddsHistoryHandler(req: Request, res: Response): Promis
 
   const lineMovement: OddsHistoryResponse['lineMovement'] = {};
   if (opener.spread && current.spread) {
+    const homeMoved = current.spread.homeLine - opener.spread.homeLine;
     lineMovement.spread = {
-      opened: opener.spread.line,
-      current: current.spread.line,
-      moved: current.spread.line - opener.spread.line,
+      home: {
+        opened: opener.spread.homeLine,
+        current: current.spread.homeLine,
+        moved: homeMoved,
+      },
+      away: {
+        opened: opener.spread.awayLine,
+        current: current.spread.awayLine,
+        moved: -homeMoved,
+      },
     };
   }
   if (opener.total && current.total) {
