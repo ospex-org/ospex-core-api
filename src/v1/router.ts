@@ -8,6 +8,7 @@ import {
   postCommitmentHandler,
 } from './commitments.js';
 import { getMarketByIdHandler, getMarketsHandler } from './markets.js';
+import { getOddsHistoryHandler } from './analytics.js';
 import { getAuthDomainHandler } from './auth.js';
 import { getProtocolInfoHandler } from './protocol.js';
 import {
@@ -67,3 +68,5 @@ v1Router.get('/positions/:address', readRateLimit, asyncHandler(getPositionsByAd
 v1Router.get('/leaderboard', readRateLimit, asyncHandler(getLeaderboardHandler));
 
 v1Router.get('/schedule', readRateLimit, asyncHandler(getScheduleHandler));
+
+v1Router.get('/analytics/odds-history/:contestId', readRateLimit, asyncHandler(getOddsHistoryHandler));
