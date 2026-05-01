@@ -1,19 +1,25 @@
 /**
  * /v1/commitments — write + read for the EIP-712 commitment relay.
  *
- *   POST /v1/commitments  — accept a signed OspexCommitment and persist it.
- *                           Idempotent on commitment_hash; if an indexer-only
- *                           row exists, enrich it. Returns the canonical
- *                           commitment body.
+ *   POST   /v1/commitments        — accept a signed OspexCommitment and persist it.
+ *                                   Idempotent on commitment_hash; if an indexer-only
+ *                                   row exists, enrich it. Returns the canonical
+ *                                   commitment body.
  *
- *   GET  /v1/commitments  — list commitments with filters (maker,
- *                           contestId, scorer, status) and pagination
- *                           (limit, offset). Sorted by
- *                           `created_at DESC, commitment_hash ASC` —
- *                           newest first; tie-break on hash so
- *                           offset-based pagination is deterministic
- *                           across ties (rows backfilled by indexer
- *                           migration 039 share a timestamp).
+ *   GET    /v1/commitments        — list commitments with filters (maker,
+ *                                   contestId, scorer, status) and pagination
+ *                                   (limit, offset). Sorted by
+ *                                   `created_at DESC, commitment_hash ASC` —
+ *                                   newest first; tie-break on hash so
+ *                                   offset-based pagination is deterministic
+ *                                   across ties (rows backfilled by indexer
+ *                                   migration 039 share a timestamp).
+ *
+ *   DELETE /v1/commitments/:hash  — off-chain cancel via signed CancelCommitment
+ *                                   action. Sets `status='cancelled'` so the row
+ *                                   stops surfacing in the open book. Authoritative
+ *                                   cancel is still on-chain (cancelCommitment /
+ *                                   raiseMinNonce); see docs/CANCEL_FLOW.md.
  */
 
 import type { Request, Response } from 'express';
@@ -459,4 +465,159 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
     },
   };
   res.status(200).json(body);
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// DELETE /v1/commitments/:hash
+// ────────────────────────────────────────────────────────────────────────
+
+/**
+ * Off-chain cancel. The maker signs a CancelCommitment action; we mark
+ * the row as `cancelled` so it stops appearing in the open book. The
+ * authoritative cancel is on-chain — once the indexer projects the
+ * COMMITMENT_CANCELLED event, the row's `status` already lands on
+ * `cancelled`, so this endpoint and the indexer converge on the same
+ * terminal state.
+ *
+ * Race notes (see docs/CANCEL_FLOW.md):
+ *   - Off-chain DELETE then on-chain cancel: both write `status='cancelled'`.
+ *     Idempotent.
+ *   - On-chain cancel then off-chain DELETE: handler sees `status='cancelled'`
+ *     and returns 200 idempotent.
+ *   - Off-chain DELETE while a taker has an in-flight matchCommitment tx:
+ *     contract is the source of truth — if the on-chain match lands first,
+ *     status flips to `partially_filled` / `filled`, and DELETE returns 409.
+ */
+export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Response): Promise<void> {
+  const config = loadConfig();
+  const sb = getSupabase();
+
+  // ── Validate the URL :hash matches the signed action ─────────────────
+  const urlHash = String(req.params['hash'] ?? '').toLowerCase();
+  if (!/^0x[0-9a-f]{64}$/.test(urlHash)) {
+    res.status(400).json({
+      error: 'Path :hash must be a 0x-prefixed 32-byte hex string.',
+      code: 'INVALID_PARAM',
+    } satisfies ApiError);
+    return;
+  }
+  const signedHash = String(req.actionMessage['commitmentHash']).toLowerCase();
+  if (signedHash !== urlHash) {
+    res.status(400).json({
+      error: 'Signed commitmentHash does not match the URL :hash. Re-sign with the correct hash.',
+      code: 'INVALID_PARAM',
+    } satisfies ApiError);
+    return;
+  }
+
+  // ── Lookup ────────────────────────────────────────────────────────────
+  const lookup = await sb
+    .from('commitments')
+    .select(COMMITMENT_COLUMNS)
+    .eq('network', config.network)
+    .eq('commitment_hash', urlHash)
+    .maybeSingle();
+
+  if (lookup.error) {
+    logger.error({ err: lookup.error.message }, 'commitments: cancel lookup failed');
+    res.status(500).json({ error: 'Failed to look up commitment.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+    return;
+  }
+  if (!lookup.data) {
+    res.status(404).json({
+      error: 'Commitment not found.',
+      code: 'NOT_FOUND',
+    } satisfies ApiError);
+    return;
+  }
+  const row = lookup.data as unknown as CommitmentRow;
+
+  // ── Authorization: signer must equal the row's maker ─────────────────
+  // The middleware already verified the signature; the recovered address
+  // is the only authoritative claim of identity. Since CancelCommitment
+  // doesn't carry maker in the typed data, we compare here.
+  if (req.authenticatedWallet.toLowerCase() !== row.maker.toLowerCase()) {
+    logger.warn(
+      { recovered: req.authenticatedWallet, rowMaker: row.maker, commitmentHash: urlHash },
+      'commitments: cancel signer does not match commitment maker',
+    );
+    res.status(403).json({
+      error: 'Signature does not match the commitment maker.',
+      code: 'FORBIDDEN',
+    } satisfies ApiError);
+    return;
+  }
+
+  // ── Status branching ──────────────────────────────────────────────────
+  // Already cancelled → idempotent 200 with current row.
+  if (row.status === 'cancelled') {
+    res.status(200).json(rowToBody(row));
+    return;
+  }
+  // Matched (filled or partially_filled) → on-chain only.
+  if (row.status === 'filled' || row.status === 'partially_filled') {
+    res.status(409).json({
+      error: `Commitment is ${row.status}; off-chain cancel is not allowed once a match exists. Use MatchingModule.cancelCommitment(c) on chain.`,
+      code: 'COMMITMENT_MATCHED',
+    } satisfies ApiError);
+    return;
+  }
+  // Anything other than `open` at this point is an unexpected state.
+  if (row.status !== 'open') {
+    logger.warn(
+      { commitmentHash: urlHash, status: row.status },
+      'commitments: cancel hit an unexpected status',
+    );
+    res.status(409).json({
+      error: `Commitment is in an unexpected state (${row.status}) and cannot be cancelled.`,
+      code: 'INVALID_STATE',
+    } satisfies ApiError);
+    return;
+  }
+
+  // ── Mark cancelled ────────────────────────────────────────────────────
+  // `cancelled_at` column is not yet in the schema (see step5b flag).
+  // When the migration adds it, this UPDATE should also set
+  // `cancelled_at: new Date().toISOString()`.
+  const update = await sb
+    .from('commitments')
+    .update({ status: 'cancelled' })
+    .eq('network', config.network)
+    .eq('commitment_hash', urlHash)
+    .eq('status', 'open') // CAS guard against race with indexer match
+    .select(COMMITMENT_COLUMNS)
+    .maybeSingle();
+
+  if (update.error) {
+    logger.error({ err: update.error.message }, 'commitments: cancel update failed');
+    res.status(500).json({ error: 'Failed to cancel commitment.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+    return;
+  }
+  if (!update.data) {
+    // CAS lost — between lookup and update the row stopped being `open`.
+    // Re-read and respond based on the new state.
+    const reread = await sb
+      .from('commitments')
+      .select(COMMITMENT_COLUMNS)
+      .eq('network', config.network)
+      .eq('commitment_hash', urlHash)
+      .maybeSingle();
+    if (reread.error || !reread.data) {
+      res.status(500).json({ error: 'Failed to cancel commitment.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+      return;
+    }
+    const fresh = reread.data as unknown as CommitmentRow;
+    if (fresh.status === 'cancelled') {
+      res.status(200).json(rowToBody(fresh));
+      return;
+    }
+    res.status(409).json({
+      error: `Commitment status changed to ${fresh.status} during cancel; off-chain cancel is no longer applicable.`,
+      code: 'COMMITMENT_MATCHED',
+    } satisfies ApiError);
+    return;
+  }
+
+  logger.info({ commitmentHash: urlHash, maker: row.maker }, 'commitments: off-chain cancel applied');
+  res.status(200).json(rowToBody(update.data as unknown as CommitmentRow));
 }

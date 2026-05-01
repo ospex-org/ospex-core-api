@@ -20,7 +20,7 @@ import type { ChainId } from './env.js';
 // Action registry
 // ────────────────────────────────────────────────────────────────────
 
-export type ActionType = 'OspexCommitment';
+export type ActionType = 'OspexCommitment' | 'CancelCommitment';
 
 /**
  * R4 OspexCommitment fields — 9, in the exact order the contract's
@@ -38,8 +38,25 @@ const OSPEX_COMMITMENT_FIELDS: TypedDataField[] = [
   { name: 'expiry', type: 'uint256' },
 ];
 
+/**
+ * Off-chain cancel — the API-only action that flags a commitment as
+ * `cancelled` so takers stop seeing it on the order book. Authoritative
+ * cancellation is on-chain (`MatchingModule.cancelCommitment` or
+ * `raiseMinNonce`); this is the "remove from book" signal.
+ *
+ * No `maker` in the typed data: the signer recovered from the signature
+ * IS the maker, and the handler authoritatively compares against the
+ * looked-up commitment's `maker` column. Adding maker to the message
+ * would be redundant — the signature already binds the signer.
+ */
+const CANCEL_COMMITMENT_FIELDS: TypedDataField[] = [
+  { name: 'commitmentHash', type: 'bytes32' },
+  { name: 'expiry', type: 'uint256' },
+];
+
 const ACTION_FIELDS: Record<ActionType, TypedDataField[]> = {
   OspexCommitment: OSPEX_COMMITMENT_FIELDS,
+  CancelCommitment: CANCEL_COMMITMENT_FIELDS,
 };
 
 export function getActionFields(action: ActionType): TypedDataField[] {

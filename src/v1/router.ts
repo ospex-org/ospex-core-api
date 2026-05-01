@@ -2,7 +2,11 @@ import { Router } from 'express';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { eip712Auth, type AuthenticatedRequest } from '../middleware/eip712Auth.js';
 import { commitmentsRateLimit, readRateLimit } from '../middleware/rateLimit.js';
-import { getCommitmentsHandler, postCommitmentHandler } from './commitments.js';
+import {
+  deleteCommitmentHandler,
+  getCommitmentsHandler,
+  postCommitmentHandler,
+} from './commitments.js';
 import { getMarketByIdHandler, getMarketsHandler } from './markets.js';
 import { getProtocolInfoHandler } from './protocol.js';
 import {
@@ -32,6 +36,13 @@ v1Router.post(
   commitmentsRateLimit,
   eip712Auth('OspexCommitment'),
   asyncHandler((req, res) => postCommitmentHandler(req as AuthenticatedRequest, res)),
+);
+
+v1Router.delete(
+  '/commitments/:hash',
+  commitmentsRateLimit,
+  eip712Auth('CancelCommitment'),
+  asyncHandler((req, res) => deleteCommitmentHandler(req as AuthenticatedRequest, res)),
 );
 
 // ── Reads ─────────────────────────────────────────────────────────────
