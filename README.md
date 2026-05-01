@@ -224,7 +224,7 @@ Set via `heroku config:set <var>=<value> --app ospex-core-api`. Mirrors `.env.ex
 - `NETWORK` — `polygon` for production, `amoy` for testnet
 - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
 - `ALCHEMY_RPC_URL` — Polygon mainnet RPC (PAYG-tier — required by `/v1/positions/by-tx` and `/v1/positions/claim-result`)
-- `MATCHING_MODULE_ADDRESS` — R4 matching module (required by `POST /v1/commitments`)
+- `MATCHING_MODULE_ADDRESS` — R4 matching module; verifying contract for the EIP-712 domain on `POST /v1/commitments` and `DELETE /v1/commitments/:hash`
 - `SCORER_MONEYLINE_ADDRESS`, `SCORER_SPREAD_ADDRESS`, `SCORER_TOTAL_ADDRESS` — required by `POST /v1/commitments` (all-or-nothing; partial config is rejected at boot)
 - `POSITION_MODULE_ADDRESS` — optional defensive log-source filter for tx parsers
 
