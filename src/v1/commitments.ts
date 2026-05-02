@@ -40,7 +40,7 @@ import type { ApiError } from '../middleware/errorHandler.js';
 // Supabase are normalized to camelCase here.
 // ────────────────────────────────────────────────────────────────────────
 
-interface CommitmentBody {
+export interface CommitmentBody {
   commitmentHash: string;
   maker: string;
   contestId: string | null;
@@ -63,13 +63,13 @@ interface CommitmentBody {
   createdAt: string;              // ISO 8601 — filled by DB default `now()`
 }
 
-const COMMITMENT_COLUMNS =
+export const COMMITMENT_COLUMNS =
   'commitment_hash, maker, contest_id, scorer, line_ticks, position_type, ' +
   'odds_tick, market_type, risk_amount, filled_risk_amount, nonce, expiry, ' +
   'speculation_key, signature, status, source, network, nonce_invalidated, ' +
   'created_at';
 
-interface CommitmentRow {
+export interface CommitmentRow {
   commitment_hash: string;
   maker: string;
   contest_id: string | number | null;
@@ -93,7 +93,7 @@ interface CommitmentRow {
 
 const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower: 1 };
 
-function rowToBody(row: CommitmentRow): CommitmentBody {
+export function rowToBody(row: CommitmentRow): CommitmentBody {
   const risk = row.risk_amount != null ? BigInt(String(row.risk_amount)) : 0n;
   const filled = row.filled_risk_amount != null ? BigInt(String(row.filled_risk_amount)) : 0n;
   const remaining = risk > filled ? risk - filled : 0n;
@@ -118,6 +118,38 @@ function rowToBody(row: CommitmentRow): CommitmentBody {
     network: row.network,
     nonceInvalidated: Boolean(row.nonce_invalidated),
     createdAt: row.created_at,
+  };
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Shared open-book helper
+//
+// Bakes in the same default filter set as `GET /v1/commitments` (status
+// open|partially_filled, nonce_invalidated=false, expiry in the future)
+// so consumers like `GET /v1/markets/:contestId` show the same orderbook
+// as the canonical commitment-list endpoint.
+// ────────────────────────────────────────────────────────────────────────
+
+const OPEN_BOOK_MAX_ROWS = 1000;
+
+export async function fetchOpenCommitmentsByContestId(
+  contestId: string,
+): Promise<{ commitments: CommitmentBody[] | null; error: string | null }> {
+  const config = loadConfig();
+  const sb = getSupabase();
+  const { data, error } = await sb
+    .from('commitments')
+    .select(COMMITMENT_COLUMNS)
+    .eq('network', config.network)
+    .eq('contest_id', contestId)
+    .in('status', ['open', 'partially_filled'])
+    .eq('nonce_invalidated', false)
+    .gt('expiry', new Date().toISOString())
+    .limit(OPEN_BOOK_MAX_ROWS);
+  if (error) return { commitments: null, error: error.message };
+  return {
+    commitments: (data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow)),
+    error: null,
   };
 }
 

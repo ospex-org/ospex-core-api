@@ -1,12 +1,14 @@
 /**
  * GET /v1/markets               — list upcoming contests with their speculations
- * GET /v1/markets/:contestId    — single contest detail (with stub orderbook)
+ * GET /v1/markets/:contestId    — single contest detail with populated orderbooks
  *
  * The agent-server's R3 orderbook field has been removed (R4 superseded
- * it with off-chain EIP-712 commitments). For the detail endpoint we
- * return `orderbook: []` for each speculation as a placeholder; a future
- * batch can populate from the `commitments` table aggregated per
- * (speculation_key, position_type).
+ * it with off-chain EIP-712 commitments). The detail endpoint groups
+ * commitments by `speculation_key` and attaches the same default
+ * open-book filter set as `GET /v1/commitments` (status open or
+ * partially_filled, not invalidated, not expired). The list endpoint
+ * intentionally still returns speculations without orderbooks — populating
+ * for every contest in a window is heavy and not currently needed.
  */
 
 import type { Request, Response } from 'express';
@@ -14,7 +16,9 @@ import { loadConfig } from '../lib/env.js';
 import { logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
 import { scorerToType, lineTicksToLine, type MarketType } from '../lib/speculation.js';
+import { deriveSpeculationKey } from '../lib/eip712.js';
 import type { ApiError } from '../middleware/errorHandler.js';
+import { fetchOpenCommitmentsByContestId, type CommitmentBody } from './commitments.js';
 
 const VALID_SPORTS = new Set(['nba', 'nhl', 'ncaab', 'nfl', 'mlb']);
 // Mirrors what `ospex-indexer/src/handlers/contests.ts` writes today
@@ -39,7 +43,7 @@ interface MarketSpeculation {
 }
 
 interface MarketSpeculationDetail extends MarketSpeculation {
-  orderbook: unknown[];     // intentionally empty — see header comment
+  orderbook: CommitmentBody[];
 }
 
 interface MarketBody {
@@ -271,11 +275,47 @@ export async function getMarketByIdHandler(req: Request, res: Response): Promise
     return;
   }
 
+  const ob = await fetchOpenCommitmentsByContestId(contestId);
+  if (ob.error || !ob.commitments) {
+    logger.error({ err: ob.error }, 'markets: orderbook query failed');
+    res.status(500).json({ error: 'Failed to fetch orderbook.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+    return;
+  }
+
+  // Group commitments by speculation_key. Indexer-only rows that haven't
+  // been enriched yet (speculationKey === null) cannot be attributed to a
+  // speculation and are dropped from the orderbook.
+  const orderbookByKey = new Map<string, CommitmentBody[]>();
+  for (const c of ob.commitments) {
+    if (!c.speculationKey) continue;
+    const list = orderbookByKey.get(c.speculationKey) ?? [];
+    list.push(c);
+    orderbookByKey.set(c.speculationKey, list);
+  }
+  // TODO: price-aware sort. The existing /v1/commitments endpoint sorts
+  // by created_at DESC for chronological listing; an orderbook wants
+  // best-price-first, but "best" depends on which side a commitment
+  // takes (positionType + oddsTick) and there's no convention here yet.
+  // For now, sort by createdAt ascending (earliest first) only.
+  for (const list of orderbookByKey.values()) {
+    list.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  const contestIdBig = BigInt(contestId);
   const speculations: MarketSpeculationDetail[] = [];
   for (const s of specsRes.data ?? []) {
     const ms = specRowToBase(s as SpecRow, scorers);
     if (!ms) continue;
-    speculations.push({ ...ms, orderbook: [] });
+    let orderbook: CommitmentBody[] = [];
+    if (s.speculation_scorer && s.line_ticks != null) {
+      const key = deriveSpeculationKey(
+        contestIdBig,
+        String(s.speculation_scorer).toLowerCase(),
+        s.line_ticks,
+      );
+      orderbook = orderbookByKey.get(key) ?? [];
+    }
+    speculations.push({ ...ms, orderbook });
   }
 
   const body: MarketDetail = {
