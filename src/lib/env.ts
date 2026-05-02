@@ -25,6 +25,7 @@ export interface Config {
   chainId: ChainId;
   supabaseUrl: string;
   supabaseServiceRoleKey: string;
+  supabaseAnonKey?: string;
   alchemyRpcUrl?: string;
   matchingModuleAddress?: string;
   positionModuleAddress?: string;
@@ -101,6 +102,7 @@ export function loadConfig(): Config {
 
   const supabaseUrl = requireEnv('SUPABASE_URL');
   const supabaseServiceRoleKey = requireEnv('SUPABASE_SERVICE_ROLE_KEY');
+  const supabaseAnonKey = optionalEnv('SUPABASE_ANON_KEY');
 
   const alchemyRpcUrl = optionalEnv('ALCHEMY_RPC_URL');
   const matchingModuleAddress = optionalAddressEnv('MATCHING_MODULE_ADDRESS');
@@ -147,6 +149,7 @@ export function loadConfig(): Config {
     chainId,
     supabaseUrl,
     supabaseServiceRoleKey,
+    ...(supabaseAnonKey !== undefined ? { supabaseAnonKey } : {}),
     ...(alchemyRpcUrl !== undefined ? { alchemyRpcUrl } : {}),
     ...(matchingModuleAddress !== undefined ? { matchingModuleAddress } : {}),
     ...(positionModuleAddress !== undefined ? { positionModuleAddress } : {}),
