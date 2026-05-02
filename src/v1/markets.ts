@@ -61,6 +61,13 @@ interface MarketListItem extends MarketBody {
 }
 
 interface MarketDetail extends MarketBody {
+  /**
+   * Upstream JSONOdds ID for this contest, used by the SDK to open
+   * Realtime channels on `current_odds`. Null when the contest was
+   * created without a JSONOdds linkage. Surfaced on the detail
+   * endpoint only — list responses stay minimal.
+   */
+  jsonoddsId: string | null;
   speculations: MarketSpeculationDetail[];
 }
 
@@ -247,7 +254,7 @@ export async function getMarketByIdHandler(req: Request, res: Response): Promise
   const sb = getSupabase();
   const contestRes = await sb
     .from('contests')
-    .select('contest_id, away_team, home_team, sport_slug, jsonodds_sport_id, start_time, contest_status')
+    .select('contest_id, jsonodds_id, away_team, home_team, sport_slug, jsonodds_sport_id, start_time, contest_status')
     .eq('network', config.network)
     .eq('contest_id', contestId)
     .maybeSingle();
@@ -320,6 +327,7 @@ export async function getMarketByIdHandler(req: Request, res: Response): Promise
 
   const body: MarketDetail = {
     contestId: String(c.contest_id),
+    jsonoddsId: c.jsonodds_id ?? null,
     awayTeam: c.away_team ?? '',
     homeTeam: c.home_team ?? '',
     sport: c.sport_slug ?? '',
