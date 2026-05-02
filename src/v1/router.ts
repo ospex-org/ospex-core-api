@@ -10,6 +10,7 @@ import {
 import { getMarketByIdHandler, getMarketsHandler } from './markets.js';
 import { getOddsHistoryHandler } from './analytics.js';
 import { getAuthDomainHandler } from './auth.js';
+import { getPublicConfigHandler } from './config.js';
 import { getProtocolInfoHandler } from './protocol.js';
 import {
   getClaimParamsHandler,
@@ -56,6 +57,8 @@ v1Router.get('/markets/:contestId', readRateLimit, asyncHandler(getMarketByIdHan
 v1Router.get('/protocol/info', readRateLimit, (req, res) => getProtocolInfoHandler(req, res));
 
 v1Router.get('/auth/domain', readRateLimit, (req, res) => getAuthDomainHandler(req, res));
+
+v1Router.get('/config/public', readRateLimit, (req, res) => getPublicConfigHandler(req, res));
 
 // Static-prefix tx parsers MUST come before `/positions/:address`
 // so Express doesn't match `by-tx` / `claim-result` as an address.
