@@ -122,7 +122,7 @@ Response: `{ markets: MarketListItem[], pagination }`. Each market has `contestI
 
 ### `GET /v1/markets/:contestId`
 
-Single market detail. Returns the same shape as a list item, plus an `orderbook: []` array on each speculation (currently empty — populating from `commitments` is a future-batch task; until then, callers should query `GET /v1/commitments?contestId=...` for the open book).
+Single market detail. Returns the same shape as a list item, plus an `orderbook` array on each speculation populated with currently fillable commitments. Same default filter as `GET /v1/commitments` (status `open` or `partially_filled`, not invalidated, not expired); each entry has the same wire shape as a commitment from `GET /v1/commitments`. Sorted by `createdAt` ascending; price-aware sorting is a follow-up. The list endpoint `GET /v1/markets` does not populate orderbooks.
 
 ### `GET /v1/protocol/info`
 
