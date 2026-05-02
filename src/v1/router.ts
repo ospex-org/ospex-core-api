@@ -4,6 +4,7 @@ import { eip712Auth, type AuthenticatedRequest } from '../middleware/eip712Auth.
 import { commitmentsRateLimit, readRateLimit } from '../middleware/rateLimit.js';
 import {
   deleteCommitmentHandler,
+  getCommitmentByHashHandler,
   getCommitmentsHandler,
   postCommitmentHandler,
 } from './commitments.js';
@@ -49,6 +50,12 @@ v1Router.delete(
 );
 
 // ── Reads ─────────────────────────────────────────────────────────────
+// Single-row :hash lookup is mounted before the bare list route so the
+// path-by-segment ordering matches how positions.ts mounts its
+// static-prefix paths first. Express would resolve either order
+// correctly here (no segment collision), but consistent ordering keeps
+// the file readable.
+v1Router.get('/commitments/:hash', readRateLimit, asyncHandler(getCommitmentByHashHandler));
 v1Router.get('/commitments', readRateLimit, asyncHandler(getCommitmentsHandler));
 
 v1Router.get('/markets', readRateLimit, asyncHandler(getMarketsHandler));

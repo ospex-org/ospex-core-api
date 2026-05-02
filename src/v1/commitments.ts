@@ -15,6 +15,13 @@
  *                                   across ties (rows backfilled by indexer
  *                                   migration 039 share a timestamp).
  *
+ *   GET    /v1/commitments/:hash  — single commitment lookup by EIP-712 hash.
+ *                                   Returns the same canonical body shape as
+ *                                   the list endpoint, or 404. Lets clients
+ *                                   that hold a hash (e.g. SDK match flow)
+ *                                   fetch the full struct + signature without
+ *                                   scanning the list.
+ *
  *   DELETE /v1/commitments/:hash  — off-chain cancel via signed CancelCommitment
  *                                   action. Sets `status='cancelled'` so the row
  *                                   stops surfacing in the open book. Authoritative
@@ -497,6 +504,57 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
     },
   };
   res.status(200).json(body);
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// GET /v1/commitments/:hash
+// ────────────────────────────────────────────────────────────────────────
+
+const HASH_PATTERN = /^0x[0-9a-f]{64}$/i;
+
+/**
+ * Single-row lookup by EIP-712 commitment hash. Returns the canonical
+ * body shape so consumers don't have to branch on which endpoint
+ * produced the row. 404 when no row exists for the (network, hash)
+ * pair — including when only an indexer-projected cancel/match exists
+ * (those rows DO have a hash). Lowercased before query because the
+ * `commitments` table stores the hash lowercased.
+ */
+export async function getCommitmentByHashHandler(req: Request, res: Response): Promise<void> {
+  const config = loadConfig();
+  const sb = getSupabase();
+
+  const raw = String(req.params['hash'] ?? '').trim();
+  if (!HASH_PATTERN.test(raw)) {
+    res.status(400).json({
+      error: 'Path :hash must be a 0x-prefixed 32-byte hex string.',
+      code: 'INVALID_PARAM',
+    } satisfies ApiError);
+    return;
+  }
+  const hash = raw.toLowerCase();
+
+  const { data, error } = await sb
+    .from('commitments')
+    .select(COMMITMENT_COLUMNS)
+    .eq('network', config.network)
+    .eq('commitment_hash', hash)
+    .maybeSingle();
+
+  if (error) {
+    logger.error({ err: error.message }, 'commitments: get-by-hash query failed');
+    res.status(500).json({ error: 'Failed to fetch commitment.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+    return;
+  }
+  if (!data) {
+    res.status(404).json({
+      error: `Commitment ${hash} not found.`,
+      code: 'NOT_FOUND',
+    } satisfies ApiError);
+    return;
+  }
+
+  res.status(200).json(rowToBody(data as unknown as CommitmentRow));
 }
 
 // ────────────────────────────────────────────────────────────────────────
