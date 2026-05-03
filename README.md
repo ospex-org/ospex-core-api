@@ -140,19 +140,77 @@ Query params: `limit` (max 200), `offset`.
 
 #### `GET /v1/positions/:address/status`
 
-Returns the wallet's unclaimed positions split into `active` (speculation still open) and `claimable` (speculation closed, position has non-zero expected payout). Each entry has `positionId`, `speculationId`, `positionType`, `team`, `opponent`, `market`, `oddsDecimal`, `riskAmountUSDC`, `profitAmountUSDC`. Claimable entries also have `result` (`won`/`push`/`void`), `estimatedPayoutUSDC` (full precision, no rounding), and `estimatedPayoutWei6` (raw uint256-as-string). Totals at the top level mirror this — `estimatedPayoutUSDC` plus `estimatedPayoutWei6` aggregated in bigint to avoid float-rounding loss across many claimable rows. Capped at 200 unclaimed positions per address (matches agent-server behavior).
+Returns the wallet's unclaimed positions split into three buckets:
 
-Filtering matches the contract exactly: `claimPosition` reverts only when `riskAmount == 0 || payout == 0` (`PositionModule.sol:367-370`). The filter is done in wei6 (bigint), so sub-cent payouts that ARE claimable on-chain still appear in the response. Lost positions are excluded (the contract would revert with `NoPayout`); positions on still-open speculations go in `active`. There is no `withdrawable` bucket — see note below.
+- **`active`** — speculation still open AND parent contest not yet `Scored`. Nothing the user can do yet.
+- **`pendingSettle`** — speculation still open but the parent contest's `contest_status = 'scored'` on-chain. Anyone can call `SpeculationModule.settleSpeculation(speculationId)` (permissionless) to finalize, after which the position becomes claimable. Predicted-loser rows are filtered out (settling them would just expose `NoPayout` on the subsequent `claimPosition`).
+- **`claimable`** — speculation closed (already settled), position has non-zero expected payout.
 
-This endpoint reads `speculations.market_type` directly (populated by the indexer per migration 027) and does not depend on the `SCORER_*_ADDRESS` env vars — those are only required for `POST /v1/commitments`.
+Each entry has `positionId`, `speculationId`, `positionType`, `team`, `opponent`, `market`, `oddsDecimal`, `riskAmountUSDC`, `profitAmountUSDC`. **Claimable** entries also have `result` (`won`/`push`/`void`), `estimatedPayoutUSDC` (full precision, no rounding), and `estimatedPayoutWei6` (raw uint256-as-string). **PendingSettle** entries carry the same `result` / `estimatedPayoutUSDC` / `estimatedPayoutWei6` fields plus `predictedWinSide` (`away`/`home`/`over`/`under`/`push`) — derived off-chain by replaying the on-chain scorer logic against `contests.{away_score, home_score}` and `speculations.line_ticks`. Once `settleSpeculation` runs the on-chain `winSide` will match.
+
+Top-level `totals` mirrors all three buckets:
+
+| Field | What it sums |
+|---|---|
+| `activeCount` | rows in `active` |
+| `pendingSettleCount` | rows in `pendingSettle` |
+| `claimableCount` | rows in `claimable` |
+| `estimatedPayoutUSDC` / `estimatedPayoutWei6` | claimable-only payouts (ready to sweep right now) |
+| `pendingSettlePayoutUSDC` / `pendingSettlePayoutWei6` | pendingSettle-only predicted payouts (require an extra `settleSpeculation` call before they materialize) |
+
+Wei6 totals are aggregated in bigint to avoid float-rounding loss across many rows; the USDC float is the bigint sum divided by 1e6. Capped at 200 unclaimed positions per address (matches agent-server behavior).
+
+Filtering matches the contract exactly: `claimPosition` reverts only when `riskAmount == 0 || payout == 0` (`PositionModule.sol:367-370`). The filter is done in wei6 (bigint), so sub-cent payouts that ARE claimable on-chain still appear in the response. Lost positions are excluded (the contract would revert with `NoPayout`); positions on still-open speculations whose parent contest is not yet scored go in `active`. There is no `withdrawable` bucket — see note below.
+
+This endpoint reads `speculations.market_type` and `contests.{contest_status, away_score, home_score}` directly (all populated by the indexer) and does not depend on the `SCORER_*_ADDRESS` env vars — those are only required for `POST /v1/commitments`.
 
 #### `GET /v1/positions/:address/claim-params`
 
-Returns ready-to-sign tx params for every claimable position. R4 `claimPosition` takes `(speculationId, positionType)` — no `oddsPairId` (the R3 field is gone in R4 since positions are uniquely identified by `(speculationId, user, positionType)`).
+Returns ready-to-sign tx params for every claimable AND pendingSettle position. R4 `claimPosition` takes `(speculationId, positionType)` — no `oddsPairId` (the R3 field is gone in R4 since positions are uniquely identified by `(speculationId, user, positionType)`).
 
-Same filter / market_type semantics as `/status` above.
+Same filter / market_type / scorer-replay semantics as `/status` above.
 
-Response: `{ address, positions: [{ positionId, speculationId, description, txParams: { method: 'claimPosition', args: { speculationId, positionType } } }, …] }`. The `description` field shows `"<$0.01"` for sub-cent expected payouts so it doesn't misleadingly round to `$0.00`.
+Response shape:
+
+```json
+{
+  "address": "0x…",
+  "positions": [
+    {
+      "positionId":           "42_0x…_0",
+      "speculationId":        "42",
+      "description":          "Lakers moneyline — Won (≈ $191.00)",
+      "bucket":               "claimable",
+      "result":               "won",
+      "estimatedPayoutUSDC":  191,
+      "estimatedPayoutWei6":  "191000000",
+      "txParams": [
+        { "method": "claimPosition", "target": "PositionModule",
+          "args": { "speculationId": "42", "positionType": 0 } }
+      ]
+    },
+    {
+      "positionId":           "99_0x…_1",
+      "speculationId":        "99",
+      "description":          "Celtics moneyline — Won (≈ $50.00, needs settle)",
+      "bucket":               "pendingSettle",
+      "result":               "won",
+      "estimatedPayoutUSDC":  50,
+      "estimatedPayoutWei6":  "50000000",
+      "txParams": [
+        { "method": "settleSpeculation", "target": "SpeculationModule",
+          "args": { "speculationId": "99" } },
+        { "method": "claimPosition",     "target": "PositionModule",
+          "args": { "speculationId": "99", "positionType": 1 } }
+      ]
+    }
+  ]
+}
+```
+
+`txParams` is **always an array** — `claimable` rows have a single `claimPosition` step; `pendingSettle` rows lead with `settleSpeculation` (permissionless, any EOA) and then `claimPosition`. Consumers MUST execute the steps in array order; later steps depend on earlier ones (a `claimPosition` call would revert with `NotSettled` if the preceding `settleSpeculation` hasn't yet landed). `target` is a stable label the consumer maps to the deployed contract address per chain — the API never returns raw contract addresses here so address rotations don't ripple through every consumer. Claimable rows are listed first (single tx, faster to execute), then pendingSettle rows.
+
+The `description` field shows `"<$0.01"` for sub-cent expected payouts so it doesn't misleadingly round to `$0.00`. PendingSettle descriptions append `, needs settle` so the wording differentiates the two buckets when rendered in a CLI / dashboard.
 
 #### `GET /v1/positions/by-tx/:txHash`
 
@@ -283,5 +341,5 @@ src/
     leaderboard.ts     # GET /v1/leaderboard
     schedule.ts        # GET /v1/schedule
     utils/
-      positionFetch.ts # categorize active/claimable (Supabase-only)
+      positionFetch.ts # categorize active/pendingSettle/claimable (Supabase-only)
 ```
