@@ -68,6 +68,31 @@ interface MarketDetail extends MarketBody {
    * endpoint only — list responses stay minimal.
    */
   jsonoddsId: string | null;
+  /**
+   * Contest fields surfaced on the detail endpoint only. The list
+   * endpoint omits them to keep page payloads lean. Source hashes are
+   * the keccak256 of the Chainlink Functions JS sources baked into
+   * the on-chain contest at creation; they're persisted by the
+   * indexer and surfaced here so SDK consumers can verify the contest
+   * was created against the protocol-approved scripts.
+   *
+   * Naming conflates Contest and Market for now. A future rename pass
+   * (`client.markets` → `client.speculations`, separating Contest as
+   * its own entity) will untangle this.
+   */
+  rundownId: string | null;
+  sportspageId: string | null;
+  contestCreator: string;
+  leagueId: string;
+  verifySourceHash: string | null;
+  marketUpdateSourceHash: string | null;
+  scoreContestSourceHash: string | null;
+  awayScore: number | null;
+  homeScore: number | null;
+  contestCreatedAt: string | null;
+  verifiedAt: string | null;
+  scoredAt: string | null;
+  voidedAt: string | null;
   speculations: MarketSpeculationDetail[];
 }
 
@@ -77,6 +102,35 @@ interface SpecRow {
   speculation_scorer: string | null;
   line_ticks: number | null;
   speculation_status: string | null;
+}
+
+/**
+ * Explicit row shape for the detail query. Supabase's inference gives
+ * up at this column count and falls back to `GenericStringError`, so
+ * we narrow with an `as` cast at the consumer instead.
+ */
+interface ContestDetailRow {
+  contest_id: string | number;
+  jsonodds_id: string | null;
+  rundown_id: string | null;
+  sportspage_id: string | null;
+  contest_creator: string | null;
+  league_id: string | null;
+  verify_source_hash: string | null;
+  market_update_source_hash: string | null;
+  score_contest_source_hash: string | null;
+  away_team: string | null;
+  home_team: string | null;
+  sport_slug: string | null;
+  jsonodds_sport_id: number | null;
+  start_time: string | null;
+  contest_status: string | null;
+  away_score: number | null;
+  home_score: number | null;
+  contest_created_at: string | null;
+  verified_at: string | null;
+  scored_at: string | null;
+  voided_at: string | null;
 }
 
 function specRowToBase(spec: SpecRow, scorers: { moneyline: string; spread: string; total: string }): MarketSpeculation | null {
@@ -254,7 +308,12 @@ export async function getMarketByIdHandler(req: Request, res: Response): Promise
   const sb = getSupabase();
   const contestRes = await sb
     .from('contests')
-    .select('contest_id, jsonodds_id, away_team, home_team, sport_slug, jsonodds_sport_id, start_time, contest_status')
+    .select(
+      'contest_id, jsonodds_id, rundown_id, sportspage_id, contest_creator, league_id, ' +
+        'verify_source_hash, market_update_source_hash, score_contest_source_hash, ' +
+        'away_team, home_team, sport_slug, jsonodds_sport_id, start_time, contest_status, ' +
+        'away_score, home_score, contest_created_at, verified_at, scored_at, voided_at',
+    )
     .eq('network', config.network)
     .eq('contest_id', contestId)
     .maybeSingle();
@@ -269,7 +328,7 @@ export async function getMarketByIdHandler(req: Request, res: Response): Promise
     return;
   }
 
-  const c = contestRes.data;
+  const c = contestRes.data as unknown as ContestDetailRow;
   const specsRes = await sb
     .from('speculations')
     .select('speculation_id, contest_id, speculation_scorer, line_ticks, speculation_status')
@@ -328,12 +387,25 @@ export async function getMarketByIdHandler(req: Request, res: Response): Promise
   const body: MarketDetail = {
     contestId: String(c.contest_id),
     jsonoddsId: c.jsonodds_id ?? null,
+    rundownId: c.rundown_id ?? null,
+    sportspageId: c.sportspage_id ?? null,
+    contestCreator: c.contest_creator ?? '',
+    leagueId: c.league_id ?? 'unknown',
+    verifySourceHash: c.verify_source_hash ?? null,
+    marketUpdateSourceHash: c.market_update_source_hash ?? null,
+    scoreContestSourceHash: c.score_contest_source_hash ?? null,
     awayTeam: c.away_team ?? '',
     homeTeam: c.home_team ?? '',
     sport: c.sport_slug ?? '',
     sportId: c.jsonodds_sport_id ?? 0,
     matchTime: c.start_time ?? '',
     status: c.contest_status ?? '',
+    awayScore: c.away_score ?? null,
+    homeScore: c.home_score ?? null,
+    contestCreatedAt: c.contest_created_at ?? null,
+    verifiedAt: c.verified_at ?? null,
+    scoredAt: c.scored_at ?? null,
+    voidedAt: c.voided_at ?? null,
     speculations,
   };
   res.status(200).json(body);

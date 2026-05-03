@@ -8,6 +8,7 @@ import {
   getCommitmentsHandler,
   postCommitmentHandler,
 } from './commitments.js';
+import { getApprovedScriptsHandler } from './contests.js';
 import { getMarketByIdHandler, getMarketsHandler } from './markets.js';
 import { getOddsHistoryHandler } from './analytics.js';
 import { getAuthDomainHandler } from './auth.js';
@@ -60,6 +61,10 @@ v1Router.get('/commitments', readRateLimit, asyncHandler(getCommitmentsHandler))
 
 v1Router.get('/markets', readRateLimit, asyncHandler(getMarketsHandler));
 v1Router.get('/markets/:contestId', readRateLimit, asyncHandler(getMarketByIdHandler));
+
+v1Router.get('/contests/scripts/approved', readRateLimit, (req, res) =>
+  getApprovedScriptsHandler(req, res),
+);
 
 v1Router.get('/protocol/info', readRateLimit, (req, res) => getProtocolInfoHandler(req, res));
 
