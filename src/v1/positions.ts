@@ -32,7 +32,11 @@ import {
   fetchCategorizedPositions,
   positionTypeIntToString,
 } from './utils/positionFetch.js';
-import type { ClaimablePosition, PositionBase } from './utils/positionFetch.js';
+import type {
+  ClaimablePosition,
+  PendingSettlePosition,
+  PositionBase,
+} from './utils/positionFetch.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 
 const DEFAULT_LIMIT = 50;
@@ -179,12 +183,21 @@ export async function getPositionsByAddressHandler(req: Request, res: Response):
 interface StatusResponse {
   address: string;
   active: PositionBase[];
+  pendingSettle: PendingSettlePosition[];
   claimable: ClaimablePosition[];
   totals: {
     activeCount: number;
+    pendingSettleCount: number;
     claimableCount: number;
+    /** Aggregate of `claimable` payouts only (matches the "ready to
+     * sweep right now" mental model). Pending-settle entries are
+     * predictions that require an extra tx to materialize and are
+     * tracked separately below. */
     estimatedPayoutUSDC: number;
     estimatedPayoutWei6: string;
+    /** Aggregate of `pendingSettle` predicted payouts. */
+    pendingSettlePayoutUSDC: number;
+    pendingSettlePayoutWei6: string;
   };
 }
 
@@ -205,18 +218,24 @@ export async function getPositionStatusHandler(req: Request, res: Response): Pro
   }
 
   // Sum in wei6 (bigint) so sub-cent payouts aggregate without rounding loss.
-  let estimatedPayoutWei6 = 0n;
-  for (const p of result.claimable) estimatedPayoutWei6 += BigInt(p.estimatedPayoutWei6);
+  let claimablePayoutWei6 = 0n;
+  for (const p of result.claimable) claimablePayoutWei6 += BigInt(p.estimatedPayoutWei6);
+  let pendingSettlePayoutWei6 = 0n;
+  for (const p of result.pendingSettle) pendingSettlePayoutWei6 += BigInt(p.estimatedPayoutWei6);
 
   const body: StatusResponse = {
     address,
     active: result.active,
+    pendingSettle: result.pendingSettle,
     claimable: result.claimable,
     totals: {
       activeCount: result.active.length,
+      pendingSettleCount: result.pendingSettle.length,
       claimableCount: result.claimable.length,
-      estimatedPayoutUSDC: wei6ToUSDC(estimatedPayoutWei6.toString()),
-      estimatedPayoutWei6: estimatedPayoutWei6.toString(),
+      estimatedPayoutUSDC: wei6ToUSDC(claimablePayoutWei6.toString()),
+      estimatedPayoutWei6: claimablePayoutWei6.toString(),
+      pendingSettlePayoutUSDC: wei6ToUSDC(pendingSettlePayoutWei6.toString()),
+      pendingSettlePayoutWei6: pendingSettlePayoutWei6.toString(),
     },
   };
   res.status(200).json(body);
@@ -226,14 +245,56 @@ export async function getPositionStatusHandler(req: Request, res: Response): Pro
 // GET /v1/positions/:address/claim-params
 // ──────────────────────────────────────────────────────────────────────
 
+/**
+ * One step in the on-chain action plan a client must execute to
+ * realize a payout. `target` is a stable label the SDK maps to a
+ * deployed contract address per chain — the API never returns raw
+ * contract addresses here so address rotations don't ripple through
+ * every consumer.
+ *
+ * For M3, two `(target, method)` pairs are emitted:
+ *   - SpeculationModule.settleSpeculation(speculationId)
+ *   - PositionModule.claimPosition(speculationId, positionType)
+ */
+type TxStep =
+  | {
+      method: 'settleSpeculation';
+      target: 'SpeculationModule';
+      args: { speculationId: string };
+    }
+  | {
+      method: 'claimPosition';
+      target: 'PositionModule';
+      args: { speculationId: string; positionType: 0 | 1 };
+    };
+
 interface ClaimParamEntry {
   positionId: string;
   speculationId: string;
   description: string;
-  txParams: {
-    method: 'claimPosition';
-    args: { speculationId: string; positionType: 0 | 1 };
-  };
+  /**
+   * Whether the parent speculation is already settled on-chain
+   * (`'claimable'`) or still needs `settleSpeculation` first
+   * (`'pendingSettle'`). The bucket label lets clients render
+   * different UX without re-deriving from `txParams.length`.
+   */
+  bucket: 'claimable' | 'pendingSettle';
+  /** Predicted result; for pendingSettle this is computed off-chain
+   * by replaying the scorer logic against the contest scores. */
+  result: 'won' | 'push' | 'void';
+  estimatedPayoutUSDC: number;
+  estimatedPayoutWei6: string;
+  /**
+   * Ordered list of on-chain calls to make. The SDK MUST execute these
+   * in array order; later steps depend on earlier ones (a `claimPosition`
+   * call would revert with `NotSettled` if the preceding
+   * `settleSpeculation` hasn't yet landed).
+   *
+   * `claimable` rows have a single `claimPosition` step.
+   * `pendingSettle` rows have two steps: `settleSpeculation` then
+   * `claimPosition`.
+   */
+  txParams: TxStep[];
 }
 
 interface ClaimParamsResponse {
@@ -246,6 +307,18 @@ const MARKET_LABEL: Record<string, string> = {
   spread: 'spread',
   total: 'total',
 };
+
+function payoutDisplay(usdc: number): string {
+  // Sub-cent payouts round to "$0.00" with toFixed(2) — surface them
+  // honestly as "<$0.01" so the description doesn't mislead. The
+  // structured fields (estimatedPayoutUSDC, estimatedPayoutWei6) carry
+  // full precision regardless.
+  return usdc >= 0.01 ? `$${usdc.toFixed(2)}` : '<$0.01';
+}
+
+function resultLabel(result: 'won' | 'push' | 'void'): string {
+  return result === 'won' ? 'Won' : result === 'push' ? 'Push' : 'Void';
+}
 
 export async function getClaimParamsHandler(req: Request, res: Response): Promise<void> {
   const address = parseAddressParam(req.params.address);
@@ -263,28 +336,48 @@ export async function getClaimParamsHandler(req: Request, res: Response): Promis
     return;
   }
 
-  const positions: ClaimParamEntry[] = result.claimable.map((p) => {
-    const resultLabel =
-      p.result === 'won' ? 'Won'
-      : p.result === 'push' ? 'Push'
-      : 'Void';
-    // Sub-cent payouts round to "$0.00" with toFixed(2) — surface them
-    // honestly as "<$0.01" so the description doesn't mislead. The
-    // structured fields (estimatedPayoutUSDC, estimatedPayoutWei6) carry
-    // full precision regardless.
-    const payoutDisplay = p.estimatedPayoutUSDC >= 0.01
-      ? `$${p.estimatedPayoutUSDC.toFixed(2)}`
-      : '<$0.01';
-    return {
-      positionId: p.positionId,
-      speculationId: p.speculationId,
-      description: `${p.team} ${MARKET_LABEL[p.market] ?? p.market} — ${resultLabel} (≈ ${payoutDisplay})`,
-      txParams: {
+  const claimableEntries: ClaimParamEntry[] = result.claimable.map((p) => ({
+    positionId: p.positionId,
+    speculationId: p.speculationId,
+    description: `${p.team} ${MARKET_LABEL[p.market] ?? p.market} — ${resultLabel(p.result)} (≈ ${payoutDisplay(p.estimatedPayoutUSDC)})`,
+    bucket: 'claimable',
+    result: p.result,
+    estimatedPayoutUSDC: p.estimatedPayoutUSDC,
+    estimatedPayoutWei6: p.estimatedPayoutWei6,
+    txParams: [
+      {
         method: 'claimPosition',
+        target: 'PositionModule',
         args: { speculationId: p.speculationId, positionType: p.positionType },
       },
-    };
-  });
+    ],
+  }));
+
+  const pendingEntries: ClaimParamEntry[] = result.pendingSettle.map((p) => ({
+    positionId: p.positionId,
+    speculationId: p.speculationId,
+    description: `${p.team} ${MARKET_LABEL[p.market] ?? p.market} — ${resultLabel(p.result)} (≈ ${payoutDisplay(p.estimatedPayoutUSDC)}, needs settle)`,
+    bucket: 'pendingSettle',
+    result: p.result,
+    estimatedPayoutUSDC: p.estimatedPayoutUSDC,
+    estimatedPayoutWei6: p.estimatedPayoutWei6,
+    txParams: [
+      {
+        method: 'settleSpeculation',
+        target: 'SpeculationModule',
+        args: { speculationId: p.speculationId },
+      },
+      {
+        method: 'claimPosition',
+        target: 'PositionModule',
+        args: { speculationId: p.speculationId, positionType: p.positionType },
+      },
+    ],
+  }));
+
+  // Claimable first — they're a single tx, faster to execute.
+  // pendingSettle entries follow.
+  const positions: ClaimParamEntry[] = [...claimableEntries, ...pendingEntries];
 
   const body: ClaimParamsResponse = { address, positions };
   res.status(200).json(body);

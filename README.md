@@ -14,8 +14,10 @@ In progress. Working today:
 - `GET /v1/markets`, `GET /v1/markets/:contestId` — market list / detail
 - `GET /v1/protocol/info` — static protocol metadata
 - `GET /v1/positions/:address` — wallet position history
-- `GET /v1/positions/:address/status` — categorized active / claimable
-- `GET /v1/positions/:address/claim-params` — txParams for claim calls
+- `GET /v1/positions/:address/status` — categorized active / pendingSettle / claimable
+- `GET /v1/positions/:address/claim-params` — ordered `txParams[]` action plan
+  (one `claimPosition` step for settled rows; `settleSpeculation` then `claimPosition` for
+  rows whose contest is scored but whose speculation is still open)
 - `GET /v1/positions/by-tx/:txHash` — parse `PositionFilled` from a tx
 - `GET /v1/positions/claim-result/:txHash` — parse `PositionClaimed` from a tx
 - `GET /v1/leaderboard` — current active leaderboard
