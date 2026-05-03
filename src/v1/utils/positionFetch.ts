@@ -20,11 +20,24 @@
  *     reconstruct from upper/lower odds at query time).
  *
  * Categorization:
- *   - active     — speculation_status = 'open',   claimed = false
- *   - claimable  — speculation_status = 'closed', claimed = false,
- *                  estimated payout > 0 (won, push, or void; lost
- *                  positions have payout = 0 and are filtered out
- *                  because `claimPosition` reverts with NoPayout)
+ *   - active        — speculation_status = 'open',   claimed = false,
+ *                     contest_status != 'scored' (parent contest not
+ *                     yet final). The user can't do anything yet.
+ *   - pendingSettle — speculation_status = 'open',   claimed = false,
+ *                     contest_status = 'scored'. The contest is final
+ *                     but `settleSpeculation` hasn't been called yet.
+ *                     The SDK can resolve these by calling
+ *                     `settleSpeculation` followed by `claimPosition`.
+ *                     Predicted result + payout are computed from the
+ *                     contest scores by replaying the scorer logic.
+ *                     Lost positions are filtered out (settling them
+ *                     would be wasted gas — `claimPosition` reverts
+ *                     with NoPayout, and nothing else gates the eventual
+ *                     auto-void path either).
+ *   - claimable     — speculation_status = 'closed', claimed = false,
+ *                     estimated payout > 0 (won, push, or void; lost
+ *                     positions have payout = 0 and are filtered out
+ *                     because `claimPosition` reverts with NoPayout)
  *
  * Hard-coded query cap of 200 unclaimed positions per address. The
  * agent-server used the same cap; preserving the behavior keeps a
@@ -60,8 +73,27 @@ export interface ClaimablePosition extends PositionBase {
   estimatedPayoutWei6: string;
 }
 
+/**
+ * A position whose parent contest has been scored on-chain but whose
+ * speculation hasn't been settled yet. The on-chain finalization path
+ * is `SpeculationModule.settleSpeculation(speculationId)` (permissionless,
+ * any EOA) followed by `PositionModule.claimPosition(...)`. The `result`
+ * is computed off-chain from `contests.{away_score, home_score}` plus
+ * `speculations.line_ticks` by replaying the scorer logic — once
+ * `settleSpeculation` runs, the on-chain `winSide` will match.
+ */
+export interface PendingSettlePosition extends PositionBase {
+  /** Predicted result once `settleSpeculation` is called. */
+  result: 'won' | 'push' | 'void';
+  /** Predicted on-chain winSide once settled. */
+  predictedWinSide: 'away' | 'home' | 'over' | 'under' | 'push';
+  estimatedPayoutUSDC: number;
+  estimatedPayoutWei6: string;
+}
+
 export interface PositionFetchResult {
   active: PositionBase[];
+  pendingSettle: PendingSettlePosition[];
   claimable: ClaimablePosition[];
 }
 
@@ -79,6 +111,7 @@ interface SpeculationRow {
   speculation_id: number;
   contest_id: number | null;
   market_type: MarketType | null;
+  line_ticks: number | null;
   speculation_status: 'open' | 'closed';
   win_side: 'tbd' | 'away' | 'home' | 'over' | 'under' | 'push' | 'void';
 }
@@ -87,6 +120,9 @@ interface ContestRow {
   contest_id: number;
   away_team: string | null;
   home_team: string | null;
+  contest_status: 'unverified' | 'verified' | 'scored' | 'voided';
+  away_score: number | null;
+  home_score: number | null;
 }
 
 function impliedOddsDecimal(risk: bigint, profit: bigint | null): number | null {
@@ -104,6 +140,50 @@ function impliedOddsDecimal(risk: bigint, profit: bigint | null): number | null 
 function didWin(positionType: 0 | 1, winSide: SpeculationRow['win_side']): boolean {
   if (positionType === 0) return winSide === 'away' || winSide === 'over';
   return winSide === 'home' || winSide === 'under';
+}
+
+/**
+ * Replays the on-chain scorer logic in TS for pending-settle prediction.
+ * Mirrors `MoneylineScorerModule._scoreMoneyline`,
+ * `SpreadScorerModule._scoreSpread`, and `TotalScorerModule._scoreTotal`.
+ *
+ * `lineTicks` semantics (from the speculation, not the contest's stored
+ * default odds):
+ *   - moneyline: ignored
+ *   - spread:    int32 in 10× domain (away-side adjustment); push if
+ *                `awayScore*10 + lineTicks == homeScore*10`
+ *   - total:     int32 in 10× domain; push if `(away+home)*10 == lineTicks`
+ *
+ * Returns `null` if the inputs are inconsistent (e.g., scores missing
+ * even though contest_status='scored'). Caller skips the row in that
+ * case rather than emitting a misleading prediction.
+ */
+function predictWinSide(
+  market: MarketType,
+  awayScore: number,
+  homeScore: number,
+  lineTicks: number | null,
+): 'away' | 'home' | 'over' | 'under' | 'push' | null {
+  if (market === 'moneyline') {
+    if (awayScore > homeScore) return 'away';
+    if (homeScore > awayScore) return 'home';
+    return 'push';
+  }
+  if (market === 'spread') {
+    if (lineTicks == null) return null;
+    const scaledAway = awayScore * 10;
+    const scaledHome = homeScore * 10;
+    const adjustedAway = scaledAway + lineTicks;
+    if (adjustedAway > scaledHome) return 'away';
+    if (adjustedAway < scaledHome) return 'home';
+    return 'push';
+  }
+  // total
+  if (lineTicks == null) return null;
+  const scaledTotal = (awayScore + homeScore) * 10;
+  if (scaledTotal > lineTicks) return 'over';
+  if (scaledTotal < lineTicks) return 'under';
+  return 'push';
 }
 
 export async function fetchCategorizedPositions(
@@ -138,7 +218,7 @@ export async function fetchCategorizedPositions(
 
   if (posRes.error) throw new Error(`fetchCategorizedPositions positions: ${posRes.error.message}`);
   const positions = (posRes.data ?? []) as unknown as PositionRow[];
-  if (positions.length === 0) return { active: [], claimable: [] };
+  if (positions.length === 0) return { active: [], pendingSettle: [], claimable: [] };
 
   // Step 2: batch-fetch related speculations.
   // `market_type` is read straight from the column (populated by the
@@ -149,7 +229,7 @@ export async function fetchCategorizedPositions(
   if (specIds.length > 0) {
     const specRes = await sb
       .from('speculations')
-      .select('speculation_id, contest_id, market_type, speculation_status, win_side')
+      .select('speculation_id, contest_id, market_type, line_ticks, speculation_status, win_side')
       .eq('network', config.network)
       .in('speculation_id', specIds);
     if (specRes.error) throw new Error(`fetchCategorizedPositions speculations: ${specRes.error.message}`);
@@ -157,9 +237,12 @@ export async function fetchCategorizedPositions(
     for (const s of specs) specById.set(s.speculation_id, s);
   }
 
-  // Step 3: batch-fetch contests for team-name lookup. Only run the
-  // query if there are contest_ids to look up — Supabase / PostgREST
-  // builds `contest_id=in.()` from an empty list, which is malformed.
+  // Step 3: batch-fetch contests for team-name lookup AND contest_status
+  // / scores. The pendingSettle bucket needs `contest_status='scored'`
+  // plus `away_score`/`home_score` to predict the eventual winSide.
+  // Run the query only if there are contest_ids — Supabase /
+  // PostgREST builds `contest_id=in.()` from an empty list, which is
+  // malformed.
   const contestIds = [
     ...new Set(
       [...specById.values()]
@@ -171,7 +254,7 @@ export async function fetchCategorizedPositions(
   if (contestIds.length > 0) {
     const contestRes = await sb
       .from('contests')
-      .select('contest_id, away_team, home_team')
+      .select('contest_id, away_team, home_team, contest_status, away_score, home_score')
       .eq('network', config.network)
       .in('contest_id', contestIds);
     if (contestRes.error) throw new Error(`fetchCategorizedPositions contests: ${contestRes.error.message}`);
@@ -185,6 +268,7 @@ export async function fetchCategorizedPositions(
   // We do the comparison in wei6 (bigint) so sub-cent payouts (which
   // ARE claimable on-chain) aren't filtered by USDC-float rounding.
   const active: PositionBase[] = [];
+  const pendingSettle: PendingSettlePosition[] = [];
   const claimable: ClaimablePosition[] = [];
 
   for (const p of positions) {
@@ -218,6 +302,7 @@ export async function fetchCategorizedPositions(
     };
 
     if (spec.speculation_status === 'closed') {
+      // Already settled on-chain. Read win_side directly.
       let result: ClaimablePosition['result'];
       let payoutWei6: bigint;
       if (didWin(positionType, spec.win_side)) {
@@ -244,12 +329,62 @@ export async function fetchCategorizedPositions(
         estimatedPayoutUSDC: wei6ToUSDC(payoutWei6.toString()),
         estimatedPayoutWei6: payoutWei6.toString(),
       });
-    } else {
-      active.push(base);
+      continue;
     }
+
+    // speculation_status === 'open'
+    if (
+      contest &&
+      contest.contest_status === 'scored' &&
+      contest.away_score != null &&
+      contest.home_score != null
+    ) {
+      const predicted = predictWinSide(
+        market,
+        contest.away_score,
+        contest.home_score,
+        spec.line_ticks,
+      );
+      if (predicted == null) {
+        // Inputs missing or inconsistent — fall through to active.
+        active.push(base);
+        continue;
+      }
+      let result: PendingSettlePosition['result'];
+      let payoutWei6: bigint;
+      if (predicted === 'push') {
+        result = 'push';
+        payoutWei6 = riskWei6;
+      } else {
+        const isWinner =
+          (positionType === 0 && (predicted === 'away' || predicted === 'over')) ||
+          (positionType === 1 && (predicted === 'home' || predicted === 'under'));
+        if (isWinner) {
+          result = 'won';
+          payoutWei6 = riskWei6 + profitWei6;
+        } else {
+          // Predicted loser. Settling won't change that — once
+          // `settleSpeculation` runs, `claimPosition` will revert
+          // with NoPayout. Skip.
+          continue;
+        }
+      }
+      if (riskWei6 === 0n || payoutWei6 === 0n) continue;
+      pendingSettle.push({
+        ...base,
+        result,
+        predictedWinSide: predicted,
+        estimatedPayoutUSDC: wei6ToUSDC(payoutWei6.toString()),
+        estimatedPayoutWei6: payoutWei6.toString(),
+      });
+      continue;
+    }
+
+    // Open speculation, contest not yet scored. Plain active.
+    active.push(base);
   }
 
-  return { active, claimable };
+  return { active, pendingSettle, claimable };
 }
 
 /** Convenience for callers needing the on-chain enum string back from the int. */
