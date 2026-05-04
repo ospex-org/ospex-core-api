@@ -66,7 +66,7 @@ interface SidedSnapshot {
    * `odds_history.line` column is stored from the home perspective
    * (the fdb writer pulls `PointSpreadHome` / `sportspage.spread.open.home`
    * — see `ospex-fdb/src/oddsHistory.ts:134,218`). Returning a single
-   * un-labelled `line` would let a caller misalign with `/v1/markets`,
+   * un-labelled `line` would let a caller misalign with `/v1/contests`,
    * which exposes both `homeLine`/`awayLine` from the speculation row.
    * Convention: negative homeLine = home favored.
    */

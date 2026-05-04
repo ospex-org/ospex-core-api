@@ -11,7 +11,9 @@ In progress. Working today:
 - `/healthz` (liveness), `/readyz` (readiness)
 - `POST /v1/commitments` — EIP-712 commitment relay
 - `GET /v1/commitments` — list with filters / pagination
-- `GET /v1/markets`, `GET /v1/markets/:contestId` — market list / detail
+- `GET /v1/contests`, `GET /v1/contests/:contestId` — contest list / detail (renamed from `/v1/markets/*`)
+- `GET /v1/contests/scripts/approved` — EIP-712 script approvals (M4)
+- `GET /v1/speculations`, `GET /v1/speculations/:speculationId` — speculation list (filters: `contestId`, `sport`, `status`) / detail (with orderbook + parent contest context)
 - `GET /v1/protocol/info` — static protocol metadata
 - `GET /v1/positions/:address` — wallet position history
 - `GET /v1/positions/:address/status` — categorized active / pendingSettle / claimable
@@ -114,17 +116,46 @@ Query params:
 
 Response: `{ commitments: CommitmentBody[], pagination: { limit, offset, total, hasMore } }`. Each `CommitmentBody` has the full canonical shape including `signature`, `speculationKey`, `nonceInvalidated`, `createdAt`, etc.
 
-### `GET /v1/markets`
+### `GET /v1/contests`
 
-List upcoming markets within a configurable time window (default 72h, max 168h).
+List upcoming contests within a configurable time window (default 72h, max 168h).
 
 Query params: `sport` (one of `nba`, `nhl`, `ncaab`, `nfl`, `mlb`), `status`, `window` (hours), `limit` (max 200), `offset`.
 
-Response: `{ markets: MarketListItem[], pagination }`. Each market has `contestId`, team names, sport, `matchTime`, status, and a list of speculations. Each speculation has `type` (`moneyline`/`spread`/`total`), `lineTicks` (raw int32, 10x format per the contracts), `line` (`lineTicks / 10`), and for spread also `awayLine` / `homeLine`.
+Response: `{ contests: ContestListItem[], pagination }`. Each contest has `contestId`, team names, sport, `matchTime`, status, and a list of speculations. Each speculation has `speculationId`, `contestId`, `type` (`moneyline`/`spread`/`total`), `lineTicks` (raw int32, 10x format per the contracts), `line` (`lineTicks / 10`), and for spread also `awayLine` / `homeLine`.
 
-### `GET /v1/markets/:contestId`
+### `GET /v1/contests/:contestId`
 
-Single market detail. Returns the same shape as a list item, plus an `orderbook` array on each speculation populated with currently fillable commitments. Same default filter as `GET /v1/commitments` (status `open` or `partially_filled`, not invalidated, not expired); each entry has the same wire shape as a commitment from `GET /v1/commitments`. Sorted by `createdAt` ascending; price-aware sorting is a follow-up. The list endpoint `GET /v1/markets` does not populate orderbooks.
+Single contest detail. Returns the same shape as a list item, plus an `orderbook` array on each speculation populated with currently fillable commitments. Same default filter as `GET /v1/commitments` (status `open` or `partially_filled`, not invalidated, not expired); each entry has the same wire shape as a commitment from `GET /v1/commitments`. Sorted by `createdAt` ascending; price-aware sorting is a follow-up. The list endpoint `GET /v1/contests` does not populate orderbooks.
+
+Detail-only fields surfaced here (omitted on list rows): `jsonoddsId`, `rundownId`, `sportspageId`, `contestCreator`, `leagueId`, `verifySourceHash`, `marketUpdateSourceHash`, `scoreContestSourceHash`, `awayScore`, `homeScore`, `contestCreatedAt`, `verifiedAt`, `scoredAt`, `voidedAt`.
+
+### `GET /v1/speculations`
+
+List speculations across one or more contests.
+
+Query params:
+
+| Name | What it does |
+|---|---|
+| `contestId` | optional. Fast path — single-table query keyed on the indexed `contest_id` column. |
+| `sport` | optional, one of `nba`/`nhl`/`ncaab`/`nfl`/`mlb`. Slower path: resolves to a contest_id list via the `contests` table first. |
+| `status` | optional, `open` or `closed`. Filters on `speculations.speculation_status`. |
+| `limit` | optional, default 100, max 500. |
+| `offset` | optional, default 0. |
+
+Response: `{ speculations: Speculation[], pagination }`. Each `Speculation` carries `speculationId`, `contestId`, `type`, `lineTicks`, `line`, `speculationStatus`, and (for spread) `awayLine`/`homeLine`. List rows do NOT include `orderbook` — fetch the detail endpoint for that.
+
+Reads `speculations.market_type` directly; does not depend on the `SCORER_*_ADDRESS` env vars.
+
+### `GET /v1/speculations/:speculationId`
+
+Single speculation detail with the orderbook of currently fillable commitments and a small parent-contest context block.
+
+Response: `Speculation` (as above) plus:
+
+- `orderbook: CommitmentBody[]` — same wire shape and default filter as `GET /v1/commitments` (open/partially_filled, not invalidated, not expired), keyed on the speculation's `speculation_key`.
+- `contest: { contestId, awayTeam, homeTeam, sport, matchTime, status }` — five fields so consumers don't have to fetch `/v1/contests/:contestId` for the common "what game is this on?" question. Source hashes / scores / lifecycle timestamps stay on the contest detail endpoint.
 
 ### `GET /v1/protocol/info`
 
@@ -240,7 +271,7 @@ Query params: `limit` (max 500), `offset`.
 
 Upcoming games within `windowHours` (default 36, max 168). Returns games with team names resolved from the `teams` table.
 
-Out of scope for this batch: best-effort merge with on-chain `contests` (so each game can flag whether it has a contest). Needs the `resolveTeam` alias resolver from agent-server's `db/supabase/queries.ts`. Until then, callers can cross-check by team-name against `GET /v1/markets`.
+Out of scope for this batch: best-effort merge with on-chain `contests` (so each game can flag whether it has a contest). Needs the `resolveTeam` alias resolver from agent-server's `db/supabase/queries.ts`. Until then, callers can cross-check by team-name against `GET /v1/contests`.
 
 ## Scripts
 
@@ -297,7 +328,7 @@ URL=https://ospex-core-api-195f635df864.herokuapp.com
 curl -s "$URL/healthz"            # 200 + service / network / chainId
 curl -s "$URL/readyz"              # 200 only when supabase.connected and commitments.configured
 curl -s "$URL/v1/protocol/info"    # mainnet contract addresses
-curl -s "$URL/v1/markets"          # paginated list (empty until indexer ingests data)
+curl -s "$URL/v1/contests"         # paginated list (empty until indexer ingests data)
 ```
 
 `/readyz` is the canonical "everything wired" check — both Supabase reachability and EIP-712 relay env config are surfaced in the JSON.
@@ -334,7 +365,8 @@ src/
   v1/
     router.ts          # versioned router
     commitments.ts     # POST + GET /v1/commitments
-    markets.ts         # GET /v1/markets, GET /v1/markets/:contestId
+    contests.ts        # GET /v1/contests, /:contestId, /scripts/approved
+    speculations.ts    # GET /v1/speculations, /:speculationId
     protocol.ts        # GET /v1/protocol/info
     positions.ts       # GET /v1/positions/:address + /status, /claim-params,
                        #   /by-tx/:txHash, /claim-result/:txHash
@@ -342,4 +374,5 @@ src/
     schedule.ts        # GET /v1/schedule
     utils/
       positionFetch.ts # categorize active/pendingSettle/claimable (Supabase-only)
+      speculations.ts  # shared Speculation wire shape + row→Speculation converters
 ```
