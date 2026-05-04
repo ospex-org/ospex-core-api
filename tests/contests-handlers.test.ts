@@ -1,17 +1,35 @@
 /**
- * Handler-level tests for the contests endpoints. Mocks loadConfig so we
- * can drive the network selection without a real env.
+ * Handler-level tests for the /v1/contests/* endpoints. Mocks
+ * loadConfig + getSupabase so the test never touches a real network.
  */
 import { describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 
+const SCORERS = {
+  moneyline: '0x1111111111111111111111111111111111111111',
+  spread: '0x2222222222222222222222222222222222222222',
+  total: '0x3333333333333333333333333333333333333333',
+};
+
+const supabaseMock = vi.hoisted(() => ({ getSupabase: vi.fn() }));
 const envMock = vi.hoisted(() => ({
-  loadConfig: vi.fn(() => ({ network: 'polygon', chainId: 137 })),
+  loadConfig: vi.fn(() => ({
+    network: 'polygon',
+    chainId: 137,
+    scorers: {
+      moneyline: '0x1111111111111111111111111111111111111111',
+      spread: '0x2222222222222222222222222222222222222222',
+      total: '0x3333333333333333333333333333333333333333',
+    },
+  })),
 }));
 
+vi.mock('../src/lib/supabase.js', () => supabaseMock);
 vi.mock('../src/lib/env.js', () => envMock);
 
-const { getApprovedScriptsHandler } = await import('../src/v1/contests.js');
+const { getApprovedScriptsHandler, getContestsHandler, getContestByIdHandler } = await import(
+  '../src/v1/contests.js'
+);
 
 interface FakeRes {
   statusCode?: number;
@@ -34,38 +52,80 @@ function makeRes(): FakeRes {
   return res;
 }
 
-function makeReq(): Request {
-  return { params: {}, query: {} } as unknown as Request;
+function makeReq(query: Record<string, string> = {}, params: Record<string, string> = {}): Request {
+  return { params, query } as unknown as Request;
+}
+
+interface MockResponse {
+  data: unknown;
+  error: unknown;
+  count?: number;
+}
+
+/**
+ * Per-table response queue. Each `.from(table)` call pops the next
+ * response for that table — lets a single test set up multiple
+ * sequential queries against the same table (e.g. /v1/contests/:id
+ * queries `commitments` once via the helper).
+ */
+function makeSupabase(tables: Record<string, MockResponse | MockResponse[]>): {
+  from: (table: string) => unknown;
+} {
+  const callCounts = new Map<string, number>();
+  return {
+    from(table: string): unknown {
+      const responses = tables[table];
+      const arr = Array.isArray(responses) ? responses : responses ? [responses] : [];
+      const count = callCounts.get(table) ?? 0;
+      callCounts.set(table, count + 1);
+      const response: MockResponse = arr[Math.min(count, arr.length - 1)] ?? {
+        data: null,
+        error: null,
+      };
+      const builder: Record<string, unknown> = {
+        select: () => builder,
+        eq: () => builder,
+        in: () => builder,
+        gt: () => builder,
+        gte: () => builder,
+        lte: () => builder,
+        order: () => builder,
+        range: () => builder,
+        limit: () => builder,
+        maybeSingle: () => Promise.resolve(response),
+        single: () => Promise.resolve(response),
+        then: (resolve: (v: unknown) => void) => resolve(response),
+      };
+      return builder;
+    },
+  };
 }
 
 describe('GET /v1/contests/scripts/approved', () => {
   it('returns the polygon approvals bundle on a polygon deployment', () => {
-    envMock.loadConfig.mockReturnValueOnce({ network: 'polygon', chainId: 137 });
+    envMock.loadConfig.mockReturnValueOnce({
+      network: 'polygon',
+      chainId: 137,
+      scorers: SCORERS,
+    });
     const res = makeRes();
     getApprovedScriptsHandler(makeReq(), res as unknown as Response);
     expect(res.statusCode).toBe(200);
     expect(res.body).toMatchObject({
       network: 'polygon',
       approvedSigner: '0xfd6C7Fc1F182de53AA636584f1c6B80d9D885886',
-      verify: {
-        scriptHash: '0x01c48e15068b68b7d5986d5013edd83a243ac31a761567e9db0e57b513c26c01',
-        purpose: 0,
-        leagueId: 0,
-        version: 1,
-      },
-      marketUpdate: {
-        purpose: 1,
-        validUntil: 0,
-      },
-      score: {
-        purpose: 2,
-        validUntil: 0,
-      },
+      verify: { purpose: 0, leagueId: 0, version: 1 },
+      marketUpdate: { purpose: 1, validUntil: 0 },
+      score: { purpose: 2, validUntil: 0 },
     });
   });
 
   it('exposes the verify approval expiry and a non-empty signature', () => {
-    envMock.loadConfig.mockReturnValueOnce({ network: 'polygon', chainId: 137 });
+    envMock.loadConfig.mockReturnValueOnce({
+      network: 'polygon',
+      chainId: 137,
+      scorers: SCORERS,
+    });
     const res = makeRes();
     getApprovedScriptsHandler(makeReq(), res as unknown as Response);
     const body = res.body as { verify: { validUntil: number; signature: string } };
@@ -75,10 +135,168 @@ describe('GET /v1/contests/scripts/approved', () => {
   });
 
   it('returns 503 SCRIPT_APPROVALS_NOT_CONFIGURED on amoy (no committed approvals)', () => {
-    envMock.loadConfig.mockReturnValueOnce({ network: 'amoy', chainId: 80002 });
+    envMock.loadConfig.mockReturnValueOnce({ network: 'amoy', chainId: 80002, scorers: SCORERS });
     const res = makeRes();
     getApprovedScriptsHandler(makeReq(), res as unknown as Response);
     expect(res.statusCode).toBe(503);
     expect(res.body).toMatchObject({ code: 'SCRIPT_APPROVALS_NOT_CONFIGURED' });
+  });
+});
+
+describe('GET /v1/contests', () => {
+  it('returns 400 for an unknown sport', async () => {
+    const res = makeRes();
+    await getContestsHandler(makeReq({ sport: 'soccer' }), res as unknown as Response);
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toMatchObject({ code: 'INVALID_PARAM' });
+  });
+
+  it('returns 400 for an out-of-range window', async () => {
+    const res = makeRes();
+    await getContestsHandler(makeReq({ window: '999' }), res as unknown as Response);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('returns 200 with embedded speculations grouped per contest', async () => {
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabase({
+        contests: {
+          data: [
+            {
+              contest_id: 42,
+              away_team: 'Lakers',
+              home_team: 'Celtics',
+              sport_slug: 'nba',
+              jsonodds_sport_id: 1,
+              start_time: '2026-05-04T01:00:00Z',
+              contest_status: 'verified',
+            },
+          ],
+          error: null,
+          count: 1,
+        },
+        speculations: {
+          data: [
+            {
+              speculation_id: 100,
+              contest_id: 42,
+              speculation_scorer: SCORERS.moneyline,
+              market_type: 'moneyline',
+              line_ticks: 0,
+              speculation_status: 'open',
+            },
+            {
+              speculation_id: 101,
+              contest_id: 42,
+              speculation_scorer: SCORERS.spread,
+              market_type: 'spread',
+              line_ticks: -35,
+              speculation_status: 'open',
+            },
+          ],
+          error: null,
+        },
+      }),
+    );
+
+    const res = makeRes();
+    await getContestsHandler(makeReq({ sport: 'nba', limit: '10' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as {
+      contests: Array<{ contestId: string; speculations: Array<{ type: string; awayLine?: number }> }>;
+    };
+    expect(body.contests).toHaveLength(1);
+    expect(body.contests[0]!.contestId).toBe('42');
+    expect(body.contests[0]!.speculations).toHaveLength(2);
+    const spread = body.contests[0]!.speculations.find((s) => s.type === 'spread');
+    expect(spread?.awayLine).toBe(-3.5);
+  });
+});
+
+describe('GET /v1/contests/:contestId', () => {
+  it('returns 400 INVALID_PARAM for a non-numeric id', async () => {
+    const res = makeRes();
+    await getContestByIdHandler(makeReq({}, { contestId: 'abc' }), res as unknown as Response);
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toMatchObject({ code: 'INVALID_PARAM' });
+  });
+
+  it('returns 404 NOT_FOUND when the contest row does not exist', async () => {
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabase({
+        contests: { data: null, error: null },
+      }),
+    );
+
+    const res = makeRes();
+    await getContestByIdHandler(makeReq({}, { contestId: '999' }), res as unknown as Response);
+    expect(res.statusCode).toBe(404);
+    expect(res.body).toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('returns 200 with the contest detail block + speculations[].orderbook populated', async () => {
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabase({
+        contests: {
+          data: {
+            contest_id: 42,
+            jsonodds_id: 'a783e37e-4ce1-4f42-9dd6-615568f73044',
+            rundown_id: 'r1',
+            sportspage_id: 's1',
+            contest_creator: '0x' + '00'.repeat(20),
+            league_id: 'nba',
+            verify_source_hash: '0x' + 'aa'.repeat(32),
+            market_update_source_hash: '0x' + 'bb'.repeat(32),
+            score_contest_source_hash: '0x' + 'cc'.repeat(32),
+            away_team: 'Lakers',
+            home_team: 'Celtics',
+            sport_slug: 'nba',
+            jsonodds_sport_id: 1,
+            start_time: '2026-05-04T01:00:00Z',
+            contest_status: 'verified',
+            away_score: null,
+            home_score: null,
+            contest_created_at: '2026-05-01T00:00:00Z',
+            verified_at: '2026-05-01T00:01:00Z',
+            scored_at: null,
+            voided_at: null,
+          },
+          error: null,
+        },
+        speculations: {
+          data: [
+            {
+              speculation_id: 100,
+              contest_id: 42,
+              speculation_scorer: SCORERS.moneyline,
+              market_type: 'moneyline',
+              line_ticks: 0,
+              speculation_status: 'open',
+            },
+          ],
+          error: null,
+        },
+        // The orderbook helper queries `commitments` once.
+        commitments: {
+          data: [],
+          error: null,
+        },
+      }),
+    );
+
+    const res = makeRes();
+    await getContestByIdHandler(makeReq({}, { contestId: '42' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as {
+      contestId: string;
+      jsonoddsId: string | null;
+      speculations: Array<{ speculationId: string; contestId: string; orderbook: unknown[] }>;
+    };
+    expect(body.contestId).toBe('42');
+    expect(body.jsonoddsId).toBe('a783e37e-4ce1-4f42-9dd6-615568f73044');
+    expect(body.speculations).toHaveLength(1);
+    expect(body.speculations[0]!.speculationId).toBe('100');
+    expect(body.speculations[0]!.contestId).toBe('42');
+    expect(body.speculations[0]!.orderbook).toEqual([]);
   });
 });

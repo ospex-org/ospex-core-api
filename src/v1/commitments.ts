@@ -7,8 +7,8 @@
  *                                   commitment body.
  *
  *   GET    /v1/commitments        — list commitments with filters (maker,
- *                                   contestId, scorer, status) and pagination
- *                                   (limit, offset). Sorted by
+ *                                   contestId, scorer, speculationId, status)
+ *                                   and pagination (limit, offset). Sorted by
  *                                   `created_at DESC, commitment_hash ASC` —
  *                                   newest first; tie-break on hash so
  *                                   offset-based pagination is deterministic
@@ -133,7 +133,7 @@ export function rowToBody(row: CommitmentRow): CommitmentBody {
 //
 // Bakes in the same default filter set as `GET /v1/commitments` (status
 // open|partially_filled, nonce_invalidated=false, expiry in the future)
-// so consumers like `GET /v1/markets/:contestId` show the same orderbook
+// so consumers like `GET /v1/contests/:contestId` show the same orderbook
 // as the canonical commitment-list endpoint.
 // ────────────────────────────────────────────────────────────────────────
 
@@ -461,6 +461,59 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
     }
   }
 
+  // Speculation filter: validate the id, look up the speculation row to
+  // derive its `speculation_key`, and filter commitments on that column.
+  // Faster than a (contestId, scorer, lineTicks) tuple match because
+  // `speculation_key` is an indexed column on commitments.
+  let speculationKey: string | undefined;
+  if (req.query.speculationId !== undefined) {
+    let speculationId: string;
+    try {
+      const v = BigInt(String(req.query.speculationId));
+      if (v < 0n) throw new Error();
+      speculationId = v.toString();
+    } catch {
+      res.status(400).json({
+        error: 'speculationId must be a non-negative integer.',
+        code: 'INVALID_PARAM',
+      } satisfies ApiError);
+      return;
+    }
+    const specRes = await sb
+      .from('speculations')
+      .select('contest_id, speculation_scorer, line_ticks')
+      .eq('network', config.network)
+      .eq('speculation_id', speculationId)
+      .maybeSingle();
+    if (specRes.error) {
+      logger.error({ err: specRes.error.message }, 'commitments: speculation lookup failed');
+      res.status(500).json({ error: 'Failed to resolve speculationId.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+      return;
+    }
+    if (!specRes.data) {
+      res.status(404).json({
+        error: `Speculation ${speculationId} not found.`,
+        code: 'NOT_FOUND',
+      } satisfies ApiError);
+      return;
+    }
+    const sRow = specRes.data as { contest_id: string | number; speculation_scorer: string | null; line_ticks: number | null };
+    if (!sRow.speculation_scorer || sRow.line_ticks == null) {
+      // Indexer-only stub before the speculation is fully enriched —
+      // can't derive a key. Treat as not-found for filter purposes.
+      res.status(404).json({
+        error: `Speculation ${speculationId} is not yet enriched (missing scorer / lineTicks).`,
+        code: 'NOT_FOUND',
+      } satisfies ApiError);
+      return;
+    }
+    speculationKey = deriveSpeculationKey(
+      BigInt(String(sRow.contest_id)),
+      String(sRow.speculation_scorer).toLowerCase(),
+      sRow.line_ticks,
+    );
+  }
+
   // ── Build query ───────────────────────────────────────────────────────
   let q = sb
     .from('commitments')
@@ -471,6 +524,7 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
   if (maker !== undefined) q = q.eq('maker', maker);
   if (scorer !== undefined) q = q.eq('scorer', scorer);
   if (contestId !== undefined) q = q.eq('contest_id', contestId);
+  if (speculationKey !== undefined) q = q.eq('speculation_key', speculationKey);
   if (!includeInvalidated) q = q.eq('nonce_invalidated', false);
   if (!includeExpired) {
     // Postgres `>` returns false (not true, not null) for NULL operands,

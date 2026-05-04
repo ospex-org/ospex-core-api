@@ -8,8 +8,15 @@ import {
   getCommitmentsHandler,
   postCommitmentHandler,
 } from './commitments.js';
-import { getApprovedScriptsHandler } from './contests.js';
-import { getMarketByIdHandler, getMarketsHandler } from './markets.js';
+import {
+  getApprovedScriptsHandler,
+  getContestByIdHandler,
+  getContestsHandler,
+} from './contests.js';
+import {
+  getSpeculationByIdHandler,
+  getSpeculationsHandler,
+} from './speculations.js';
 import { getOddsHistoryHandler } from './analytics.js';
 import { getAuthDomainHandler } from './auth.js';
 import { getPublicConfigHandler } from './config.js';
@@ -30,8 +37,8 @@ import { getScheduleHandler } from './schedule.js';
  * auth middleware where appropriate; the router itself stays thin.
  *
  * Static / specific paths are registered before parameterized ones
- * (e.g. `/markets` before `/markets/:contestId`) so Express's matcher
- * doesn't claim `markets` as a `:contestId`.
+ * (e.g. `/contests/scripts/approved` before `/contests/:contestId`)
+ * so Express's matcher doesn't claim a static segment as a parameter.
  */
 export const v1Router: Router = Router();
 
@@ -59,12 +66,16 @@ v1Router.delete(
 v1Router.get('/commitments/:hash', readRateLimit, asyncHandler(getCommitmentByHashHandler));
 v1Router.get('/commitments', readRateLimit, asyncHandler(getCommitmentsHandler));
 
-v1Router.get('/markets', readRateLimit, asyncHandler(getMarketsHandler));
-v1Router.get('/markets/:contestId', readRateLimit, asyncHandler(getMarketByIdHandler));
-
+// Static /contests/scripts/approved MUST come before /contests/:contestId
+// or Express would match `scripts` as the contestId.
 v1Router.get('/contests/scripts/approved', readRateLimit, (req, res) =>
   getApprovedScriptsHandler(req, res),
 );
+v1Router.get('/contests', readRateLimit, asyncHandler(getContestsHandler));
+v1Router.get('/contests/:contestId', readRateLimit, asyncHandler(getContestByIdHandler));
+
+v1Router.get('/speculations', readRateLimit, asyncHandler(getSpeculationsHandler));
+v1Router.get('/speculations/:speculationId', readRateLimit, asyncHandler(getSpeculationByIdHandler));
 
 v1Router.get('/protocol/info', readRateLimit, (req, res) => getProtocolInfoHandler(req, res));
 

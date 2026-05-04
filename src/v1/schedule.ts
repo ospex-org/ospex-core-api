@@ -10,7 +10,7 @@
  * merge depended on the `resolveTeam` alias resolver in
  * `db/supabase/queries.ts` to bridge name differences between feeds.
  * The resolver isn't ported in this batch; consumers can cross-check
- * against `GET /v1/markets`. Adding the merge with proper alias
+ * against `GET /v1/contests`. Adding the merge with proper alias
  * resolution is a follow-up.
  */
 
