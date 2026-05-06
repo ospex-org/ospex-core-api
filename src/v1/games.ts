@@ -1,6 +1,6 @@
 /**
  * GET /v1/games — upcoming games available for contest creation.
- * GET /v1/games/:gameId — single game by slug.
+ * GET /v1/games/:gameId — single game by jsonodds_id.
  *
  * Reads `games` (writer-managed) instead of `current_schedules` because
  * `games` is the table the writer pipeline actually populates with the
@@ -8,20 +8,31 @@
  * by `OracleModule.createContestFromOracle`. Team UUIDs are joined to
  * `teams` for readable home/away names.
  *
- * The user-facing identifier is `slug` (e.g. `lal-okc-2026-05-05`) — a
- * human-readable, unique-within-(network) string the writer already
- * computes and stores. The `:gameId` path param is matched against
- * `slug`. The (network, jsonodds_id) pkey isn't user-visible.
+ * **gameId stability.** The canonical `gameId` in the response is the
+ * row's `jsonodds_id` — part of the writer's `(network, jsonodds_id)`
+ * primary key, immutable for the life of the row. The writer's `slug`
+ * field is exposed separately for human readability (e.g.
+ * `lal-okc-2026-05-05`), but slugs are mutable: the writer renames them
+ * when a doubleheader lands or a game is rescheduled. Anything that
+ * stores a gameId between calls (CLI clipboard, SDK retries, scripts)
+ * MUST use the jsonodds_id form, not the slug form, or `/v1/games/:id`
+ * will 404 after a rename.
  *
  * The response includes `externalIds` ({ jsonodds, sportspage, rundown })
  * because contest creation needs all three; the SDK is responsible for
  * hiding them from end-user-facing public types so consumers only think
- * in terms of `gameId` + `client.contests.create({ gameId })`.
+ * in terms of `gameId` + `client.contests.create({ gameId })`. Note that
+ * `externalIds.jsonodds` is intentionally redundant with `gameId` — the
+ * SDK code that builds the contract call reads it from `externalIds`
+ * for symmetry with the other two IDs.
  *
  * `canCreateContest` is computed: all three external IDs present AND
- * `contest_created = false`. The default `availableOnly=true` filters
- * the list to only games that match this — typical user flow is "show
- * me what I can create a contest for right now."
+ * `contest_created = false` AND `status = 'upcoming'`. Status is part
+ * of the predicate because the schema admits `live | final | postponed |
+ * cancelled` — without the status check, a postponed game with all IDs
+ * would still report as creatable. The default `availableOnly=true`
+ * applies the same predicate as a DB filter so the list view never
+ * includes uncreatable rows.
  */
 
 import type { Request, Response } from 'express';
@@ -51,6 +62,7 @@ interface ExternalIds {
 
 interface GameRow {
   gameId: string;
+  slug: string;
   sport: Sport;
   matchTime: string;
   status: string;
@@ -75,7 +87,11 @@ interface GamesDbRow {
   away_team_id: string;
   has_odds: boolean | null;
   contest_created: boolean | null;
-  contest_id: string | null;
+  // contest_id is `bigint` in PG; PostgREST may serialize as either
+  // string (if it exceeds Number.MAX_SAFE_INTEGER) or number. Stringify
+  // defensively in the handler — existing endpoints in this repo
+  // (commitments / positions) follow the same pattern for bigint IDs.
+  contest_id: string | number | null;
   slug: string;
 }
 
@@ -88,12 +104,12 @@ interface TeamDbRow {
 const GAMES_SELECT =
   'network, jsonodds_id, sportspage_id, rundown_id, sport, match_time, status, home_team_id, away_team_id, has_odds, contest_created, contest_id, slug';
 
-function parseBoolParam(raw: string | undefined, defaultValue: boolean): boolean {
-  if (raw === undefined) return defaultValue;
+function parseBoolParam(raw: string | undefined): boolean | 'invalid' | undefined {
+  if (raw === undefined) return undefined;
   const v = raw.toLowerCase();
   if (v === 'true' || v === '1') return true;
   if (v === 'false' || v === '0') return false;
-  return defaultValue;
+  return 'invalid';
 }
 
 function buildTeamLookup(rows: TeamDbRow[]): Map<string, TeamInfo> {
@@ -112,13 +128,15 @@ function computeCanCreateContest(row: GamesDbRow): boolean {
     row.sportspage_id !== '' &&
     row.rundown_id !== null &&
     row.rundown_id !== '' &&
-    row.contest_created !== true
+    row.contest_created !== true &&
+    row.status === 'upcoming'
   );
 }
 
 function dbRowToGameRow(row: GamesDbRow, teams: Map<string, TeamInfo>): GameRow {
   return {
-    gameId: row.slug,
+    gameId: row.jsonodds_id,
+    slug: row.slug,
     sport: row.sport as Sport,
     matchTime: row.match_time,
     status: row.status,
@@ -126,7 +144,7 @@ function dbRowToGameRow(row: GamesDbRow, teams: Map<string, TeamInfo>): GameRow 
     awayTeam: teams.get(row.away_team_id) ?? FALLBACK_TEAM,
     hasOdds: row.has_odds === true,
     contestCreated: row.contest_created === true,
-    contestId: row.contest_id,
+    contestId: row.contest_id !== null ? String(row.contest_id) : null,
     canCreateContest: computeCanCreateContest(row),
     externalIds: {
       jsonodds: row.jsonodds_id,
@@ -194,10 +212,17 @@ export async function getGamesHandler(req: Request, res: Response): Promise<void
     return;
   }
 
-  const availableOnly = parseBoolParam(
+  const availableOnlyRaw = parseBoolParam(
     req.query.availableOnly === undefined ? undefined : String(req.query.availableOnly),
-    true,
   );
+  if (availableOnlyRaw === 'invalid') {
+    res.status(400).json({
+      error: 'availableOnly must be "true" or "false".',
+      code: 'INVALID_PARAM',
+    } satisfies ApiError);
+    return;
+  }
+  const availableOnly = availableOnlyRaw ?? true;
 
   const { network } = loadConfig();
   const sb = getSupabase();
@@ -216,11 +241,14 @@ export async function getGamesHandler(req: Request, res: Response): Promise<void
 
   // The DB has no single "available" boolean; emulate canCreateContest
   // server-side so callers don't have to filter client-side AND so we
-  // don't return rows that would be wasted page-fill.
+  // don't return rows that would be wasted page-fill. Status check
+  // ('upcoming') is required — without it, a postponed/cancelled game
+  // with all three IDs would still pass the filter.
   if (availableOnly) {
     q = q
       .not('sportspage_id', 'is', null)
       .not('rundown_id', 'is', null)
+      .eq('status', 'upcoming')
       .or('contest_created.is.null,contest_created.eq.false');
   }
 
@@ -273,14 +301,15 @@ export async function getGameByIdHandler(req: Request, res: Response): Promise<v
   const { network } = loadConfig();
   const sb = getSupabase();
 
-  // (network, slug) is unique by writer convention (verified empirically
-  // and by the slug pattern `<away>-<home>-<date>`). If a future writer
-  // change introduces collisions, .single() will throw and we'll know.
+  // (network, jsonodds_id) is the games table primary key — guaranteed
+  // unique and immutable. We deliberately do NOT match against `slug`
+  // here: slugs are mutable (writer renames them on doubleheader detect
+  // / reschedule) and unsafe to use as a stable lookup key.
   const result = await sb
     .from('games')
     .select(GAMES_SELECT)
     .eq('network', network)
-    .eq('slug', gameId)
+    .eq('jsonodds_id', gameId)
     .maybeSingle();
 
   if (result.error) {
