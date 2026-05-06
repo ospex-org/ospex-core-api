@@ -18,6 +18,7 @@ import {
   getSpeculationsHandler,
 } from './speculations.js';
 import { getOddsHistoryHandler } from './analytics.js';
+import { getGameByIdHandler, getGamesHandler } from './games.js';
 import { getAuthDomainHandler } from './auth.js';
 import { getPublicConfigHandler } from './config.js';
 import { getProtocolInfoHandler } from './protocol.js';
@@ -94,5 +95,8 @@ v1Router.get('/positions/:address', readRateLimit, asyncHandler(getPositionsByAd
 v1Router.get('/leaderboard', readRateLimit, asyncHandler(getLeaderboardHandler));
 
 v1Router.get('/schedule', readRateLimit, asyncHandler(getScheduleHandler));
+
+v1Router.get('/games', readRateLimit, asyncHandler(getGamesHandler));
+v1Router.get('/games/:gameId', readRateLimit, asyncHandler(getGameByIdHandler));
 
 v1Router.get('/analytics/odds-history/:contestId', readRateLimit, asyncHandler(getOddsHistoryHandler));
