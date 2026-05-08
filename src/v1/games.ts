@@ -39,10 +39,8 @@ import type { Request, Response } from 'express';
 import { loadConfig } from '../lib/env.js';
 import { logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
+import { SPORTS as VALID_SPORTS, isSport, type Sport } from '../lib/sports.js';
 import type { ApiError } from '../middleware/errorHandler.js';
-
-type Sport = 'mlb' | 'nba' | 'ncaab' | 'ncaaf' | 'nfl' | 'nhl';
-const VALID_SPORTS = new Set<Sport>(['mlb', 'nba', 'ncaab', 'ncaaf', 'nfl', 'nhl']);
 
 const DEFAULT_WINDOW_HOURS = 168;
 const MAX_WINDOW_HOURS = 720; // ~30 days
@@ -175,14 +173,14 @@ export async function getGamesHandler(req: Request, res: Response): Promise<void
   let sport: Sport | undefined;
   if (req.query.sport !== undefined) {
     const sportRaw = String(req.query.sport).toLowerCase();
-    if (!VALID_SPORTS.has(sportRaw as Sport)) {
+    if (!isSport(sportRaw)) {
       res.status(400).json({
-        error: `Invalid "sport". Must be one of: ${[...VALID_SPORTS].join(', ')}.`,
+        error: `Invalid "sport". Must be one of: ${[...VALID_SPORTS].sort().join(', ')}.`,
         code: 'INVALID_PARAM',
       } satisfies ApiError);
       return;
     }
-    sport = sportRaw as Sport;
+    sport = sportRaw;
   }
 
   const windowHours = req.query.windowHours ? Number(req.query.windowHours) : DEFAULT_WINDOW_HOURS;

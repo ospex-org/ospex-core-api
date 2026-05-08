@@ -194,7 +194,7 @@ describe('GET /v1/speculations/:speculationId', () => {
     expect(res.body).toMatchObject({ code: 'NOT_FOUND' });
   });
 
-  it('returns 200 with the speculation, parent contest context, and orderbook', async () => {
+  it('returns 200 with the speculation, parent contest context (team_ids null when no game linkage), and orderbook', async () => {
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabase({
         speculations: {
@@ -211,6 +211,7 @@ describe('GET /v1/speculations/:speculationId', () => {
         contests: {
           data: {
             contest_id: 42,
+            jsonodds_id: null,
             away_team: 'Lakers',
             home_team: 'Celtics',
             sport_slug: 'nba',
@@ -238,10 +239,59 @@ describe('GET /v1/speculations/:speculationId', () => {
         contestId: '42',
         awayTeam: 'Lakers',
         homeTeam: 'Celtics',
+        // PR 0 widening: team_ids are null when jsonodds_id is null
+        // (no games linkage to resolve through). SDK falls back to
+        // exact + nickname matching.
+        awayTeamId: null,
+        homeTeamId: null,
         sport: 'nba',
         matchTime: '2026-05-04T01:00:00Z',
         status: 'verified',
       },
     });
+  });
+
+  it('populates team_ids on the parent contest context when the games row is present', async () => {
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabase({
+        speculations: {
+          data: {
+            speculation_id: 100,
+            contest_id: 42,
+            speculation_scorer: SCORERS.moneyline,
+            market_type: 'moneyline',
+            line_ticks: 0,
+            speculation_status: 'open',
+          },
+          error: null,
+        },
+        contests: {
+          data: {
+            contest_id: 42,
+            jsonodds_id: 'a783e37e-4ce1-4f42-9dd6-615568f73044',
+            away_team: 'Lakers',
+            home_team: 'Celtics',
+            sport_slug: 'nba',
+            start_time: '2026-05-04T01:00:00Z',
+            contest_status: 'verified',
+          },
+          error: null,
+        },
+        games: {
+          data: { away_team_id: 'lakers-uuid', home_team_id: 'celtics-uuid' },
+          error: null,
+        },
+        commitments: { data: [], error: null },
+      }),
+    );
+
+    const res = makeRes();
+    await getSpeculationByIdHandler(makeReq({}, { speculationId: '100' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as {
+      contest: { awayTeamId: string | null; homeTeamId: string | null };
+    };
+    expect(body.contest.awayTeamId).toBe('lakers-uuid');
+    expect(body.contest.homeTeamId).toBe('celtics-uuid');
   });
 });

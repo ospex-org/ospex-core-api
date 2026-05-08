@@ -25,6 +25,8 @@ import { loadConfig } from '../lib/env.js';
 import { logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
 import { deriveSpeculationKey } from '../lib/eip712.js';
+import { SPORTS as VALID_SPORTS, isSport } from '../lib/sports.js';
+import { resolveTeamIdsForContest } from '../lib/teamIds.js';
 import {
   COMMITMENT_COLUMNS,
   rowToBody,
@@ -41,7 +43,10 @@ import {
 } from './utils/speculations.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 
-const VALID_SPORTS = new Set(['nba', 'nhl', 'ncaab', 'nfl', 'mlb']);
+// VALID_SPORTS is the shared canonical list from lib/sports.ts (drops
+// the prior local 5-sport set that omitted ncaaf). The detail handler
+// uses lib/teamIds.ts to widen the parent contest context with team
+// UUIDs the SDK resolver needs.
 const VALID_SPECULATION_STATUSES = new Set(['open', 'closed']);
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 500;
@@ -74,9 +79,9 @@ export async function getSpeculationsHandler(req: Request, res: Response): Promi
   }
 
   const sportFilter = req.query.sport ? String(req.query.sport).toLowerCase() : null;
-  if (sportFilter && !VALID_SPORTS.has(sportFilter)) {
+  if (sportFilter && !isSport(sportFilter)) {
     res.status(400).json({
-      error: `Invalid sport "${sportFilter}". Must be one of: ${[...VALID_SPORTS].join(', ')}.`,
+      error: `Invalid sport "${sportFilter}". Must be one of: ${[...VALID_SPORTS].sort().join(', ')}.`,
       code: 'INVALID_PARAM',
     } satisfies ApiError);
     return;
@@ -171,6 +176,7 @@ export async function getSpeculationsHandler(req: Request, res: Response): Promi
 
 interface ContestContextRow {
   contest_id: string | number;
+  jsonodds_id: string | null;
   away_team: string | null;
   home_team: string | null;
   sport_slug: string | null;
@@ -222,12 +228,13 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
     return;
   }
 
-  // Parent contest context (5 fields — keeps the response useful without
-  // a second fetch). Source hashes / lifecycle timestamps stay on
-  // /v1/contests/:contestId.
+  // Parent contest context. Source hashes / lifecycle timestamps stay
+  // on /v1/contests/:contestId; this block is the bare minimum the SDK
+  // resolver needs. `jsonodds_id` is selected (but not surfaced in the
+  // response body) so we can resolve team UUIDs via the games join.
   const ctxRes = await sb
     .from('contests')
-    .select('contest_id, away_team, home_team, sport_slug, start_time, contest_status')
+    .select('contest_id, jsonodds_id, away_team, home_team, sport_slug, start_time, contest_status')
     .eq('network', config.network)
     .eq('contest_id', speculation.contestId)
     .maybeSingle();
@@ -245,10 +252,13 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
     return;
   }
   const ctxRow = ctxRes.data as unknown as ContestContextRow;
+  const teamIds = await resolveTeamIdsForContest(config.network, ctxRow.jsonodds_id ?? null);
   const contest: SpeculationParentContext = {
     contestId: String(ctxRow.contest_id),
     awayTeam: ctxRow.away_team ?? '',
     homeTeam: ctxRow.home_team ?? '',
+    awayTeamId: teamIds.awayTeamId,
+    homeTeamId: teamIds.homeTeamId,
     sport: ctxRow.sport_slug ?? '',
     matchTime: ctxRow.start_time ?? '',
     status: ctxRow.contest_status ?? '',

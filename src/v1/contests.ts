@@ -23,6 +23,8 @@ import { loadConfig } from '../lib/env.js';
 import { logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
 import { deriveSpeculationKey } from '../lib/eip712.js';
+import { SPORTS as VALID_SPORTS, isSport } from '../lib/sports.js';
+import { resolveTeamIdsForContest } from '../lib/teamIds.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 import {
   SCRIPT_APPROVALS_BY_NETWORK,
@@ -36,7 +38,10 @@ import {
   type SpeculationRow,
 } from './utils/speculations.js';
 
-const VALID_SPORTS = new Set(['nba', 'nhl', 'ncaab', 'nfl', 'mlb']);
+// VALID_SPORTS is the shared canonical list from lib/sports.ts.
+// Previously this file carried a local 5-sport allowlist that omitted
+// `ncaaf`; that local set is now retired in favor of the shared module
+// so the only place to add a new sport is `lib/sports.ts`.
 // Mirrors what `ospex-indexer/src/handlers/contests.ts` writes today
 // (unverified/verified/scored/voided) plus `scored_manually` from
 // agent / ops paths. Keep in sync with the indexer's contest-status
@@ -62,11 +67,23 @@ interface ContestListItem extends ContestBody {
   speculations: Speculation[];
 }
 
+// Team UUIDs are resolved via lib/teamIds.ts so contests + speculations
+// share the same join logic. See that file's jsdoc for null semantics.
+
 interface SpeculationDetail extends Speculation {
   orderbook: CommitmentBody[];
 }
 
 interface ContestDetail extends ContestBody {
+  /**
+   * Team UUIDs resolved through the `games` join (see {@link resolveTeamIds}).
+   * Surfaced on the detail endpoint only — list responses stay minimal.
+   * Null when the contest has no JSONOdds linkage or the games row is
+   * missing. Consumers of the SDK resolver layer use these to scope
+   * alias matching; nulls trigger fallback to exact + nickname.
+   */
+  awayTeamId: string | null;
+  homeTeamId: string | null;
   /**
    * Upstream JSONOdds ID for this contest, used by the SDK to open
    * Realtime channels on `current_odds`. Null when the contest was
@@ -137,9 +154,9 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
   const scorers = config.scorers;
 
   const sportFilter = req.query.sport ? String(req.query.sport).toLowerCase() : null;
-  if (sportFilter && !VALID_SPORTS.has(sportFilter)) {
+  if (sportFilter && !isSport(sportFilter)) {
     res.status(400).json({
-      error: `Invalid sport "${sportFilter}". Must be one of: ${[...VALID_SPORTS].join(', ')}.`,
+      error: `Invalid sport "${sportFilter}". Must be one of: ${[...VALID_SPORTS].sort().join(', ')}.`,
       code: 'INVALID_PARAM',
     } satisfies ApiError);
     return;
@@ -356,8 +373,12 @@ export async function getContestByIdHandler(req: Request, res: Response): Promis
     speculations.push({ ...ms, orderbook });
   }
 
+  const teamIds = await resolveTeamIdsForContest(config.network, c.jsonodds_id ?? null);
+
   const body: ContestDetail = {
     contestId: String(c.contest_id),
+    awayTeamId: teamIds.awayTeamId,
+    homeTeamId: teamIds.homeTeamId,
     jsonoddsId: c.jsonodds_id ?? null,
     rundownId: c.rundown_id ?? null,
     sportspageId: c.sportspage_id ?? null,

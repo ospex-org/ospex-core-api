@@ -290,13 +290,115 @@ describe('GET /v1/contests/:contestId', () => {
     const body = res.body as {
       contestId: string;
       jsonoddsId: string | null;
+      awayTeamId: string | null;
+      homeTeamId: string | null;
       speculations: Array<{ speculationId: string; contestId: string; orderbook: unknown[] }>;
     };
     expect(body.contestId).toBe('42');
     expect(body.jsonoddsId).toBe('a783e37e-4ce1-4f42-9dd6-615568f73044');
+    // No games row mocked → team_ids degrade to null. PR 0 widening
+    // is present in the response shape, just empty.
+    expect(body.awayTeamId).toBeNull();
+    expect(body.homeTeamId).toBeNull();
     expect(body.speculations).toHaveLength(1);
     expect(body.speculations[0]!.speculationId).toBe('100');
     expect(body.speculations[0]!.contestId).toBe('42');
     expect(body.speculations[0]!.orderbook).toEqual([]);
+  });
+
+  it('populates awayTeamId / homeTeamId when the games row is present', async () => {
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabase({
+        contests: {
+          data: {
+            contest_id: 42,
+            jsonodds_id: 'a783e37e-4ce1-4f42-9dd6-615568f73044',
+            rundown_id: 'r1',
+            sportspage_id: 's1',
+            contest_creator: '0x' + '00'.repeat(20),
+            league_id: 'nba',
+            verify_source_hash: '0x' + 'aa'.repeat(32),
+            market_update_source_hash: '0x' + 'bb'.repeat(32),
+            score_contest_source_hash: '0x' + 'cc'.repeat(32),
+            away_team: 'Lakers',
+            home_team: 'Celtics',
+            sport_slug: 'nba',
+            jsonodds_sport_id: 1,
+            start_time: '2026-05-04T01:00:00Z',
+            contest_status: 'verified',
+            away_score: null,
+            home_score: null,
+            contest_created_at: '2026-05-01T00:00:00Z',
+            verified_at: '2026-05-01T00:01:00Z',
+            scored_at: null,
+            voided_at: null,
+          },
+          error: null,
+        },
+        speculations: { data: [], error: null },
+        commitments: { data: [], error: null },
+        games: {
+          data: {
+            away_team_id: 'lakers-uuid',
+            home_team_id: 'celtics-uuid',
+          },
+          error: null,
+        },
+      }),
+    );
+
+    const res = makeRes();
+    await getContestByIdHandler(makeReq({}, { contestId: '42' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { awayTeamId: string | null; homeTeamId: string | null };
+    expect(body.awayTeamId).toBe('lakers-uuid');
+    expect(body.homeTeamId).toBe('celtics-uuid');
+  });
+
+  it('degrades awayTeamId / homeTeamId to null on games-side errors', async () => {
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabase({
+        contests: {
+          data: {
+            contest_id: 42,
+            jsonodds_id: 'a783e37e-4ce1-4f42-9dd6-615568f73044',
+            rundown_id: null,
+            sportspage_id: null,
+            contest_creator: '0x' + '00'.repeat(20),
+            league_id: 'nba',
+            verify_source_hash: null,
+            market_update_source_hash: null,
+            score_contest_source_hash: null,
+            away_team: 'Lakers',
+            home_team: 'Celtics',
+            sport_slug: 'nba',
+            jsonodds_sport_id: 1,
+            start_time: '2026-05-04T01:00:00Z',
+            contest_status: 'verified',
+            away_score: null,
+            home_score: null,
+            contest_created_at: null,
+            verified_at: null,
+            scored_at: null,
+            voided_at: null,
+          },
+          error: null,
+        },
+        speculations: { data: [], error: null },
+        commitments: { data: [], error: null },
+        games: { data: null, error: { message: 'connection reset' } },
+      }),
+    );
+
+    const res = makeRes();
+    await getContestByIdHandler(makeReq({}, { contestId: '42' }), res as unknown as Response);
+    // Parent endpoint succeeds; team_ids degrade to null. Trust model:
+    // the SDK falls back to exact + nickname matching when team_ids
+    // are null. The contest detail itself is not blocked on the
+    // games-side enrichment.
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { awayTeamId: string | null; homeTeamId: string | null };
+    expect(body.awayTeamId).toBeNull();
+    expect(body.homeTeamId).toBeNull();
   });
 });
