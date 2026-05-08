@@ -24,6 +24,7 @@ In progress. Working today:
 - `GET /v1/positions/claim-result/:txHash` — parse `PositionClaimed` from a tx
 - `GET /v1/leaderboard` — current active leaderboard
 - `GET /v1/schedule?sport=` — upcoming games
+- `GET /v1/teams/aliases?sport=` — flat list of team aliases (full name / nickname / abbrev / city) joined to canonical team metadata. Consumed by `@ospex/sdk`'s resolver layer to map free-form `--side` input ("Lakers", "LAL") to a canonical team id when staking a commitment.
 
 Not ported (no R4 analog — see "Position helpers" section below): `/withdraw-params`, `/withdraw-result/:txHash`. Not ported in any batch yet (deferred or out of scope): `/v1/analytics/*`, `/v1/current-odds*`.
 
@@ -128,7 +129,7 @@ Response: `{ contests: ContestListItem[], pagination }`. Each contest has `conte
 
 Single contest detail. Returns the same shape as a list item, plus an `orderbook` array on each speculation populated with currently fillable commitments. Same default filter as `GET /v1/commitments` (status `open` or `partially_filled`, not invalidated, not expired); each entry has the same wire shape as a commitment from `GET /v1/commitments`. Sorted by `createdAt` ascending; price-aware sorting is a follow-up. The list endpoint `GET /v1/contests` does not populate orderbooks.
 
-Detail-only fields surfaced here (omitted on list rows): `jsonoddsId`, `rundownId`, `sportspageId`, `contestCreator`, `leagueId`, `verifySourceHash`, `marketUpdateSourceHash`, `scoreContestSourceHash`, `awayScore`, `homeScore`, `contestCreatedAt`, `verifiedAt`, `scoredAt`, `voidedAt`.
+Detail-only fields surfaced here (omitted on list rows): `jsonoddsId`, `rundownId`, `sportspageId`, `contestCreator`, `leagueId`, `verifySourceHash`, `marketUpdateSourceHash`, `scoreContestSourceHash`, `awayScore`, `homeScore`, `contestCreatedAt`, `verifiedAt`, `scoredAt`, `voidedAt`, plus `awayTeamId` / `homeTeamId` (UUIDs from the `teams` table, resolved via `contests.network + jsonodds_id → games.{home_team_id, away_team_id}`; null when no game linkage exists). The team UUIDs are consumed by `@ospex/sdk`'s resolver layer to scope alias matching to a contest's two teams.
 
 ### `GET /v1/speculations`
 
@@ -155,7 +156,7 @@ Single speculation detail with the orderbook of currently fillable commitments a
 Response: `Speculation` (as above) plus:
 
 - `orderbook: CommitmentBody[]` — same wire shape and default filter as `GET /v1/commitments` (open/partially_filled, not invalidated, not expired), keyed on the speculation's `speculation_key`.
-- `contest: { contestId, awayTeam, homeTeam, sport, matchTime, status }` — five fields so consumers don't have to fetch `/v1/contests/:contestId` for the common "what game is this on?" question. Source hashes / scores / lifecycle timestamps stay on the contest detail endpoint.
+- `contest: { contestId, awayTeam, homeTeam, awayTeamId, homeTeamId, sport, matchTime, status }` — keeps the response useful without a second fetch. `awayTeamId` / `homeTeamId` are UUIDs from the `teams` table (resolved via the `games` join — null when no game linkage exists). Source hashes / scores / lifecycle timestamps stay on the contest detail endpoint.
 
 ### `GET /v1/protocol/info`
 
@@ -271,7 +272,45 @@ Query params: `limit` (max 500), `offset`.
 
 Upcoming games within `windowHours` (default 36, max 168). Returns games with team names resolved from the `teams` table.
 
-Out of scope for this batch: best-effort merge with on-chain `contests` (so each game can flag whether it has a contest). Needs the `resolveTeam` alias resolver from agent-server's `db/supabase/queries.ts`. Until then, callers can cross-check by team-name against `GET /v1/contests`.
+Out of scope for this batch: best-effort merge with on-chain `contests` (so each game can flag whether it has a contest). Callers can cross-check by team-name against `GET /v1/contests` (or, for free-form input, use `GET /v1/teams/aliases` plus a contest's `awayTeamId` / `homeTeamId`).
+
+### `GET /v1/teams/aliases`
+
+Flat list of every row in the `team_aliases` table joined to canonical team metadata from the `teams` table. Network-agnostic — `team_aliases` and `teams` are sports-reference data shared across networks.
+
+Closes the `resolveTeam` gap historically called out in this file. The legacy resolver lived in deprecated `ospex-agent-server` and never migrated; consumers (notably the SDK's commitment resolver layer) now read aliases from this endpoint instead of re-implementing.
+
+Query params:
+
+| Name | What it does |
+|---|---|
+| `sport` | optional, one of `mlb`/`nba`/`ncaab`/`ncaaf`/`nfl`/`nhl`. Validated against the shared sport constant (`src/lib/sports.ts`). |
+| `limit` | optional, default 2000, max 5000. |
+| `offset` | optional, default 0. |
+
+Response:
+
+```json
+{
+  "aliases": [
+    {
+      "teamId": "<uuid>",
+      "sport": "nba",
+      "sportId": 1,
+      "teamName": "Los Angeles Lakers",
+      "abbrev": "LAL",
+      "alias": "Lakers",
+      "aliasType": "nickname",
+      "source": "manual"
+    }
+  ],
+  "pagination": { "limit": 2000, "offset": 0, "total": 1846, "hasMore": false }
+}
+```
+
+`team_aliases` stores `sport_id` (smallint) but not `sport` (text). The handler joins through `teams` so callers don't have to maintain their own sport_id ↔ sport mapping.
+
+Pagination caveat: PostgREST returns at most 1000 rows per query by default; the table is ~1300+ rows. SDK consumers should paginate until `hasMore: false` rather than assuming one 2000-row page covers everything forever.
 
 ## Scripts
 
@@ -372,6 +411,7 @@ src/
                        #   /by-tx/:txHash, /claim-result/:txHash
     leaderboard.ts     # GET /v1/leaderboard
     schedule.ts        # GET /v1/schedule
+    teams.ts           # GET /v1/teams/aliases
     utils/
       positionFetch.ts # categorize active/pendingSettle/claimable (Supabase-only)
       speculations.ts  # shared Speculation wire shape + row→Speculation converters
