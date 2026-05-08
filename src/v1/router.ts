@@ -18,6 +18,7 @@ import {
   getSpeculationsHandler,
 } from './speculations.js';
 import { getOddsHistoryHandler } from './analytics.js';
+import { getCurrentOddsHandler } from './odds.js';
 import { getGameByIdHandler, getGamesHandler } from './games.js';
 import { getTeamAliasesHandler } from './teams.js';
 import { getAuthDomainHandler } from './auth.js';
@@ -74,6 +75,7 @@ v1Router.get('/contests/scripts/approved', readRateLimit, (req, res) =>
   getApprovedScriptsHandler(req, res),
 );
 v1Router.get('/contests', readRateLimit, asyncHandler(getContestsHandler));
+v1Router.get('/contests/:contestId/odds', readRateLimit, asyncHandler(getCurrentOddsHandler));
 v1Router.get('/contests/:contestId', readRateLimit, asyncHandler(getContestByIdHandler));
 
 v1Router.get('/speculations', readRateLimit, asyncHandler(getSpeculationsHandler));
