@@ -25,8 +25,10 @@ In progress. Working today:
 - `GET /v1/leaderboard` — current active leaderboard
 - `GET /v1/schedule?sport=` — upcoming games
 - `GET /v1/teams/aliases?sport=` — flat list of team aliases (full name / nickname / abbrev / city) joined to canonical team metadata. Consumed by `@ospex/sdk`'s resolver layer to map free-form `--side` input ("Lakers", "LAL") to a canonical team id when staking a commitment.
+- `GET /v1/contests/:contestId/odds` — current upstream reference odds for the contest's underlying game (moneyline / spread / total snapshot from `current_odds`). Per-market response shapes are explicit (no shared "line + away/home" envelope) so consumers can't misread the semantics — see "Odds snapshot" below for the exact shape.
+- `GET /v1/analytics/odds-history/:contestId` — opening + current odds for analytics callers (deprecated SDK-internal use; new code should prefer `/contests/:contestId/odds` for current-state reads).
 
-Not ported (no R4 analog — see "Position helpers" section below): `/withdraw-params`, `/withdraw-result/:txHash`. Not ported in any batch yet (deferred or out of scope): `/v1/analytics/*`, `/v1/current-odds*`.
+Not ported (no R4 analog — see "Position helpers" section below): `/withdraw-params`, `/withdraw-result/:txHash`. Not ported in any batch yet (deferred or out of scope): everything else under `/v1/analytics/*`, `/v1/current-odds*` (the legacy `/v1/current-odds*` paths from agent-server are superseded by the contest-centric `/v1/contests/:contestId/odds`).
 
 ## Stack
 
@@ -130,6 +132,48 @@ Response: `{ contests: ContestListItem[], pagination }`. Each contest has `conte
 Single contest detail. Returns the same shape as a list item, plus an `orderbook` array on each speculation populated with currently fillable commitments. Same default filter as `GET /v1/commitments` (status `open` or `partially_filled`, not invalidated, not expired); each entry has the same wire shape as a commitment from `GET /v1/commitments`. Sorted by `createdAt` ascending; price-aware sorting is a follow-up. The list endpoint `GET /v1/contests` does not populate orderbooks.
 
 Detail-only fields surfaced here (omitted on list rows): `jsonoddsId`, `rundownId`, `sportspageId`, `contestCreator`, `leagueId`, `verifySourceHash`, `marketUpdateSourceHash`, `scoreContestSourceHash`, `awayScore`, `homeScore`, `contestCreatedAt`, `verifiedAt`, `scoredAt`, `voidedAt`, plus `awayTeamId` / `homeTeamId` (UUIDs from the `teams` table, resolved via `contests.network + jsonodds_id → games.{home_team_id, away_team_id}`; null when no game linkage exists). The team UUIDs are consumed by `@ospex/sdk`'s resolver layer to scope alias matching to a contest's two teams.
+
+### `GET /v1/contests/:contestId/odds`
+
+Current upstream reference odds for the contest's underlying game. One snapshot read of `current_odds` keyed by the contest's `jsonodds_id`. Distinct from the Realtime subscribe path on the SDK side (`client.odds.subscribe(...)`) — the snapshot is "what are the odds right now?", subscribe is "stream me changes."
+
+**Source labelling**: this is upstream reference data (JSONOdds live updates / Sportspage opening lines via `ospex-writer`), NOT Ospex liquidity. Consumers should label it that way to users — the SDK + CLI surfacing this endpoint do.
+
+Response shape:
+
+```jsonc
+{
+  "contestId": "42",
+  "jsonoddsId": "jo-abc-123",  // null when contest has no upstream linkage
+  "odds": {
+    "moneyline": { "market": "moneyline", "awayOddsAmerican": 145, "homeOddsAmerican": -180,
+                   "upstreamLastUpdated": "...", "pollCapturedAt": "...", "changedAt": "..." } | null,
+    "spread":    { "market": "spread", "awayLine": 3.5, "homeLine": -3.5,
+                   "awayOddsAmerican": -110, "homeOddsAmerican": -110, ...timestamps } | null,
+    "total":     { "market": "total", "line": 8.5,
+                   "overOddsAmerican": -105, "underOddsAmerican": -115, ...timestamps } | null
+  }
+}
+```
+
+**Per-market shapes are explicit** so callers can't misread the semantics:
+
+- **moneyline** carries `awayOddsAmerican` / `homeOddsAmerican` only. No `line` field — moneyline is line-less.
+- **spread** carries both `awayLine` and `homeLine` — they're always negations of each other (`awayLine = -homeLine`). No generic un-labelled `line` field, because the writer's raw `current_odds.line` column stores the *home* team's spread (negative if home favored), and a single un-labelled value would let callers misalign with `/v1/contests/:contestId` (which exposes both `awayLine` and `homeLine` on each speculation row) or `/v1/analytics/odds-history`.
+- **total** carries `line` (over/under threshold, perspective-neutral) and `overOddsAmerican` / `underOddsAmerican`. The writer's storage convention (Over → `away_odds_american`, Under → `home_odds_american`) is hidden — consumers don't see away/home naming on total markets.
+
+**Status codes**:
+
+| Status | Condition |
+|---|---|
+| 200 (full) | Contest exists, has `jsonoddsId`, `current_odds` has all three markets populated |
+| 200 (partial) | Some markets `null` because the writer hasn't populated them for this game |
+| 200 (all `null`) | Contest exists but has no upstream `jsonoddsId` linkage, OR no `current_odds` rows for this game |
+| 404 | Contest does not exist |
+| 400 | `contestId` is non-numeric |
+| 500 | `contests` or `current_odds` query errored (logged with `contestId` + `jsonoddsId`) |
+
+`network` is implicit (the API is deployment-bound to one network) and is not duplicated on each market entry. `jsonoddsId` is at the top level only — a snapshot is for one game, so per-market repetition would be noise.
 
 ### `GET /v1/speculations`
 

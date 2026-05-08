@@ -140,6 +140,141 @@ describe('GET /v1/contests/:contestId/odds', () => {
     });
   });
 
+  it('moneyline market: exposes per-side American odds (no line)', async () => {
+    const moneyline = {
+      jsonodds_id: 'jo-abc',
+      market: 'moneyline',
+      line: null,
+      away_odds_american: 145,
+      home_odds_american: -180,
+      upstream_last_updated: '2026-05-08T22:00:00Z',
+      poll_captured_at: '2026-05-08T22:00:30Z',
+      changed_at: '2026-05-08T22:00:30Z',
+    };
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabase({
+        contests: { data: { jsonodds_id: 'jo-abc' }, error: null },
+        current_odds: { data: [moneyline], error: null },
+      }),
+    );
+    const res = makeRes();
+    await getCurrentOddsHandler(makeReq({ contestId: '42' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { odds: { moneyline: Record<string, unknown> | null } };
+    expect(body.odds.moneyline).toEqual({
+      market: 'moneyline',
+      awayOddsAmerican: 145,
+      homeOddsAmerican: -180,
+      upstreamLastUpdated: '2026-05-08T22:00:00Z',
+      pollCapturedAt: '2026-05-08T22:00:30Z',
+      changedAt: '2026-05-08T22:00:30Z',
+    });
+    // Spec says: moneyline has no `line` field at all.
+    expect(body.odds.moneyline).not.toHaveProperty('line');
+    expect(body.odds.moneyline).not.toHaveProperty('homeLine');
+    expect(body.odds.moneyline).not.toHaveProperty('awayLine');
+  });
+
+  it('spread market: exposes both awayLine and homeLine (= -homeLine) explicitly', async () => {
+    const spread = {
+      jsonodds_id: 'jo-abc',
+      market: 'spread',
+      line: -3.5, // raw current_odds.line is the home team's spread
+      away_odds_american: -110,
+      home_odds_american: -110,
+      upstream_last_updated: '2026-05-08T22:00:00Z',
+      poll_captured_at: '2026-05-08T22:00:30Z',
+      changed_at: '2026-05-08T22:00:30Z',
+    };
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabase({
+        contests: { data: { jsonodds_id: 'jo-abc' }, error: null },
+        current_odds: { data: [spread], error: null },
+      }),
+    );
+    const res = makeRes();
+    await getCurrentOddsHandler(makeReq({ contestId: '42' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { odds: { spread: Record<string, unknown> | null } };
+    expect(body.odds.spread).toEqual({
+      market: 'spread',
+      awayLine: 3.5, // away is the negation of home
+      homeLine: -3.5, // raw column value
+      awayOddsAmerican: -110,
+      homeOddsAmerican: -110,
+      upstreamLastUpdated: '2026-05-08T22:00:00Z',
+      pollCapturedAt: '2026-05-08T22:00:30Z',
+      changedAt: '2026-05-08T22:00:30Z',
+    });
+    // Spec: spread does NOT carry a generic `line` to avoid the side-ambiguity
+    // that prompted this design.
+    expect(body.odds.spread).not.toHaveProperty('line');
+  });
+
+  it('spread market with null line: both awayLine and homeLine are null', async () => {
+    const spread = {
+      jsonodds_id: 'jo-abc',
+      market: 'spread',
+      line: null,
+      away_odds_american: -110,
+      home_odds_american: -110,
+      upstream_last_updated: '2026-05-08T22:00:00Z',
+      poll_captured_at: '2026-05-08T22:00:30Z',
+      changed_at: '2026-05-08T22:00:30Z',
+    };
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabase({
+        contests: { data: { jsonodds_id: 'jo-abc' }, error: null },
+        current_odds: { data: [spread], error: null },
+      }),
+    );
+    const res = makeRes();
+    await getCurrentOddsHandler(makeReq({ contestId: '42' }), res as unknown as Response);
+    const body = res.body as { odds: { spread: Record<string, unknown> | null } };
+    expect(body.odds.spread).toMatchObject({
+      market: 'spread',
+      awayLine: null,
+      homeLine: null,
+    });
+  });
+
+  it('total market: exposes overOddsAmerican / underOddsAmerican (NOT away/home)', async () => {
+    // Writer stores Over → away_odds_american and Under → home_odds_american.
+    // Endpoint must hide that storage convention from consumers.
+    const total = {
+      jsonodds_id: 'jo-abc',
+      market: 'total',
+      line: 8.5,
+      away_odds_american: -105, // raw column = OVER odds in writer convention
+      home_odds_american: -115, // raw column = UNDER odds in writer convention
+      upstream_last_updated: '2026-05-08T22:00:00Z',
+      poll_captured_at: '2026-05-08T22:00:30Z',
+      changed_at: '2026-05-08T22:00:30Z',
+    };
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabase({
+        contests: { data: { jsonodds_id: 'jo-abc' }, error: null },
+        current_odds: { data: [total], error: null },
+      }),
+    );
+    const res = makeRes();
+    await getCurrentOddsHandler(makeReq({ contestId: '42' }), res as unknown as Response);
+    const body = res.body as { odds: { total: Record<string, unknown> | null } };
+    expect(body.odds.total).toEqual({
+      market: 'total',
+      line: 8.5,
+      overOddsAmerican: -105,
+      underOddsAmerican: -115,
+      upstreamLastUpdated: '2026-05-08T22:00:00Z',
+      pollCapturedAt: '2026-05-08T22:00:30Z',
+      changedAt: '2026-05-08T22:00:30Z',
+    });
+    // Spec: total uses over/under naming exclusively. away/home naming
+    // would leak the writer's storage convention.
+    expect(body.odds.total).not.toHaveProperty('awayOddsAmerican');
+    expect(body.odds.total).not.toHaveProperty('homeOddsAmerican');
+  });
+
   it('returns 200 with all three markets populated when all three rows exist', async () => {
     const moneyline = {
       jsonodds_id: 'jo-abc',
@@ -187,26 +322,9 @@ describe('GET /v1/contests/:contestId/odds', () => {
     };
     expect(body.contestId).toBe('42');
     expect(body.jsonoddsId).toBe('jo-abc');
-    expect(body.odds.moneyline).toMatchObject({
-      jsonoddsId: 'jo-abc',
-      market: 'moneyline',
-      network: 'polygon',
-      line: null,
-      awayOddsAmerican: 145,
-      homeOddsAmerican: -180,
-    });
-    expect(body.odds.spread).toMatchObject({
-      market: 'spread',
-      line: -3.5,
-      awayOddsAmerican: -110,
-      homeOddsAmerican: -110,
-    });
-    expect(body.odds.total).toMatchObject({
-      market: 'total',
-      line: 8.5,
-      awayOddsAmerican: -105,
-      homeOddsAmerican: -115,
-    });
+    expect(body.odds.moneyline).toMatchObject({ market: 'moneyline' });
+    expect(body.odds.spread).toMatchObject({ market: 'spread', homeLine: -3.5, awayLine: 3.5 });
+    expect(body.odds.total).toMatchObject({ market: 'total', line: 8.5, overOddsAmerican: -105 });
   });
 
   it('returns 200 with partial-market coverage (missing markets stay null)', async () => {
