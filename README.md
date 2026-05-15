@@ -329,7 +329,7 @@ Query params:
 | Name | What it does |
 |---|---|
 | `sport` | optional, one of `mlb`/`nba`/`ncaab`/`ncaaf`/`nfl`/`nhl`. Validated against the shared sport constant (`src/lib/sports.ts`). |
-| `limit` | optional, default 2000, max 5000. |
+| `limit` | optional, default 1000, max 1000 (matches the underlying PostgREST per-request row cap). |
 | `offset` | optional, default 0. |
 
 Response:
@@ -348,13 +348,13 @@ Response:
       "source": "manual"
     }
   ],
-  "pagination": { "limit": 2000, "offset": 0, "total": 1846, "hasMore": false }
+  "pagination": { "limit": 1000, "offset": 0, "total": 1846, "hasMore": true }
 }
 ```
 
 `team_aliases` stores `sport_id` (smallint) but not `sport` (text). The handler joins through `teams` so callers don't have to maintain their own sport_id ↔ sport mapping.
 
-Pagination caveat: PostgREST returns at most 1000 rows per query by default; the table is ~1300+ rows. SDK consumers should paginate until `hasMore: false` rather than assuming one 2000-row page covers everything forever.
+Pagination caveat: PostgREST returns at most 1000 rows per request, so `limit` is capped at 1000 — the table is ~1300+ rows, and a larger advertised limit would silently truncate while still echoing the requested limit in `pagination.limit`, causing naive `offset += pagination.limit` clients to skip rows. SDK consumers should paginate until `hasMore: false`.
 
 ## Scripts
 

@@ -137,7 +137,10 @@ export function rowToBody(row: CommitmentRow): CommitmentBody {
 // as the canonical commitment-list endpoint.
 // ────────────────────────────────────────────────────────────────────────
 
-const OPEN_BOOK_MAX_ROWS = 1000;
+// Exported so peer endpoints (e.g. /v1/speculations/:id orderbook) cap
+// their open-book selects at the same row count. PostgREST's per-request
+// row ceiling is 1000; an unbounded `.select()` would silently truncate.
+export const OPEN_BOOK_MAX_ROWS = 1000;
 
 export async function fetchOpenCommitmentsByContestId(
   contestId: string,
