@@ -29,6 +29,7 @@ import { SPORTS as VALID_SPORTS, isSport } from '../lib/sports.js';
 import { resolveTeamIdsForContest } from '../lib/teamIds.js';
 import {
   COMMITMENT_COLUMNS,
+  OPEN_BOOK_MAX_ROWS,
   rowToBody,
   type CommitmentBody,
   type CommitmentRow,
@@ -115,20 +116,33 @@ export async function getSpeculationsHandler(req: Request, res: Response): Promi
 
   // ── Resolve --sport to a contest_id list (slow path) ─────────────────
   // No sport column on speculations; have to filter via the parent
-  // contests table. Skip when --sport isn't set.
+  // contests table. Skip when --sport isn't set. Paginate the lookup —
+  // PostgREST caps each query at 1000 rows, and a single sport can
+  // accumulate well past that across a season, so an unpaginated select
+  // would silently drop contests and the resulting speculation list
+  // would be missing rows with no error.
+  const CONTEST_ID_PAGE = 1000;
   let contestIdsFromSport: string[] | undefined;
   if (sportFilter) {
-    const sportRes = await sb
-      .from('contests')
-      .select('contest_id')
-      .eq('network', config.network)
-      .eq('sport_slug', sportFilter);
-    if (sportRes.error) {
-      logger.error({ err: sportRes.error.message }, 'speculations: sport→contest_id resolve failed');
-      res.status(500).json({ error: 'Failed to resolve sport filter.', code: 'INTERNAL_ERROR' } satisfies ApiError);
-      return;
+    const ids: string[] = [];
+    for (let pageOffset = 0; ; pageOffset += CONTEST_ID_PAGE) {
+      const page = await sb
+        .from('contests')
+        .select('contest_id')
+        .eq('network', config.network)
+        .eq('sport_slug', sportFilter)
+        .order('contest_id', { ascending: true })
+        .range(pageOffset, pageOffset + CONTEST_ID_PAGE - 1);
+      if (page.error) {
+        logger.error({ err: page.error.message }, 'speculations: sport→contest_id resolve failed');
+        res.status(500).json({ error: 'Failed to resolve sport filter.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+        return;
+      }
+      const rows = page.data ?? [];
+      for (const r of rows) ids.push(String(r.contest_id));
+      if (rows.length < CONTEST_ID_PAGE) break;
     }
-    contestIdsFromSport = (sportRes.data ?? []).map((r) => String(r.contest_id));
+    contestIdsFromSport = ids;
     if (contestIdsFromSport.length === 0) {
       res.status(200).json({
         speculations: [],
@@ -282,7 +296,8 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
       .in('status', ['open', 'partially_filled'])
       .eq('nonce_invalidated', false)
       .gt('expiry', new Date().toISOString())
-      .order('created_at', { ascending: true });
+      .order('created_at', { ascending: true })
+      .limit(OPEN_BOOK_MAX_ROWS);
 
     if (obRes.error) {
       logger.error({ err: obRes.error.message }, 'speculations: orderbook query failed');

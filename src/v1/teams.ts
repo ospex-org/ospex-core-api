@@ -12,11 +12,13 @@
  * propagates without a SDK release.
  *
  * Pagination caveat: PostgREST returns at most 1000 rows per query by
- * default. `team_aliases` is ~1300+ rows today, so the SDK paginates
- * until `hasMore: false`. The response sets `limit` to 2000 to avoid
- * gratuitous round-trips for the typical "fetch everything once and
- * cache" pattern; callers can pass an explicit `?limit=` if they want
- * smaller pages.
+ * default, so DEFAULT_LIMIT and MAX_LIMIT are both capped at 1000. A
+ * larger advertised limit would silently truncate to 1000 rows while
+ * still echoing the requested limit back in `pagination.limit`, which
+ * makes naive `offset += pagination.limit` clients skip rows. The SDK
+ * resolver layer paginates until `hasMore: false`; the table is ~1300+
+ * rows today, so the typical "fetch everything once and cache" pattern
+ * is two round-trips.
  *
  * Data shape note: `team_aliases` stores `sport_id` (smallint) but not
  * `sport` (text). This handler joins through `teams` to surface
@@ -33,8 +35,8 @@ import { getSupabase } from '../lib/supabase.js';
 import { SPORTS, isSport, type Sport } from '../lib/sports.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 
-const DEFAULT_LIMIT = 2000;
-const MAX_LIMIT = 5000;
+const DEFAULT_LIMIT = 1000;
+const MAX_LIMIT = 1000;
 
 interface AliasRow {
   teamId: string;

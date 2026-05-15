@@ -126,7 +126,7 @@ describe('GET /v1/teams/aliases', () => {
           source: 'seed',
         },
       ],
-      pagination: { limit: 2000, offset: 0, total: 2, hasMore: false },
+      pagination: { limit: 1000, offset: 0, total: 2, hasMore: false },
     });
   });
 
@@ -192,6 +192,29 @@ describe('GET /v1/teams/aliases', () => {
     const res3 = makeRes();
     await getTeamAliasesHandler(makeReq({ limit: '1.5' }), res3 as unknown as Response);
     expect(res3.statusCode).toBe(400);
+  });
+
+  // Regression guard for issue #17: PostgREST silently caps each query
+  // at 1000 rows. A larger advertised MAX_LIMIT would still return 1000
+  // rows while echoing the requested limit in `pagination.limit`, and
+  // clients incrementing offset by `pagination.limit` would skip rows.
+  // The cap must stay at the underlying row limit until pagination is
+  // re-architected (e.g. internal looping) — see speculations.ts for
+  // the looped pattern used elsewhere in this repo.
+  it('caps limit at the underlying PostgREST row cap (1000)', async () => {
+    const justOver = makeRes();
+    await getTeamAliasesHandler(makeReq({ limit: '1001' }), justOver as unknown as Response);
+    expect(justOver.statusCode).toBe(400);
+    expect(justOver.body).toMatchObject({ code: 'INVALID_PARAM' });
+    const errMsg = (justOver.body as { error: string }).error;
+    expect(errMsg).toContain('1000');
+
+    const atCap = makeRes();
+    supabaseMock.getSupabase.mockReturnValueOnce(
+      makeSupabase({ data: [], error: null, count: 0 }),
+    );
+    await getTeamAliasesHandler(makeReq({ limit: '1000' }), atCap as unknown as Response);
+    expect(atCap.statusCode).toBe(200);
   });
 
   it('rejects negative offset', async () => {
