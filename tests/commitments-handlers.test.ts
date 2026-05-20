@@ -2,8 +2,9 @@
  * Handler-level tests for /v1/commitments read surfaces, focused on the
  * effective-status contract: a time-expired or nonce-invalidated commitment
  * whose stored status is still open/partially_filled must surface as terminal
- * (`expired` / `cancelled`) while preserving fill accounting, and the list
- * `status=` filter must match the effective `status` it returns.
+ * (`expired` / `cancelled`) while preserving fill accounting. The list
+ * `status=`/include* filters operate on the STORED columns (DB-exact pagination),
+ * while the response `status` is effective.
  *
  * Mocks loadConfig + getSupabase. `Date.now()` is pinned via fake timers so
  * expiry comparisons are deterministic.
@@ -192,7 +193,7 @@ describe('GET /v1/commitments/:hash', () => {
   });
 });
 
-// ── GET /v1/commitments list: effective-aware filter ──────────────────────
+// ── GET /v1/commitments list: stored-status filter, effective-status response ──
 describe('GET /v1/commitments list', () => {
   it('default path uses the efficient SQL filter (live status + expiry boundary)', async () => {
     const { client, calls } = makeSupabase({ data: [row()], error: null, count: 1 });
