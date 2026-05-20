@@ -36,6 +36,7 @@ import { logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
 import { deriveSpeculationKey } from '../lib/eip712.js';
 import { scorerToType, type MarketType } from '../lib/speculation.js';
+import { deriveEffectiveStatus } from '../lib/commitmentStatus.js';
 import type { AuthenticatedRequest } from '../middleware/eip712Auth.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 
@@ -63,7 +64,8 @@ export interface CommitmentBody {
   expiry: string | null;
   speculationKey: string | null;
   signature: string | null;
-  status: string;
+  status: string;                 // EFFECTIVE status — folds in time-expiry + nonce invalidation
+  storedStatus: string;           // raw indexer/relay status (open|partially_filled|filled|cancelled)
   source: string;
   network: string;
   nonceInvalidated: boolean;
@@ -100,10 +102,23 @@ export interface CommitmentRow {
 
 const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower: 1 };
 
-export function rowToBody(row: CommitmentRow): CommitmentBody {
+/**
+ * Map a raw `commitments` row to the canonical body. `nowMs` is the request's
+ * single captured timestamp (epoch ms) — required (not defaulted) so callers
+ * can't accidentally call Date.now() per row; it drives effective-status
+ * derivation and must match the expiry boundary used by the surrounding query.
+ */
+export function rowToBody(row: CommitmentRow, nowMs: number): CommitmentBody {
   const risk = row.risk_amount != null ? BigInt(String(row.risk_amount)) : 0n;
   const filled = row.filled_risk_amount != null ? BigInt(String(row.filled_risk_amount)) : 0n;
   const remaining = risk > filled ? risk - filled : 0n;
+  const storedStatus = row.status;
+  const status = deriveEffectiveStatus({
+    storedStatus,
+    expiry: row.expiry,
+    nonceInvalidated: Boolean(row.nonce_invalidated),
+    nowMs,
+  });
   return {
     commitmentHash: row.commitment_hash,
     maker: row.maker,
@@ -120,7 +135,8 @@ export function rowToBody(row: CommitmentRow): CommitmentBody {
     expiry: row.expiry,
     speculationKey: row.speculation_key,
     signature: row.signature,
-    status: row.status,
+    status,
+    storedStatus,
     source: row.source,
     network: row.network,
     nonceInvalidated: Boolean(row.nonce_invalidated),
@@ -144,9 +160,13 @@ export const OPEN_BOOK_MAX_ROWS = 1000;
 
 export async function fetchOpenCommitmentsByContestId(
   contestId: string,
+  nowMs: number = Date.now(),
 ): Promise<{ commitments: CommitmentBody[] | null; error: string | null }> {
   const config = loadConfig();
   const sb = getSupabase();
+  // Open-book filter == "effective status ∈ {open, partially_filled}": live
+  // status, not nonce-invalidated, not past expiry. Same boundary `nowMs` is
+  // reused for rowToBody so the filter and the labels agree.
   const { data, error } = await sb
     .from('commitments')
     .select(COMMITMENT_COLUMNS)
@@ -154,11 +174,11 @@ export async function fetchOpenCommitmentsByContestId(
     .eq('contest_id', contestId)
     .in('status', ['open', 'partially_filled'])
     .eq('nonce_invalidated', false)
-    .gt('expiry', new Date().toISOString())
+    .gt('expiry', new Date(nowMs).toISOString())
     .limit(OPEN_BOOK_MAX_ROWS);
   if (error) return { commitments: null, error: error.message };
   return {
-    commitments: (data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow)),
+    commitments: (data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow, nowMs)),
     error: null,
   };
 }
@@ -171,6 +191,7 @@ const POSITION_TYPE_LABEL: Record<number, 'upper' | 'lower'> = { 0: 'upper', 1: 
 
 export async function postCommitmentHandler(req: AuthenticatedRequest, res: Response): Promise<void> {
   const config = loadConfig();
+  const nowMs = Date.now();
   if (!config.scorers) {
     logger.error('postCommitmentHandler invoked but SCORER_*_ADDRESS env vars are not configured');
     res.status(500).json({
@@ -247,10 +268,10 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
         { commitmentHash, priorSource: existingRow.source },
         'commitments: enriched signature-less row',
       );
-      res.status(200).json(rowToBody(enriched.data as unknown as CommitmentRow));
+      res.status(200).json(rowToBody(enriched.data as unknown as CommitmentRow, nowMs));
       return;
     }
-    res.status(200).json(rowToBody(existingRow));
+    res.status(200).json(rowToBody(existingRow, nowMs));
     return;
   }
 
@@ -314,7 +335,7 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
         .eq('commitment_hash', commitmentHash)
         .maybeSingle();
       if (!reread.error && reread.data) {
-        res.status(200).json(rowToBody(reread.data as unknown as CommitmentRow));
+        res.status(200).json(rowToBody(reread.data as unknown as CommitmentRow, nowMs));
         return;
       }
     }
@@ -323,7 +344,7 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
     return;
   }
 
-  res.status(201).json(rowToBody(insert.data as unknown as CommitmentRow));
+  res.status(201).json(rowToBody(insert.data as unknown as CommitmentRow, nowMs));
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -332,6 +353,10 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 1000;
+// Stored `status` values the `status=` filter accepts (the raw values the indexer
+// / relay write). `expired` is intentionally NOT here: no writer stores it, so a
+// `status=expired` filter would always be empty — effective `expired` is read off
+// the response `status` field instead. See lib/commitmentStatus.ts.
 const VALID_STATUSES = new Set(['open', 'partially_filled', 'filled', 'cancelled']);
 
 function parseBoolQuery(value: unknown): boolean | null {
@@ -374,10 +399,14 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
     return;
   }
 
-  // Status: comma-separated list. Default `open,partially_filled` because
-  // both are still-fillable liquidity (a partially_filled commitment has
-  // remaining_risk_amount > 0 and can be matched again). The previous
-  // single-value default of `open` silently hid valid takeable orders.
+  // Status: comma-separated list, filtered against the STORED `status` column.
+  // Default `open,partially_filled` (both still fillable — `partially_filled`
+  // rows have `remaining_risk_amount > 0`). NOTE: this filters the raw indexed
+  // value, while the response `status` is EFFECTIVE (folds expiry + nonce
+  // invalidation — see `storedStatus` for the raw value). Filtering the stored
+  // column keeps pagination + count DB-exact; effective `expired`/`cancelled`
+  // rows that derive from a stored open/partially_filled row are surfaced by the
+  // response `status` (e.g. with includeExpired=true), not by `status=expired`.
   let statuses: string[];
   if (req.query.status !== undefined) {
     const raw = String(req.query.status).toLowerCase();
@@ -517,7 +546,19 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
     );
   }
 
-  // ── Build query ───────────────────────────────────────────────────────
+  // ── Query + map ─────────────────────────────────────────────────────────
+  // `status`, `includeInvalidated`, and `includeExpired` filter on the STORED
+  // status column + the nonce/expiry columns. Keeping the filter DB-backed means
+  // pagination + count stay exact at any scale (no in-memory post-filter cap).
+  // The response `status` is EFFECTIVE (rowToBody folds expiry + nonce
+  // invalidation; `storedStatus` carries the raw value). `nowMs` is captured once
+  // and reused for BOTH the expiry boundary and derivation, so on the rows this
+  // returns the filter and the labels agree. (Effective `expired`/`cancelled`
+  // that derive from a stored open/partially_filled row are surfaced by reading
+  // the response `status` — e.g. with includeExpired=true / get-by-hash — not by
+  // a `status=expired` filter, which matches the stored column. See README.)
+  const nowMs = Date.now();
+
   let q = sb
     .from('commitments')
     .select(COMMITMENT_COLUMNS, { count: 'exact' })
@@ -530,12 +571,9 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
   if (speculationKey !== undefined) q = q.eq('speculation_key', speculationKey);
   if (!includeInvalidated) q = q.eq('nonce_invalidated', false);
   if (!includeExpired) {
-    // Postgres `>` returns false (not true, not null) for NULL operands,
-    // so this naturally excludes rows with NULL expiry. That's the right
-    // behavior here: NULL expiry only appears on indexer-cancel-only rows
-    // (per migration 028), which already have status='cancelled' and
-    // wouldn't pass the default status filter anyway.
-    q = q.gt('expiry', new Date().toISOString());
+    // Postgres `>` is false (not null) for NULL operands, so this also excludes
+    // NULL-expiry rows — correct, since their effective status is `expired`.
+    q = q.gt('expiry', new Date(nowMs).toISOString());
   }
 
   q = q
@@ -552,7 +590,7 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
 
   const total = count ?? 0;
   const body: ListResponse = {
-    commitments: (data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow)),
+    commitments: (data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow, nowMs)),
     pagination: {
       limit: limitRaw,
       offset: offsetRaw,
@@ -580,6 +618,7 @@ const HASH_PATTERN = /^0x[0-9a-f]{64}$/i;
 export async function getCommitmentByHashHandler(req: Request, res: Response): Promise<void> {
   const config = loadConfig();
   const sb = getSupabase();
+  const nowMs = Date.now();
 
   const raw = String(req.params['hash'] ?? '').trim();
   if (!HASH_PATTERN.test(raw)) {
@@ -611,7 +650,7 @@ export async function getCommitmentByHashHandler(req: Request, res: Response): P
     return;
   }
 
-  res.status(200).json(rowToBody(data as unknown as CommitmentRow));
+  res.status(200).json(rowToBody(data as unknown as CommitmentRow, nowMs));
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -638,6 +677,7 @@ export async function getCommitmentByHashHandler(req: Request, res: Response): P
 export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Response): Promise<void> {
   const config = loadConfig();
   const sb = getSupabase();
+  const nowMs = Date.now();
 
   // ── Validate the URL :hash matches the signed action ─────────────────
   const urlHash = String(req.params['hash'] ?? '').toLowerCase();
@@ -698,7 +738,7 @@ export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Re
   // ── Status branching ──────────────────────────────────────────────────
   // Already cancelled → idempotent 200 with current row.
   if (row.status === 'cancelled') {
-    res.status(200).json(rowToBody(row));
+    res.status(200).json(rowToBody(row, nowMs));
     return;
   }
   // Matched (filled or partially_filled) → on-chain only.
@@ -755,7 +795,7 @@ export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Re
     }
     const fresh = reread.data as unknown as CommitmentRow;
     if (fresh.status === 'cancelled') {
-      res.status(200).json(rowToBody(fresh));
+      res.status(200).json(rowToBody(fresh, nowMs));
       return;
     }
     res.status(409).json({
@@ -766,5 +806,5 @@ export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Re
   }
 
   logger.info({ commitmentHash: urlHash, maker: row.maker }, 'commitments: off-chain cancel applied');
-  res.status(200).json(rowToBody(update.data as unknown as CommitmentRow));
+  res.status(200).json(rowToBody(update.data as unknown as CommitmentRow, nowMs));
 }

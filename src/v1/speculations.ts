@@ -288,6 +288,8 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
       String(specRow.speculation_scorer).toLowerCase(),
       specRow.line_ticks,
     );
+    // One captured `now` for both the expiry boundary and rowToBody labeling.
+    const nowMs = Date.now();
     const obRes = await sb
       .from('commitments')
       .select(COMMITMENT_COLUMNS)
@@ -295,7 +297,7 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
       .eq('speculation_key', speculationKey)
       .in('status', ['open', 'partially_filled'])
       .eq('nonce_invalidated', false)
-      .gt('expiry', new Date().toISOString())
+      .gt('expiry', new Date(nowMs).toISOString())
       .order('created_at', { ascending: true })
       .limit(OPEN_BOOK_MAX_ROWS);
 
@@ -304,7 +306,7 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
       res.status(500).json({ error: 'Failed to fetch orderbook.', code: 'INTERNAL_ERROR' } satisfies ApiError);
       return;
     }
-    orderbook = (obRes.data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow));
+    orderbook = (obRes.data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow, nowMs));
   }
 
   const body: SpeculationDetail = { ...speculation, orderbook, contest };
