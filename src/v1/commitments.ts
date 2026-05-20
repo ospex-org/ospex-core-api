@@ -36,11 +36,7 @@ import { logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
 import { deriveSpeculationKey } from '../lib/eip712.js';
 import { scorerToType, type MarketType } from '../lib/speculation.js';
-import {
-  deriveEffectiveStatus,
-  rawStatusCandidates,
-  isLiveOnlyFilter,
-} from '../lib/commitmentStatus.js';
+import { deriveEffectiveStatus } from '../lib/commitmentStatus.js';
 import type { AuthenticatedRequest } from '../middleware/eip712Auth.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 
@@ -357,14 +353,11 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 1000;
-// Requestable EFFECTIVE statuses. `expired` is included even though no writer
-// stores it: it's a valid effective status to filter on (raw open/partially_filled
-// rows past expiry derive to it). See lib/commitmentStatus.ts.
-const VALID_STATUSES = new Set(['open', 'partially_filled', 'filled', 'cancelled', 'expired']);
-// Candidate-fetch ceiling for the effective-status post-filter path (terminal
-// statuses can't be expressed as a single paginated SQL filter). PostgREST caps
-// at 1000; at current scale the matching set is far below this.
-const POST_FILTER_FETCH_CAP = MAX_LIMIT;
+// Stored `status` values the `status=` filter accepts (the raw values the indexer
+// / relay write). `expired` is intentionally NOT here: no writer stores it, so a
+// `status=expired` filter would always be empty — effective `expired` is read off
+// the response `status` field instead. See lib/commitmentStatus.ts.
+const VALID_STATUSES = new Set(['open', 'partially_filled', 'filled', 'cancelled']);
 
 function parseBoolQuery(value: unknown): boolean | null {
   if (value === undefined) return false;
@@ -406,24 +399,26 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
     return;
   }
 
-  // Status: comma-separated list of EFFECTIVE statuses to return. When set, it
-  // is authoritative and matches the effective `status` in responses (a row is
-  // returned iff its effective status ∈ this set). Default `open,partially_filled`
-  // — both are still-fillable liquidity. When omitted, includeExpired /
-  // includeInvalidated expand that default (see below); when set, those flags
-  // are redundant and ignored.
-  let parsedStatuses: string[] | null = null;
+  // Status: comma-separated list, filtered against the STORED `status` column.
+  // Default `open,partially_filled` (both still fillable — `partially_filled`
+  // rows have `remaining_risk_amount > 0`). NOTE: this filters the raw indexed
+  // value, while the response `status` is EFFECTIVE (folds expiry + nonce
+  // invalidation — see `storedStatus` for the raw value). Filtering the stored
+  // column keeps pagination + count DB-exact; effective `expired`/`cancelled`
+  // rows that derive from a stored open/partially_filled row are surfaced by the
+  // response `status` (e.g. with includeExpired=true), not by `status=expired`.
+  let statuses: string[];
   if (req.query.status !== undefined) {
     const raw = String(req.query.status).toLowerCase();
-    const parsed = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
-    if (parsed.length === 0) {
+    statuses = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+    if (statuses.length === 0) {
       res.status(400).json({
         error: 'status must be a non-empty comma-separated list.',
         code: 'INVALID_PARAM',
       } satisfies ApiError);
       return;
     }
-    for (const s of parsed) {
+    for (const s of statuses) {
       if (!VALID_STATUSES.has(s)) {
         res.status(400).json({
           error: `Invalid status "${s}". Must be one of: ${[...VALID_STATUSES].join(', ')}.`,
@@ -432,7 +427,8 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
         return;
       }
     }
-    parsedStatuses = parsed;
+  } else {
+    statuses = ['open', 'partially_filled'];
   }
 
   // Boolean opt-outs for the default "matchable open book" filters.
@@ -453,18 +449,6 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
       code: 'INVALID_PARAM',
     } satisfies ApiError);
     return;
-  }
-
-  // Resolve the set of EFFECTIVE statuses to return. Explicit `status` wins;
-  // otherwise default to the open book and let the legacy include* flags widen it.
-  const wanted = new Set<string>();
-  if (parsedStatuses !== null) {
-    for (const s of parsedStatuses) wanted.add(s);
-  } else {
-    wanted.add('open');
-    wanted.add('partially_filled');
-    if (includeExpired) wanted.add('expired');
-    if (includeInvalidated) wanted.add('cancelled'); // nonce-invalidated → effective cancelled
   }
 
   // Lowercase first so mixed-case input passes (see positions.ts comment).
@@ -563,93 +547,55 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
   }
 
   // ── Query + map ─────────────────────────────────────────────────────────
-  // `nowMs` is captured once and reused for BOTH the expiry query boundary and
-  // effective-status derivation (rowToBody), so the SQL filter and the response
-  // labels can never disagree.
+  // `status`, `includeInvalidated`, and `includeExpired` filter on the STORED
+  // status column + the nonce/expiry columns. Keeping the filter DB-backed means
+  // pagination + count stay exact at any scale (no in-memory post-filter cap).
+  // The response `status` is EFFECTIVE (rowToBody folds expiry + nonce
+  // invalidation; `storedStatus` carries the raw value). `nowMs` is captured once
+  // and reused for BOTH the expiry boundary and derivation, so on the rows this
+  // returns the filter and the labels agree. (Effective `expired`/`cancelled`
+  // that derive from a stored open/partially_filled row are surfaced by reading
+  // the response `status` — e.g. with includeExpired=true / get-by-hash — not by
+  // a `status=expired` filter, which matches the stored column. See README.)
   const nowMs = Date.now();
-  const nowIso = new Date(nowMs).toISOString();
 
-  let bodies: CommitmentBody[];
-  let total: number;
+  let q = sb
+    .from('commitments')
+    .select(COMMITMENT_COLUMNS, { count: 'exact' })
+    .eq('network', config.network)
+    .in('status', statuses);
 
-  if (isLiveOnlyFilter(wanted)) {
-    // Efficient path: every wanted status is live (open/partially_filled), so
-    // `status IN wanted AND nonce_invalidated=false AND expiry>now` is exactly
-    // "effective status ∈ wanted". Clean SQL pagination + exact count. (Postgres
-    // `>` is false for NULL, so NULL-expiry rows are correctly excluded — their
-    // effective status is `expired`.)
-    let q = sb
-      .from('commitments')
-      .select(COMMITMENT_COLUMNS, { count: 'exact' })
-      .eq('network', config.network)
-      .in('status', [...wanted])
-      .eq('nonce_invalidated', false)
-      .gt('expiry', nowIso);
-    if (maker !== undefined) q = q.eq('maker', maker);
-    if (scorer !== undefined) q = q.eq('scorer', scorer);
-    if (contestId !== undefined) q = q.eq('contest_id', contestId);
-    if (speculationKey !== undefined) q = q.eq('speculation_key', speculationKey);
-    q = q
-      .order('created_at', { ascending: false })
-      .order('commitment_hash', { ascending: true })
-      .range(offsetRaw, offsetRaw + limitRaw - 1);
-
-    const { data, count, error } = await q;
-    if (error) {
-      logger.error({ err: error.message }, 'commitments: list query failed');
-      res.status(500).json({ error: 'Failed to list commitments.', code: 'INTERNAL_ERROR' } satisfies ApiError);
-      return;
-    }
-    bodies = (data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow, nowMs));
-    total = count ?? 0;
-  } else {
-    // Post-filter path: wanted includes a terminal status (filled/cancelled/
-    // expired). Terminal statuses ignore expiry, and effective cancelled/expired
-    // can derive from raw open/partially_filled rows, so the predicate isn't a
-    // single paginated SQL filter. Fetch the candidate superset, derive effective
-    // status, then filter + paginate in JS. Pagination/total are exact up to
-    // POST_FILTER_FETCH_CAP matching candidates (far above current scale).
-    let q = sb
-      .from('commitments')
-      .select(COMMITMENT_COLUMNS)
-      .eq('network', config.network)
-      .in('status', rawStatusCandidates(wanted));
-    if (maker !== undefined) q = q.eq('maker', maker);
-    if (scorer !== undefined) q = q.eq('scorer', scorer);
-    if (contestId !== undefined) q = q.eq('contest_id', contestId);
-    if (speculationKey !== undefined) q = q.eq('speculation_key', speculationKey);
-    q = q
-      .order('created_at', { ascending: false })
-      .order('commitment_hash', { ascending: true })
-      .limit(POST_FILTER_FETCH_CAP);
-
-    const { data, error } = await q;
-    if (error) {
-      logger.error({ err: error.message }, 'commitments: list query failed');
-      res.status(500).json({ error: 'Failed to list commitments.', code: 'INTERNAL_ERROR' } satisfies ApiError);
-      return;
-    }
-    const rows = data ?? [];
-    if (rows.length >= POST_FILTER_FETCH_CAP) {
-      logger.warn(
-        { cap: POST_FILTER_FETCH_CAP, wanted: [...wanted] },
-        'commitments: effective-status candidate fetch hit cap; total may be undercounted',
-      );
-    }
-    const filtered = rows
-      .map((r) => rowToBody(r as unknown as CommitmentRow, nowMs))
-      .filter((b) => wanted.has(b.status));
-    total = filtered.length;
-    bodies = filtered.slice(offsetRaw, offsetRaw + limitRaw);
+  if (maker !== undefined) q = q.eq('maker', maker);
+  if (scorer !== undefined) q = q.eq('scorer', scorer);
+  if (contestId !== undefined) q = q.eq('contest_id', contestId);
+  if (speculationKey !== undefined) q = q.eq('speculation_key', speculationKey);
+  if (!includeInvalidated) q = q.eq('nonce_invalidated', false);
+  if (!includeExpired) {
+    // Postgres `>` is false (not null) for NULL operands, so this also excludes
+    // NULL-expiry rows — correct, since their effective status is `expired`.
+    q = q.gt('expiry', new Date(nowMs).toISOString());
   }
 
+  q = q
+    .order('created_at', { ascending: false })
+    .order('commitment_hash', { ascending: true })
+    .range(offsetRaw, offsetRaw + limitRaw - 1);
+
+  const { data, count, error } = await q;
+  if (error) {
+    logger.error({ err: error.message }, 'commitments: list query failed');
+    res.status(500).json({ error: 'Failed to list commitments.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+    return;
+  }
+
+  const total = count ?? 0;
   const body: ListResponse = {
-    commitments: bodies,
+    commitments: (data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow, nowMs)),
     pagination: {
       limit: limitRaw,
       offset: offsetRaw,
       total,
-      hasMore: offsetRaw + bodies.length < total,
+      hasMore: offsetRaw + (data?.length ?? 0) < total,
     },
   };
   res.status(200).json(body);

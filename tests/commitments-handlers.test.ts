@@ -205,63 +205,43 @@ describe('GET /v1/commitments list', () => {
     expect(calls).toContainEqual({ method: 'gt', args: ['expiry', NOW_ISO] });
   });
 
-  it('status=expired uses the post-filter path: no expiry/nonce SQL filter, JS-filters by effective status', async () => {
-    const rows = [
-      row({ commitment_hash: `0x${'1'.repeat(64)}`, status: 'open', expiry: FUTURE }), // eff open
-      row({ commitment_hash: `0x${'2'.repeat(64)}`, status: 'open', expiry: PAST }), // eff expired ✓
-      row({
-        commitment_hash: `0x${'3'.repeat(64)}`,
-        status: 'partially_filled',
-        expiry: PAST,
-      }), // eff expired ✓
-      row({ commitment_hash: `0x${'4'.repeat(64)}`, status: 'filled', expiry: PAST }), // eff filled
-      row({
-        commitment_hash: `0x${'5'.repeat(64)}`,
-        status: 'open',
-        expiry: FUTURE,
-        nonce_invalidated: true,
-      }), // eff cancelled
-    ];
-    const { client, calls } = makeSupabase({ data: rows, error: null });
+  it('status=expired is rejected (400) — "expired" is effective-only, not a stored filter value', async () => {
+    const { client } = makeSupabase({ data: [], error: null, count: 0 });
     supabaseMock.getSupabase.mockReturnValue(client);
     const res = makeRes();
     await getCommitmentsHandler(makeReq({ status: 'expired' }), res as unknown as Response);
-    expect(res.statusCode).toBe(200);
-
-    // Candidate fetch is the superset; expiry/nonce are NOT pushed to SQL here.
-    const inCall = calls.find((c) => c.method === 'in');
-    expect(new Set(inCall?.args[1] as string[])).toEqual(
-      new Set(['expired', 'open', 'partially_filled']),
-    );
-    expect(calls.some((c) => c.method === 'gt')).toBe(false);
-    expect(calls.some((c) => c.method === 'eq' && c.args[0] === 'nonce_invalidated')).toBe(false);
-
-    const body = res.body as { commitments: Array<{ status: string; storedStatus: string }>; pagination: { total: number } };
-    expect(body.commitments.map((c) => c.status)).toEqual(['expired', 'expired']);
-    expect(new Set(body.commitments.map((c) => c.storedStatus))).toEqual(
-      new Set(['open', 'partially_filled']),
-    );
-    expect(body.pagination.total).toBe(2);
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toMatchObject({ code: 'INVALID_PARAM' });
   });
 
-  it('status=cancelled surfaces nonce-invalidated open rows as effective cancelled', async () => {
+  it('includeExpired=true drops the expiry SQL boundary; a past-expiry stored-open row is returned labeled effective "expired"', async () => {
     const rows = [
-      row({ commitment_hash: `0x${'1'.repeat(64)}`, status: 'open', expiry: FUTURE }), // eff open
-      row({
-        commitment_hash: `0x${'2'.repeat(64)}`,
-        status: 'open',
-        expiry: FUTURE,
-        nonce_invalidated: true,
-      }), // eff cancelled ✓
-      row({ commitment_hash: `0x${'3'.repeat(64)}`, status: 'cancelled', expiry: PAST }), // eff cancelled ✓
+      row({ commitment_hash: `0x${'1'.repeat(64)}`, status: 'open', expiry: PAST }), // eff expired
+      row({ commitment_hash: `0x${'2'.repeat(64)}`, status: 'open', expiry: FUTURE }), // eff open
     ];
-    const { client } = makeSupabase({ data: rows, error: null });
+    const { client, calls } = makeSupabase({ data: rows, error: null, count: 2 });
     supabaseMock.getSupabase.mockReturnValue(client);
     const res = makeRes();
-    await getCommitmentsHandler(makeReq({ status: 'cancelled' }), res as unknown as Response);
+    await getCommitmentsHandler(makeReq({ includeExpired: 'true' }), res as unknown as Response);
     expect(res.statusCode).toBe(200);
-    const body = res.body as { commitments: Array<{ status: string }> };
-    expect(body.commitments.every((c) => c.status === 'cancelled')).toBe(true);
-    expect(body.commitments).toHaveLength(2);
+    expect(calls.some((c) => c.method === 'gt' && c.args[0] === 'expiry')).toBe(false);
+    const body = res.body as { commitments: Array<{ status: string; storedStatus: string }>; pagination: { total: number } };
+    expect(body.commitments.map((c) => c.status)).toEqual(['expired', 'open']);
+    expect(body.commitments.every((c) => c.storedStatus === 'open')).toBe(true);
+    expect(body.pagination.total).toBe(2); // DB-exact count, no in-memory cap
+  });
+
+  it('includeInvalidated=true drops the nonce_invalidated SQL filter (original meaning); the row is labeled effective "cancelled"', async () => {
+    const rows = [
+      row({ commitment_hash: `0x${'1'.repeat(64)}`, status: 'open', expiry: FUTURE, nonce_invalidated: true }), // eff cancelled
+    ];
+    const { client, calls } = makeSupabase({ data: rows, error: null, count: 1 });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await getCommitmentsHandler(makeReq({ includeInvalidated: 'true' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    expect(calls.some((c) => c.method === 'eq' && c.args[0] === 'nonce_invalidated')).toBe(false);
+    const body = res.body as { commitments: Array<{ status: string; storedStatus: string; nonceInvalidated: boolean }> };
+    expect(body.commitments[0]).toMatchObject({ status: 'cancelled', storedStatus: 'open', nonceInvalidated: true });
   });
 });

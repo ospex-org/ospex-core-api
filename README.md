@@ -105,19 +105,21 @@ List commitments, sorted by `created_at DESC, commitment_hash ASC` (newest first
 
 The default response is **the matchable open book**: still-fillable commitments that a taker could `matchCommitment` against right now. Power users can opt back into invalidated / expired / non-default-status rows via the flags below.
 
+Every returned commitment carries two status fields: **`status` is the _effective_ lifecycle status** and **`storedStatus`** is the raw value the indexer/relay recorded. Effective status folds in what the contract enforces at match time but the indexer never writes as an event: a stored `open`/`partially_filled` row past its `expiry` reports `status: 'expired'`, and a nonce-invalidated one reports `status: 'cancelled'` (invalidation takes precedence when a row is both). `filled` and `cancelled` stay terminal. The `status`, `includeExpired`, and `includeInvalidated` query params filter on the **stored** value + the expiry/nonce columns (which keeps pagination and `total` exact); the effective lifecycle is read off the response `status` (notably on get-by-hash and on `includeExpired`/`includeInvalidated` results).
+
 Query params:
 | Param | Notes |
 |---|---|
 | `maker` | optional — filter by maker address |
 | `contestId` | optional — filter by contest |
 | `scorer` | optional — filter by scorer address |
-| `status` | optional, comma-separated. Default `open,partially_filled` (both are still fillable — `partially_filled` rows have `remaining_risk_amount > 0`). Any of `open`, `partially_filled`, `filled`, `cancelled`. |
-| `includeInvalidated` | optional bool, default `false`. By default, rows where the maker has raised `s_minNonces[maker][speculationKey]` past this commitment's nonce (`nonce_invalidated = true`) are excluded — the contract would reject `matchCommitment` on them. Set `true` to include. |
-| `includeExpired` | optional bool, default `false`. By default, rows whose `expiry` has passed are excluded. Set `true` to include. |
+| `status` | optional, comma-separated. Filters the **stored** status column. Default `open,partially_filled` (both still fillable — `partially_filled` rows have `remaining_risk_amount > 0`). Any of `open`, `partially_filled`, `filled`, `cancelled`. `expired` is **not** accepted here — it is never a stored value; surface time-expired rows with `includeExpired=true` and read the effective `status` in the response. |
+| `includeInvalidated` | optional bool, default `false`. By default, rows where the maker has raised `s_minNonces[maker][speculationKey]` past this commitment's nonce (`nonce_invalidated = true`) are excluded — the contract would reject `matchCommitment` on them. Set `true` to include; included nonce-invalidated rows report effective `status: 'cancelled'` (raw `storedStatus` unchanged). |
+| `includeExpired` | optional bool, default `false`. By default, rows whose `expiry` has passed are excluded. Set `true` to include; included past-expiry rows report effective `status: 'expired'`. |
 | `limit` | optional, default 100, max 1000 |
 | `offset` | optional, default 0 |
 
-Response: `{ commitments: CommitmentBody[], pagination: { limit, offset, total, hasMore } }`. Each `CommitmentBody` has the full canonical shape including `signature`, `speculationKey`, `nonceInvalidated`, `createdAt`, etc.
+Response: `{ commitments: CommitmentBody[], pagination: { limit, offset, total, hasMore } }`. Each `CommitmentBody` has the full canonical shape including `status` (effective lifecycle), `storedStatus` (raw indexed value), `signature`, `speculationKey`, `nonceInvalidated`, `createdAt`, etc.
 
 ### `GET /v1/contests`
 

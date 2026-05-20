@@ -5,11 +5,7 @@
  * `open`/`partially_filled` derives to a terminal effective status.
  */
 import { describe, expect, it } from 'vitest';
-import {
-  deriveEffectiveStatus,
-  rawStatusCandidates,
-  isLiveOnlyFilter,
-} from '../src/lib/commitmentStatus.js';
+import { deriveEffectiveStatus } from '../src/lib/commitmentStatus.js';
 
 const NOW = Date.parse('2026-05-20T16:00:00.000Z');
 const FUTURE = '2026-05-20T17:00:00.000Z';
@@ -98,49 +94,5 @@ describe('deriveEffectiveStatus', () => {
   // ── defensive: unknown stored status passes through, never fabricated ─────
   it('unknown stored status → passed through unchanged', () => {
     expect(eff('something_weird', FUTURE)).toBe('something_weird');
-  });
-});
-
-describe('rawStatusCandidates', () => {
-  it('open/partially_filled map to themselves', () => {
-    expect(new Set(rawStatusCandidates(new Set(['open'])))).toEqual(new Set(['open']));
-    expect(new Set(rawStatusCandidates(new Set(['open', 'partially_filled'])))).toEqual(
-      new Set(['open', 'partially_filled']),
-    );
-  });
-
-  it('filled maps to itself only', () => {
-    expect(new Set(rawStatusCandidates(new Set(['filled'])))).toEqual(new Set(['filled']));
-  });
-
-  it('cancelled pulls in raw open/partially_filled (nonce-invalidated rows)', () => {
-    expect(new Set(rawStatusCandidates(new Set(['cancelled'])))).toEqual(
-      new Set(['cancelled', 'open', 'partially_filled']),
-    );
-  });
-
-  it('expired pulls in raw open/partially_filled (time-expired rows)', () => {
-    expect(new Set(rawStatusCandidates(new Set(['expired'])))).toEqual(
-      new Set(['expired', 'open', 'partially_filled']),
-    );
-  });
-});
-
-describe('isLiveOnlyFilter', () => {
-  it('true for live-only sets', () => {
-    expect(isLiveOnlyFilter(new Set(['open']))).toBe(true);
-    expect(isLiveOnlyFilter(new Set(['partially_filled']))).toBe(true);
-    expect(isLiveOnlyFilter(new Set(['open', 'partially_filled']))).toBe(true);
-  });
-
-  it('false when any terminal status is present', () => {
-    expect(isLiveOnlyFilter(new Set(['expired']))).toBe(false);
-    expect(isLiveOnlyFilter(new Set(['cancelled']))).toBe(false);
-    expect(isLiveOnlyFilter(new Set(['filled']))).toBe(false);
-    expect(isLiveOnlyFilter(new Set(['open', 'filled']))).toBe(false);
-  });
-
-  it('false for the empty set', () => {
-    expect(isLiveOnlyFilter(new Set())).toBe(false);
   });
 });
