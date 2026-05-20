@@ -36,6 +36,11 @@ import { logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
 import { deriveSpeculationKey } from '../lib/eip712.js';
 import { scorerToType, type MarketType } from '../lib/speculation.js';
+import {
+  deriveEffectiveStatus,
+  rawStatusCandidates,
+  isLiveOnlyFilter,
+} from '../lib/commitmentStatus.js';
 import type { AuthenticatedRequest } from '../middleware/eip712Auth.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 
@@ -63,7 +68,8 @@ export interface CommitmentBody {
   expiry: string | null;
   speculationKey: string | null;
   signature: string | null;
-  status: string;
+  status: string;                 // EFFECTIVE status — folds in time-expiry + nonce invalidation
+  storedStatus: string;           // raw indexer/relay status (open|partially_filled|filled|cancelled)
   source: string;
   network: string;
   nonceInvalidated: boolean;
@@ -100,10 +106,23 @@ export interface CommitmentRow {
 
 const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower: 1 };
 
-export function rowToBody(row: CommitmentRow): CommitmentBody {
+/**
+ * Map a raw `commitments` row to the canonical body. `nowMs` is the request's
+ * single captured timestamp (epoch ms) — required (not defaulted) so callers
+ * can't accidentally call Date.now() per row; it drives effective-status
+ * derivation and must match the expiry boundary used by the surrounding query.
+ */
+export function rowToBody(row: CommitmentRow, nowMs: number): CommitmentBody {
   const risk = row.risk_amount != null ? BigInt(String(row.risk_amount)) : 0n;
   const filled = row.filled_risk_amount != null ? BigInt(String(row.filled_risk_amount)) : 0n;
   const remaining = risk > filled ? risk - filled : 0n;
+  const storedStatus = row.status;
+  const status = deriveEffectiveStatus({
+    storedStatus,
+    expiry: row.expiry,
+    nonceInvalidated: Boolean(row.nonce_invalidated),
+    nowMs,
+  });
   return {
     commitmentHash: row.commitment_hash,
     maker: row.maker,
@@ -120,7 +139,8 @@ export function rowToBody(row: CommitmentRow): CommitmentBody {
     expiry: row.expiry,
     speculationKey: row.speculation_key,
     signature: row.signature,
-    status: row.status,
+    status,
+    storedStatus,
     source: row.source,
     network: row.network,
     nonceInvalidated: Boolean(row.nonce_invalidated),
@@ -144,9 +164,13 @@ export const OPEN_BOOK_MAX_ROWS = 1000;
 
 export async function fetchOpenCommitmentsByContestId(
   contestId: string,
+  nowMs: number = Date.now(),
 ): Promise<{ commitments: CommitmentBody[] | null; error: string | null }> {
   const config = loadConfig();
   const sb = getSupabase();
+  // Open-book filter == "effective status ∈ {open, partially_filled}": live
+  // status, not nonce-invalidated, not past expiry. Same boundary `nowMs` is
+  // reused for rowToBody so the filter and the labels agree.
   const { data, error } = await sb
     .from('commitments')
     .select(COMMITMENT_COLUMNS)
@@ -154,11 +178,11 @@ export async function fetchOpenCommitmentsByContestId(
     .eq('contest_id', contestId)
     .in('status', ['open', 'partially_filled'])
     .eq('nonce_invalidated', false)
-    .gt('expiry', new Date().toISOString())
+    .gt('expiry', new Date(nowMs).toISOString())
     .limit(OPEN_BOOK_MAX_ROWS);
   if (error) return { commitments: null, error: error.message };
   return {
-    commitments: (data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow)),
+    commitments: (data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow, nowMs)),
     error: null,
   };
 }
@@ -171,6 +195,7 @@ const POSITION_TYPE_LABEL: Record<number, 'upper' | 'lower'> = { 0: 'upper', 1: 
 
 export async function postCommitmentHandler(req: AuthenticatedRequest, res: Response): Promise<void> {
   const config = loadConfig();
+  const nowMs = Date.now();
   if (!config.scorers) {
     logger.error('postCommitmentHandler invoked but SCORER_*_ADDRESS env vars are not configured');
     res.status(500).json({
@@ -247,10 +272,10 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
         { commitmentHash, priorSource: existingRow.source },
         'commitments: enriched signature-less row',
       );
-      res.status(200).json(rowToBody(enriched.data as unknown as CommitmentRow));
+      res.status(200).json(rowToBody(enriched.data as unknown as CommitmentRow, nowMs));
       return;
     }
-    res.status(200).json(rowToBody(existingRow));
+    res.status(200).json(rowToBody(existingRow, nowMs));
     return;
   }
 
@@ -314,7 +339,7 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
         .eq('commitment_hash', commitmentHash)
         .maybeSingle();
       if (!reread.error && reread.data) {
-        res.status(200).json(rowToBody(reread.data as unknown as CommitmentRow));
+        res.status(200).json(rowToBody(reread.data as unknown as CommitmentRow, nowMs));
         return;
       }
     }
@@ -323,7 +348,7 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
     return;
   }
 
-  res.status(201).json(rowToBody(insert.data as unknown as CommitmentRow));
+  res.status(201).json(rowToBody(insert.data as unknown as CommitmentRow, nowMs));
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -332,7 +357,14 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 1000;
-const VALID_STATUSES = new Set(['open', 'partially_filled', 'filled', 'cancelled']);
+// Requestable EFFECTIVE statuses. `expired` is included even though no writer
+// stores it: it's a valid effective status to filter on (raw open/partially_filled
+// rows past expiry derive to it). See lib/commitmentStatus.ts.
+const VALID_STATUSES = new Set(['open', 'partially_filled', 'filled', 'cancelled', 'expired']);
+// Candidate-fetch ceiling for the effective-status post-filter path (terminal
+// statuses can't be expressed as a single paginated SQL filter). PostgREST caps
+// at 1000; at current scale the matching set is far below this.
+const POST_FILTER_FETCH_CAP = MAX_LIMIT;
 
 function parseBoolQuery(value: unknown): boolean | null {
   if (value === undefined) return false;
@@ -374,22 +406,24 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
     return;
   }
 
-  // Status: comma-separated list. Default `open,partially_filled` because
-  // both are still-fillable liquidity (a partially_filled commitment has
-  // remaining_risk_amount > 0 and can be matched again). The previous
-  // single-value default of `open` silently hid valid takeable orders.
-  let statuses: string[];
+  // Status: comma-separated list of EFFECTIVE statuses to return. When set, it
+  // is authoritative and matches the effective `status` in responses (a row is
+  // returned iff its effective status ∈ this set). Default `open,partially_filled`
+  // — both are still-fillable liquidity. When omitted, includeExpired /
+  // includeInvalidated expand that default (see below); when set, those flags
+  // are redundant and ignored.
+  let parsedStatuses: string[] | null = null;
   if (req.query.status !== undefined) {
     const raw = String(req.query.status).toLowerCase();
-    statuses = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
-    if (statuses.length === 0) {
+    const parsed = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+    if (parsed.length === 0) {
       res.status(400).json({
         error: 'status must be a non-empty comma-separated list.',
         code: 'INVALID_PARAM',
       } satisfies ApiError);
       return;
     }
-    for (const s of statuses) {
+    for (const s of parsed) {
       if (!VALID_STATUSES.has(s)) {
         res.status(400).json({
           error: `Invalid status "${s}". Must be one of: ${[...VALID_STATUSES].join(', ')}.`,
@@ -398,8 +432,7 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
         return;
       }
     }
-  } else {
-    statuses = ['open', 'partially_filled'];
+    parsedStatuses = parsed;
   }
 
   // Boolean opt-outs for the default "matchable open book" filters.
@@ -420,6 +453,18 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
       code: 'INVALID_PARAM',
     } satisfies ApiError);
     return;
+  }
+
+  // Resolve the set of EFFECTIVE statuses to return. Explicit `status` wins;
+  // otherwise default to the open book and let the legacy include* flags widen it.
+  const wanted = new Set<string>();
+  if (parsedStatuses !== null) {
+    for (const s of parsedStatuses) wanted.add(s);
+  } else {
+    wanted.add('open');
+    wanted.add('partially_filled');
+    if (includeExpired) wanted.add('expired');
+    if (includeInvalidated) wanted.add('cancelled'); // nonce-invalidated → effective cancelled
   }
 
   // Lowercase first so mixed-case input passes (see positions.ts comment).
@@ -517,47 +562,94 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
     );
   }
 
-  // ── Build query ───────────────────────────────────────────────────────
-  let q = sb
-    .from('commitments')
-    .select(COMMITMENT_COLUMNS, { count: 'exact' })
-    .eq('network', config.network)
-    .in('status', statuses);
+  // ── Query + map ─────────────────────────────────────────────────────────
+  // `nowMs` is captured once and reused for BOTH the expiry query boundary and
+  // effective-status derivation (rowToBody), so the SQL filter and the response
+  // labels can never disagree.
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
 
-  if (maker !== undefined) q = q.eq('maker', maker);
-  if (scorer !== undefined) q = q.eq('scorer', scorer);
-  if (contestId !== undefined) q = q.eq('contest_id', contestId);
-  if (speculationKey !== undefined) q = q.eq('speculation_key', speculationKey);
-  if (!includeInvalidated) q = q.eq('nonce_invalidated', false);
-  if (!includeExpired) {
-    // Postgres `>` returns false (not true, not null) for NULL operands,
-    // so this naturally excludes rows with NULL expiry. That's the right
-    // behavior here: NULL expiry only appears on indexer-cancel-only rows
-    // (per migration 028), which already have status='cancelled' and
-    // wouldn't pass the default status filter anyway.
-    q = q.gt('expiry', new Date().toISOString());
+  let bodies: CommitmentBody[];
+  let total: number;
+
+  if (isLiveOnlyFilter(wanted)) {
+    // Efficient path: every wanted status is live (open/partially_filled), so
+    // `status IN wanted AND nonce_invalidated=false AND expiry>now` is exactly
+    // "effective status ∈ wanted". Clean SQL pagination + exact count. (Postgres
+    // `>` is false for NULL, so NULL-expiry rows are correctly excluded — their
+    // effective status is `expired`.)
+    let q = sb
+      .from('commitments')
+      .select(COMMITMENT_COLUMNS, { count: 'exact' })
+      .eq('network', config.network)
+      .in('status', [...wanted])
+      .eq('nonce_invalidated', false)
+      .gt('expiry', nowIso);
+    if (maker !== undefined) q = q.eq('maker', maker);
+    if (scorer !== undefined) q = q.eq('scorer', scorer);
+    if (contestId !== undefined) q = q.eq('contest_id', contestId);
+    if (speculationKey !== undefined) q = q.eq('speculation_key', speculationKey);
+    q = q
+      .order('created_at', { ascending: false })
+      .order('commitment_hash', { ascending: true })
+      .range(offsetRaw, offsetRaw + limitRaw - 1);
+
+    const { data, count, error } = await q;
+    if (error) {
+      logger.error({ err: error.message }, 'commitments: list query failed');
+      res.status(500).json({ error: 'Failed to list commitments.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+      return;
+    }
+    bodies = (data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow, nowMs));
+    total = count ?? 0;
+  } else {
+    // Post-filter path: wanted includes a terminal status (filled/cancelled/
+    // expired). Terminal statuses ignore expiry, and effective cancelled/expired
+    // can derive from raw open/partially_filled rows, so the predicate isn't a
+    // single paginated SQL filter. Fetch the candidate superset, derive effective
+    // status, then filter + paginate in JS. Pagination/total are exact up to
+    // POST_FILTER_FETCH_CAP matching candidates (far above current scale).
+    let q = sb
+      .from('commitments')
+      .select(COMMITMENT_COLUMNS)
+      .eq('network', config.network)
+      .in('status', rawStatusCandidates(wanted));
+    if (maker !== undefined) q = q.eq('maker', maker);
+    if (scorer !== undefined) q = q.eq('scorer', scorer);
+    if (contestId !== undefined) q = q.eq('contest_id', contestId);
+    if (speculationKey !== undefined) q = q.eq('speculation_key', speculationKey);
+    q = q
+      .order('created_at', { ascending: false })
+      .order('commitment_hash', { ascending: true })
+      .limit(POST_FILTER_FETCH_CAP);
+
+    const { data, error } = await q;
+    if (error) {
+      logger.error({ err: error.message }, 'commitments: list query failed');
+      res.status(500).json({ error: 'Failed to list commitments.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+      return;
+    }
+    const rows = data ?? [];
+    if (rows.length >= POST_FILTER_FETCH_CAP) {
+      logger.warn(
+        { cap: POST_FILTER_FETCH_CAP, wanted: [...wanted] },
+        'commitments: effective-status candidate fetch hit cap; total may be undercounted',
+      );
+    }
+    const filtered = rows
+      .map((r) => rowToBody(r as unknown as CommitmentRow, nowMs))
+      .filter((b) => wanted.has(b.status));
+    total = filtered.length;
+    bodies = filtered.slice(offsetRaw, offsetRaw + limitRaw);
   }
 
-  q = q
-    .order('created_at', { ascending: false })
-    .order('commitment_hash', { ascending: true })
-    .range(offsetRaw, offsetRaw + limitRaw - 1);
-
-  const { data, count, error } = await q;
-  if (error) {
-    logger.error({ err: error.message }, 'commitments: list query failed');
-    res.status(500).json({ error: 'Failed to list commitments.', code: 'INTERNAL_ERROR' } satisfies ApiError);
-    return;
-  }
-
-  const total = count ?? 0;
   const body: ListResponse = {
-    commitments: (data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow)),
+    commitments: bodies,
     pagination: {
       limit: limitRaw,
       offset: offsetRaw,
       total,
-      hasMore: offsetRaw + (data?.length ?? 0) < total,
+      hasMore: offsetRaw + bodies.length < total,
     },
   };
   res.status(200).json(body);
@@ -580,6 +672,7 @@ const HASH_PATTERN = /^0x[0-9a-f]{64}$/i;
 export async function getCommitmentByHashHandler(req: Request, res: Response): Promise<void> {
   const config = loadConfig();
   const sb = getSupabase();
+  const nowMs = Date.now();
 
   const raw = String(req.params['hash'] ?? '').trim();
   if (!HASH_PATTERN.test(raw)) {
@@ -611,7 +704,7 @@ export async function getCommitmentByHashHandler(req: Request, res: Response): P
     return;
   }
 
-  res.status(200).json(rowToBody(data as unknown as CommitmentRow));
+  res.status(200).json(rowToBody(data as unknown as CommitmentRow, nowMs));
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -638,6 +731,7 @@ export async function getCommitmentByHashHandler(req: Request, res: Response): P
 export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Response): Promise<void> {
   const config = loadConfig();
   const sb = getSupabase();
+  const nowMs = Date.now();
 
   // ── Validate the URL :hash matches the signed action ─────────────────
   const urlHash = String(req.params['hash'] ?? '').toLowerCase();
@@ -698,7 +792,7 @@ export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Re
   // ── Status branching ──────────────────────────────────────────────────
   // Already cancelled → idempotent 200 with current row.
   if (row.status === 'cancelled') {
-    res.status(200).json(rowToBody(row));
+    res.status(200).json(rowToBody(row, nowMs));
     return;
   }
   // Matched (filled or partially_filled) → on-chain only.
@@ -755,7 +849,7 @@ export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Re
     }
     const fresh = reread.data as unknown as CommitmentRow;
     if (fresh.status === 'cancelled') {
-      res.status(200).json(rowToBody(fresh));
+      res.status(200).json(rowToBody(fresh, nowMs));
       return;
     }
     res.status(409).json({
@@ -766,5 +860,5 @@ export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Re
   }
 
   logger.info({ commitmentHash: urlHash, maker: row.maker }, 'commitments: off-chain cancel applied');
-  res.status(200).json(rowToBody(update.data as unknown as CommitmentRow));
+  res.status(200).json(rowToBody(update.data as unknown as CommitmentRow, nowMs));
 }
