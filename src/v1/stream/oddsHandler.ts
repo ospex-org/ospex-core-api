@@ -249,8 +249,15 @@ export async function getOddsStreamHandler(req: Request, res: Response): Promise
         }
         if (closed) return;
         if (ok) {
+          // Advance the watermark only on a snapshot that carries odds, and
+          // never backward. A null (odds-absent) or stale recovery snapshot must
+          // NOT reset it — otherwise flushPending would treat a buffered older
+          // row as newer than the (reset) watermark and resurrect it, breaking
+          // the latest-state contract.
           const ms = odds ? Date.parse(odds.pollCapturedAt) : NaN;
-          lastPollMs = Number.isFinite(ms) ? ms : undefined;
+          if (Number.isFinite(ms)) {
+            lastPollMs = lastPollMs === undefined ? ms : Math.max(lastPollMs, ms);
+          }
           writeEvent(res, 'snapshot', { contestId, market, odds: odds ?? null });
           shedIfSlow();
           live = true;

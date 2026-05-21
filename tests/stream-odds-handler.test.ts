@@ -470,6 +470,37 @@ describe('GET /v1/stream/odds snapshot + live', () => {
     expect(refreshes[0]?.data?.odds).toMatchObject({ awayOddsAmerican: -115 });
   });
 
+  it('does not resurrect a stale buffered row after a null recovery snapshot (watermark preserved)', async () => {
+    sbMock.state.contest = { data: { jsonodds_id: 'jo-1' }, error: null };
+    sbMock.state.odds = { data: oddsRow(), error: null }; // initial baseline, poll_captured_at = T2
+    const res = makeRes();
+    await getOddsStreamHandler(makeReq({ contestId: '1', market: 'spread' }), res as unknown as Response);
+    fake.captured?.cb.onActive();
+    await flush();
+    expect(frames(res).filter((f) => f.event === 'snapshot')).toHaveLength(1);
+
+    // Source drops; the recovery snapshot returns null (current_odds absent) and
+    // is held in flight.
+    fake.captured?.cb.onDegraded('channel_error');
+    sbMock.state.odds = { data: null, error: null };
+    let releaseGate: () => void = () => undefined;
+    sbMock.state.oddsGate = new Promise<void>((r) => {
+      releaseGate = r;
+    });
+    fake.captured?.cb.onActive(); // recovery — runSnapshot awaits the gate
+    await flush();
+
+    // A stale/duplicate live row (older than the T2 baseline) buffers while gated.
+    fake.captured?.cb.onRefresh(spreadOdds({ pollCapturedAt: T1 })); // T1 < T2
+
+    releaseGate();
+    await flush();
+
+    // The recovery snapshot is null; the watermark stays at T2, so the stale T1
+    // row is dropped — a stream that emitted T2 must not resurrect older odds.
+    expect(eventsOf(res)).toEqual(['snapshot', 'degraded', 'snapshot']);
+  });
+
   it('unsubscribes and releases the slot when the client disconnects', async () => {
     sbMock.state.contest = { data: { jsonodds_id: 'jo-1' }, error: null };
     sbMock.state.odds = { data: oddsRow(), error: null };
