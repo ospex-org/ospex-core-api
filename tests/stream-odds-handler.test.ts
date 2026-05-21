@@ -1,9 +1,10 @@
 /**
- * Odds SSE connect-handler tests: param/contest guards, snapshot-first
- * ordering, the monotonic poll_captured_at watermark, degraded/resnapshot
- * passthrough, and disconnect cleanup. A hoisted Supabase double serves the
- * contest-resolve + snapshot reads; an injected fake OddsHub lets the test
- * drive live callbacks.
+ * Odds SSE connect-handler tests: param/contest guards, onActive-driven
+ * snapshot (no pre-readiness eager snapshot), the monotonic poll_captured_at
+ * watermark, coalesced buffering, the snapshot-first contract on query failure,
+ * degraded/recovery passthrough, and disconnect cleanup. A hoisted Supabase
+ * double serves the contest-resolve + snapshot reads; an injected fake OddsHub
+ * lets the test drive readiness/live callbacks.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
@@ -207,7 +208,7 @@ function oddsRow(o: Record<string, unknown> = {}): Record<string, unknown> {
     away_odds_american: -110,
     home_odds_american: -110,
     upstream_last_updated: T1,
-    poll_captured_at: T2,
+    poll_captured_at: T2, // baseline watermark
     changed_at: T1,
     ...o,
   };
@@ -265,90 +266,107 @@ describe('GET /v1/stream/odds snapshot + live', () => {
     expect(connectionStats().total).toBe(1); // stays open
   });
 
-  it('emits the snapshot first, then subscribes for live deltas', async () => {
+  it('does not snapshot until the live source is active (onActive)', async () => {
     sbMock.state.contest = { data: { jsonodds_id: 'jo-1' }, error: null };
     sbMock.state.odds = { data: oddsRow(), error: null };
     const res = makeRes();
     await getOddsStreamHandler(makeReq({ contestId: '1', market: 'spread' }), res as unknown as Response);
 
+    expect(fake.subscribeCalls).toBe(1);
+    expect(eventsOf(res)).not.toContain('snapshot'); // not before readiness
+
+    fake.captured?.cb.onActive();
+    await flush();
     const snap = frames(res).find((f) => f.event === 'snapshot');
     expect(snap?.data).toMatchObject({ contestId: '1', market: 'spread' });
     expect(snap?.data?.odds).toMatchObject({ market: 'spread', homeLine: -3.5, awayLine: 3.5 });
     expect(snap?.data?.odds).not.toHaveProperty('jsonoddsId');
-    expect(fake.subscribeCalls).toBe(1);
-    expect(fake.captured?.jid).toBe('jo-1');
-    expect(fake.captured?.market).toBe('spread');
   });
 
   it('forwards a newer change but drops one older than the snapshot watermark', async () => {
     sbMock.state.contest = { data: { jsonodds_id: 'jo-1' }, error: null };
-    sbMock.state.odds = { data: oddsRow(), error: null }; // snapshot poll_captured_at = T2
+    sbMock.state.odds = { data: oddsRow(), error: null }; // baseline poll_captured_at = T2
     const res = makeRes();
     await getOddsStreamHandler(makeReq({ contestId: '1', market: 'spread' }), res as unknown as Response);
+    fake.captured?.cb.onActive();
+    await flush();
 
     fake.captured?.cb.onChange(spreadOdds({ pollCapturedAt: T3, awayOddsAmerican: -120 }));
     expect(frames(res).filter((f) => f.event === 'change')).toHaveLength(1);
 
-    // Older than the last emitted (T3) → dropped.
-    fake.captured?.cb.onChange(spreadOdds({ pollCapturedAt: T1 }));
+    fake.captured?.cb.onChange(spreadOdds({ pollCapturedAt: T1 })); // older than T3 → dropped
     expect(frames(res).filter((f) => f.event === 'change')).toHaveLength(1);
   });
 
-  it('buffers live deltas during the snapshot query and flushes them after (snapshot first, stale dropped)', async () => {
+  it('buffers + coalesces live deltas during the snapshot query, then flushes the latest (snapshot first)', async () => {
     sbMock.state.contest = { data: { jsonodds_id: 'jo-1' }, error: null };
-    sbMock.state.odds = { data: oddsRow(), error: null }; // snapshot poll_captured_at = T2
+    sbMock.state.odds = { data: oddsRow(), error: null }; // baseline poll_captured_at = T2
     let releaseGate: () => void = () => undefined;
     sbMock.state.oddsGate = new Promise<void>((r) => {
       releaseGate = r;
     });
 
     const res = makeRes();
-    const p = getOddsStreamHandler(makeReq({ contestId: '1', market: 'spread' }), res as unknown as Response);
-    await flush(); // resolves contest, opens SSE, subscribes, blocks on the gate
+    await getOddsStreamHandler(makeReq({ contestId: '1', market: 'spread' }), res as unknown as Response);
+    fake.captured?.cb.onActive(); // triggers the (gated) snapshot
+    await flush();
 
-    expect(fake.captured).toBeDefined();
-    // A delta older than the snapshot and one newer arrive while snapshotting.
+    // Three deltas arrive while snapshotting: one stale, two newer. They must
+    // coalesce to a single latest delta (bounded buffer).
     fake.captured?.cb.onChange(spreadOdds({ pollCapturedAt: '2026-05-20T11:59:00.000Z' }));
+    fake.captured?.cb.onChange(spreadOdds({ pollCapturedAt: '2026-05-20T12:00:45.000Z', awayOddsAmerican: -115 }));
     fake.captured?.cb.onChange(spreadOdds({ pollCapturedAt: T3, awayOddsAmerican: -120 }));
     expect(eventsOf(res)).not.toContain('snapshot'); // nothing emitted yet
 
     releaseGate();
     await flush();
-    await p;
 
     const ev = eventsOf(res);
     expect(ev.indexOf('snapshot')).toBeGreaterThanOrEqual(0);
     expect(ev.indexOf('snapshot')).toBeLessThan(ev.indexOf('change')); // snapshot first
-    expect(frames(res).filter((f) => f.event === 'change')).toHaveLength(1); // stale one dropped
+    const changes = frames(res).filter((f) => f.event === 'change');
+    expect(changes).toHaveLength(1); // coalesced
+    expect(changes[0]?.data?.odds).toMatchObject({ awayOddsAmerican: -120 }); // the newest
   });
 
-  it('passes through a degraded signal and re-snapshots on recovery', async () => {
+  it('passes through a degraded signal and re-snapshots on recovery (onActive)', async () => {
     sbMock.state.contest = { data: { jsonodds_id: 'jo-1' }, error: null };
     sbMock.state.odds = { data: oddsRow(), error: null };
     const res = makeRes();
     await getOddsStreamHandler(makeReq({ contestId: '1', market: 'spread' }), res as unknown as Response);
+    fake.captured?.cb.onActive();
+    await flush();
 
     fake.captured?.cb.onDegraded('channel_error');
     expect(frames(res).find((f) => f.event === 'degraded')?.data).toMatchObject({ reason: 'channel_error' });
 
     sbMock.state.odds = { data: oddsRow({ poll_captured_at: '2026-05-20T12:02:00.000Z', away_odds_american: -200 }), error: null };
-    fake.captured?.cb.onResnapshot();
+    fake.captured?.cb.onActive();
     await flush();
     expect(frames(res).filter((f) => f.event === 'snapshot')).toHaveLength(2);
   });
 
-  it('on a snapshot query failure: emits degraded, goes live anyway, and still forwards deltas', async () => {
+  it('on a snapshot query failure stays pre-baseline (no deltas without a snapshot), then recovers', async () => {
     sbMock.state.contest = { data: { jsonodds_id: 'jo-1' }, error: null };
     sbMock.state.odds = { data: null, error: { message: 'odds boom' } }; // fetchMarketSnapshot throws
     const res = makeRes();
     await getOddsStreamHandler(makeReq({ contestId: '1', market: 'spread' }), res as unknown as Response);
+    fake.captured?.cb.onActive();
+    await flush();
 
     expect(frames(res).find((f) => f.event === 'degraded')?.data).toMatchObject({ reason: 'snapshot_failed' });
-    expect(frames(res).filter((f) => f.event === 'snapshot')).toHaveLength(0);
+    expect(eventsOf(res)).not.toContain('snapshot');
 
-    // The handler must be live (not stuck buffering) — a live delta flows.
+    // A delta now must NOT be emitted — there's no baseline yet (it buffers).
     fake.captured?.cb.onChange(spreadOdds({ pollCapturedAt: T3, awayOddsAmerican: -120 }));
-    expect(frames(res).filter((f) => f.event === 'change')).toHaveLength(1);
+    expect(eventsOf(res)).not.toContain('change');
+
+    // Recovery: the read succeeds → baseline, then the buffered delta flushes.
+    sbMock.state.odds = { data: oddsRow(), error: null }; // poll_captured_at = T2
+    fake.captured?.cb.onActive();
+    await flush();
+    expect(frames(res).filter((f) => f.event === 'snapshot')).toHaveLength(1);
+    expect(frames(res).filter((f) => f.event === 'change')).toHaveLength(1); // T3 > T2
   });
 
   it('unsubscribes and releases the slot when the client disconnects', async () => {
@@ -356,6 +374,8 @@ describe('GET /v1/stream/odds snapshot + live', () => {
     sbMock.state.odds = { data: oddsRow(), error: null };
     const res = makeRes();
     await getOddsStreamHandler(makeReq({ contestId: '1', market: 'spread' }), res as unknown as Response);
+    fake.captured?.cb.onActive();
+    await flush();
     expect(connectionStats().total).toBe(1);
 
     res.emitClose();

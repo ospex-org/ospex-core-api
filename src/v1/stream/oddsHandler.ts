@@ -2,30 +2,33 @@
  * GET /v1/stream/odds?contestId=&market= — the odds SSE connect handler.
  *
  * Odds is latest-state, not a durable log, so this is a simpler model than the
- * protocol stream (no cursor, no catch-up replay):
+ * protocol stream (no cursor, no catch-up replay). The contract:
  *
- *   1. Resolve contestId → jsonodds_id (server-side; the provider id never
- *      reaches the client). Unknown contest → 404 before the stream opens.
- *   2. Open the stream and send one `snapshot` event — the current per-market
- *      odds (or `null` if the writer hasn't populated it).
- *   3. Go live: forward `change` / `refresh` deltas from the shared OddsHub
- *      (one internal Realtime channel for the whole process).
+ *   - `snapshot {contestId, market, odds}` — the current per-market odds (or
+ *     `null`). Sent only once the internal live source is confirmed active
+ *     (`onActive` ⇒ Realtime SUBSCRIBED), and re-sent after a reconnect. The
+ *     client is live with this baseline. ALWAYS the first data the client acts
+ *     on — we never emit a delta before a snapshot.
+ *   - `change` / `refresh {contestId, market, odds}` — live deltas, classified
+ *     server-side; only after a snapshot.
+ *   - `degraded {reason}` — the live source is behind/unavailable; updates are
+ *     paused. May arrive before any snapshot (source down at connect → the
+ *     client gets no baseline until recovery) or after (source dropped). On
+ *     recovery a fresh `snapshot` resyncs (latest-state).
  *
- * Snapshot/live ordering: the handler subscribes to the hub BEFORE running the
- * snapshot query and buffers any live delta that arrives during it, then
- * flushes after the snapshot — so a delta can't be lost in the gap, and
- * `snapshot` is always the first event a client sees.
+ * Why snapshot-on-`onActive` and not eagerly: Realtime only delivers changes
+ * that occur after SUBSCRIBED, and that handshake is async. Snapshotting before
+ * the channel is live could miss an update committed in between (in neither the
+ * snapshot nor a delta). So the hub signals readiness and the snapshot is taken
+ * then; live deltas that arrive while the snapshot query is in flight are
+ * buffered (coalesced) and flushed after.
  *
- * Convergence is by a monotonic `poll_captured_at` watermark (the writer
- * advances it on every poll, change or not): the handler emits a delta only
- * when its `pollCapturedAt` is strictly newer than the last emitted one for
- * this (contestId, market). That makes the stream immune to the snapshot/live
- * race (a buffered delta older than the snapshot is dropped) and to duplicate
- * or out-of-order Realtime delivery.
- *
- * Degradation: if the internal source drops, the hub broadcasts — the handler
- * emits `degraded` and keeps the connection open; on recovery the hub triggers
- * a re-snapshot, which fully resyncs (latest-state) and resumes live.
+ * Convergence/dedup is a monotonic `poll_captured_at` watermark (the writer
+ * advances it every poll): a delta is emitted only when strictly newer than the
+ * last emitted for this (contestId, market). The buffer holds at most one
+ * (coalesced latest) delta — odds is latest-state and single-market, so an
+ * older buffered delta is always superseded — keeping per-connection memory
+ * bounded even if a snapshot read stalls during active updates.
  */
 
 import type { Request, Response } from 'express';
@@ -47,6 +50,8 @@ import { initSse, writeComment, writeEvent } from './sse.js';
 const HEARTBEAT_MS = 20_000;
 // Outbound buffer ceiling: a client that isn't draining gets shed (reconnects).
 const MAX_PENDING_BYTES = 1_000_000;
+// Backoff between baseline-snapshot retries after a query failure.
+const SNAPSHOT_RETRY_MS = 2_000;
 
 type LiveKind = 'change' | 'refresh';
 
@@ -80,11 +85,13 @@ export async function getOddsStreamHandler(req: Request, res: Response): Promise
   // pre-stream resolve still releases it (and unsubscribes if we got that far).
   let sub: OddsSubscriber | undefined;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
   const cleanup = (): void => {
     if (closed) return;
     closed = true;
     if (heartbeat) clearInterval(heartbeat);
+    if (retryTimer) clearTimeout(retryTimer);
     if (sub) getOddsHub().unsubscribe(sub);
     release(ip);
   };
@@ -127,12 +134,13 @@ export async function getOddsStreamHandler(req: Request, res: Response): Promise
   }
   const jid: string = jsonoddsId;
 
-  // ── snapshot-first state machine ──────────────────────────────────────────
-  let phase: 'snapshotting' | 'live' = 'snapshotting';
-  const pending: Array<{ kind: LiveKind; odds: MarketOdds }> = [];
-  let lastPollMs: number | undefined;
+  // ── state ─────────────────────────────────────────────────────────────────
+  let live = false; // a baseline snapshot has been sent
   let snapshotInFlight = false;
   let needsResnapshot = false;
+  let clientDegraded = false; // we've told the client it's behind (deduped)
+  let pendingDelta: { kind: LiveKind; odds: MarketOdds } | undefined; // coalesced buffer (≤1)
+  let lastPollMs: number | undefined; // watermark
 
   const shedIfSlow = (): void => {
     const len = (res as { writableLength?: number }).writableLength;
@@ -140,6 +148,12 @@ export async function getOddsStreamHandler(req: Request, res: Response): Promise
       logger.warn({ contestId, market, pending: len }, 'odds stream: shedding slow client (backpressure)');
       res.end(); // → 'close' → cleanup; client reconnects + re-snapshots
     }
+  };
+
+  const markDegraded = (reason: string): void => {
+    if (clientDegraded || closed) return; // deduped: one degraded per outage
+    clientDegraded = true;
+    writeEvent(res, 'degraded', { reason });
   };
 
   // Emit a live delta iff it's strictly newer (by poll_captured_at) than the
@@ -154,83 +168,98 @@ export async function getOddsStreamHandler(req: Request, res: Response): Promise
     shedIfSlow();
   };
 
-  // Go live and drain anything buffered during the snapshot query. Synchronous
-  // (no await), so no live delta can interleave between phase flip and flush.
-  const goLiveAndFlush = (): void => {
-    phase = 'live';
-    const buffered = pending.splice(0, pending.length);
-    for (const ev of buffered) emitLive(ev.kind, ev.odds);
-  };
-
-  const runSnapshot = async (): Promise<void> => {
-    if (snapshotInFlight) {
-      needsResnapshot = true; // fold concurrent resnapshot requests into the in-flight one
+  // Coalesce into the single buffer slot: keep the newest odds; the kind is a
+  // change if any coalesced delta was a change (a real move since the baseline).
+  const bufferDelta = (kind: LiveKind, odds: MarketOdds): void => {
+    const prev = pendingDelta;
+    if (prev === undefined) {
+      pendingDelta = { kind, odds };
       return;
     }
+    const newer = Date.parse(odds.pollCapturedAt) >= Date.parse(prev.odds.pollCapturedAt) ? odds : prev.odds;
+    const mergedKind: LiveKind = kind === 'change' || prev.kind === 'change' ? 'change' : 'refresh';
+    pendingDelta = { kind: mergedKind, odds: newer };
+  };
+
+  // Live deltas emit only once a baseline exists and no snapshot is mid-flight;
+  // otherwise they coalesce into the buffer and flush after the next snapshot.
+  const deliver = (kind: LiveKind, odds: MarketOdds): void => {
+    if (live && !snapshotInFlight) emitLive(kind, odds);
+    else bufferDelta(kind, odds);
+  };
+
+  const flushPending = (): void => {
+    const d = pendingDelta;
+    pendingDelta = undefined;
+    if (d) emitLive(d.kind, d.odds);
+  };
+
+  const scheduleRetry = (): void => {
+    if (closed || retryTimer !== undefined) return;
+    retryTimer = setTimeout(() => {
+      retryTimer = undefined;
+      void runSnapshot();
+    }, SNAPSHOT_RETRY_MS);
+    retryTimer.unref?.();
+  };
+
+  // Take (or refresh) the baseline. Only runs when the live source is active —
+  // if it's degraded we wait for onActive (recovery), so we never publish a
+  // baseline the stream can't keep current.
+  const runSnapshot = async (): Promise<void> => {
+    if (retryTimer !== undefined) {
+      clearTimeout(retryTimer);
+      retryTimer = undefined;
+    }
+    if (snapshotInFlight) {
+      needsResnapshot = true; // fold concurrent requests into the in-flight one
+      return;
+    }
+    if (getOddsHub().isDegraded()) return; // source down — onActive will retrigger
+
     snapshotInFlight = true;
+    let ok = true;
     try {
       do {
         needsResnapshot = false;
-        phase = 'snapshotting'; // buffer live deltas while the query is in flight
+        ok = true;
         let odds: MarketOdds | null = null;
-        let ok = true;
         try {
           odds = await fetchMarketSnapshot(sb, net, jid, market);
         } catch (err) {
           ok = false;
           logger.error({ err: err instanceof Error ? err.message : String(err), contestId, market }, 'odds stream: snapshot query failed');
-          if (!closed) writeEvent(res, 'degraded', { reason: 'snapshot_failed' });
         }
         if (closed) return;
         if (ok) {
-          // Reset the watermark to the snapshot (it's the authoritative current
-          // state). On a failed read we keep the prior watermark, if any.
           const ms = odds ? Date.parse(odds.pollCapturedAt) : NaN;
           lastPollMs = Number.isFinite(ms) ? ms : undefined;
           writeEvent(res, 'snapshot', { contestId, market, odds: odds ?? null });
           shedIfSlow();
+          live = true;
+          // The snapshot is the recovery signal — clear degraded if the source
+          // is healthy; if it dropped during the query, keep the client behind.
+          if (getOddsHub().isDegraded()) markDegraded('channel_error');
+          else clientDegraded = false;
+          flushPending();
+        } else {
+          // Stay pre-baseline (no deltas emitted without a snapshot) and retry,
+          // so the documented snapshot-first contract holds.
+          markDegraded('snapshot_failed');
+          scheduleRetry();
         }
-        // Always go live — even on a failed snapshot — so deltas keep flowing
-        // (a later change or a resnapshot rebuilds state) instead of buffering
-        // forever in 'snapshotting'.
-        goLiveAndFlush();
-      } while (needsResnapshot && !closed);
-
-      // Surface a degradation that's still in effect (e.g. connected mid-outage,
-      // or the source dropped during the query). By here goLiveAndFlush has run,
-      // so we're live; if we just resynced on recovery, isDegraded() is false
-      // and we stay quiet.
-      if (!closed && getOddsHub().isDegraded()) {
-        writeEvent(res, 'degraded', { reason: 'degraded' });
-      }
+      } while (needsResnapshot && !closed && ok);
     } finally {
       snapshotInFlight = false;
     }
   };
 
-  // Subscribe BEFORE the first snapshot so live deltas during the query buffer.
   sub = getOddsHub().subscribe(jid, market, {
-    onChange: (odds) => {
-      if (phase === 'live') emitLive('change', odds);
-      else pending.push({ kind: 'change', odds });
-    },
-    onRefresh: (odds) => {
-      if (phase === 'live') emitLive('refresh', odds);
-      else pending.push({ kind: 'refresh', odds });
-    },
-    onDegraded: (reason) => {
-      // While snapshotting, the post-snapshot isDegraded() check covers it.
-      if (phase === 'live' && !closed) writeEvent(res, 'degraded', { reason });
-    },
-    onResnapshot: () => {
+    onChange: (odds) => deliver('change', odds),
+    onRefresh: (odds) => deliver('refresh', odds),
+    onDegraded: (reason) => markDegraded(reason),
+    onActive: () => {
       void runSnapshot();
     },
   });
-
-  try {
-    await runSnapshot();
-  } catch (err) {
-    logger.error({ err: err instanceof Error ? err.message : String(err), contestId, market }, 'odds stream: initial snapshot failed');
-    if (!closed) writeEvent(res, 'degraded', { reason: 'internal_error' });
-  }
 }

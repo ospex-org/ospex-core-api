@@ -1,10 +1,10 @@
 /**
  * OddsHub tests. A fake Supabase Realtime channel lets the test drive
  * postgres_changes payloads and channel-status transitions directly, so the
- * classify → map → fan-out path and the degraded/resnapshot/hard-reset
- * lifecycle run exactly as in prod, without a websocket.
+ * classify → map → fan-out path and the readiness/degraded/reset lifecycle run
+ * exactly as in prod, without a websocket.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { OddsHub } from '../src/v1/stream/oddsHub.js';
 import type { MarketOdds, OddsMarket } from '../src/v1/utils/odds.js';
@@ -12,7 +12,6 @@ import type { MarketOdds, OddsMarket } from '../src/v1/utils/odds.js';
 const T1 = '2026-05-20T12:00:00.000Z';
 const T2 = '2026-05-20T12:00:30.000Z';
 
-beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
 
 interface FakeChannel {
@@ -65,12 +64,12 @@ interface Collector {
   changes: MarketOdds[];
   refreshes: MarketOdds[];
   degraded: string[];
-  resnaps: number;
+  actives: number;
   cb: {
     onChange: (o: MarketOdds) => void;
     onRefresh: (o: MarketOdds) => void;
     onDegraded: (r: string) => void;
-    onResnapshot: () => void;
+    onActive: () => void;
   };
 }
 function collector(jsonoddsId: string, market: OddsMarket): Collector {
@@ -80,13 +79,13 @@ function collector(jsonoddsId: string, market: OddsMarket): Collector {
     changes: [],
     refreshes: [],
     degraded: [],
-    resnaps: 0,
+    actives: 0,
     cb: {
       onChange: (o) => c.changes.push(o),
       onRefresh: (o) => c.refreshes.push(o),
       onDegraded: (r) => c.degraded.push(r),
-      onResnapshot: () => {
-        c.resnaps += 1;
+      onActive: () => {
+        c.actives += 1;
       },
     },
   };
@@ -111,8 +110,9 @@ function evt(newRow: Record<string, unknown> | null, oldRow: Record<string, unkn
   return { eventType: 'UPDATE', new: newRow ?? {}, old: oldRow ?? {} };
 }
 
-function makeHub(client: SupabaseClient): OddsHub {
-  return new OddsHub({ getClient: () => client, getNetwork: () => 'polygon', resetDelayMs: 10_000 });
+// Large reset delay so the backstop timer never fires in tests that don't drive it.
+function makeHub(client: SupabaseClient, resetDelayMs = 1e9): OddsHub {
+  return new OddsHub({ getClient: () => client, getNetwork: () => 'polygon', resetDelayMs });
 }
 
 describe('OddsHub lifecycle', () => {
@@ -130,6 +130,21 @@ describe('OddsHub lifecycle', () => {
     expect(channels[0]?.removed).toBe(true);
     expect(hub.stats().channelOpen).toBe(false);
   });
+
+  it('fires onActive (deferred) for a subscriber that joins an already-subscribed channel', async () => {
+    const { client, channels } = makeRealtime();
+    const hub = makeHub(client);
+    const c1 = collector('jo-1', 'spread');
+    hub.subscribe(c1.jsonoddsId, c1.market, c1.cb);
+    channels[0]?.status('SUBSCRIBED');
+    expect(c1.actives).toBe(1);
+
+    const c2 = collector('jo-2', 'total');
+    hub.subscribe(c2.jsonoddsId, c2.market, c2.cb);
+    expect(c2.actives).toBe(0); // deferred to a microtask
+    await Promise.resolve();
+    expect(c2.actives).toBe(1); // late joiner caught up to the live channel
+  });
 });
 
 describe('OddsHub fan-out + classification', () => {
@@ -144,9 +159,7 @@ describe('OddsHub fan-out + classification', () => {
     expect(c.changes).toHaveLength(1);
     const got = c.changes[0];
     expect(got?.market).toBe('spread');
-    // spread mapping: line is the home spread; awayLine = -homeLine.
     expect(got).toMatchObject({ homeLine: -3.5, awayLine: 3.5, awayOddsAmerican: -120 });
-    // jsonoddsId is never on the public shape.
     expect(got).not.toHaveProperty('jsonoddsId');
     expect(c.refreshes).toHaveLength(0);
   });
@@ -217,12 +230,26 @@ describe('OddsHub fan-out + classification', () => {
   });
 });
 
-describe('OddsHub degradation + recovery', () => {
-  it('broadcasts degraded once per outage, then resnapshot on return to SUBSCRIBED', () => {
+describe('OddsHub readiness + degradation', () => {
+  it('broadcasts onActive on the first SUBSCRIBED (initial snapshot trigger)', () => {
     const { client, channels } = makeRealtime();
     const hub = makeHub(client);
     const c = collector('jo-1', 'spread');
     hub.subscribe(c.jsonoddsId, c.market, c.cb);
+
+    channels[0]?.status('SUBSCRIBED');
+    expect(c.actives).toBe(1);
+    expect(hub.stats().subscribed).toBe(true);
+  });
+
+  it('broadcasts degraded once per outage, then onActive on return to SUBSCRIBED', () => {
+    const { client, channels } = makeRealtime();
+    const hub = makeHub(client);
+    const c = collector('jo-1', 'spread');
+    hub.subscribe(c.jsonoddsId, c.market, c.cb);
+
+    channels[0]?.status('SUBSCRIBED'); // initial
+    expect(c.actives).toBe(1);
 
     channels[0]?.status('CHANNEL_ERROR');
     expect(c.degraded).toEqual(['channel_error']);
@@ -231,24 +258,28 @@ describe('OddsHub degradation + recovery', () => {
     channels[0]?.status('CHANNEL_ERROR'); // still degraded — must not re-fire
     expect(c.degraded).toHaveLength(1);
 
-    channels[0]?.status('SUBSCRIBED');
-    expect(c.resnaps).toBe(1);
+    channels[0]?.status('SUBSCRIBED'); // recovery
+    expect(c.actives).toBe(2);
     expect(hub.isDegraded()).toBe(false);
   });
 
-  it('does not resnapshot on the very first SUBSCRIBED (no prior degradation)', () => {
+  it('treats an unexpected CLOSED as degraded', () => {
     const { client, channels } = makeRealtime();
     const hub = makeHub(client);
     const c = collector('jo-1', 'spread');
     hub.subscribe(c.jsonoddsId, c.market, c.cb);
 
     channels[0]?.status('SUBSCRIBED');
-    expect(c.resnaps).toBe(0);
+    channels[0]?.status('CLOSED');
+    expect(c.degraded).toEqual(['closed']);
+    expect(hub.isDegraded()).toBe(true);
+    expect(hub.stats().subscribed).toBe(false);
   });
 
-  it('hard-resets the channel as a backstop when the library has not rejoined', async () => {
+  it('hard-resets the channel as a backstop and ignores the torn-down channel afterwards', async () => {
+    vi.useFakeTimers();
     const { client, channels } = makeRealtime();
-    const hub = makeHub(client);
+    const hub = makeHub(client, 10_000);
     const c = collector('jo-1', 'spread');
     hub.subscribe(c.jsonoddsId, c.market, c.cb);
 
@@ -258,10 +289,15 @@ describe('OddsHub degradation + recovery', () => {
     await vi.advanceTimersByTimeAsync(10_000); // reset backstop fires
 
     expect(channels[0]?.removed).toBe(true);
-    expect(channels).toHaveLength(2); // a fresh channel was created
+    expect(channels).toHaveLength(2);
 
-    channels[1]?.status('SUBSCRIBED'); // fresh channel comes up (still degraded → resnapshot)
-    expect(c.resnaps).toBe(1);
+    // A late status callback from the OLD channel must be ignored.
+    channels[0]?.status('SUBSCRIBED');
+    expect(c.actives).toBe(0);
+
+    // The current channel coming up triggers onActive (resnapshot).
+    channels[1]?.status('SUBSCRIBED');
+    expect(c.actives).toBe(1);
     expect(hub.isDegraded()).toBe(false);
   });
 });

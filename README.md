@@ -142,7 +142,7 @@ Detail-only fields surfaced here (omitted on list rows): `jsonoddsId`, `rundownI
 
 Current upstream reference odds for the contest's underlying game. One snapshot read of `current_odds` keyed by the contest's `jsonodds_id`. Distinct from the Realtime subscribe path on the SDK side (`client.odds.subscribe(...)`) — the snapshot is "what are the odds right now?", subscribe is "stream me changes."
 
-**Source labelling**: this is upstream reference data (JSONOdds live updates / Sportspage opening lines via `ospex-writer`), NOT Ospex liquidity. Consumers should label it that way to users — the SDK + CLI surfacing this endpoint do.
+**Source labelling**: this is upstream/reference odds (what the broader market is pricing the game at, via `ospex-writer`), NOT Ospex liquidity. Consumers should label it that way to users — the SDK + CLI surfacing this endpoint do.
 
 Response shape:
 
@@ -406,20 +406,20 @@ Operational notes:
 
 ### Odds stream (Phase 1.5)
 
-`GET /v1/stream/odds?contestId=<numeric>&market=<moneyline|spread|total>` opens a Server-Sent Events stream of upstream reference odds for a contest's underlying game. Both query params are **required**. This is a separate route from the protocol `/v1/stream/:resource` streams because odds is **latest-state, not a durable log** — there's no cursor, no catch-up replay, and no `Last-Event-ID` resume. The server maintains one internal Supabase Realtime subscription on `current_odds` for the whole process and fans out to every connected client (the N→1 collapse); the Supabase boundary stays server-side and the provider's `jsonoddsId` is **never** on the wire (it's resolved from `contestId` internally).
+`GET /v1/stream/odds?contestId=<numeric>&market=<moneyline|spread|total>` opens a Server-Sent Events stream of upstream reference odds for a contest's underlying game. Both query params are **required**. This is a separate route from the protocol `/v1/stream/:resource` streams because odds is **latest-state, not a durable log** — there's no cursor, no catch-up replay, and no `Last-Event-ID` resume. The server maintains one internal `current_odds` subscription for the whole process and fans out to every connected client (the N→1 collapse); that internal source stays server-side and the provider game id is **never** on the wire (it's resolved from `contestId` internally).
 
-**Source labelling**: as with the REST snapshot, this is upstream reference data (JSONOdds live / Sportspage opening lines via `ospex-writer`), NOT Ospex liquidity — surface it to users that way.
+**Source labelling**: this is upstream/reference odds (what the broader market is pricing the game at, via `ospex-writer`), NOT Ospex liquidity — surface it to users that way.
 
 Events:
-- `event: snapshot` — `data: { contestId, market, odds }` where `odds` is the current per-market shape (same shapes as `GET /v1/contests/:contestId/odds` — moneyline / spread / total) or `null` when the writer hasn't populated that market (or the contest has no upstream linkage). Always the **first** event, and re-sent on internal recovery (see `degraded`).
+- `event: snapshot` — `data: { contestId, market, odds }` where `odds` is the current per-market shape (same shapes as `GET /v1/contests/:contestId/odds` — moneyline / spread / total) or `null` when the writer hasn't populated that market (or the contest has no upstream linkage). It is the baseline you're live from, and is re-sent on recovery. **The server never emits a `change`/`refresh` before a `snapshot`** — if the baseline read fails it retries (staying behind a `degraded`) rather than streaming deltas without a baseline.
 - `event: change` — `data: { contestId, market, odds }`. A genuine price move (a tracked column changed, or `changedAt` advanced).
 - `event: refresh` — `data: { contestId, market, odds }`. The writer re-polled and saw no price change (liveness). Usually you only care about `change`.
-- `event: degraded` — `data: { reason }`. The internal source dropped; the stream is briefly behind. The connection stays open — on recovery the server sends a fresh `snapshot` (which fully resyncs, since odds is latest-state) and resumes live.
+- `event: degraded` — `data: { reason }`. The internal source is behind/unavailable; updates are paused. It can arrive **before** any snapshot (the source was down at connect — you get no baseline until it recovers) or after (the source dropped). The connection stays open; on recovery the server sends a fresh `snapshot` (which fully resyncs, since odds is latest-state) and resumes live.
 - `: hb` comment heartbeats (~20s).
 
 Apply semantics:
 - **No cursor** — there's no `id:` on these events; don't try to resume with `Last-Event-ID`. On any disconnect, just reconnect; the new connection re-snapshots.
-- **Latest-state convergence** — the server only emits a delta whose `pollCapturedAt` is strictly newer than the last one emitted for this stream, so duplicates and out-of-order Realtime delivery are already filtered. Treat each `change`/`refresh`/`snapshot` as the current value for `(contestId, market)`.
+- **Latest-state convergence** — the server only emits a delta whose `pollCapturedAt` is strictly newer than the last one emitted for this stream, so duplicates and out-of-order delivery are already filtered. Treat each `change`/`refresh`/`snapshot` as the current value for `(contestId, market)`.
 - Unknown `market` (or non-numeric `contestId`) → `400`; unknown contest → `404`; both *before* the stream opens.
 - Same gzip exemption and concurrent-connection cap as the protocol streams (shared budget; `429` when full).
 

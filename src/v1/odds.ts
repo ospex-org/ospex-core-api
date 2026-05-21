@@ -7,11 +7,10 @@
  * upstream provider doesn't carry odds for this game).
  *
  * Scope: this is **upstream reference odds** — what the broader sports
- * betting market is currently pricing the game at, sourced from
- * JSONOdds (live) / Sportspage (opening lines) by `ospex-writer` on a
- * ~30s polling cycle. Ospex commitments are user-priced and don't have
- * to match these. The SDK and CLI surfacing this endpoint label it as
- * reference data for the same reason.
+ * betting market is currently pricing the game at, captured upstream by
+ * `ospex-writer` on a ~30s polling cycle. Ospex commitments are
+ * user-priced and don't have to match these. The SDK and CLI surfacing
+ * this endpoint label it as reference data for the same reason.
  *
  * Endpoint shape is contest-centric (not jsonodds-id-centric) because
  * the user-facing flow starts from an Ospex contest ID. Resolving
