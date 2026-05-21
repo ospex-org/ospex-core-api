@@ -398,7 +398,7 @@ Events:
 - `: hb` comment heartbeats (~20s) keep the connection under the platform idle timeout.
 
 Operational notes:
-- **Reconnect** with the last `id` you saw (a live cursor): either as `?cursor=` or via the standard `Last-Event-ID` header (a native `EventSource` sends it automatically). The server replays missed deltas from there, re-scanning the overlap window so a row committed late under the `now()`-based schema isn't missed, then emits `ready`.
+- **Reconnect** with the last `id` you saw (a live cursor): a native `EventSource` resends it automatically as the `Last-Event-ID` header, or pass it as `?cursor=`. **`Last-Event-ID` takes precedence** over `?cursor=` — on an `EventSource` auto-reconnect the original URL's `?cursor=` is stale, while the header is the true resume point. The server replays missed deltas from there, re-scanning the overlap window so a row committed late under the `now()`-based schema isn't missed, then emits `ready`.
 - SSE is **exempt from gzip** (compression buffers streams would defeat it) and from the request-rate limiter; a **concurrent-connection cap** (per-IP + total) bounds resource use instead — `429` when full.
 - `position_fills` is append-only (every event delivered); the other four are state-delta convergence (latest state per row).
 - Backed by the same `(network, row_updated_at, id)` indexes as recovery (indexer migration 048) — apply those before production stream traffic.
@@ -504,7 +504,7 @@ src/
                        #   /claim-params, /by-tx/:txHash, /claim-result/:txHash
     fills.ts           # GET /v1/fills — append-only fill event recovery
     stream/            # GET /v1/stream/:resource — SSE live deltas
-      handler.ts       #   connect lifecycle: cap → catch-up → buffer flush → live
+      handler.ts       #   lifecycle: cap → subscribe(buffer) → catch-up → flush → live
       hub.ts           #   per-resource poller + fan-out + resync watcher (N→1)
       resources.ts     #   per-resource registry (columns, toBody, filters)
       sse.ts           #   SSE wire helpers (event/comment frames)

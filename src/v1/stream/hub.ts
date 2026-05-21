@@ -321,11 +321,16 @@ export class StreamHub {
       const net = this.deps.getNetwork();
       const client = this.deps.getClient();
       if (this.resyncHighId === null) {
+        // Baseline EXCLUDES recoveries completed within the grace window, so one
+        // completing right around the first subscribe isn't absorbed — it has an
+        // id > baseline and is broadcast by the same poll (fall through below).
+        const cutoff = new Date(Date.now() - this.deps.resyncGraceMs).toISOString();
         const { data, error } = await client
           .from('recovery_runs')
           .select('id')
           .eq('network', net)
           .eq('status', 'complete')
+          .lt('completed_at', cutoff)
           .order('id', { ascending: false })
           .limit(1);
         if (error) {
@@ -334,7 +339,7 @@ export class StreamHub {
         }
         const top = (data ?? [])[0] as { id: string | number } | undefined;
         this.resyncHighId = top ? BigInt(String(top.id)) : 0n;
-        return;
+        // No early return: fall through so within-grace completions get broadcast.
       }
 
       const { data, error } = await client

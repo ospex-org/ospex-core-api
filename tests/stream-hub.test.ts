@@ -36,6 +36,7 @@ interface QState {
   lteTs?: string;
   gtId?: string;
   gtCompletedAt?: string;
+  ltCompletedAt?: string;
   limit: number;
   descId: boolean;
   eqStatus?: string;
@@ -50,6 +51,10 @@ function datasetClient(rows: () => DRow[], recovery: () => RRow[]): SupabaseClie
       if (st.gtCompletedAt !== undefined) {
         const c = Date.parse(st.gtCompletedAt);
         r = r.filter((x) => x.completed_at !== undefined && Date.parse(x.completed_at) > c);
+      }
+      if (st.ltCompletedAt !== undefined) {
+        const c = Date.parse(st.ltCompletedAt);
+        r = r.filter((x) => x.completed_at !== undefined && Date.parse(x.completed_at) < c);
       }
       r = [...r].sort((a, b) => (st.descId ? b.id - a.id : a.id - b.id));
       return r.slice(0, st.limit);
@@ -92,6 +97,10 @@ function datasetClient(rows: () => DRow[], recovery: () => RRow[]): SupabaseClie
     };
     b['lte'] = (col: string, val: unknown) => {
       if (col === 'row_updated_at') st.lteTs = String(val);
+      return b;
+    };
+    b['lt'] = (col: string, val: unknown) => {
+      if (col === 'completed_at') st.ltCompletedAt = String(val);
       return b;
     };
     b['gt'] = (col: string, val: unknown) => {
@@ -306,25 +315,7 @@ describe('StreamHub per-subscriber recovery check (blocker 3)', () => {
     const c = collector('positions');
     const sub = hub.subscribe('positions', {}, c.cb);
     await flush(); // checkRecentRecovery is async
-    expect(c.resyncs).toContain('recovery');
-    hub.unsubscribe(sub);
-  });
-
-  it('does NOT re-sync when the only recovery is older than the grace window', async () => {
-    const recovery: RRow[] = [
-      { id: 1, kind: 'reorg', status: 'complete', completed_at: new Date(NOW - 120_000).toISOString() },
-    ];
-    const hub = new StreamHub({
-      getClient: () => datasetClient(() => [], () => recovery),
-      getNetwork: () => 'polygon',
-      pollMs: 1e9,
-      resyncMs: 1e9,
-      resyncGraceMs: 60_000,
-    });
-    const c = collector('positions');
-    const sub = hub.subscribe('positions', {}, c.cb);
-    await flush();
-    expect(c.resyncs).toHaveLength(0);
+    expect(c.resyncs).toContain('recovery'); // checkRecentRecovery's reason
     hub.unsubscribe(sub);
   });
 });
@@ -367,6 +358,47 @@ describe('StreamHub resync', () => {
     await hub.pollResync();
     expect(c.resyncs).toEqual(['reorg', 'backfill']);
 
+    hub.unsubscribe(sub);
+  });
+
+  it('does not absorb a within-grace recovery — the baseline excludes it and the first poll broadcasts it', async () => {
+    // The race: a recovery completing right around the first subscribe must not
+    // be swallowed by the baseline. The baseline excludes completions newer than
+    // the grace window, so this one has id > baseline and is broadcast.
+    const recovery: RRow[] = [
+      { id: 9, kind: 'reorg', status: 'complete', completed_at: new Date(NOW - 5_000).toISOString() },
+    ];
+    const hub = new StreamHub({
+      getClient: () => datasetClient(() => [], () => recovery),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+      resyncGraceMs: 60_000,
+    });
+    const c = collector('positions');
+    const sub = hub.subscribe('positions', {}, c.cb); // kicks the immediate baseline + broadcast
+    await flush();
+    // 'reorg' is the recovery's kind, emitted only by the broadcast path — its
+    // presence proves the baseline did NOT absorb the within-grace completion.
+    expect(c.resyncs).toContain('reorg');
+    hub.unsubscribe(sub);
+  });
+
+  it('absorbs a recovery older than the grace window (a fresh snapshot already has it)', async () => {
+    const recovery: RRow[] = [
+      { id: 9, kind: 'reorg', status: 'complete', completed_at: new Date(NOW - 120_000).toISOString() },
+    ];
+    const hub = new StreamHub({
+      getClient: () => datasetClient(() => [], () => recovery),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+      resyncGraceMs: 60_000,
+    });
+    const c = collector('positions');
+    const sub = hub.subscribe('positions', {}, c.cb);
+    await flush();
+    expect(c.resyncs).toHaveLength(0);
     hub.unsubscribe(sub);
   });
 });

@@ -2,18 +2,20 @@
  * GET /v1/stream/:resource — the SSE connect handler.
  *
  * Lifecycle:
- *   1. Validate resource + filters + resume cursor (`?cursor=` or, for native
- *      EventSource auto-reconnect, the `Last-Event-ID` header); enforce the
- *      concurrent-connection cap (429 when full).
+ *   1. Validate resource + filters + resume cursor (the `Last-Event-ID` header
+ *      — what a native EventSource auto-sends on reconnect — or `?cursor=`);
+ *      enforce the concurrent-connection cap (429 when full).
  *   2. Open the SSE response.
- *   3. Catch up: replay missed deltas from the cursor (overlap-aware for a
- *      `live` cursor; strict keyset paging thereafter).
- *   4. Attach to the shared poller for live deltas and emit `ready` (only when
- *      catch-up completed cleanly). Deltas committed during catch-up are caught
- *      by the poller's overlap re-scan (a fresh read), so no buffer is needed.
+ *   3. Subscribe to the shared poller, buffering live deltas. Subscribing
+ *      BEFORE catch-up is what makes the handoff gap-free: the hub dedupes
+ *      globally per resource, so a row the poller emits to another subscriber
+ *      during this client's catch-up would otherwise be marked emitted and
+ *      never fanned here. Buffering from before catch-up captures those.
+ *   4. Catch up from the cursor (reads the DB directly, so it's independent of
+ *      the poller's dedupe), then flush the buffer and emit `ready`.
  *   5. On disconnect: unsubscribe, clear the heartbeat, release the cap slot.
  *
- * Events: `delta` (id = opaque live cursor), `resync` (re-snapshot), `ready`
+ * Events: `delta` (id = opaque resume cursor), `resync` (re-snapshot), `ready`
  * (catch-up complete, now live). The cursor is OPAQUE — clients store the last
  * `id` to resume and never decode it. Deltas are NOT ordered by cursor (a
  * late-committed row can arrive after a newer one under the now()-based
@@ -35,7 +37,7 @@ import {
 import { recoveryKeysetExpr } from '../../lib/recovery.js';
 import type { ApiError } from '../../middleware/errorHandler.js';
 import { acquire, release } from './connections.js';
-import { getStreamHub, type Subscriber } from './hub.js';
+import { getStreamHub } from './hub.js';
 import { initSse, writeComment, writeEvent } from './sse.js';
 import {
   STREAM_RESOURCES,
@@ -48,6 +50,9 @@ import {
 const HEARTBEAT_MS = 20_000;
 const CATCHUP_PAGE = 500;
 const CATCHUP_MAX_PAGES = 50;
+// Live deltas can pile up during catch-up. Beyond this we stop buffering and
+// tell the client to re-snapshot rather than hold unbounded memory per connection.
+const MAX_LIVE_BUFFER = 2_000;
 // Outbound buffer ceiling: a client that isn't draining gets shed (forced to reconnect).
 const MAX_PENDING_BYTES = 1_000_000;
 
@@ -82,10 +87,12 @@ export function getStreamHandler(req: Request, res: Response): void {
     return;
   }
 
-  // Resume cursor: explicit ?cursor= wins; otherwise the Last-Event-ID header a
-  // native EventSource auto-sends on reconnect (= the last `id:` we emitted).
-  const cursorRaw =
-    req.query.cursor !== undefined ? String(req.query.cursor) : (req.header('Last-Event-ID') ?? undefined);
+  // Resume cursor: the Last-Event-ID header wins. A native EventSource reconnect
+  // reuses the original request URL (so a stale `?cursor=` would replay from the
+  // initial point) but sends Last-Event-ID = the last `id:` we emitted, which is
+  // the correct resume point. `?cursor=` is the fallback for first connect / the
+  // fetch-based SDK transport.
+  const cursorRaw = req.header('Last-Event-ID') ?? (req.query.cursor !== undefined ? String(req.query.cursor) : undefined);
   let cursor: StreamCursor | null = null;
   if (cursorRaw !== undefined && cursorRaw !== '') {
     try {
@@ -109,13 +116,31 @@ export function getStreamHandler(req: Request, res: Response): void {
     }
   };
 
-  let sub: Subscriber | undefined;
+  // Subscribe BEFORE catch-up so no live delta is lost to global dedupe (see
+  // header). Live deltas buffer until catch-up finishes, then flush in order.
+  let liveMode = false;
+  let bufferOverflow = false;
+  const buffer: Array<{ body: unknown; cursorId: string }> = [];
+  const sub = getStreamHub().subscribe(name, filters, {
+    onDelta: (body, cursorId) => {
+      if (liveMode) {
+        writeEvent(res, 'delta', body, cursorId);
+        shedIfSlow();
+      } else if (buffer.length < MAX_LIVE_BUFFER) {
+        buffer.push({ body, cursorId });
+      } else {
+        bufferOverflow = true; // too much live activity during catch-up — resync instead
+      }
+    },
+    onResync: (reason) => writeEvent(res, 'resync', { reason }),
+  });
+
   let closed = false;
   const cleanup = (): void => {
     if (closed) return;
     closed = true;
     clearInterval(heartbeat);
-    if (sub) getStreamHub().unsubscribe(sub);
+    getStreamHub().unsubscribe(sub);
     release(ip);
   };
   const heartbeat = setInterval(() => writeComment(res, 'hb'), HEARTBEAT_MS);
@@ -124,27 +149,27 @@ export function getStreamHandler(req: Request, res: Response): void {
   res.on('error', cleanup);
 
   void (async () => {
-    const status: CatchupStatus = cursor
-      ? await runCatchUp(res, resource, filters, cursor, () => closed, shedIfSlow)
-      : 'complete';
-    if (closed) return;
+    try {
+      const status: CatchupStatus = cursor
+        ? await runCatchUp(res, resource, filters, cursor, () => closed, shedIfSlow)
+        : 'complete';
+      if (closed) return;
 
-    // Attach to live AFTER catch-up. Deltas committed during catch-up are
-    // re-read by the poller's overlap re-scan (last-received-wins), so there's
-    // no need to buffer them per-connection.
-    sub = getStreamHub().subscribe(name, filters, {
-      onDelta: (body, cursorId) => {
-        writeEvent(res, 'delta', body, cursorId);
+      liveMode = true;
+      if (bufferOverflow) {
+        buffer.length = 0;
+        writeEvent(res, 'resync', { reason: 'buffer_overflow' });
+      } else {
+        const buffered = buffer.splice(0);
+        for (const d of buffered) writeEvent(res, 'delta', d.body, d.cursorId);
         shedIfSlow();
-      },
-      onResync: (reason) => writeEvent(res, 'resync', { reason }),
-    });
-    // Lost the race with a disconnect during catch-up/subscribe — don't leak.
-    if (closed) {
-      getStreamHub().unsubscribe(sub);
-      return;
+      }
+      // `ready` means "catch-up complete, now live" — only when that's true.
+      if (status === 'complete' && !bufferOverflow) writeEvent(res, 'ready', { resource: name });
+    } catch (err) {
+      logger.error({ err: err instanceof Error ? err.message : String(err), resource: name }, 'stream: catch-up/handoff failed');
+      writeEvent(res, 'resync', { reason: 'internal_error' });
     }
-    if (status === 'complete') writeEvent(res, 'ready', { resource: name });
   })();
 }
 

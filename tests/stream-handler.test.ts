@@ -9,11 +9,15 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 
 // Mutable catch-up response the handler's runCatchUp sees via getSupabase().
 const sb = vi.hoisted(() => {
-  const state: { response: { data: unknown; error: unknown } } = { response: { data: [], error: null } };
+  const state: { response: { data: unknown; error: unknown }; lastOr?: string } = { response: { data: [], error: null } };
   const client = {
     from: () => {
       const b: Record<string, unknown> = {};
-      for (const m of ['select', 'eq', 'or', 'lte', 'order', 'limit']) b[m] = () => b;
+      for (const m of ['select', 'eq', 'lte', 'order', 'limit']) b[m] = () => b;
+      b['or'] = (e: string) => {
+        state.lastOr = e; // capture the catch-up keyset to assert which cursor was used
+        return b;
+      };
       b['then'] = (resolve: (v: unknown) => void) => resolve(state.response);
       return b;
     },
@@ -30,7 +34,7 @@ const { encodeCursor } = await import('../src/lib/cursor.js');
 
 function emptyClient(): SupabaseClient {
   const b: Record<string, unknown> = {};
-  for (const m of ['select', 'eq', 'or', 'gt', 'lte', 'order', 'limit']) b[m] = () => b;
+  for (const m of ['select', 'eq', 'or', 'gt', 'lt', 'lte', 'order', 'limit']) b[m] = () => b;
   b['then'] = (resolve: (v: unknown) => void) => resolve({ data: [], error: null });
   return { from: () => b } as unknown as SupabaseClient;
 }
@@ -41,6 +45,7 @@ beforeEach(() => {
   hub = new StreamHub({ getClient: () => emptyClient(), getNetwork: () => 'polygon', pollMs: 1e9, resyncMs: 1e9 });
   __setStreamHubForTest(hub);
   sb.state.response = { data: [], error: null };
+  sb.state.lastOr = undefined;
 });
 afterEach(() => {
   __setStreamHubForTest(undefined);
@@ -184,6 +189,23 @@ describe('GET /v1/stream/:resource lifecycle', () => {
     expect(ev).toContain('delta'); // catch-up replayed the missed row
     expect(ev.indexOf('delta')).toBeLessThan(ev.indexOf('ready')); // delta before ready
     expect(ev).toContain('ready');
+  });
+
+  it('prefers Last-Event-ID over a stale ?cursor= on reconnect', async () => {
+    // Native EventSource reconnects reuse the original URL (stale ?cursor=) and
+    // send Last-Event-ID = the true resume point. The header must win.
+    const headerCursor = encodeCursor({ t: 'fills', s: '2026-05-20T11:00:00.000Z', i: '1', k: 'live' });
+    const queryCursor = encodeCursor({ t: 'fills', s: '2026-05-20T10:00:00.000Z', i: '2', k: 'live' });
+    const res = makeRes();
+    getStreamHandler(
+      makeReq({ resource: 'fills', query: { cursor: queryCursor }, headers: { 'Last-Event-ID': headerCursor } }),
+      res as unknown as Response,
+    );
+    await flush();
+    // Catch-up's first-page keyset floors the HEADER cursor (11:00:00 − 30s),
+    // not the stale query cursor (10:00:00 − 30s).
+    expect(sb.state.lastOr).toContain('2026-05-20T10:59:30.000Z');
+    expect(sb.state.lastOr).not.toContain('09:59:30');
   });
 
   it('catch-up failure emits resync and NOT ready (#2)', async () => {
