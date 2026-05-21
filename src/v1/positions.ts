@@ -37,6 +37,7 @@ import type {
   PendingSettlePosition,
   PositionBase,
 } from './utils/positionFetch.js';
+import { nextCursor, parseRecovery, recoveryKeysetExpr } from '../lib/recovery.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 
 const DEFAULT_LIMIT = 50;
@@ -174,6 +175,110 @@ export async function getPositionsByAddressHandler(req: Request, res: Response):
     pagination: { limit: lo.limit, offset: lo.offset, total, hasMore: lo.offset + positions.length < total },
   };
   res.status(200).json(body);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// GET /v1/positions?since=<cursor>   (recovery mode — positions stream)
+//
+// Cursor-ordered (row_updated_at, id) catch-up. The address-scoped
+// /v1/positions/:address endpoint stays the snapshot/history surface;
+// this bare endpoint is the recovery side, surfacing fill / claim
+// transitions a disconnected client missed. Identity filters: address,
+// speculationId (both optional). State-delta convergence (latest state
+// per position), keyed client-side on (speculationId, userAddress,
+// positionType).
+// ──────────────────────────────────────────────────────────────────────
+
+interface PositionRecoveryBody {
+  speculationId: string;
+  userAddress: string;
+  positionType: 0 | 1 | null;
+  riskAmountUSDC: number;
+  profitAmountUSDC: number;
+  claimed: boolean;
+  positionCreatedAt: string | null;
+  claimedAt: string | null;
+}
+
+interface PositionRecoveryRow {
+  speculation_id: string | number;
+  user_address: string;
+  position_type: 'upper' | 'lower' | null;
+  risk_amount: string | number | null;
+  profit_amount: string | number | null;
+  claimed: boolean | null;
+  claimed_at: string | null;
+  position_created_at: string | null;
+  id: string | number;
+  row_updated_at: string;
+}
+
+const POSITION_RECOVERY_COLUMNS =
+  'speculation_id, user_address, position_type, risk_amount, profit_amount, ' +
+  'claimed, claimed_at, position_created_at, id, row_updated_at';
+
+export async function getPositionsRecoveryHandler(req: Request, res: Response): Promise<void> {
+  const config = loadConfig();
+  const sb = getSupabase();
+
+  const recovery = parseRecovery(req, 'positions');
+  if ('errorBody' in recovery) {
+    res.status(400).json(recovery.errorBody);
+    return;
+  }
+
+  let address: string | undefined;
+  if (req.query.address !== undefined) {
+    const lowered = String(req.query.address).trim().toLowerCase();
+    if (!isAddress(lowered)) {
+      res.status(400).json({ error: 'address must be a valid Ethereum address.', code: 'INVALID_PARAM' } satisfies ApiError);
+      return;
+    }
+    address = lowered;
+  }
+
+  let speculationId: string | undefined;
+  if (req.query.speculationId !== undefined) {
+    try {
+      const v = BigInt(String(req.query.speculationId));
+      if (v < 0n) throw new Error();
+      speculationId = v.toString();
+    } catch {
+      res.status(400).json({ error: 'speculationId must be a non-negative integer.', code: 'INVALID_PARAM' } satisfies ApiError);
+      return;
+    }
+  }
+
+  let q = sb.from('positions').select(POSITION_RECOVERY_COLUMNS).eq('network', config.network);
+  if (address !== undefined) q = q.eq('user_address', address);
+  if (speculationId !== undefined) q = q.eq('speculation_id', speculationId);
+  if (recovery.cursor) q = q.or(recoveryKeysetExpr(recovery.cursor));
+  q = q.order('row_updated_at', { ascending: true }).order('id', { ascending: true }).limit(recovery.limit);
+
+  const { data, error } = await q;
+  if (error) {
+    logger.error({ err: error.message }, 'positions: recovery query failed');
+    res.status(500).json({ error: 'Failed to fetch position changes.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+    return;
+  }
+
+  const rows = (data ?? []) as unknown as PositionRecoveryRow[];
+  const positions: PositionRecoveryBody[] = rows.map((r) => ({
+    speculationId: String(r.speculation_id),
+    userAddress: r.user_address,
+    positionType: r.position_type ? POSITION_TYPE_TO_INT[r.position_type] : null,
+    riskAmountUSDC: wei6ToUSDC(r.risk_amount),
+    profitAmountUSDC: wei6ToUSDC(r.profit_amount),
+    claimed: Boolean(r.claimed),
+    positionCreatedAt: r.position_created_at,
+    claimedAt: r.claimed_at,
+  }));
+  const last = rows.length > 0 ? rows[rows.length - 1] : undefined;
+  res.status(200).json({
+    positions,
+    nextCursor: nextCursor('positions', last, recovery.sinceRaw),
+    hasMore: rows.length === recovery.limit,
+  });
 }
 
 // ──────────────────────────────────────────────────────────────────────

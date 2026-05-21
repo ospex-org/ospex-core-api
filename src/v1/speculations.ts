@@ -42,6 +42,8 @@ import {
   type SpeculationParentContext,
   type SpeculationRow,
 } from './utils/speculations.js';
+import type { CursorableRow } from '../lib/cursor.js';
+import { nextCursor, parseRecovery, recoveryKeysetExpr } from '../lib/recovery.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 
 // VALID_SPORTS is the shared canonical list from lib/sports.ts (drops
@@ -59,7 +61,71 @@ interface SpeculationsListBody {
   pagination: { limit: number; offset: number; total: number; hasMore: boolean };
 }
 
+// ── GET /v1/speculations?since=<cursor> (recovery mode) ─────────────────
+//
+// Cursor-ordered (row_updated_at, id) catch-up for the speculations stream:
+// surfaces scored / settled / voided lifecycle transitions a disconnected
+// client missed. Identity filter: contestId. No status/open-book defaults.
+// State-delta convergence (latest state per row), not a full event log.
+type SpeculationRecoveryRow = SpeculationRow & CursorableRow;
+
+async function getSpeculationsRecovery(req: Request, res: Response): Promise<void> {
+  const config = loadConfig();
+  const sb = getSupabase();
+
+  const recovery = parseRecovery(req, 'speculations');
+  if ('errorBody' in recovery) {
+    res.status(400).json(recovery.errorBody);
+    return;
+  }
+
+  let contestId: string | undefined;
+  if (req.query.contestId !== undefined) {
+    try {
+      const v = BigInt(String(req.query.contestId));
+      if (v < 0n) throw new Error();
+      contestId = v.toString();
+    } catch {
+      res.status(400).json({ error: 'contestId must be a non-negative integer.', code: 'INVALID_PARAM' } satisfies ApiError);
+      return;
+    }
+  }
+
+  let q = sb
+    .from('speculations')
+    .select(`${SPECULATION_COLUMNS}, id, row_updated_at`)
+    .eq('network', config.network);
+  if (contestId !== undefined) q = q.eq('contest_id', contestId);
+  if (recovery.cursor) q = q.or(recoveryKeysetExpr(recovery.cursor));
+  q = q.order('row_updated_at', { ascending: true }).order('id', { ascending: true }).limit(recovery.limit);
+
+  const { data, error } = await q;
+  if (error) {
+    logger.error({ err: error.message }, 'speculations: recovery query failed');
+    res.status(500).json({ error: 'Failed to fetch speculation changes.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+    return;
+  }
+
+  const rows = (data ?? []) as unknown as SpeculationRecoveryRow[];
+  const speculations: Speculation[] = [];
+  for (const r of rows) {
+    const s = specRowToSpeculation(r as unknown as SpeculationRow);
+    if (s) speculations.push(s);
+  }
+  const last = rows.length > 0 ? rows[rows.length - 1] : undefined;
+  res.status(200).json({
+    speculations,
+    nextCursor: nextCursor('speculations', last, recovery.sinceRaw),
+    hasMore: rows.length === recovery.limit,
+  });
+}
+
 export async function getSpeculationsHandler(req: Request, res: Response): Promise<void> {
+  if (req.query.since !== undefined) {
+    await getSpeculationsRecovery(req, res);
+    return;
+  }
+
   const config = loadConfig();
   const sb = getSupabase();
 

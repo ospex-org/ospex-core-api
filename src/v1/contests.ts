@@ -37,6 +37,8 @@ import {
   type Speculation,
   type SpeculationRow,
 } from './utils/speculations.js';
+import type { CursorableRow } from '../lib/cursor.js';
+import { nextCursor, parseRecovery, recoveryKeysetExpr } from '../lib/recovery.js';
 
 // VALID_SPORTS is the shared canonical list from lib/sports.ts.
 // Previously this file carried a local 5-sport allowlist that omitted
@@ -143,9 +145,116 @@ interface ContestDetailRow {
   voided_at: string | null;
 }
 
+// ── GET /v1/contests?since=<cursor> (recovery mode) ─────────────────────
+//
+// Cursor-ordered (row_updated_at, id) catch-up for the contests stream:
+// surfaces verify / score / void lifecycle transitions (the triggers for
+// settlement + claims) a disconnected client missed. Identity filter:
+// contestId. Lean lifecycle-focused body; no speculations/orderbook (those
+// have their own streams) so this path doesn't need SCORER_* config.
+interface ContestRecoveryRow extends CursorableRow {
+  contest_id: string | number;
+  away_team: string | null;
+  home_team: string | null;
+  sport_slug: string | null;
+  jsonodds_sport_id: number | null;
+  start_time: string | null;
+  contest_status: string | null;
+  away_score: number | null;
+  home_score: number | null;
+  verified_at: string | null;
+  scored_at: string | null;
+  voided_at: string | null;
+  contest_created_at: string | null;
+}
+
+interface ContestRecoveryBody {
+  contestId: string;
+  awayTeam: string;
+  homeTeam: string;
+  sport: string;
+  sportId: number;
+  matchTime: string;
+  status: string;
+  awayScore: number | null;
+  homeScore: number | null;
+  verifiedAt: string | null;
+  scoredAt: string | null;
+  voidedAt: string | null;
+  contestCreatedAt: string | null;
+}
+
+const CONTEST_RECOVERY_COLUMNS =
+  'contest_id, away_team, home_team, sport_slug, jsonodds_sport_id, start_time, ' +
+  'contest_status, away_score, home_score, verified_at, scored_at, voided_at, ' +
+  'contest_created_at, id, row_updated_at';
+
+async function getContestsRecovery(req: Request, res: Response): Promise<void> {
+  const config = loadConfig();
+  const sb = getSupabase();
+
+  const recovery = parseRecovery(req, 'contests');
+  if ('errorBody' in recovery) {
+    res.status(400).json(recovery.errorBody);
+    return;
+  }
+
+  let contestId: string | undefined;
+  if (req.query.contestId !== undefined) {
+    try {
+      const v = BigInt(String(req.query.contestId));
+      if (v < 0n) throw new Error();
+      contestId = v.toString();
+    } catch {
+      res.status(400).json({ error: 'contestId must be a non-negative integer.', code: 'INVALID_PARAM' } satisfies ApiError);
+      return;
+    }
+  }
+
+  let q = sb.from('contests').select(CONTEST_RECOVERY_COLUMNS).eq('network', config.network);
+  if (contestId !== undefined) q = q.eq('contest_id', contestId);
+  if (recovery.cursor) q = q.or(recoveryKeysetExpr(recovery.cursor));
+  q = q.order('row_updated_at', { ascending: true }).order('id', { ascending: true }).limit(recovery.limit);
+
+  const { data, error } = await q;
+  if (error) {
+    logger.error({ err: error.message }, 'contests: recovery query failed');
+    res.status(500).json({ error: 'Failed to fetch contest changes.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+    return;
+  }
+
+  const rows = (data ?? []) as unknown as ContestRecoveryRow[];
+  const contests: ContestRecoveryBody[] = rows.map((c) => ({
+    contestId: String(c.contest_id),
+    awayTeam: c.away_team ?? '',
+    homeTeam: c.home_team ?? '',
+    sport: c.sport_slug ?? '',
+    sportId: c.jsonodds_sport_id ?? 0,
+    matchTime: c.start_time ?? '',
+    status: c.contest_status ?? '',
+    awayScore: c.away_score ?? null,
+    homeScore: c.home_score ?? null,
+    verifiedAt: c.verified_at ?? null,
+    scoredAt: c.scored_at ?? null,
+    voidedAt: c.voided_at ?? null,
+    contestCreatedAt: c.contest_created_at ?? null,
+  }));
+  const last = rows.length > 0 ? rows[rows.length - 1] : undefined;
+  res.status(200).json({
+    contests,
+    nextCursor: nextCursor('contests', last, recovery.sinceRaw),
+    hasMore: rows.length === recovery.limit,
+  });
+}
+
 // ── GET /v1/contests ───────────────────────────────────────────────────
 
 export async function getContestsHandler(req: Request, res: Response): Promise<void> {
+  if (req.query.since !== undefined) {
+    await getContestsRecovery(req, res);
+    return;
+  }
+
   const config = loadConfig();
   if (!config.scorers) {
     res.status(500).json({ error: 'Server not configured: missing scorer addresses.', code: 'INTERNAL_ERROR' } satisfies ApiError);

@@ -37,6 +37,8 @@ import { getSupabase } from '../lib/supabase.js';
 import { deriveSpeculationKey } from '../lib/eip712.js';
 import { scorerToType, type MarketType } from '../lib/speculation.js';
 import { deriveEffectiveStatus } from '../lib/commitmentStatus.js';
+import type { CursorableRow } from '../lib/cursor.js';
+import { nextCursor, parseRecovery, recoveryKeysetExpr } from '../lib/recovery.js';
 import type { AuthenticatedRequest } from '../middleware/eip712Auth.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 
@@ -101,6 +103,12 @@ export interface CommitmentRow {
 }
 
 const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower: 1 };
+
+// Recovery reads also need the cursor columns. `row_updated_at` is
+// trigger-maintained on every UPDATE, so a stored open→filled/cancelled
+// transition advances it and surfaces in the recovery stream.
+const COMMITMENT_RECOVERY_COLUMNS = `${COMMITMENT_COLUMNS}, id, row_updated_at`;
+type CommitmentRecoveryRow = CommitmentRow & CursorableRow;
 
 /**
  * Map a raw `commitments` row to the canonical body. `nowMs` is the request's
@@ -377,7 +385,132 @@ interface ListResponse {
   };
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// GET /v1/commitments?since=<cursor>   (recovery mode)
+//
+// Cursor-ordered (row_updated_at, id) catch-up for the commitments stream.
+// Unlike the open-book list, recovery INCLUDES terminal rows (filled /
+// cancelled / effective-expired) so a disconnected client converges its
+// local state — recovery must never hide a lifecycle transition. Filters
+// are identity/scope only (maker, contestId, scorer, speculationId); the
+// open-book status/expiry/nonce defaults are intentionally not applied.
+// This is state-delta convergence, not a full event log: a row that
+// changed several times while the client was away may surface only at its
+// latest state (the append-only event stream is /v1/fills).
+// ────────────────────────────────────────────────────────────────────────
+async function getCommitmentsRecovery(req: Request, res: Response): Promise<void> {
+  const config = loadConfig();
+  const sb = getSupabase();
+  const nowMs = Date.now();
+
+  const recovery = parseRecovery(req, 'commitments');
+  if ('errorBody' in recovery) {
+    res.status(400).json(recovery.errorBody);
+    return;
+  }
+
+  let maker: string | undefined;
+  if (req.query.maker !== undefined) {
+    const lowered = String(req.query.maker).trim().toLowerCase();
+    if (!isAddress(lowered)) {
+      res.status(400).json({ error: 'maker must be a valid Ethereum address.', code: 'INVALID_PARAM' } satisfies ApiError);
+      return;
+    }
+    maker = lowered;
+  }
+
+  let scorer: string | undefined;
+  if (req.query.scorer !== undefined) {
+    const lowered = String(req.query.scorer).trim().toLowerCase();
+    if (!isAddress(lowered)) {
+      res.status(400).json({ error: 'scorer must be a valid Ethereum address.', code: 'INVALID_PARAM' } satisfies ApiError);
+      return;
+    }
+    scorer = lowered;
+  }
+
+  let contestId: string | undefined;
+  if (req.query.contestId !== undefined) {
+    try {
+      const v = BigInt(String(req.query.contestId));
+      if (v < 0n) throw new Error();
+      contestId = v.toString();
+    } catch {
+      res.status(400).json({ error: 'contestId must be a non-negative integer.', code: 'INVALID_PARAM' } satisfies ApiError);
+      return;
+    }
+  }
+
+  // speculationId → speculation_key (the indexed column commitments carry).
+  let speculationKey: string | undefined;
+  if (req.query.speculationId !== undefined) {
+    let speculationId: string;
+    try {
+      const v = BigInt(String(req.query.speculationId));
+      if (v < 0n) throw new Error();
+      speculationId = v.toString();
+    } catch {
+      res.status(400).json({ error: 'speculationId must be a non-negative integer.', code: 'INVALID_PARAM' } satisfies ApiError);
+      return;
+    }
+    const specRes = await sb
+      .from('speculations')
+      .select('contest_id, speculation_scorer, line_ticks')
+      .eq('network', config.network)
+      .eq('speculation_id', speculationId)
+      .maybeSingle();
+    if (specRes.error) {
+      logger.error({ err: specRes.error.message }, 'commitments: recovery speculation lookup failed');
+      res.status(500).json({ error: 'Failed to resolve speculationId.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+      return;
+    }
+    const sRow = specRes.data as
+      | { contest_id: string | number; speculation_scorer: string | null; line_ticks: number | null }
+      | null;
+    if (!sRow || !sRow.speculation_scorer || sRow.line_ticks == null) {
+      res.status(404).json({ error: `Speculation ${speculationId} not found or not yet enriched.`, code: 'NOT_FOUND' } satisfies ApiError);
+      return;
+    }
+    speculationKey = deriveSpeculationKey(
+      BigInt(String(sRow.contest_id)),
+      String(sRow.speculation_scorer).toLowerCase(),
+      sRow.line_ticks,
+    );
+  }
+
+  let q = sb.from('commitments').select(COMMITMENT_RECOVERY_COLUMNS).eq('network', config.network);
+  if (maker !== undefined) q = q.eq('maker', maker);
+  if (scorer !== undefined) q = q.eq('scorer', scorer);
+  if (contestId !== undefined) q = q.eq('contest_id', contestId);
+  if (speculationKey !== undefined) q = q.eq('speculation_key', speculationKey);
+  if (recovery.cursor) q = q.or(recoveryKeysetExpr(recovery.cursor));
+  q = q.order('row_updated_at', { ascending: true }).order('id', { ascending: true }).limit(recovery.limit);
+
+  const { data, error } = await q;
+  if (error) {
+    logger.error({ err: error.message }, 'commitments: recovery query failed');
+    res.status(500).json({ error: 'Failed to fetch commitment changes.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+    return;
+  }
+
+  const rows = (data ?? []) as unknown as CommitmentRecoveryRow[];
+  const last = rows.length > 0 ? rows[rows.length - 1] : undefined;
+  res.status(200).json({
+    commitments: rows.map((r) => rowToBody(r as unknown as CommitmentRow, nowMs)),
+    nextCursor: nextCursor('commitments', last, recovery.sinceRaw),
+    hasMore: rows.length === recovery.limit,
+  });
+}
+
 export async function getCommitmentsHandler(req: Request, res: Response): Promise<void> {
+  // `?since=<cursor>` switches to cursor recovery mode (ordered by
+  // row_updated_at, includes terminal lifecycle rows). Absent → the
+  // open-book list below, unchanged.
+  if (req.query.since !== undefined) {
+    await getCommitmentsRecovery(req, res);
+    return;
+  }
+
   const config = loadConfig();
   const sb = getSupabase();
 
