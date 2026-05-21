@@ -135,12 +135,18 @@ export async function getOddsStreamHandler(req: Request, res: Response): Promise
   const jid: string = jsonoddsId;
 
   // ── state ─────────────────────────────────────────────────────────────────
-  let live = false; // a baseline snapshot has been sent
+  let live = false; // a baseline snapshot has been sent at least once
   let snapshotInFlight = false;
   let needsResnapshot = false;
-  let clientDegraded = false; // we've told the client it's behind (deduped)
-  let pendingDelta: { kind: LiveKind; odds: MarketOdds } | undefined; // coalesced buffer (≤1)
-  let lastPollMs: number | undefined; // watermark
+  let clientDegraded = false; // told the client it's behind (deduped); gates delivery
+  let lastPollMs: number | undefined; // watermark = last emitted poll_captured_at (ms)
+  // Coalesced live buffer (≤1 slot): the newest odds seen while not deliverable,
+  // plus the newest poll_captured_at among *change* rows — so the kind is decided
+  // against the snapshot watermark at flush time, not eagerly (a stale buffered
+  // change must not taint a newer refresh).
+  let bufferedOdds: MarketOdds | undefined;
+  let bufferedPollMs = Number.NEGATIVE_INFINITY;
+  let bufferedChangePollMs = Number.NEGATIVE_INFINITY;
 
   const shedIfSlow = (): void => {
     const len = (res as { writableLength?: number }).writableLength;
@@ -168,30 +174,40 @@ export async function getOddsStreamHandler(req: Request, res: Response): Promise
     shedIfSlow();
   };
 
-  // Coalesce into the single buffer slot: keep the newest odds; the kind is a
-  // change if any coalesced delta was a change (a real move since the baseline).
+  // Coalesce into the single buffer slot: keep the newest odds, and separately
+  // track the newest poll_captured_at among change rows. The change-vs-refresh
+  // decision is deferred to flush (against the snapshot watermark).
   const bufferDelta = (kind: LiveKind, odds: MarketOdds): void => {
-    const prev = pendingDelta;
-    if (prev === undefined) {
-      pendingDelta = { kind, odds };
-      return;
+    const ms = Date.parse(odds.pollCapturedAt);
+    const pollMs = Number.isFinite(ms) ? ms : Number.NEGATIVE_INFINITY;
+    if (bufferedOdds === undefined || pollMs >= bufferedPollMs) {
+      bufferedOdds = odds;
+      bufferedPollMs = pollMs;
     }
-    const newer = Date.parse(odds.pollCapturedAt) >= Date.parse(prev.odds.pollCapturedAt) ? odds : prev.odds;
-    const mergedKind: LiveKind = kind === 'change' || prev.kind === 'change' ? 'change' : 'refresh';
-    pendingDelta = { kind: mergedKind, odds: newer };
+    if (kind === 'change' && pollMs > bufferedChangePollMs) bufferedChangePollMs = pollMs;
   };
 
-  // Live deltas emit only once a baseline exists and no snapshot is mid-flight;
-  // otherwise they coalesce into the buffer and flush after the next snapshot.
+  // Delivery is gated on a *valid* baseline: a snapshot has been sent (`live`),
+  // we're not behind (`!clientDegraded` — set on degraded, cleared only by a
+  // successful recovery snapshot), and no snapshot is mid-flight. Otherwise the
+  // delta coalesces into the buffer and flushes after the next clean snapshot.
   const deliver = (kind: LiveKind, odds: MarketOdds): void => {
-    if (live && !snapshotInFlight) emitLive(kind, odds);
+    if (live && !clientDegraded && !snapshotInFlight) emitLive(kind, odds);
     else bufferDelta(kind, odds);
   };
 
   const flushPending = (): void => {
-    const d = pendingDelta;
-    pendingDelta = undefined;
-    if (d) emitLive(d.kind, d.odds);
+    const odds = bufferedOdds;
+    const changePollMs = bufferedChangePollMs;
+    bufferedOdds = undefined;
+    bufferedPollMs = Number.NEGATIVE_INFINITY;
+    bufferedChangePollMs = Number.NEGATIVE_INFINITY;
+    if (odds === undefined) return;
+    // It's a genuine change only if a change row landed *after* the baseline we
+    // just took; otherwise it's a refresh (and emitLive drops it if not newer).
+    const watermark = lastPollMs ?? Number.NEGATIVE_INFINITY;
+    const kind: LiveKind = changePollMs > watermark ? 'change' : 'refresh';
+    emitLive(kind, odds);
   };
 
   const scheduleRetry = (): void => {
@@ -237,11 +253,17 @@ export async function getOddsStreamHandler(req: Request, res: Response): Promise
           writeEvent(res, 'snapshot', { contestId, market, odds: odds ?? null });
           shedIfSlow();
           live = true;
-          // The snapshot is the recovery signal — clear degraded if the source
-          // is healthy; if it dropped during the query, keep the client behind.
-          if (getOddsHub().isDegraded()) markDegraded('channel_error');
-          else clientDegraded = false;
-          flushPending();
+          if (getOddsHub().isDegraded()) {
+            // The source dropped again during the query (flap): this baseline is
+            // fresh, but we can't promise it's current — stay gated (keep
+            // buffering, don't flush) until a clean recovery snapshot.
+            markDegraded('channel_error');
+          } else {
+            // Clean baseline — the snapshot is the recovery signal. Reopen
+            // delivery and flush whatever coalesced while we were behind.
+            clientDegraded = false;
+            flushPending();
+          }
         } else {
           // Stay pre-baseline (no deltas emitted without a snapshot) and retry,
           // so the documented snapshot-first contract holds.

@@ -369,6 +369,65 @@ describe('GET /v1/stream/odds snapshot + live', () => {
     expect(frames(res).filter((f) => f.event === 'change')).toHaveLength(1); // T3 > T2
   });
 
+  it('does not resume live deltas after a FAILED recovery snapshot until a successful one (recovery gate)', async () => {
+    sbMock.state.contest = { data: { jsonodds_id: 'jo-1' }, error: null };
+    sbMock.state.odds = { data: oddsRow(), error: null }; // initial baseline T2
+    const res = makeRes();
+    await getOddsStreamHandler(makeReq({ contestId: '1', market: 'spread' }), res as unknown as Response);
+    fake.captured?.cb.onActive();
+    await flush();
+    expect(frames(res).filter((f) => f.event === 'snapshot')).toHaveLength(1);
+
+    // Source drops, then "recovers" but the recovery snapshot query fails.
+    fake.captured?.cb.onDegraded('channel_error');
+    sbMock.state.odds = { data: null, error: { message: 'still flaky' } };
+    fake.captured?.cb.onActive();
+    await flush();
+
+    // A live row arrives before the recovery snapshot succeeds — it must NOT emit
+    // (the missed move during the outage might be classified only as a refresh).
+    fake.captured?.cb.onRefresh(spreadOdds({ pollCapturedAt: T3 }));
+    fake.captured?.cb.onChange(spreadOdds({ pollCapturedAt: T3, awayOddsAmerican: -120 }));
+    expect(eventsOf(res)).not.toContain('refresh');
+    expect(eventsOf(res)).not.toContain('change');
+    expect(frames(res).filter((f) => f.event === 'snapshot')).toHaveLength(1); // still only the initial
+
+    // Recovery snapshot finally succeeds → fresh baseline, then live resumes.
+    sbMock.state.odds = { data: oddsRow({ poll_captured_at: '2026-05-20T12:01:30.000Z' }), error: null };
+    fake.captured?.cb.onActive();
+    await flush();
+    expect(frames(res).filter((f) => f.event === 'snapshot')).toHaveLength(2);
+    // The buffered row (T3) predates the recovery snapshot (12:01:30) → dropped.
+    expect(eventsOf(res)).toEqual(['snapshot', 'degraded', 'snapshot']);
+  });
+
+  it('does not emit a false change when a stale buffered change coalesces with a newer refresh', async () => {
+    sbMock.state.contest = { data: { jsonodds_id: 'jo-1' }, error: null };
+    sbMock.state.odds = { data: oddsRow(), error: null }; // baseline poll_captured_at = T2
+    let releaseGate: () => void = () => undefined;
+    sbMock.state.oddsGate = new Promise<void>((r) => {
+      releaseGate = r;
+    });
+
+    const res = makeRes();
+    await getOddsStreamHandler(makeReq({ contestId: '1', market: 'spread' }), res as unknown as Response);
+    fake.captured?.cb.onActive(); // gated snapshot
+    await flush();
+
+    // A stale change (older than the baseline) and a newer refresh coalesce.
+    fake.captured?.cb.onChange(spreadOdds({ pollCapturedAt: T1 })); // T1 < T2 baseline → stale
+    fake.captured?.cb.onRefresh(spreadOdds({ pollCapturedAt: T3, awayOddsAmerican: -115 })); // T3 > T2
+
+    releaseGate();
+    await flush();
+
+    // The only post-baseline row is a refresh; the stale change must not make it a change.
+    expect(frames(res).filter((f) => f.event === 'change')).toHaveLength(0);
+    const refreshes = frames(res).filter((f) => f.event === 'refresh');
+    expect(refreshes).toHaveLength(1);
+    expect(refreshes[0]?.data?.odds).toMatchObject({ awayOddsAmerican: -115 });
+  });
+
   it('unsubscribes and releases the slot when the client disconnects', async () => {
     sbMock.state.contest = { data: { jsonodds_id: 'jo-1' }, error: null };
     sbMock.state.odds = { data: oddsRow(), error: null };
