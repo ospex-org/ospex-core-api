@@ -10,7 +10,11 @@
 
 import type { Response } from 'express';
 
-export type SseEvent = 'ready' | 'delta' | 'resync';
+/** Protocol-stream events (cursor catch-up + live deltas): see stream/handler.ts. */
+export type ProtocolSseEvent = 'ready' | 'delta' | 'resync';
+/** Odds-stream events (snapshot-then-live, latest-state, no cursor): see stream/oddsHandler.ts. */
+export type OddsSseEvent = 'snapshot' | 'change' | 'refresh' | 'degraded';
+export type SseEvent = ProtocolSseEvent | OddsSseEvent;
 
 export function initSse(res: Response): void {
   res.statusCode = 200;

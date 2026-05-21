@@ -7,44 +7,24 @@
  * upstream provider doesn't carry odds for this game).
  *
  * Scope: this is **upstream reference odds** — what the broader sports
- * betting market is currently pricing the game at, sourced from
- * JSONOdds (live) / Sportspage (opening lines) by `ospex-writer` on a
- * ~30s polling cycle. Ospex commitments are user-priced and don't have
- * to match these. The SDK and CLI surfacing this endpoint label it as
- * reference data for the same reason.
+ * betting market is currently pricing the game at, captured upstream by
+ * `ospex-writer` on a ~30s polling cycle. Ospex commitments are
+ * user-priced and don't have to match these. The SDK and CLI surfacing
+ * this endpoint label it as reference data for the same reason.
  *
  * Endpoint shape is contest-centric (not jsonodds-id-centric) because
  * the user-facing flow starts from an Ospex contest ID. Resolving
  * jsonoddsId from contestId on the server keeps the public API
  * vocabulary consistent with the rest of /v1.
  *
- * Per-market response shapes are explicit (no shared "line +
- * awayOddsAmerican + homeOddsAmerican" envelope) so consumers can't
- * misread the semantics:
+ * The per-market shapes (and the row→shape mapping) are shared with the
+ * SSE odds stream via `utils/odds.ts`, so a one-shot snapshot here and a
+ * live `change`/`refresh` delta on `/v1/stream/odds` are the same shape
+ * for the same market.
  *
- *   - moneyline { awayOddsAmerican, homeOddsAmerican }
- *       Per-side American odds. Line is meaningless here, so it isn't
- *       in the shape at all.
- *
- *   - spread { awayLine, homeLine, awayOddsAmerican, homeOddsAmerican }
- *       Both sides of the spread line are explicit. Convention from
- *       the writer (pollCycle.ts:523) is that current_odds.line stores
- *       the *home* team's spread (negative if home favored); we expose
- *       both `homeLine` (raw) and `awayLine = -homeLine` so callers
- *       don't have to remember which side the un-labelled `line`
- *       belongs to. Mirrors `/v1/analytics/odds-history` and the
- *       speculation row in `/v1/contests/:contestId`.
- *
- *   - total { line, overOddsAmerican, underOddsAmerican }
- *       Single line is the over/under threshold (perspective-neutral).
- *       Over and under odds are named explicitly even though the
- *       writer stores Over → away_odds_american and Under →
- *       home_odds_american (`pollCycle.ts:526`); consumers should
- *       never see the writer's storage convention.
- *
- * Per-market entries do not duplicate `jsonoddsId` (it's at the
- * top-level response — the snapshot is for one game) or `network`
- * (the API is deployment-bound to one network).
+ * This REST response still carries a top-level `jsonoddsId` (the snapshot
+ * is for one game); the SSE stream omits it. Per-market entries never
+ * duplicate it or `network` (the API is deployment-bound to one network).
  */
 
 import type { Request, Response } from 'express';
@@ -52,64 +32,28 @@ import { loadConfig } from '../lib/env.js';
 import { logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
 import type { ApiError } from '../middleware/errorHandler.js';
-
-interface OddsTimestamps {
-  upstreamLastUpdated: string;
-  pollCapturedAt: string;
-  changedAt: string;
-}
-
-interface MoneylineOddsResponse extends OddsTimestamps {
-  market: 'moneyline';
-  awayOddsAmerican: number | null;
-  homeOddsAmerican: number | null;
-}
-
-interface SpreadOddsResponse extends OddsTimestamps {
-  market: 'spread';
-  /** Away team's spread (= -homeLine when home line is set). */
-  awayLine: number | null;
-  /** Home team's spread (raw current_odds.line — negative if home favored). */
-  homeLine: number | null;
-  awayOddsAmerican: number | null;
-  homeOddsAmerican: number | null;
-}
-
-interface TotalOddsResponse extends OddsTimestamps {
-  market: 'total';
-  /** Over/under threshold (perspective-neutral). */
-  line: number | null;
-  overOddsAmerican: number | null;
-  underOddsAmerican: number | null;
-}
+import {
+  rowToMarketOdds,
+  CURRENT_ODDS_COLUMNS,
+  type MarketOddsRow,
+  type MoneylineOdds,
+  type SpreadOdds,
+  type TotalOdds,
+} from './utils/odds.js';
 
 interface ContestOddsResponse {
   contestId: string;
   jsonoddsId: string | null;
   odds: {
-    moneyline: MoneylineOddsResponse | null;
-    spread: SpreadOddsResponse | null;
-    total: TotalOddsResponse | null;
+    moneyline: MoneylineOdds | null;
+    spread: SpreadOdds | null;
+    total: TotalOdds | null;
   };
 }
 
 interface ContestRow {
   jsonodds_id: string | null;
 }
-
-interface CurrentOddsRow {
-  jsonodds_id: string;
-  market: string;
-  line: number | null;
-  away_odds_american: number | null;
-  home_odds_american: number | null;
-  upstream_last_updated: string;
-  poll_captured_at: string;
-  changed_at: string;
-}
-
-const CURRENT_ODDS_SELECT =
-  'jsonodds_id, market, line, away_odds_american, home_odds_american, upstream_last_updated, poll_captured_at, changed_at';
 
 export async function getCurrentOddsHandler(req: Request, res: Response): Promise<void> {
   // Express types `req.params[key]` as `string | string[]` (the array
@@ -192,7 +136,7 @@ export async function getCurrentOddsHandler(req: Request, res: Response): Promis
   // game id would collide.
   const oddsRes = await sb
     .from('current_odds')
-    .select(CURRENT_ODDS_SELECT)
+    .select(CURRENT_ODDS_COLUMNS)
     .eq('network', network)
     .eq('jsonodds_id', jsonoddsId);
 
@@ -208,7 +152,7 @@ export async function getCurrentOddsHandler(req: Request, res: Response): Promis
     return;
   }
 
-  const rows = (oddsRes.data ?? []) as unknown as CurrentOddsRow[];
+  const rows = (oddsRes.data ?? []) as unknown as MarketOddsRow[];
   const odds: ContestOddsResponse['odds'] = {
     moneyline: null,
     spread: null,
@@ -216,47 +160,11 @@ export async function getCurrentOddsHandler(req: Request, res: Response): Promis
   };
 
   for (const row of rows) {
-    const ts: OddsTimestamps = {
-      upstreamLastUpdated: row.upstream_last_updated,
-      pollCapturedAt: row.poll_captured_at,
-      changedAt: row.changed_at,
-    };
-    if (row.market === 'moneyline') {
-      odds.moneyline = {
-        ...ts,
-        market: 'moneyline',
-        awayOddsAmerican: row.away_odds_american,
-        homeOddsAmerican: row.home_odds_american,
-      };
-    } else if (row.market === 'spread') {
-      // Writer stores `line` as the home team's spread (PointSpreadHome
-      // — pollCycle.ts:523). Expose both sides explicitly so callers
-      // never have to remember which side the raw column belongs to.
-      const homeLine = row.line;
-      odds.spread = {
-        ...ts,
-        market: 'spread',
-        awayLine: homeLine === null ? null : -homeLine,
-        homeLine,
-        awayOddsAmerican: row.away_odds_american,
-        homeOddsAmerican: row.home_odds_american,
-      };
-    } else if (row.market === 'total') {
-      // Writer stores Over → away_odds_american and Under →
-      // home_odds_american (pollCycle.ts:526 reads OverLine into the
-      // away slot). Consumers see over/under names directly; the
-      // storage convention does not leak.
-      odds.total = {
-        ...ts,
-        market: 'total',
-        line: row.line,
-        overOddsAmerican: row.away_odds_american,
-        underOddsAmerican: row.home_odds_american,
-      };
-    }
-    // Defensive: an unknown market value (the table has a CHECK
-    // constraint, but a future market type would otherwise crash the
-    // shape contract) is silently ignored.
+    const shape = rowToMarketOdds(row);
+    if (shape === null) continue; // defensive: unknown market value
+    if (shape.market === 'moneyline') odds.moneyline = shape;
+    else if (shape.market === 'spread') odds.spread = shape;
+    else odds.total = shape;
   }
 
   const response: ContestOddsResponse = {

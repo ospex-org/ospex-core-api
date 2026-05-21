@@ -34,6 +34,7 @@ import {
 } from './positions.js';
 import { getFillsHandler } from './fills.js';
 import { getStreamHandler } from './stream/handler.js';
+import { getOddsStreamHandler } from './stream/oddsHandler.js';
 import { getLeaderboardHandler } from './leaderboard.js';
 import { getScheduleHandler } from './schedule.js';
 
@@ -105,10 +106,18 @@ v1Router.get('/positions/:address', readRateLimit, asyncHandler(getPositionsByAd
 v1Router.get('/fills', readRateLimit, asyncHandler(getFillsHandler));
 
 // ── SSE streams ───────────────────────────────────────────────────────
-// Long-lived Server-Sent Events: live deltas + cursor catch-up + resync.
-// No readRateLimit (a stream is one long request, not a burst); the handler
-// enforces a concurrent-connection cap instead. `:resource` is validated
-// against the stream registry (404 otherwise).
+// Long-lived Server-Sent Events. No readRateLimit (a stream is one long
+// request, not a burst); the handlers enforce a concurrent-connection cap
+// instead.
+//
+// Odds is its own static route (latest-state: snapshot + live change/refresh,
+// no cursor) and MUST be registered before `/stream/:resource` so Express
+// doesn't bind `odds` as the `:resource` param.
+v1Router.get('/stream/odds', (req, res) => {
+  void getOddsStreamHandler(req, res);
+});
+// Protocol streams: live deltas + cursor catch-up + resync. `:resource` is
+// validated against the stream registry (404 otherwise).
 v1Router.get('/stream/:resource', (req, res) => getStreamHandler(req, res));
 
 v1Router.get('/leaderboard', readRateLimit, asyncHandler(getLeaderboardHandler));

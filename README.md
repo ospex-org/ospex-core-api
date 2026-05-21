@@ -29,6 +29,7 @@ In progress. Working today:
 - `GET /v1/analytics/odds-history/:contestId` — opening + current odds for analytics callers (deprecated SDK-internal use; new code should prefer `/contests/:contestId/odds` for current-state reads).
 - **Cursor recovery (Phase 1.5):** `?since=<cursor>` recovery mode on `GET /v1/commitments`, `/v1/speculations`, `/v1/contests`; bare `GET /v1/positions` (recovery) alongside the address-scoped snapshot; `GET /v1/fills` (append-only fill events). See "Cursor recovery reads" below.
 - **SSE streams (Phase 1.5):** `GET /v1/stream/{commitments,positions,fills,speculations,contests}` — live deltas + cursor catch-up + resync over Server-Sent Events. See "SSE streams" below.
+- **Odds stream (Phase 1.5):** `GET /v1/stream/odds?contestId=&market=` — snapshot then live `change`/`refresh` over Server-Sent Events (latest-state, no cursor). See "Odds stream" below.
 
 Not ported (no R4 analog — see "Position helpers" section below): `/withdraw-params`, `/withdraw-result/:txHash`. Not ported in any batch yet (deferred or out of scope): everything else under `/v1/analytics/*`, `/v1/current-odds*` (the legacy `/v1/current-odds*` paths from agent-server are superseded by the contest-centric `/v1/contests/:contestId/odds`).
 
@@ -141,7 +142,7 @@ Detail-only fields surfaced here (omitted on list rows): `jsonoddsId`, `rundownI
 
 Current upstream reference odds for the contest's underlying game. One snapshot read of `current_odds` keyed by the contest's `jsonodds_id`. Distinct from the Realtime subscribe path on the SDK side (`client.odds.subscribe(...)`) — the snapshot is "what are the odds right now?", subscribe is "stream me changes."
 
-**Source labelling**: this is upstream reference data (JSONOdds live updates / Sportspage opening lines via `ospex-writer`), NOT Ospex liquidity. Consumers should label it that way to users — the SDK + CLI surfacing this endpoint do.
+**Source labelling**: this is upstream/reference odds (what the broader market is pricing the game at, via `ospex-writer`), NOT Ospex liquidity. Consumers should label it that way to users — the SDK + CLI surfacing this endpoint do.
 
 Response shape:
 
@@ -403,6 +404,25 @@ Operational notes:
 - `position_fills` is append-only (every event delivered); the other four are state-delta convergence (latest state per row).
 - Backed by the same `(network, row_updated_at, id)` indexes as recovery (indexer migration 048) — apply those before production stream traffic.
 
+### Odds stream (Phase 1.5)
+
+`GET /v1/stream/odds?contestId=<numeric>&market=<moneyline|spread|total>` opens a Server-Sent Events stream of upstream reference odds for a contest's underlying game. Both query params are **required**. This is a separate route from the protocol `/v1/stream/:resource` streams because odds is **latest-state, not a durable log** — there's no cursor, no catch-up replay, and no `Last-Event-ID` resume. The server maintains one internal `current_odds` subscription for the whole process and fans out to every connected client (the N→1 collapse); that internal source stays server-side and the provider game id is **never** on the wire (it's resolved from `contestId` internally).
+
+**Source labelling**: this is upstream/reference odds (what the broader market is pricing the game at, via `ospex-writer`), NOT Ospex liquidity — surface it to users that way.
+
+Events:
+- `event: snapshot` — `data: { contestId, market, odds }` where `odds` is the current per-market shape (same shapes as `GET /v1/contests/:contestId/odds` — moneyline / spread / total) or `null` when the writer hasn't populated that market (or the contest has no upstream linkage). It is the baseline you're live from, and is re-sent on recovery. **The server never emits a `change`/`refresh` before a `snapshot`** — if the baseline read fails it retries (staying behind a `degraded`) rather than streaming deltas without a baseline.
+- `event: change` — `data: { contestId, market, odds }`. A genuine price move (a tracked column changed, or `changedAt` advanced).
+- `event: refresh` — `data: { contestId, market, odds }`. The writer re-polled and saw no price change (liveness). Usually you only care about `change`.
+- `event: degraded` — `data: { reason }`. The internal source is behind/unavailable; updates are paused. It can arrive **before** any snapshot (the source was down at connect — you get no baseline until it recovers) or after (the source dropped). The connection stays open; on recovery the server sends a fresh `snapshot` (which fully resyncs, since odds is latest-state) and resumes live.
+- `: hb` comment heartbeats (~20s).
+
+Apply semantics:
+- **No cursor** — there's no `id:` on these events; don't try to resume with `Last-Event-ID`. On any disconnect, just reconnect; the new connection re-snapshots.
+- **Latest-state convergence** — the server only emits a delta whose `pollCapturedAt` is strictly newer than the last one emitted for this stream, so duplicates and out-of-order delivery are already filtered. Treat each `change`/`refresh`/`snapshot` as the current value for `(contestId, market)`.
+- Unknown `market` (or non-numeric `contestId`) → `400`; unknown contest → `404`; both *before* the stream opens.
+- Same gzip exemption and concurrent-connection cap as the protocol streams (shared budget; `429` when full).
+
 ## Scripts
 
 | Script | What it does |
@@ -489,6 +509,7 @@ src/
     txParams.ts        # numeric primitives for on-chain tx building
     cursor.ts          # opaque (table, row_updated_at, id) recovery cursor codec
     recovery.ts        # ?since= parse + nextCursor helpers for recovery reads
+    oddsClassifier.ts  # current_odds change/refresh/none classifier (pure)
   middleware/
     asyncHandler.ts    # error-forwarding wrapper
     errorHandler.ts    # final 500 handler, ApiError shape
@@ -503,10 +524,12 @@ src/
     positions.ts       # GET /v1/positions (recovery) + /:address + /status,
                        #   /claim-params, /by-tx/:txHash, /claim-result/:txHash
     fills.ts           # GET /v1/fills — append-only fill event recovery
-    stream/            # GET /v1/stream/:resource — SSE live deltas
-      handler.ts       #   handoff state machine: cap → subscribe → catch-up → (clean? ready : resync)
+    stream/            # GET /v1/stream/* — SSE
+      handler.ts       #   protocol handoff state machine: cap → subscribe → catch-up → (clean? ready : resync)
       hub.ts           #   per-resource poller + fan-out + resync watcher (N→1)
       resources.ts     #   per-resource registry (columns, toBody, filters)
+      oddsHandler.ts   #   GET /v1/stream/odds — snapshot + live change/refresh (latest-state)
+      oddsHub.ts       #   one current_odds Realtime channel → classify → fan out (N→1)
       sse.ts           #   SSE wire helpers (event/comment frames)
       connections.ts   #   concurrent-connection caps
     leaderboard.ts     # GET /v1/leaderboard
@@ -515,4 +538,5 @@ src/
     utils/
       positionFetch.ts # categorize active/pendingSettle/claimable (Supabase-only)
       speculations.ts  # shared Speculation wire shape + row→Speculation converters
+      odds.ts          # shared per-market odds shapes + row→shape mapper (REST + stream)
 ```
