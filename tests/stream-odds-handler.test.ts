@@ -401,6 +401,48 @@ describe('GET /v1/stream/odds snapshot + live', () => {
     expect(eventsOf(res)).toEqual(['snapshot', 'degraded', 'snapshot']);
   });
 
+  it('stays gated through a source flap during an in-flight recovery snapshot until a clean resnapshot', async () => {
+    sbMock.state.contest = { data: { jsonodds_id: 'jo-1' }, error: null };
+    sbMock.state.odds = { data: oddsRow(), error: null }; // initial baseline T2
+    const res = makeRes();
+    await getOddsStreamHandler(makeReq({ contestId: '1', market: 'spread' }), res as unknown as Response);
+    fake.captured?.cb.onActive();
+    await flush();
+    expect(frames(res).filter((f) => f.event === 'snapshot')).toHaveLength(1);
+
+    // Source drops → degraded.
+    fake.captured?.cb.onDegraded('channel_error');
+
+    // The recovery snapshot is held in flight while the source flaps down→up
+    // (an onActive arrives mid-query, raising needsResnapshot), and a live
+    // refresh — newer than the recovery baseline — buffers. (Newer so the
+    // watermark wouldn't drop it: the bug is a premature flush, not a drop.)
+    const tNewer = '2026-05-20T12:02:00.000Z';
+    sbMock.state.odds = { data: oddsRow({ poll_captured_at: '2026-05-20T12:01:30.000Z' }), error: null };
+    let releaseGate: () => void = () => undefined;
+    sbMock.state.oddsGate = new Promise<void>((r) => {
+      releaseGate = r;
+    });
+    fake.captured?.cb.onActive(); // recovery — runSnapshot awaits the gate
+    await flush();
+    fake.captured?.cb.onRefresh(spreadOdds({ pollCapturedAt: tNewer })); // buffers (gated)
+    fake.captured?.cb.onDegraded('channel_error'); // flap down (already degraded → no-op)
+    fake.captured?.cb.onActive(); // flap up → needsResnapshot during the in-flight snapshot
+
+    releaseGate();
+    await flush();
+
+    // The first (flapped) recovery snapshot must NOT flush. A live delta may
+    // only resume AFTER the clean follow-up snapshot — never between the two
+    // recovery snapshots. (Without the fix the buffered refresh leaks between
+    // them: snapshot, degraded, snapshot, refresh, snapshot.)
+    const ev = eventsOf(res);
+    expect(ev.filter((e) => e === 'snapshot')).toHaveLength(3); // initial + 2 recovery
+    const lastSnapshot = ev.lastIndexOf('snapshot');
+    const firstDelta = ev.findIndex((e) => e === 'change' || e === 'refresh');
+    expect(firstDelta === -1 || firstDelta > lastSnapshot).toBe(true);
+  });
+
   it('does not emit a false change when a stale buffered change coalesces with a newer refresh', async () => {
     sbMock.state.contest = { data: { jsonodds_id: 'jo-1' }, error: null };
     sbMock.state.odds = { data: oddsRow(), error: null }; // baseline poll_captured_at = T2

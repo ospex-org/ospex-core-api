@@ -187,10 +187,11 @@ export async function getOddsStreamHandler(req: Request, res: Response): Promise
     if (kind === 'change' && pollMs > bufferedChangePollMs) bufferedChangePollMs = pollMs;
   };
 
-  // Delivery is gated on a *valid* baseline: a snapshot has been sent (`live`),
-  // we're not behind (`!clientDegraded` — set on degraded, cleared only by a
-  // successful recovery snapshot), and no snapshot is mid-flight. Otherwise the
-  // delta coalesces into the buffer and flushes after the next clean snapshot.
+  // Invariant: a live delta is emitted ONLY across a valid baseline — a
+  // snapshot has been sent (`live`), we're not behind (`!clientDegraded`, set on
+  // degraded and cleared ONLY by a *clean* recovery snapshot: source healthy
+  // across the whole query, no flap), and no snapshot is mid-flight. Otherwise
+  // the delta coalesces into the buffer and flushes after the next clean snapshot.
   const deliver = (kind: LiveKind, odds: MarketOdds): void => {
     if (live && !clientDegraded && !snapshotInFlight) emitLive(kind, odds);
     else bufferDelta(kind, odds);
@@ -253,16 +254,16 @@ export async function getOddsStreamHandler(req: Request, res: Response): Promise
           writeEvent(res, 'snapshot', { contestId, market, odds: odds ?? null });
           shedIfSlow();
           live = true;
-          if (getOddsHub().isDegraded()) {
-            // The source dropped again during the query (flap): this baseline is
-            // fresh, but we can't promise it's current — stay gated (keep
-            // buffering, don't flush) until a clean recovery snapshot.
-            markDegraded('channel_error');
-          } else {
-            // Clean baseline — the snapshot is the recovery signal. Reopen
-            // delivery and flush whatever coalesced while we were behind.
+          // "Clean" recovery = the source stayed healthy across this whole
+          // snapshot: not degraded now AND no flap raised `needsResnapshot`
+          // mid-query. A flap means this baseline spans an unstable interval, so
+          // emit it but stay gated until the follow-up resnapshot lands a clean
+          // one — only a clean snapshot reopens delivery and flushes the buffer.
+          if (!getOddsHub().isDegraded() && !needsResnapshot) {
             clientDegraded = false;
             flushPending();
+          } else if (getOddsHub().isDegraded()) {
+            markDegraded('channel_error');
           }
         } else {
           // Stay pre-baseline (no deltas emitted without a snapshot) and retry,
@@ -270,7 +271,9 @@ export async function getOddsStreamHandler(req: Request, res: Response): Promise
           markDegraded('snapshot_failed');
           scheduleRetry();
         }
-      } while (needsResnapshot && !closed && ok);
+        // Loop only to service a flap's resnapshot while the source is healthy;
+        // if it's degraded, stop and wait for the next onActive (recovery).
+      } while (needsResnapshot && !closed && ok && !getOddsHub().isDegraded());
     } finally {
       snapshotInFlight = false;
     }
