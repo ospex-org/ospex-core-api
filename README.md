@@ -27,6 +27,7 @@ In progress. Working today:
 - `GET /v1/teams/aliases?sport=` — flat list of team aliases (full name / nickname / abbrev / city) joined to canonical team metadata. Consumed by `@ospex/sdk`'s resolver layer to map free-form `--side` input ("Lakers", "LAL") to a canonical team id when staking a commitment.
 - `GET /v1/contests/:contestId/odds` — current upstream reference odds for the contest's underlying game (moneyline / spread / total snapshot from `current_odds`). Per-market response shapes are explicit (no shared "line + away/home" envelope) so consumers can't misread the semantics — see "Odds snapshot" below for the exact shape.
 - `GET /v1/analytics/odds-history/:contestId` — opening + current odds for analytics callers (deprecated SDK-internal use; new code should prefer `/contests/:contestId/odds` for current-state reads).
+- **Cursor recovery (Phase 1.5):** `?since=<cursor>` recovery mode on `GET /v1/commitments`, `/v1/speculations`, `/v1/contests`; bare `GET /v1/positions` (recovery) alongside the address-scoped snapshot; `GET /v1/fills` (append-only fill events). See "Cursor recovery reads" below.
 
 Not ported (no R4 analog — see "Position helpers" section below): `/withdraw-params`, `/withdraw-result/:txHash`. Not ported in any batch yet (deferred or out of scope): everything else under `/v1/analytics/*`, `/v1/current-odds*` (the legacy `/v1/current-odds*` paths from agent-server are superseded by the contest-centric `/v1/contests/:contestId/odds`).
 
@@ -358,6 +359,29 @@ Response:
 
 Pagination caveat: PostgREST returns at most 1000 rows per request, so `limit` is capped at 1000 — the table is ~1300+ rows, and a larger advertised limit would silently truncate while still echoing the requested limit in `pagination.limit`, causing naive `offset += pagination.limit` clients to skip rows. SDK consumers should paginate until `hasMore: false`.
 
+### Cursor recovery reads (Phase 1.5)
+
+The catch-up side of the push contract. A client streams live deltas (forthcoming SSE) and, after a disconnect, asks for everything after its last cursor. These reads are intentionally distinct from the open-book list/snapshot endpoints above.
+
+- **Ordering** is keyset `(row_updated_at, id)` ascending — not offset. `row_updated_at` is trigger-maintained on every UPDATE, so a stored `open → filled/cancelled`, a `settleSpeculation`, or a `claimPosition` advances it and surfaces here. The `id` tie-breaker means same-millisecond updates are never skipped.
+- **Includes terminal rows.** Recovery does NOT apply the open-book `status`/`expiry`/`nonce_invalidated` defaults — a commitment that went `filled`/`cancelled`, or a speculation that `settled`, must surface so a client converges its local state.
+- **Filters are identity/scope only** (e.g. `maker`, `contestId`, `scorer`, `speculationId`, `address`), not lifecycle-status.
+- **Cursor is opaque.** Treat `nextCursor` as a blob and pass it back as `?since=`; it embeds the resource so a cursor from one stream can't be used on another (400 `INVALID_CURSOR`).
+- **Convergence vs events.** For mutable rows (commitments/positions/speculations/contests) this is ordered state-delta *convergence* — a row that changed several times while you were away may surface only at its latest state. `position_fills` is the only append-only, event-like stream (`/v1/fills`), where every row is delivered; dedupe client-side on `(txHash, logIndex)`.
+- **Skew note.** These reads are strict keyset (terminating, no in-page duplicates). The late-commit overlap/re-scan that guards against `now()`-is-transaction-start skew lives in the live stream poller (forthcoming, A2), not in these stateless reads.
+
+Common response envelope: `{ <resource>: [...], nextCursor: string | null, hasMore: boolean }`. `hasMore` is true when a full `limit` page came back; an empty page echoes the input cursor so the client holds position. `limit` defaults to 100, max 1000.
+
+| Endpoint | Resource | Filters (all optional) |
+|---|---|---|
+| `GET /v1/commitments?since=` | commitments | `maker`, `contestId`, `scorer`, `speculationId` |
+| `GET /v1/positions?since=` | positions | `address`, `speculationId` |
+| `GET /v1/fills` | position_fills (events) | `maker`, `taker`, `speculationId`, `contestId`, `commitmentHash` |
+| `GET /v1/speculations?since=` | speculations | `contestId` |
+| `GET /v1/contests?since=` | contests | `contestId` |
+
+On the mutable-row endpoints, `?since=` *switches* the endpoint into recovery mode; without it they behave exactly as documented above (open-book list / window). `GET /v1/positions` (bare) and `GET /v1/fills` are recovery-native (cursor optional — absent means "from the beginning", paged).
+
 ## Scripts
 
 | Script | What it does |
@@ -442,6 +466,8 @@ src/
     slugs.ts           # toSlug / fromSlug
     speculation.ts     # scorer ↔ market_type, lineTicksToLine (pure)
     txParams.ts        # numeric primitives for on-chain tx building
+    cursor.ts          # opaque (table, row_updated_at, id) recovery cursor codec
+    recovery.ts        # ?since= parse + nextCursor helpers for recovery reads
   middleware/
     asyncHandler.ts    # error-forwarding wrapper
     errorHandler.ts    # final 500 handler, ApiError shape
@@ -453,8 +479,9 @@ src/
     contests.ts        # GET /v1/contests, /:contestId, /scripts/approved
     speculations.ts    # GET /v1/speculations, /:speculationId
     protocol.ts        # GET /v1/protocol/info
-    positions.ts       # GET /v1/positions/:address + /status, /claim-params,
-                       #   /by-tx/:txHash, /claim-result/:txHash
+    positions.ts       # GET /v1/positions (recovery) + /:address + /status,
+                       #   /claim-params, /by-tx/:txHash, /claim-result/:txHash
+    fills.ts           # GET /v1/fills — append-only fill event recovery
     leaderboard.ts     # GET /v1/leaderboard
     schedule.ts        # GET /v1/schedule
     teams.ts           # GET /v1/teams/aliases

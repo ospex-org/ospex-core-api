@@ -30,7 +30,9 @@ import {
   getPositionByTxHandler,
   getPositionStatusHandler,
   getPositionsByAddressHandler,
+  getPositionsRecoveryHandler,
 } from './positions.js';
+import { getFillsHandler } from './fills.js';
 import { getLeaderboardHandler } from './leaderboard.js';
 import { getScheduleHandler } from './schedule.js';
 
@@ -87,6 +89,9 @@ v1Router.get('/auth/domain', readRateLimit, (req, res) => getAuthDomainHandler(r
 
 v1Router.get('/config/public', readRateLimit, (req, res) => getPublicConfigHandler(req, res));
 
+// Bare /positions is the cursor-recovery endpoint (positions stream).
+// The :address routes below stay the snapshot/history surface.
+v1Router.get('/positions', readRateLimit, asyncHandler(getPositionsRecoveryHandler));
 // Static-prefix tx parsers MUST come before `/positions/:address`
 // so Express doesn't match `by-tx` / `claim-result` as an address.
 v1Router.get('/positions/by-tx/:txHash', readRateLimit, asyncHandler(getPositionByTxHandler));
@@ -94,6 +99,9 @@ v1Router.get('/positions/claim-result/:txHash', readRateLimit, asyncHandler(getC
 v1Router.get('/positions/:address/claim-params', readRateLimit, asyncHandler(getClaimParamsHandler));
 v1Router.get('/positions/:address/status', readRateLimit, asyncHandler(getPositionStatusHandler));
 v1Router.get('/positions/:address', readRateLimit, asyncHandler(getPositionsByAddressHandler));
+
+// Append-only fill event stream (position_fills).
+v1Router.get('/fills', readRateLimit, asyncHandler(getFillsHandler));
 
 v1Router.get('/leaderboard', readRateLimit, asyncHandler(getLeaderboardHandler));
 
