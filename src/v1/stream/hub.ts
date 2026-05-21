@@ -105,10 +105,12 @@ export class StreamHub {
   private readonly pollers = new Map<StreamResourceName, PollerState>();
   private totalSubs = 0;
   private resyncTimer: ReturnType<typeof setInterval> | undefined;
-  // Watermark by completion TIME, not id: recovery_runs.id is assigned at run
-  // start, so a long-running lower-id recovery can complete after a higher-id
-  // one — an id cursor would skip it.
-  private resyncCompletedAt: string | null = null;
+  // Watermark is a compound (completed_at, id) keyset. completed_at is primary
+  // because recovery_runs.id is assigned at run start (a long-running lower-id
+  // recovery can complete after a higher-id one); id is the tie-breaker so a
+  // batch of completions sharing one completed_at isn't truncated at the page
+  // boundary.
+  private resyncCursor: { completedAt: string; id: bigint } | null = null;
   private resyncPolling = false;
 
   constructor(deps: StreamHubDeps) {
@@ -145,7 +147,7 @@ export class StreamHub {
 
     this.totalSubs += 1;
     if (this.totalSubs === 1 && this.resyncTimer === undefined) {
-      this.resyncCompletedAt = null;
+      this.resyncCursor = null;
       void this.pollResync();
       this.resyncTimer = setInterval(() => {
         void this.pollResync();
@@ -323,47 +325,55 @@ export class StreamHub {
     try {
       const net = this.deps.getNetwork();
       const client = this.deps.getClient();
-      if (this.resyncCompletedAt === null) {
+      if (this.resyncCursor === null) {
         // Baseline EXCLUDES recoveries completed within the grace window, so one
         // completing right around the first subscribe isn't absorbed — it sorts
         // after the baseline and is broadcast by the same poll (fall through).
         const cutoff = new Date(Date.now() - this.deps.resyncGraceMs).toISOString();
         const { data, error } = await client
           .from('recovery_runs')
-          .select('completed_at')
+          .select('completed_at, id')
           .eq('network', net)
           .eq('status', 'complete')
           .lt('completed_at', cutoff)
           .order('completed_at', { ascending: false })
+          .order('id', { ascending: false })
           .limit(1);
         if (error) {
           logger.error({ err: error.message }, 'stream resync: baseline query failed');
           return;
         }
-        const top = (data ?? [])[0] as { completed_at: string } | undefined;
-        // Epoch sentinel when there are no older completions, so the broadcast
+        const top = (data ?? [])[0] as { completed_at: string; id: string | number } | undefined;
+        // Epoch/0 sentinel when there are no older completions, so the broadcast
         // picks up everything completed within the grace window.
-        this.resyncCompletedAt = top?.completed_at ?? new Date(0).toISOString();
+        this.resyncCursor = top
+          ? { completedAt: top.completed_at, id: BigInt(String(top.id)) }
+          : { completedAt: new Date(0).toISOString(), id: 0n };
         // No early return: fall through so within-grace completions get broadcast.
       }
 
+      const cur = this.resyncCursor;
+      // Compound keyset (completed_at, id) > (cursor) — tie-safe across the page
+      // boundary when many recoveries share one completed_at.
+      const keyset = `completed_at.gt.${cur.completedAt},and(completed_at.eq.${cur.completedAt},id.gt.${cur.id.toString()})`;
       const { data, error } = await client
         .from('recovery_runs')
-        .select('completed_at, kind')
+        .select('completed_at, id, kind')
         .eq('network', net)
         .eq('status', 'complete')
-        .gt('completed_at', this.resyncCompletedAt)
+        .or(keyset)
         .order('completed_at', { ascending: true })
+        .order('id', { ascending: true })
         .limit(50);
       if (error) {
         logger.error({ err: error.message }, 'stream resync: poll failed');
         return;
       }
-      const rows = (data ?? []) as Array<{ completed_at: string; kind: string }>;
+      const rows = (data ?? []) as Array<{ completed_at: string; id: string | number; kind: string }>;
       for (const row of rows) this.broadcastResync(String(row.kind));
-      // Rows are ordered by completed_at asc, so the last is the new watermark.
+      // Rows are ordered by (completed_at, id) asc, so the last is the new cursor.
       const last = rows[rows.length - 1];
-      if (last) this.resyncCompletedAt = last.completed_at;
+      if (last) this.resyncCursor = { completedAt: last.completed_at, id: BigInt(String(last.id)) };
     } catch (err) {
       logger.error({ err: err instanceof Error ? err.message : String(err) }, 'stream resync: tick failed');
     } finally {

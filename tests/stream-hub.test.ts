@@ -57,10 +57,24 @@ function datasetClient(rows: () => DRow[], recovery: () => RRow[]): SupabaseClie
         const c = Date.parse(st.ltCompletedAt);
         r = r.filter((x) => x.completed_at !== undefined && Date.parse(x.completed_at) < c);
       }
+      if (st.or !== undefined) {
+        // Compound (completed_at, id) keyset used by the recovery watcher poll.
+        const m = /^completed_at\.gt\.([^,]+),and\(completed_at\.eq\.([^,]+),id\.gt\.(\d+)\)$/.exec(st.or);
+        if (m) {
+          const cAt = Date.parse(m[1] as string);
+          const cId = BigInt(m[3] as string);
+          r = r.filter((x) => {
+            if (x.completed_at === undefined) return false;
+            const t = Date.parse(x.completed_at);
+            return t > cAt || (t === cAt && BigInt(x.id) > cId);
+          });
+        }
+      }
       r = [...r].sort((a, b) => {
         const ta = a.completed_at ? Date.parse(a.completed_at) : 0;
         const tb = b.completed_at ? Date.parse(b.completed_at) : 0;
-        return st.descCompletedAt ? tb - ta : ta - tb;
+        if (ta !== tb) return st.descCompletedAt ? tb - ta : ta - tb;
+        return st.descId ? b.id - a.id : a.id - b.id;
       });
       return r.slice(0, st.limit);
     }
@@ -391,6 +405,33 @@ describe('StreamHub resync', () => {
     // Both are broadcast, ordered by completion time — the lower-id one included.
     expect(c.resyncs).toContain('reorg');
     expect(c.resyncs).toContain('backfill');
+    hub.unsubscribe(sub);
+  });
+
+  it('is tie-safe at the page boundary — 51 completions sharing one completed_at all broadcast', async () => {
+    // With a completed_at-only cursor, poll 1 (limit 50) advances the watermark
+    // to T and poll 2 (completed_at > T) skips the 51st forever. The compound
+    // (completed_at, id) cursor resumes at id > 50 within the same timestamp.
+    const t = new Date(NOW - 5_000).toISOString();
+    const recovery: RRow[] = Array.from({ length: 51 }, (_, k) => ({
+      id: k + 1,
+      kind: 'reorg',
+      status: 'complete',
+      completed_at: t,
+    }));
+    const hub = new StreamHub({
+      getClient: () => datasetClient(() => [], () => recovery),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+      resyncGraceMs: 60_000,
+    });
+    const c = collector('positions');
+    const sub = hub.subscribe('positions', {}, c.cb); // immediate poll → first 50
+    await flush();
+    await hub.pollResync(); // second poll → the 51st (id > 50 at the same completed_at)
+    // 'reorg' is the broadcast kind (checkRecentRecovery emits the distinct 'recovery').
+    expect(c.resyncs.filter((r) => r === 'reorg')).toHaveLength(51);
     hub.unsubscribe(sub);
   });
 
