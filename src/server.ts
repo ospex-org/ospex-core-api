@@ -69,7 +69,18 @@ function buildApp(config: ReturnType<typeof loadConfig>): express.Express {
 
   app.use(helmet());
   app.use(cors());
-  app.use(compression());
+  app.use(
+    compression({
+      // Never compress SSE — buffering/transforming an event stream defeats
+      // its purpose. The stream handler sets `Content-Type: text/event-stream`
+      // before the first write, so the filter sees it here.
+      filter: (req, res) => {
+        const ct = res.getHeader('Content-Type');
+        if (typeof ct === 'string' && ct.includes('text/event-stream')) return false;
+        return compression.filter(req, res);
+      },
+    }),
+  );
   app.use(express.json({ limit: '1mb' }));
 
   // Liveness — process is up. No dependency checks. Always 200 while the

@@ -28,6 +28,7 @@ In progress. Working today:
 - `GET /v1/contests/:contestId/odds` — current upstream reference odds for the contest's underlying game (moneyline / spread / total snapshot from `current_odds`). Per-market response shapes are explicit (no shared "line + away/home" envelope) so consumers can't misread the semantics — see "Odds snapshot" below for the exact shape.
 - `GET /v1/analytics/odds-history/:contestId` — opening + current odds for analytics callers (deprecated SDK-internal use; new code should prefer `/contests/:contestId/odds` for current-state reads).
 - **Cursor recovery (Phase 1.5):** `?since=<cursor>` recovery mode on `GET /v1/commitments`, `/v1/speculations`, `/v1/contests`; bare `GET /v1/positions` (recovery) alongside the address-scoped snapshot; `GET /v1/fills` (append-only fill events). See "Cursor recovery reads" below.
+- **SSE streams (Phase 1.5):** `GET /v1/stream/{commitments,positions,fills,speculations,contests}` — live deltas + cursor catch-up + resync over Server-Sent Events. See "SSE streams" below.
 
 Not ported (no R4 analog — see "Position helpers" section below): `/withdraw-params`, `/withdraw-result/:txHash`. Not ported in any batch yet (deferred or out of scope): everything else under `/v1/analytics/*`, `/v1/current-odds*` (the legacy `/v1/current-odds*` paths from agent-server are superseded by the contest-centric `/v1/contests/:contestId/odds`).
 
@@ -62,7 +63,7 @@ curl http://localhost:3000/readyz    # readiness — 200 only if Supabase is rea
 
 ## Endpoints
 
-All read endpoints share `readRateLimit` (600 req/min per IP); the write endpoint has its own tighter limit.
+Most read endpoints share `readRateLimit` (600 req/min per IP); the write endpoint has its own tighter limit. The SSE stream endpoints (`/v1/stream/*`) are intentionally exempt — a stream is one long-lived request, not a burst — and are bounded by a concurrent-connection cap instead (see "SSE streams").
 
 ### `POST /v1/commitments`
 
@@ -361,14 +362,14 @@ Pagination caveat: PostgREST returns at most 1000 rows per request, so `limit` i
 
 ### Cursor recovery reads (Phase 1.5)
 
-The catch-up side of the push contract. A client streams live deltas (forthcoming SSE) and, after a disconnect, asks for everything after its last cursor. These reads are intentionally distinct from the open-book list/snapshot endpoints above.
+The catch-up side of the push contract. A client streams live deltas (SSE — see "SSE streams") and, after a disconnect, asks for everything after its last cursor. These reads are intentionally distinct from the open-book list/snapshot endpoints above.
 
 - **Ordering** is keyset `(row_updated_at, id)` ascending — not offset. `row_updated_at` is trigger-maintained on every UPDATE, so a stored `open → filled/cancelled`, a `settleSpeculation`, or a `claimPosition` advances it and surfaces here. The `id` tie-breaker means same-millisecond updates are never skipped.
 - **Includes terminal rows.** Recovery does NOT apply the open-book `status`/`expiry`/`nonce_invalidated` defaults — a commitment that went `filled`/`cancelled`, or a speculation that `settled`, must surface so a client converges its local state.
 - **Filters are identity/scope only** (e.g. `maker`, `contestId`, `scorer`, `speculationId`, `address`), not lifecycle-status.
 - **Cursor is opaque.** Treat `nextCursor` as a blob and pass it back as `?since=`; it embeds the resource so a cursor from one stream can't be used on another (400 `INVALID_CURSOR`).
 - **Convergence vs events.** For mutable rows (commitments/positions/speculations/contests) this is ordered state-delta *convergence* — a row that changed several times while you were away may surface only at its latest state. `position_fills` is the only append-only, event-like stream (`/v1/fills`), where every row is delivered; dedupe client-side on `(txHash, logIndex)`.
-- **Resume vs paging (late-commit safety).** Cursors are kind-tagged. A `live` cursor — minted at the stream tail / snapshot tip — makes recovery re-scan an **overlap window**: it queries from `cursor.ts − overlap` (default 30s) so a row committed late under the `now()`-is-transaction-start schema isn't skipped on reconnect. Every `nextCursor` is a `page` cursor (strict keyset on its own `(row_updated_at, id)`), so paging through a backlog terminates regardless of overlap size. The id tie-breaker means same-millisecond updates are never skipped; clients dedupe by the event cursor `(table, row_updated_at, id)`.
+- **Resume vs paging (late-commit safety).** Cursors are kind-tagged. A `live` cursor — minted at the stream tail / snapshot tip — makes recovery re-scan an **overlap window**: it queries from `cursor.ts − overlap` (default 30s) so a row committed late under the `now()`-is-transaction-start schema isn't skipped on reconnect. Every `nextCursor` is a `page` cursor (strict keyset on its own `(row_updated_at, id)`), so paging through a backlog terminates regardless of overlap size. The id tie-breaker means same-millisecond rows are never skipped; the overlap re-scan can re-deliver a row already returned, so apply rows idempotently by natural key (commitment hash, speculation id, etc.).
 
 Common response envelope: `{ <resource>: [...], nextCursor: string | null, hasMore: boolean }`. `hasMore` is true when a full `limit` page came back; an empty page echoes the input cursor so the client holds position. `limit` defaults to 100, max 1000.
 
@@ -381,6 +382,26 @@ Common response envelope: `{ <resource>: [...], nextCursor: string | null, hasMo
 | `GET /v1/contests?since=` | contests | `contestId` |
 
 On the mutable-row endpoints, `?since=` *switches* the endpoint into recovery mode; without it they behave exactly as documented above (open-book list / window). `GET /v1/positions` (bare) and `GET /v1/fills` are recovery-native (cursor optional — absent means "from the beginning", paged).
+
+### SSE streams (Phase 1.5)
+
+`GET /v1/stream/:resource` (`resource` ∈ `commitments | positions | fills | speculations | contests`) opens a [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) stream — the live, push side of the contract. One internal poller per resource fans deltas out to every connected client: many agents subscribe, but each resource is polled once per tick (the N→1 collapse that keeps a busy fleet off the DB).
+
+Connect, e.g. `GET /v1/stream/fills?maker=0x…&cursor=<opaque>`:
+- **Filters** (identity/scope, all optional) match the recovery table above — commitments: `maker`/`contestId`/`scorer`; positions: `address`/`speculationId`; fills: `maker`/`taker`/`speculationId`/`contestId`/`commitmentHash`; speculations/contests: `contestId`. (`speculationId` on commitments is recovery-REST-only.) Unknown `:resource` → 404.
+- **`cursor`** (optional, opaque): the resume point. With it the server replays missed deltas (catch-up) before going live; without it, snapshot first via the REST endpoints, then stream.
+
+Events:
+- `event: delta` — `id:` is the opaque cursor; `data:` is the same body shape as the REST recovery/snapshot for that resource. The cursor is an **opaque resume token, not a version** — store the last `id` to reconnect, and never decode it. Deltas are **not ordered by cursor** (a row committed late under the `now()`-is-transaction-start watermark can arrive after a newer one), so apply **last-received-wins**: process deltas in the order received and overwrite per natural key. The poller re-reads current DB state every tick, so the most recently received delta for an entity reflects its most recent read — a late update is re-emitted by the overlap re-scan and supersedes the stale one because it arrives later. (`position_fills` is append-only — apply every event; dedupe by `(txHash, logIndex)`.)
+- `event: ready` — **catch-up complete and this connection is live.** Emitted exactly once, and only on a clean handoff: catch-up finished AND no live delta or resync raced it. So at `ready` the client's state equals the DB state catch-up observed. A `resync` is never followed by `ready` on the same connection.
+- `event: resync` (`data: { reason }`) — **re-snapshot.** Fires when: a reorg/backfill recovery completes upstream (recovery hard-deletes rows, which polling can't observe); the catch-up backlog was too large to replay; or **a live delta/resync raced the cursor catch-up** (`reason: "handoff_raced"`). On a raced handoff the server emits one `resync` and closes the connection — the client should re-snapshot and reconnect. (See "Reconnect".)
+- `: hb` comment heartbeats (~20s) keep the connection under the platform idle timeout.
+
+Operational notes:
+- **Reconnect** with the last `id` you saw (a live cursor): a native `EventSource` resends it automatically as the `Last-Event-ID` header, or pass it as `?cursor=`. **`Last-Event-ID` takes precedence** over `?cursor=` — on an `EventSource` auto-reconnect the original URL's `?cursor=` is stale, while the header is the true resume point. The server replays missed deltas from there, re-scanning the overlap window so a row committed late under the `now()`-based schema isn't missed, then emits `ready`. **Under concurrent write activity** the cursor handoff conservatively aborts to `resync` rather than risk a stale-at-`ready` merge; on `resync` the client re-snapshots (REST) and reconnects (without a cursor, since the snapshot is current).
+- SSE is **exempt from gzip** (compression buffers streams would defeat it) and from the request-rate limiter; a **concurrent-connection cap** (per-IP + total) bounds resource use instead — `429` when full.
+- `position_fills` is append-only (every event delivered); the other four are state-delta convergence (latest state per row).
+- Backed by the same `(network, row_updated_at, id)` indexes as recovery (indexer migration 048) — apply those before production stream traffic.
 
 ## Scripts
 
@@ -482,6 +503,12 @@ src/
     positions.ts       # GET /v1/positions (recovery) + /:address + /status,
                        #   /claim-params, /by-tx/:txHash, /claim-result/:txHash
     fills.ts           # GET /v1/fills — append-only fill event recovery
+    stream/            # GET /v1/stream/:resource — SSE live deltas
+      handler.ts       #   handoff state machine: cap → subscribe → catch-up → (clean? ready : resync)
+      hub.ts           #   per-resource poller + fan-out + resync watcher (N→1)
+      resources.ts     #   per-resource registry (columns, toBody, filters)
+      sse.ts           #   SSE wire helpers (event/comment frames)
+      connections.ts   #   concurrent-connection caps
     leaderboard.ts     # GET /v1/leaderboard
     schedule.ts        # GET /v1/schedule
     teams.ts           # GET /v1/teams/aliases

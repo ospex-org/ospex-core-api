@@ -33,6 +33,7 @@ import {
   getPositionsRecoveryHandler,
 } from './positions.js';
 import { getFillsHandler } from './fills.js';
+import { getStreamHandler } from './stream/handler.js';
 import { getLeaderboardHandler } from './leaderboard.js';
 import { getScheduleHandler } from './schedule.js';
 
@@ -102,6 +103,13 @@ v1Router.get('/positions/:address', readRateLimit, asyncHandler(getPositionsByAd
 
 // Append-only fill event stream (position_fills).
 v1Router.get('/fills', readRateLimit, asyncHandler(getFillsHandler));
+
+// ── SSE streams ───────────────────────────────────────────────────────
+// Long-lived Server-Sent Events: live deltas + cursor catch-up + resync.
+// No readRateLimit (a stream is one long request, not a burst); the handler
+// enforces a concurrent-connection cap instead. `:resource` is validated
+// against the stream registry (404 otherwise).
+v1Router.get('/stream/:resource', (req, res) => getStreamHandler(req, res));
 
 v1Router.get('/leaderboard', readRateLimit, asyncHandler(getLeaderboardHandler));
 

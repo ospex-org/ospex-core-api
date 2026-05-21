@@ -189,7 +189,7 @@ export async function getPositionsByAddressHandler(req: Request, res: Response):
 // positionType).
 // ──────────────────────────────────────────────────────────────────────
 
-interface PositionRecoveryBody {
+export interface PositionRecoveryBody {
   speculationId: string;
   userAddress: string;
   positionType: 0 | 1 | null;
@@ -200,7 +200,7 @@ interface PositionRecoveryBody {
   claimedAt: string | null;
 }
 
-interface PositionRecoveryRow {
+export interface PositionRecoveryRow {
   speculation_id: string | number;
   user_address: string;
   position_type: 'upper' | 'lower' | null;
@@ -213,9 +213,22 @@ interface PositionRecoveryRow {
   row_updated_at: string;
 }
 
-const POSITION_RECOVERY_COLUMNS =
+export const POSITION_RECOVERY_COLUMNS =
   'speculation_id, user_address, position_type, risk_amount, profit_amount, ' +
   'claimed, claimed_at, position_created_at, id, row_updated_at';
+
+export function positionRecoveryRowToBody(r: PositionRecoveryRow): PositionRecoveryBody {
+  return {
+    speculationId: String(r.speculation_id),
+    userAddress: r.user_address,
+    positionType: r.position_type ? POSITION_TYPE_TO_INT[r.position_type] : null,
+    riskAmountUSDC: wei6ToUSDC(r.risk_amount),
+    profitAmountUSDC: wei6ToUSDC(r.profit_amount),
+    claimed: Boolean(r.claimed),
+    positionCreatedAt: r.position_created_at,
+    claimedAt: r.claimed_at,
+  };
+}
 
 export async function getPositionsRecoveryHandler(req: Request, res: Response): Promise<void> {
   const config = loadConfig();
@@ -263,16 +276,7 @@ export async function getPositionsRecoveryHandler(req: Request, res: Response): 
   }
 
   const rows = (data ?? []) as unknown as PositionRecoveryRow[];
-  const positions: PositionRecoveryBody[] = rows.map((r) => ({
-    speculationId: String(r.speculation_id),
-    userAddress: r.user_address,
-    positionType: r.position_type ? POSITION_TYPE_TO_INT[r.position_type] : null,
-    riskAmountUSDC: wei6ToUSDC(r.risk_amount),
-    profitAmountUSDC: wei6ToUSDC(r.profit_amount),
-    claimed: Boolean(r.claimed),
-    positionCreatedAt: r.position_created_at,
-    claimedAt: r.claimed_at,
-  }));
+  const positions: PositionRecoveryBody[] = rows.map(positionRecoveryRowToBody);
   const last = rows.length > 0 ? rows[rows.length - 1] : undefined;
   res.status(200).json({
     positions,

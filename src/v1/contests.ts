@@ -152,7 +152,7 @@ interface ContestDetailRow {
 // settlement + claims) a disconnected client missed. Identity filter:
 // contestId. Lean lifecycle-focused body; no speculations/orderbook (those
 // have their own streams) so this path doesn't need SCORER_* config.
-interface ContestRecoveryRow extends CursorableRow {
+export interface ContestRecoveryRow extends CursorableRow {
   contest_id: string | number;
   away_team: string | null;
   home_team: string | null;
@@ -168,7 +168,7 @@ interface ContestRecoveryRow extends CursorableRow {
   contest_created_at: string | null;
 }
 
-interface ContestRecoveryBody {
+export interface ContestRecoveryBody {
   contestId: string;
   awayTeam: string;
   homeTeam: string;
@@ -184,10 +184,28 @@ interface ContestRecoveryBody {
   contestCreatedAt: string | null;
 }
 
-const CONTEST_RECOVERY_COLUMNS =
+export const CONTEST_RECOVERY_COLUMNS =
   'contest_id, away_team, home_team, sport_slug, jsonodds_sport_id, start_time, ' +
   'contest_status, away_score, home_score, verified_at, scored_at, voided_at, ' +
   'contest_created_at, id, row_updated_at';
+
+export function contestRecoveryRowToBody(c: ContestRecoveryRow): ContestRecoveryBody {
+  return {
+    contestId: String(c.contest_id),
+    awayTeam: c.away_team ?? '',
+    homeTeam: c.home_team ?? '',
+    sport: c.sport_slug ?? '',
+    sportId: c.jsonodds_sport_id ?? 0,
+    matchTime: c.start_time ?? '',
+    status: c.contest_status ?? '',
+    awayScore: c.away_score ?? null,
+    homeScore: c.home_score ?? null,
+    verifiedAt: c.verified_at ?? null,
+    scoredAt: c.scored_at ?? null,
+    voidedAt: c.voided_at ?? null,
+    contestCreatedAt: c.contest_created_at ?? null,
+  };
+}
 
 async function getContestsRecovery(req: Request, res: Response): Promise<void> {
   const config = loadConfig();
@@ -224,21 +242,7 @@ async function getContestsRecovery(req: Request, res: Response): Promise<void> {
   }
 
   const rows = (data ?? []) as unknown as ContestRecoveryRow[];
-  const contests: ContestRecoveryBody[] = rows.map((c) => ({
-    contestId: String(c.contest_id),
-    awayTeam: c.away_team ?? '',
-    homeTeam: c.home_team ?? '',
-    sport: c.sport_slug ?? '',
-    sportId: c.jsonodds_sport_id ?? 0,
-    matchTime: c.start_time ?? '',
-    status: c.contest_status ?? '',
-    awayScore: c.away_score ?? null,
-    homeScore: c.home_score ?? null,
-    verifiedAt: c.verified_at ?? null,
-    scoredAt: c.scored_at ?? null,
-    voidedAt: c.voided_at ?? null,
-    contestCreatedAt: c.contest_created_at ?? null,
-  }));
+  const contests: ContestRecoveryBody[] = rows.map(contestRecoveryRowToBody);
   const last = rows.length > 0 ? rows[rows.length - 1] : undefined;
   res.status(200).json({
     contests,

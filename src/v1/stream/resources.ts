@@ -1,0 +1,172 @@
+/**
+ * Stream resource registry — the single per-resource config that powers both
+ * the live poller and the per-connection catch-up. Each entry says what to
+ * SELECT, how to map a row to the public body (reusing the exact A1 recovery
+ * mappers, so stream deltas and REST recovery agree shape-for-shape), how to
+ * validate query filters, and which columns those filters constrain.
+ *
+ * Filters are identity/scope only (Hermes: not lifecycle-status). `parseFilters`
+ * returns a column→value map (snake_case columns, validated values); the same
+ * map is applied as `.eq()` on the catch-up query and matched in-memory for
+ * live fan-out — see `matchesRow`. All stream filters map to direct, indexed
+ * columns so parsing stays synchronous (no speculationId→key DB lookup; use
+ * the A1 REST recovery endpoint for that).
+ */
+
+import type { Request } from 'express';
+import { isAddress } from 'ethers';
+import type { ApiError } from '../../middleware/errorHandler.js';
+import type { CursorableRow, CursorTable } from '../../lib/cursor.js';
+
+import {
+  rowToBody as commitmentRowToBody,
+  COMMITMENT_RECOVERY_COLUMNS,
+  type CommitmentRow,
+} from '../commitments.js';
+import { rowToBody as fillRowToBody, FILL_COLUMNS, type FillRow } from '../fills.js';
+import {
+  positionRecoveryRowToBody,
+  POSITION_RECOVERY_COLUMNS,
+  type PositionRecoveryRow,
+} from '../positions.js';
+import {
+  contestRecoveryRowToBody,
+  CONTEST_RECOVERY_COLUMNS,
+  type ContestRecoveryRow,
+} from '../contests.js';
+import { specRowToSpeculation, SPECULATION_COLUMNS, type SpeculationRow } from '../utils/speculations.js';
+
+export type StreamResourceName = 'commitments' | 'positions' | 'fills' | 'speculations' | 'contests';
+
+/** A raw delta row — always carries the cursor columns plus the resource's selected columns. */
+export type StreamRow = CursorableRow & Record<string, unknown>;
+
+/** Validated filter map: snake_case column → string value to compare. */
+export type StreamFilters = Record<string, string>;
+
+export interface StreamResource {
+  name: StreamResourceName;
+  /** Cursor resource tag (matches CursorTable). */
+  cursorTable: CursorTable;
+  /** Supabase table to poll / catch up from. */
+  table: string;
+  /** SELECT list — includes id + row_updated_at and every filterable column. */
+  columns: string;
+  /** Map a raw row to the public body. `null` drops the row (e.g. an unenriched speculation). */
+  toBody(row: StreamRow): unknown | null;
+  /** Validate query params into a column→value filter map, or a 400 body. */
+  parseFilters(req: Request): StreamFilters | { errorBody: ApiError };
+}
+
+/** In-memory fan-out match: a row matches when every filtered column equals its value. */
+export function matchesRow(filters: StreamFilters, row: StreamRow): boolean {
+  for (const [col, val] of Object.entries(filters)) {
+    if (String(row[col] ?? '') !== val) return false;
+  }
+  return true;
+}
+
+// ── filter validators ───────────────────────────────────────────────────
+// Return null when the param is absent, { value } when valid, { error } when not.
+type Check = { value: string } | { error: string } | null;
+
+function vAddress(raw: unknown): Check {
+  if (raw === undefined) return null;
+  const s = String(raw).trim().toLowerCase();
+  return isAddress(s) ? { value: s } : { error: 'must be a valid Ethereum address.' };
+}
+function vUint(raw: unknown): Check {
+  if (raw === undefined) return null;
+  try {
+    const n = BigInt(String(raw));
+    if (n < 0n) throw new Error();
+    return { value: n.toString() };
+  } catch {
+    return { error: 'must be a non-negative integer.' };
+  }
+}
+function vHash(raw: unknown): Check {
+  if (raw === undefined) return null;
+  const s = String(raw).trim();
+  return /^0x[0-9a-f]{64}$/i.test(s) ? { value: s.toLowerCase() } : { error: 'must be a 0x-prefixed 32-byte hex string.' };
+}
+
+/** Run a set of [param, column, check] tuples into a filter map or a 400. */
+function collect(
+  specs: Array<readonly [param: string, column: string, check: Check]>,
+): StreamFilters | { errorBody: ApiError } {
+  const out: StreamFilters = {};
+  for (const [param, column, check] of specs) {
+    if (check === null) continue;
+    if ('error' in check) {
+      return { errorBody: { error: `${param} ${check.error}`, code: 'INVALID_PARAM' } };
+    }
+    out[column] = check.value;
+  }
+  return out;
+}
+
+// ── registry ──────────────────────────────────────────────────────────────
+
+export const STREAM_RESOURCES: Record<StreamResourceName, StreamResource> = {
+  commitments: {
+    name: 'commitments',
+    cursorTable: 'commitments',
+    table: 'commitments',
+    columns: COMMITMENT_RECOVERY_COLUMNS,
+    toBody: (row) => commitmentRowToBody(row as unknown as CommitmentRow, Date.now()),
+    parseFilters: (req) =>
+      collect([
+        ['maker', 'maker', vAddress(req.query.maker)],
+        ['scorer', 'scorer', vAddress(req.query.scorer)],
+        ['contestId', 'contest_id', vUint(req.query.contestId)],
+      ]),
+  },
+  positions: {
+    name: 'positions',
+    cursorTable: 'positions',
+    table: 'positions',
+    columns: POSITION_RECOVERY_COLUMNS,
+    toBody: (row) => positionRecoveryRowToBody(row as unknown as PositionRecoveryRow),
+    parseFilters: (req) =>
+      collect([
+        ['address', 'user_address', vAddress(req.query.address)],
+        ['speculationId', 'speculation_id', vUint(req.query.speculationId)],
+      ]),
+  },
+  fills: {
+    name: 'fills',
+    cursorTable: 'fills',
+    table: 'position_fills',
+    columns: FILL_COLUMNS,
+    toBody: (row) => fillRowToBody(row as unknown as FillRow),
+    parseFilters: (req) =>
+      collect([
+        ['maker', 'maker_address', vAddress(req.query.maker)],
+        ['taker', 'taker_address', vAddress(req.query.taker)],
+        ['speculationId', 'speculation_id', vUint(req.query.speculationId)],
+        ['contestId', 'contest_id', vUint(req.query.contestId)],
+        ['commitmentHash', 'commitment_hash', vHash(req.query.commitmentHash)],
+      ]),
+  },
+  speculations: {
+    name: 'speculations',
+    cursorTable: 'speculations',
+    table: 'speculations',
+    columns: `${SPECULATION_COLUMNS}, id, row_updated_at`,
+    toBody: (row) => specRowToSpeculation(row as unknown as SpeculationRow),
+    parseFilters: (req) => collect([['contestId', 'contest_id', vUint(req.query.contestId)]]),
+  },
+  contests: {
+    name: 'contests',
+    cursorTable: 'contests',
+    table: 'contests',
+    columns: CONTEST_RECOVERY_COLUMNS,
+    toBody: (row) => contestRecoveryRowToBody(row as unknown as ContestRecoveryRow),
+    parseFilters: (req) => collect([['contestId', 'contest_id', vUint(req.query.contestId)]]),
+  },
+};
+
+export function isStreamResource(name: string): name is StreamResourceName {
+  return Object.prototype.hasOwnProperty.call(STREAM_RESOURCES, name);
+}
