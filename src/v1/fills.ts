@@ -26,7 +26,7 @@ import type { ApiError } from '../middleware/errorHandler.js';
 const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower: 1 };
 const HASH_PATTERN = /^0x[0-9a-f]{64}$/i;
 
-interface FillBody {
+export interface FillBody {
   speculationId: string;
   contestId: string;
   commitmentHash: string;
@@ -45,7 +45,7 @@ interface FillBody {
   logIndex: number;
 }
 
-interface FillRow extends CursorableRow {
+export interface FillRow extends CursorableRow {
   speculation_id: string | number;
   contest_id: string | number;
   commitment_hash: string;
@@ -62,12 +62,12 @@ interface FillRow extends CursorableRow {
   log_index: number;
 }
 
-const FILL_COLUMNS =
+export const FILL_COLUMNS =
   'speculation_id, contest_id, commitment_hash, maker_address, taker_address, ' +
   'maker_position_type, taker_position_type, maker_risk_amount, taker_risk_amount, ' +
   'odds_tick, filled_at, contest_started, tx_hash, log_index, id, row_updated_at';
 
-function rowToBody(r: FillRow): FillBody {
+export function rowToBody(r: FillRow): FillBody {
   return {
     speculationId: String(r.speculation_id),
     contestId: String(r.contest_id),

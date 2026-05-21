@@ -28,6 +28,7 @@ In progress. Working today:
 - `GET /v1/contests/:contestId/odds` — current upstream reference odds for the contest's underlying game (moneyline / spread / total snapshot from `current_odds`). Per-market response shapes are explicit (no shared "line + away/home" envelope) so consumers can't misread the semantics — see "Odds snapshot" below for the exact shape.
 - `GET /v1/analytics/odds-history/:contestId` — opening + current odds for analytics callers (deprecated SDK-internal use; new code should prefer `/contests/:contestId/odds` for current-state reads).
 - **Cursor recovery (Phase 1.5):** `?since=<cursor>` recovery mode on `GET /v1/commitments`, `/v1/speculations`, `/v1/contests`; bare `GET /v1/positions` (recovery) alongside the address-scoped snapshot; `GET /v1/fills` (append-only fill events). See "Cursor recovery reads" below.
+- **SSE streams (Phase 1.5):** `GET /v1/stream/{commitments,positions,fills,speculations,contests}` — live deltas + cursor catch-up + resync over Server-Sent Events. See "SSE streams" below.
 
 Not ported (no R4 analog — see "Position helpers" section below): `/withdraw-params`, `/withdraw-result/:txHash`. Not ported in any batch yet (deferred or out of scope): everything else under `/v1/analytics/*`, `/v1/current-odds*` (the legacy `/v1/current-odds*` paths from agent-server are superseded by the contest-centric `/v1/contests/:contestId/odds`).
 
@@ -382,6 +383,26 @@ Common response envelope: `{ <resource>: [...], nextCursor: string | null, hasMo
 
 On the mutable-row endpoints, `?since=` *switches* the endpoint into recovery mode; without it they behave exactly as documented above (open-book list / window). `GET /v1/positions` (bare) and `GET /v1/fills` are recovery-native (cursor optional — absent means "from the beginning", paged).
 
+### SSE streams (Phase 1.5)
+
+`GET /v1/stream/:resource` (`resource` ∈ `commitments | positions | fills | speculations | contests`) opens a [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) stream — the live, push side of the contract. One internal poller per resource fans deltas out to every connected client: many agents subscribe, but each resource is polled once per tick (the N→1 collapse that keeps a busy fleet off the DB).
+
+Connect, e.g. `GET /v1/stream/fills?maker=0x…&cursor=<opaque>`:
+- **Filters** (identity/scope, all optional) match the recovery table above — commitments: `maker`/`contestId`/`scorer`; positions: `address`/`speculationId`; fills: `maker`/`taker`/`speculationId`/`contestId`/`commitmentHash`; speculations/contests: `contestId`. (`speculationId` on commitments is recovery-REST-only.) Unknown `:resource` → 404.
+- **`cursor`** (optional, opaque): the resume point. With it the server replays missed deltas (catch-up) before going live; without it, snapshot first via the REST endpoints, then stream.
+
+Events:
+- `event: delta` — `id:` is the opaque (live) cursor; `data:` is the same body shape as the REST recovery/snapshot for that resource. Apply by natural key in cursor order; dedupe by the event cursor `(table, row_updated_at, id)`.
+- `event: ready` — catch-up complete; now streaming live.
+- `event: resync` (`data: { reason }`) — re-snapshot. Fires when a reorg/backfill recovery completes upstream (recovery hard-deletes rows, which polling can't observe) or the backlog was too large to replay.
+- `: hb` comment heartbeats (~20s) keep the connection under the platform idle timeout.
+
+Operational notes:
+- **Reconnect** with the last `id` you saw (a live cursor) as `?cursor=`; the server re-scans the overlap window so a row committed late under the `now()`-based schema isn't missed.
+- SSE is **exempt from gzip** (compression buffers streams would defeat it) and from the request-rate limiter; a **concurrent-connection cap** (per-IP + total) bounds resource use instead — `429` when full.
+- `position_fills` is append-only (every event delivered); the other four are state-delta convergence (latest state per row).
+- Backed by the same `(network, row_updated_at, id)` indexes as recovery (indexer migration 048) — apply those before production stream traffic.
+
 ## Scripts
 
 | Script | What it does |
@@ -482,6 +503,12 @@ src/
     positions.ts       # GET /v1/positions (recovery) + /:address + /status,
                        #   /claim-params, /by-tx/:txHash, /claim-result/:txHash
     fills.ts           # GET /v1/fills — append-only fill event recovery
+    stream/            # GET /v1/stream/:resource — SSE live deltas
+      handler.ts       #   connect lifecycle: cap → catch-up → buffer flush → live
+      hub.ts           #   per-resource poller + fan-out + resync watcher (N→1)
+      resources.ts     #   per-resource registry (columns, toBody, filters)
+      sse.ts           #   SSE wire helpers (event/comment frames)
+      connections.ts   #   concurrent-connection caps
     leaderboard.ts     # GET /v1/leaderboard
     schedule.ts        # GET /v1/schedule
     teams.ts           # GET /v1/teams/aliases

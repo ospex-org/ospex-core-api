@@ -107,8 +107,8 @@ const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower
 // Recovery reads also need the cursor columns. `row_updated_at` is
 // trigger-maintained on every UPDATE, so a stored open→filled/cancelled
 // transition advances it and surfaces in the recovery stream.
-const COMMITMENT_RECOVERY_COLUMNS = `${COMMITMENT_COLUMNS}, id, row_updated_at`;
-type CommitmentRecoveryRow = CommitmentRow & CursorableRow;
+export const COMMITMENT_RECOVERY_COLUMNS = `${COMMITMENT_COLUMNS}, id, row_updated_at`;
+export type CommitmentRecoveryRow = CommitmentRow & CursorableRow;
 
 /**
  * Map a raw `commitments` row to the canonical body. `nowMs` is the request's
