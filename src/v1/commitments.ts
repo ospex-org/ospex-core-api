@@ -37,8 +37,8 @@ import { getSupabase } from '../lib/supabase.js';
 import { deriveSpeculationKey } from '../lib/eip712.js';
 import { scorerToType, type MarketType } from '../lib/speculation.js';
 import { deriveEffectiveStatus } from '../lib/commitmentStatus.js';
-import { keysetOrExpr, type CursorableRow } from '../lib/cursor.js';
-import { nextCursor, parseRecovery } from '../lib/recovery.js';
+import type { CursorableRow } from '../lib/cursor.js';
+import { nextCursor, parseRecovery, recoveryKeysetExpr } from '../lib/recovery.js';
 import type { AuthenticatedRequest } from '../middleware/eip712Auth.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 
@@ -483,7 +483,7 @@ async function getCommitmentsRecovery(req: Request, res: Response): Promise<void
   if (scorer !== undefined) q = q.eq('scorer', scorer);
   if (contestId !== undefined) q = q.eq('contest_id', contestId);
   if (speculationKey !== undefined) q = q.eq('speculation_key', speculationKey);
-  if (recovery.cursor) q = q.or(keysetOrExpr(recovery.cursor));
+  if (recovery.cursor) q = q.or(recoveryKeysetExpr(recovery.cursor));
   q = q.order('row_updated_at', { ascending: true }).order('id', { ascending: true }).limit(recovery.limit);
 
   const { data, error } = await q;

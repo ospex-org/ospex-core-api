@@ -21,6 +21,16 @@ import type { ApiError } from '../middleware/errorHandler.js';
 
 export type CursorTable = 'commitments' | 'positions' | 'fills' | 'speculations' | 'contests';
 
+/**
+ * `live`  — minted at the live tail (stream event / snapshot tip). Resuming
+ *           from it re-scans the recovery overlap window, because `now()` is
+ *           transaction-start time and a slow writer tx can land a row whose
+ *           `row_updated_at` predates this cursor.
+ * `page`  — a recovery continuation cursor. Strict keyset, no overlap, so
+ *           paging through a backlog terminates regardless of overlap size.
+ */
+export type CursorKind = 'live' | 'page';
+
 export interface StreamCursor {
   /** Resource table this cursor was minted for. */
   t: CursorTable;
@@ -28,7 +38,17 @@ export interface StreamCursor {
   s: string;
   /** `id` (bigint identity) as a decimal string. */
   i: string;
+  /** Whether resuming from this cursor re-scans the overlap window. */
+  k: CursorKind;
 }
+
+// The exact ISO-8601 timestamptz shapes PostgREST/supabase-js mint for a
+// `timestamptz` column (`...Z` or `...+00:00`, optional fractional seconds).
+// Validating against this — not the permissive Date.parse — keeps a crafted
+// timestamp (e.g. one containing a comma, which is the PostgREST `.or()`
+// delimiter) from reaching the filter grammar and 500-ing instead of a clean
+// 400 INVALID_CURSOR.
+const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})$/;
 
 /**
  * Thrown when a client-supplied `?since=` value can't be decoded or is
@@ -45,7 +65,7 @@ export class CursorError extends Error {
 }
 
 export function encodeCursor(c: StreamCursor): string {
-  return Buffer.from(JSON.stringify({ t: c.t, s: c.s, i: c.i }), 'utf8').toString('base64url');
+  return Buffer.from(JSON.stringify({ t: c.t, s: c.s, i: c.i, k: c.k }), 'utf8').toString('base64url');
 }
 
 /**
@@ -64,7 +84,7 @@ export function decodeCursor(raw: string, expectedTable: CursorTable): StreamCur
     throw new CursorError('Malformed cursor: expected a JSON object.');
   }
   const obj = json as Record<string, unknown>;
-  const { t, s, i } = obj;
+  const { t, s, i, k } = obj;
   if (typeof t !== 'string' || typeof s !== 'string' || typeof i !== 'string') {
     throw new CursorError('Malformed cursor: missing string fields t, s, i.');
   }
@@ -76,10 +96,20 @@ export function decodeCursor(raw: string, expectedTable: CursorTable): StreamCur
   if (!/^\d+$/.test(i)) {
     throw new CursorError('Malformed cursor: id must be a non-negative integer.');
   }
-  if (Number.isNaN(Date.parse(s))) {
-    throw new CursorError('Malformed cursor: timestamp is not a valid date.');
+  if (!ISO_TIMESTAMP.test(s)) {
+    throw new CursorError('Malformed cursor: timestamp is not an ISO-8601 timestamptz.');
   }
-  return { t: expectedTable, s, i };
+  // Absent kind defaults to `live` — the conservative choice (applies the
+  // overlap re-scan). Present-but-unrecognized is rejected.
+  let kind: CursorKind;
+  if (k === undefined) {
+    kind = 'live';
+  } else if (k === 'live' || k === 'page') {
+    kind = k;
+  } else {
+    throw new CursorError('Malformed cursor: kind must be "live" or "page".');
+  }
+  return { t: expectedTable, s, i, k: kind };
 }
 
 /** A row carrying the two columns every cursor needs. */
@@ -88,24 +118,26 @@ export interface CursorableRow {
   id: string | number;
 }
 
-export function cursorFromRow(table: CursorTable, row: CursorableRow): string {
-  return encodeCursor({ t: table, s: row.row_updated_at, i: String(row.id) });
+export function cursorFromRow(table: CursorTable, row: CursorableRow, kind: CursorKind): string {
+  return encodeCursor({ t: table, s: row.row_updated_at, i: String(row.id), k: kind });
 }
 
 /**
  * PostgREST `or=(...)` expression for keyset pagination strictly after a
- * cursor: `(row_updated_at, id) > (cursor.s, cursor.i)`, expanded to
+ * comparison point `(s, i)`: `(row_updated_at, id) > (s, i)`, expanded to
  *   row_updated_at > s  OR  (row_updated_at = s AND id > i)
+ *
+ * Takes the comparison point explicitly because recovery's resume mode
+ * compares against a floored timestamp (`s - overlap`, `i = '0'`), not the
+ * cursor's own `(s, i)` — see recovery.ts `recoveryKeysetExpr`.
  *
  * Pass to supabase-js `.or(expr)`. supabase-js URL-encodes the value, so
  * the timestamp's `:` / `+` / `.` survive transport, and PostgREST compares
- * timestamptz semantically — the `eq` half matches the stored instant the
- * cursor was minted from regardless of textual formatting.
- *
- * Strict `>` (not `>=`) plus the id tie-breaker means a page boundary that
- * lands inside a same-`row_updated_at` batch resumes mid-batch without
- * re-emitting or skipping rows.
+ * timestamptz semantically — the `eq` half matches the stored instant
+ * regardless of textual formatting. Strict `>` plus the id tie-breaker means
+ * a page boundary inside a same-`row_updated_at` batch resumes mid-batch
+ * without re-emitting or skipping rows.
  */
-export function keysetOrExpr(c: StreamCursor): string {
-  return `row_updated_at.gt.${c.s},and(row_updated_at.eq.${c.s},id.gt.${c.i})`;
+export function keysetOrExpr(s: string, i: string): string {
+  return `row_updated_at.gt.${s},and(row_updated_at.eq.${s},id.gt.${i})`;
 }

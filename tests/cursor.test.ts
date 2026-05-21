@@ -9,27 +9,44 @@ import {
 } from '../src/lib/cursor.js';
 
 describe('cursor codec', () => {
-  it('round-trips t/s/i', () => {
-    const c: StreamCursor = { t: 'commitments', s: '2026-05-20T12:00:00.123456+00:00', i: '42' };
-    const decoded = decodeCursor(encodeCursor(c), 'commitments');
-    expect(decoded).toEqual(c);
+  it('round-trips t/s/i/k', () => {
+    const c: StreamCursor = { t: 'commitments', s: '2026-05-20T12:00:00.123456+00:00', i: '42', k: 'live' };
+    expect(decodeCursor(encodeCursor(c), 'commitments')).toEqual(c);
   });
 
-  it('round-trips a Z-suffixed timestamp', () => {
-    const c: StreamCursor = { t: 'fills', s: '2026-05-20T12:00:00.000Z', i: '1' };
+  it('round-trips a Z-suffixed timestamp and page kind', () => {
+    const c: StreamCursor = { t: 'fills', s: '2026-05-20T12:00:00.000Z', i: '1', k: 'page' };
     expect(decodeCursor(encodeCursor(c), 'fills')).toEqual(c);
   });
 
-  it('mints a decodable cursor from a row with a numeric id', () => {
-    const raw = cursorFromRow('positions', { row_updated_at: '2026-05-20T00:00:00Z', id: 7 });
-    const decoded = decodeCursor(raw, 'positions');
-    expect(decoded.i).toBe('7');
-    expect(decoded.s).toBe('2026-05-20T00:00:00Z');
-    expect(decoded.t).toBe('positions');
+  it('mints a page cursor from a row with a numeric id', () => {
+    const raw = cursorFromRow('positions', { row_updated_at: '2026-05-20T00:00:00Z', id: 7 }, 'page');
+    expect(decodeCursor(raw, 'positions')).toEqual({
+      t: 'positions',
+      s: '2026-05-20T00:00:00Z',
+      i: '7',
+      k: 'page',
+    });
+  });
+
+  it('defaults a kind-less cursor to live (conservative — applies the overlap re-scan)', () => {
+    const raw = Buffer.from(
+      JSON.stringify({ t: 'fills', s: '2026-05-20T00:00:00Z', i: '3' }),
+      'utf8',
+    ).toString('base64url');
+    expect(decodeCursor(raw, 'fills').k).toBe('live');
+  });
+
+  it('rejects an unrecognized kind', () => {
+    const raw = Buffer.from(
+      JSON.stringify({ t: 'fills', s: '2026-05-20T00:00:00Z', i: '3', k: 'weird' }),
+      'utf8',
+    ).toString('base64url');
+    expect(() => decodeCursor(raw, 'fills')).toThrow(CursorError);
   });
 
   it('rejects a cursor minted for a different resource', () => {
-    const raw = encodeCursor({ t: 'commitments', s: '2026-05-20T00:00:00Z', i: '1' });
+    const raw = encodeCursor({ t: 'commitments', s: '2026-05-20T00:00:00Z', i: '1', k: 'page' });
     expect(() => decodeCursor(raw, 'positions')).toThrow(CursorError);
   });
 
@@ -40,26 +57,40 @@ describe('cursor codec', () => {
     );
   });
 
-  it('rejects missing or non-string fields', () => {
-    const missingI = Buffer.from(JSON.stringify({ t: 'fills', s: '2026-05-20T00:00:00Z' }), 'utf8').toString(
-      'base64url',
-    );
-    expect(() => decodeCursor(missingI, 'fills')).toThrow(CursorError);
-
-    const numericI = Buffer.from(
-      JSON.stringify({ t: 'fills', s: '2026-05-20T00:00:00Z', i: 5 }),
+  it('rejects missing core string fields', () => {
+    const missingI = Buffer.from(
+      JSON.stringify({ t: 'fills', s: '2026-05-20T00:00:00Z', k: 'page' }),
       'utf8',
     ).toString('base64url');
-    expect(() => decodeCursor(numericI, 'fills')).toThrow(CursorError);
+    expect(() => decodeCursor(missingI, 'fills')).toThrow(CursorError);
   });
 
   it('rejects a non-integer id', () => {
-    const raw = encodeCursor({ t: 'fills', s: '2026-05-20T00:00:00Z', i: '12.5' } as StreamCursor);
+    const raw = Buffer.from(
+      JSON.stringify({ t: 'fills', s: '2026-05-20T00:00:00Z', i: '12.5', k: 'page' }),
+      'utf8',
+    ).toString('base64url');
     expect(() => decodeCursor(raw, 'fills')).toThrow(CursorError);
   });
 
-  it('rejects an unparseable timestamp', () => {
-    const raw = encodeCursor({ t: 'fills', s: 'not-a-date', i: '1' });
+  it('rejects a non-ISO timestamp', () => {
+    const raw = Buffer.from(
+      JSON.stringify({ t: 'fills', s: 'not-a-date', i: '1', k: 'page' }),
+      'utf8',
+    ).toString('base64url');
+    expect(() => decodeCursor(raw, 'fills')).toThrow(CursorError);
+  });
+
+  // Hermes hardening: a Date.parse-valid timestamp containing the PostgREST
+  // `.or()` delimiter (comma) must be rejected as INVALID_CURSOR, not flow
+  // into the filter grammar and 500.
+  it('rejects an RFC-style timestamp with a comma', () => {
+    const evil = 'Tue, 20 May 2026 12:00:00 GMT';
+    expect(Number.isNaN(Date.parse(evil))).toBe(false); // Date.parse would accept it
+    const raw = Buffer.from(
+      JSON.stringify({ t: 'fills', s: evil, i: '1', k: 'page' }),
+      'utf8',
+    ).toString('base64url');
     expect(() => decodeCursor(raw, 'fills')).toThrow(CursorError);
   });
 
@@ -77,8 +108,7 @@ describe('cursor codec', () => {
 
 describe('keysetOrExpr', () => {
   it('builds a strict (row_updated_at, id) > (s, i) keyset OR expression', () => {
-    const expr = keysetOrExpr({ t: 'commitments', s: '2026-05-20T12:00:00+00:00', i: '99' });
-    expect(expr).toBe(
+    expect(keysetOrExpr('2026-05-20T12:00:00+00:00', '99')).toBe(
       'row_updated_at.gt.2026-05-20T12:00:00+00:00,and(row_updated_at.eq.2026-05-20T12:00:00+00:00,id.gt.99)',
     );
   });

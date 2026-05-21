@@ -7,9 +7,10 @@
  *   - GET /v1/contests?since=
  *
  * Asserts the recovery contract: keyset (row_updated_at, id) ordering, the
- * `.or(...)` keyset filter when a cursor is supplied, the {resource,
- * nextCursor, hasMore} envelope, and — critically — that recovery does NOT
- * inherit the open-book status/expiry filters that would hide terminal rows.
+ * `.or(...)` keyset filter (strict for `page` cursors, overlap-floored for
+ * `live` resume cursors), the {resource, nextCursor, hasMore} envelope with a
+ * PAGE nextCursor, and that recovery does NOT inherit the open-book
+ * status/expiry filters that would hide terminal rows.
  *
  * Mocks loadConfig + getSupabase, matching the existing handler-test harness
  * (extended with `.or` on the recorded builder).
@@ -17,6 +18,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 import { encodeCursor, keysetOrExpr } from '../src/lib/cursor.js';
+import { RECOVERY_OVERLAP_MS } from '../src/lib/recovery.js';
 
 const supabaseMock = vi.hoisted(() => ({ getSupabase: vi.fn() }));
 const envMock = vi.hoisted(() => ({
@@ -83,6 +85,9 @@ function makeSupabase(response: MockResponse): { client: unknown; calls: Recorde
 
 function has(calls: RecordedCall[], method: string, arg0?: unknown): boolean {
   return calls.some((c) => c.method === method && (arg0 === undefined || c.args[0] === arg0));
+}
+function orArg(calls: RecordedCall[]): string | undefined {
+  return calls.find((c) => c.method === 'or')?.args[0] as string | undefined;
 }
 
 beforeEach(() => {
@@ -159,22 +164,24 @@ function positionRow(o: Record<string, unknown> = {}): Record<string, unknown> {
 
 // ── GET /v1/commitments?since= ──────────────────────────────────────────
 describe('commitments recovery', () => {
-  const cursor = encodeCursor({ t: 'commitments', s: '2026-05-20T11:00:00.000Z', i: '40' });
+  const CURSOR_TS = '2026-05-20T11:00:00.000Z';
+  const pageCursor = encodeCursor({ t: 'commitments', s: CURSOR_TS, i: '40', k: 'page' });
+  const liveCursor = encodeCursor({ t: 'commitments', s: CURSOR_TS, i: '40', k: 'live' });
 
-  it('returns {commitments, nextCursor, hasMore}, keyset-ordered, WITHOUT open-book filters', async () => {
+  it('page cursor: strict keyset, terminal rows included, NO open-book filters, PAGE nextCursor', async () => {
     const { client, calls } = makeSupabase({ data: [commitmentRow()], error: null });
     supabaseMock.getSupabase.mockReturnValue(client);
     const res = makeRes();
-    await getCommitmentsHandler(makeReq({ since: cursor, limit: '1' }), res as unknown as Response);
+    await getCommitmentsHandler(makeReq({ since: pageCursor, limit: '1' }), res as unknown as Response);
 
     expect(res.statusCode).toBe(200);
     const body = res.body as { commitments: Array<{ status: string }>; nextCursor: string; hasMore: boolean };
-    // terminal row surfaces — recovery must not hide it
-    expect(body.commitments[0]?.status).toBe('filled');
+    expect(body.commitments[0]?.status).toBe('filled'); // terminal row surfaces
     expect(body.hasMore).toBe(true); // 1 row == limit 1
-    expect(body.nextCursor).toBe(encodeCursor({ t: 'commitments', s: TS, i: '42' }));
-    // keyset filter + ordering applied
-    expect(has(calls, 'or', keysetOrExpr({ t: 'commitments', s: '2026-05-20T11:00:00.000Z', i: '40' }))).toBe(true);
+    // PAGE nextCursor (so subsequent paging is strict + terminating)
+    expect(body.nextCursor).toBe(encodeCursor({ t: 'commitments', s: TS, i: '42', k: 'page' }));
+    // strict keyset on the cursor's own (s, i)
+    expect(orArg(calls)).toBe(keysetOrExpr(CURSOR_TS, '40'));
     expect(has(calls, 'order', 'row_updated_at')).toBe(true);
     expect(has(calls, 'order', 'id')).toBe(true);
     // NOT the open-book defaults
@@ -182,14 +189,24 @@ describe('commitments recovery', () => {
     expect(has(calls, 'gt', 'expiry')).toBe(false);
   });
 
+  it('live (resume) cursor: re-scans the overlap window before the cursor timestamp', async () => {
+    const { client, calls } = makeSupabase({ data: [], error: null });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await getCommitmentsHandler(makeReq({ since: liveCursor }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const floored = new Date(Date.parse(CURSOR_TS) - RECOVERY_OVERLAP_MS).toISOString();
+    expect(orArg(calls)).toBe(keysetOrExpr(floored, '0'));
+  });
+
   it('hasMore=false and echoes the input cursor when the page is empty', async () => {
     const { client } = makeSupabase({ data: [], error: null });
     supabaseMock.getSupabase.mockReturnValue(client);
     const res = makeRes();
-    await getCommitmentsHandler(makeReq({ since: cursor }), res as unknown as Response);
-    const body = res.body as { commitments: unknown[]; nextCursor: string | null; hasMore: boolean };
+    await getCommitmentsHandler(makeReq({ since: pageCursor }), res as unknown as Response);
+    const body = res.body as { nextCursor: string | null; hasMore: boolean };
     expect(body.hasMore).toBe(false);
-    expect(body.nextCursor).toBe(cursor);
+    expect(body.nextCursor).toBe(pageCursor);
   });
 
   it('rejects a malformed cursor with 400 INVALID_CURSOR', async () => {
@@ -200,7 +217,7 @@ describe('commitments recovery', () => {
   });
 
   it('rejects a cursor minted for a different resource with 400', async () => {
-    const wrong = encodeCursor({ t: 'fills', s: TS, i: '1' });
+    const wrong = encodeCursor({ t: 'fills', s: TS, i: '1', k: 'page' });
     const res = makeRes();
     await getCommitmentsHandler(makeReq({ since: wrong }), res as unknown as Response);
     expect(res.statusCode).toBe(400);
@@ -222,8 +239,9 @@ describe('fills', () => {
     expect(has(calls, 'order', 'row_updated_at')).toBe(true);
   });
 
-  it('applies a maker filter and the since keyset, maps the body shape', async () => {
-    const cursor = encodeCursor({ t: 'fills', s: '2026-05-20T11:00:00.000Z', i: '1' });
+  it('applies a maker filter and a page-cursor strict keyset, maps the body shape', async () => {
+    const cursorTs = '2026-05-20T11:00:00.000Z';
+    const cursor = encodeCursor({ t: 'fills', s: cursorTs, i: '1', k: 'page' });
     const { client, calls } = makeSupabase({ data: [fillRow()], error: null });
     supabaseMock.getSupabase.mockReturnValue(client);
     const res = makeRes();
@@ -231,8 +249,8 @@ describe('fills', () => {
     await getFillsHandler(makeReq({ maker, since: cursor, limit: '1' }), res as unknown as Response);
     expect(res.statusCode).toBe(200);
     expect(has(calls, 'eq', 'maker_address')).toBe(true);
-    expect(has(calls, 'or', keysetOrExpr({ t: 'fills', s: '2026-05-20T11:00:00.000Z', i: '1' }))).toBe(true);
-    const body = res.body as { fills: Array<{ makerPositionType: number; takerPositionType: number; txHash: string; logIndex: number }>; hasMore: boolean };
+    expect(orArg(calls)).toBe(keysetOrExpr(cursorTs, '1'));
+    const body = res.body as { fills: Array<{ makerPositionType: number; takerPositionType: number; logIndex: number }>; hasMore: boolean };
     expect(body.fills[0]).toMatchObject({ makerPositionType: 0, takerPositionType: 1, logIndex: 3 });
     expect(body.hasMore).toBe(true);
   });
@@ -263,14 +281,15 @@ describe('positions recovery', () => {
 // ── GET /v1/speculations?since= ─────────────────────────────────────────
 describe('speculations recovery', () => {
   it('returns the recovery envelope keyset-ordered', async () => {
-    const cursor = encodeCursor({ t: 'speculations', s: '2026-05-20T11:00:00.000Z', i: '1' });
+    const cursorTs = '2026-05-20T11:00:00.000Z';
+    const cursor = encodeCursor({ t: 'speculations', s: cursorTs, i: '1', k: 'page' });
     const { client, calls } = makeSupabase({ data: [], error: null });
     supabaseMock.getSupabase.mockReturnValue(client);
     const res = makeRes();
     await getSpeculationsHandler(makeReq({ since: cursor }), res as unknown as Response);
     expect(res.statusCode).toBe(200);
     expect(res.body).toMatchObject({ speculations: [], hasMore: false });
-    expect(has(calls, 'or', keysetOrExpr({ t: 'speculations', s: '2026-05-20T11:00:00.000Z', i: '1' }))).toBe(true);
+    expect(orArg(calls)).toBe(keysetOrExpr(cursorTs, '1'));
     expect(has(calls, 'order', 'row_updated_at')).toBe(true);
   });
 });
@@ -278,7 +297,8 @@ describe('speculations recovery', () => {
 // ── GET /v1/contests?since= ─────────────────────────────────────────────
 describe('contests recovery', () => {
   it('works without SCORER_* config (recovery branch precedes the scorers check)', async () => {
-    const cursor = encodeCursor({ t: 'contests', s: '2026-05-20T11:00:00.000Z', i: '1' });
+    const cursorTs = '2026-05-20T11:00:00.000Z';
+    const cursor = encodeCursor({ t: 'contests', s: cursorTs, i: '1', k: 'page' });
     const { client, calls } = makeSupabase({
       data: [{ contest_id: 1, contest_status: 'scored', away_score: 3, home_score: 1, scored_at: TS, id: 9, row_updated_at: TS }],
       error: null,
@@ -287,8 +307,8 @@ describe('contests recovery', () => {
     const res = makeRes();
     await getContestsHandler(makeReq({ since: cursor }), res as unknown as Response);
     expect(res.statusCode).toBe(200);
-    const body = res.body as { contests: Array<{ contestId: string; status: string; scoredAt: string | null }>; nextCursor: string };
+    const body = res.body as { contests: Array<{ contestId: string; status: string; scoredAt: string | null }> };
     expect(body.contests[0]).toMatchObject({ contestId: '1', status: 'scored', scoredAt: TS });
-    expect(has(calls, 'or', keysetOrExpr({ t: 'contests', s: '2026-05-20T11:00:00.000Z', i: '1' }))).toBe(true);
+    expect(orArg(calls)).toBe(keysetOrExpr(cursorTs, '1'));
   });
 });

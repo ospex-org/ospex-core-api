@@ -42,8 +42,8 @@ import {
   type SpeculationParentContext,
   type SpeculationRow,
 } from './utils/speculations.js';
-import { keysetOrExpr, type CursorableRow } from '../lib/cursor.js';
-import { nextCursor, parseRecovery } from '../lib/recovery.js';
+import type { CursorableRow } from '../lib/cursor.js';
+import { nextCursor, parseRecovery, recoveryKeysetExpr } from '../lib/recovery.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 
 // VALID_SPORTS is the shared canonical list from lib/sports.ts (drops
@@ -96,7 +96,7 @@ async function getSpeculationsRecovery(req: Request, res: Response): Promise<voi
     .select(`${SPECULATION_COLUMNS}, id, row_updated_at`)
     .eq('network', config.network);
   if (contestId !== undefined) q = q.eq('contest_id', contestId);
-  if (recovery.cursor) q = q.or(keysetOrExpr(recovery.cursor));
+  if (recovery.cursor) q = q.or(recoveryKeysetExpr(recovery.cursor));
   q = q.order('row_updated_at', { ascending: true }).order('id', { ascending: true }).limit(recovery.limit);
 
   const { data, error } = await q;

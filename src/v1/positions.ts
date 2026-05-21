@@ -37,8 +37,7 @@ import type {
   PendingSettlePosition,
   PositionBase,
 } from './utils/positionFetch.js';
-import { keysetOrExpr } from '../lib/cursor.js';
-import { nextCursor, parseRecovery } from '../lib/recovery.js';
+import { nextCursor, parseRecovery, recoveryKeysetExpr } from '../lib/recovery.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 
 const DEFAULT_LIMIT = 50;
@@ -253,7 +252,7 @@ export async function getPositionsRecoveryHandler(req: Request, res: Response): 
   let q = sb.from('positions').select(POSITION_RECOVERY_COLUMNS).eq('network', config.network);
   if (address !== undefined) q = q.eq('user_address', address);
   if (speculationId !== undefined) q = q.eq('speculation_id', speculationId);
-  if (recovery.cursor) q = q.or(keysetOrExpr(recovery.cursor));
+  if (recovery.cursor) q = q.or(recoveryKeysetExpr(recovery.cursor));
   q = q.order('row_updated_at', { ascending: true }).order('id', { ascending: true }).limit(recovery.limit);
 
   const { data, error } = await q;

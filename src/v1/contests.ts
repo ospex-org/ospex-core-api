@@ -37,8 +37,8 @@ import {
   type Speculation,
   type SpeculationRow,
 } from './utils/speculations.js';
-import { keysetOrExpr, type CursorableRow } from '../lib/cursor.js';
-import { nextCursor, parseRecovery } from '../lib/recovery.js';
+import type { CursorableRow } from '../lib/cursor.js';
+import { nextCursor, parseRecovery, recoveryKeysetExpr } from '../lib/recovery.js';
 
 // VALID_SPORTS is the shared canonical list from lib/sports.ts.
 // Previously this file carried a local 5-sport allowlist that omitted
@@ -213,7 +213,7 @@ async function getContestsRecovery(req: Request, res: Response): Promise<void> {
 
   let q = sb.from('contests').select(CONTEST_RECOVERY_COLUMNS).eq('network', config.network);
   if (contestId !== undefined) q = q.eq('contest_id', contestId);
-  if (recovery.cursor) q = q.or(keysetOrExpr(recovery.cursor));
+  if (recovery.cursor) q = q.or(recoveryKeysetExpr(recovery.cursor));
   q = q.order('row_updated_at', { ascending: true }).order('id', { ascending: true }).limit(recovery.limit);
 
   const { data, error } = await q;

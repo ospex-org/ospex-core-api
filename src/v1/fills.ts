@@ -19,8 +19,8 @@ import { loadConfig } from '../lib/env.js';
 import { logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
 import { wei6ToUSDC } from '../lib/sanitize.js';
-import { keysetOrExpr, type CursorableRow } from '../lib/cursor.js';
-import { nextCursor, parseRecovery } from '../lib/recovery.js';
+import type { CursorableRow } from '../lib/cursor.js';
+import { nextCursor, parseRecovery, recoveryKeysetExpr } from '../lib/recovery.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 
 const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower: 1 };
@@ -158,7 +158,7 @@ export async function getFillsHandler(req: Request, res: Response): Promise<void
   if (speculationId !== undefined) q = q.eq('speculation_id', speculationId);
   if (contestId !== undefined) q = q.eq('contest_id', contestId);
   if (commitmentHash !== undefined) q = q.eq('commitment_hash', commitmentHash);
-  if (recovery.cursor) q = q.or(keysetOrExpr(recovery.cursor));
+  if (recovery.cursor) q = q.or(recoveryKeysetExpr(recovery.cursor));
   q = q.order('row_updated_at', { ascending: true }).order('id', { ascending: true }).limit(recovery.limit);
 
   const { data, error } = await q;

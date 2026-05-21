@@ -22,6 +22,7 @@ import {
   CursorError,
   cursorFromRow,
   decodeCursor,
+  keysetOrExpr,
   type CursorableRow,
   type CursorTable,
   type StreamCursor,
@@ -31,6 +32,13 @@ export const RECOVERY_DEFAULT_LIMIT = 100;
 // PostgREST caps any single response at 1000 rows; recovery never pages
 // beyond that in one request.
 export const RECOVERY_MAX_LIMIT = 1000;
+
+// How far before a `live` cursor's timestamp recovery re-scans, to catch rows
+// committed late under the `now()`-is-transaction-start schema. Must exceed the
+// longest writer transaction (the indexer's RPC writes are sub-second, so 30s
+// is a wide margin). Only the first (resume) request pays this; pagination uses
+// `page` cursors and is strict, so termination holds for any overlap size.
+export const RECOVERY_OVERLAP_MS = 30_000;
 
 export interface ParsedRecovery {
   /** Decoded `?since=` cursor, or null when the client is starting fresh. */
@@ -72,16 +80,38 @@ export function parseRecovery(
 }
 
 /**
- * Cursor to hand back for the next poll:
- *   - rows returned → the last row's cursor (advance forward);
- *   - empty page    → echo the input cursor so the client holds position
- *                     (or null when it started fresh).
+ * PostgREST `.or(...)` keyset expression for a recovery cursor.
+ *
+ *   - `page` cursor → strict `(row_updated_at, id) > (s, i)`. Forward-only,
+ *     terminating — used for pagination through a backlog.
+ *   - `live` cursor → re-scan an overlap window: `(row_updated_at, id) >
+ *     (s - overlap, 0)`, i.e. effectively `row_updated_at >= s - overlap`.
+ *     This catches a row committed late with `row_updated_at` predating the
+ *     cursor (now() is transaction-start time). `nextCursor` always returns a
+ *     `page` cursor, so the very next page is strict and paging terminates
+ *     regardless of how large the overlap window is.
+ */
+export function recoveryKeysetExpr(cursor: StreamCursor): string {
+  if (cursor.k === 'page') {
+    return keysetOrExpr(cursor.s, cursor.i);
+  }
+  const flooredMs = Date.parse(cursor.s) - RECOVERY_OVERLAP_MS;
+  return keysetOrExpr(new Date(flooredMs).toISOString(), '0');
+}
+
+/**
+ * Cursor to hand back for the next poll. Always a `page` cursor on a non-empty
+ * result so the client pages strictly forward (no repeated overlap re-scan):
+ *   - rows returned → the last row's `page` cursor (advance forward);
+ *   - empty page    → echo the input cursor so the client holds position and,
+ *                     if it was a `live` cursor, keeps re-scanning the overlap
+ *                     for future late commits (or null when it started fresh).
  */
 export function nextCursor(
   table: CursorTable,
   lastRow: CursorableRow | undefined,
   sinceRaw: string | null,
 ): string | null {
-  if (lastRow !== undefined) return cursorFromRow(table, lastRow);
+  if (lastRow !== undefined) return cursorFromRow(table, lastRow, 'page');
   return sinceRaw;
 }
