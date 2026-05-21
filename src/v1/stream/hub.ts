@@ -6,26 +6,30 @@
  * Each tick has two phases:
  *
  *   1. Forward drain — strict keyset `(row_updated_at, id) > tip`, paged,
- *      advancing `tip` per row. This always makes forward progress, so it can
- *      never starve: a per-tick page budget just spreads a large backlog
- *      across ticks (the next tick resumes past the new tip).
+ *      advancing `tip` per row. Always makes forward progress, so it can never
+ *      starve: a per-tick page budget just spreads a large backlog across ticks.
  *
  *   2. Overlap re-scan — the recent window `row_updated_at ∈ [tip − overlap,
- *      tip]`, deduped by event-cursor `(row_updated_at, id)`. `now()` is
- *      transaction-start time, so a slow writer tx can commit a row whose
- *      `row_updated_at` predates `tip`; the forward drain (strictly `> tip`)
- *      would miss it, so this bounded re-scan catches it. The window slides as
- *      `tip` advances, so a late row is always reached within a tick or two.
+ *      tip]`, drained fully and deduped by event-cursor `(row_updated_at, id)`.
+ *      `now()` is transaction-START time, so a slow writer tx can commit a row
+ *      whose `row_updated_at` predates `tip` (and even predates a value already
+ *      emitted for that row). The forward drain (strictly `> tip`) misses it;
+ *      this re-scan re-reads the window every tick and emits the row again with
+ *      its new event-cursor. The window MUST be drained fully — a low page cap
+ *      could leave a late row permanently unread — so if it ever exceeds the
+ *      (high) safety budget we broadcast `resync` instead of risking a miss.
  *
- * A late row is therefore emitted out of `row_updated_at` order (after newer
- * rows). The contract is convergence, not wire-order: clients apply
- * last-write-wins keyed by natural key, comparing the event cursor — a delta
- * whose cursor is ≤ the one already applied for that key is a no-op.
+ * Because a late row is re-emitted after newer rows, the client contract is
+ * **last-received-wins**, NOT cursor ordering: clients apply each delta in the
+ * order received, overwriting per natural key. The poller reads current DB
+ * state every tick, so the most recently received delta for an entity reflects
+ * the most recent read. The cursor is opaque and used only to resume.
  *
- * Reorg safety: a watcher polls `recovery_runs`; when a recovery completes it
- * broadcasts `resync` to every subscriber (recovery hard-deletes rows, which
- * polling can't observe). Pollers are ref-counted; the resync watcher runs
- * whenever any subscriber exists and baselines immediately on the first one.
+ * Reorg safety: a watcher polls `recovery_runs` and broadcasts `resync` to all
+ * subscribers when a recovery completes (recovery hard-deletes rows, which
+ * polling can't observe). Additionally each subscriber, on connect, checks for
+ * a recovery completed within a grace window and re-snapshots if so — this
+ * closes the race between a subscriber's REST snapshot and the shared baseline.
  *
  * Dependency-injected (client/network/intervals) so it unit-tests without
  * timers or a live DB.
@@ -65,17 +69,25 @@ export interface StreamHubDeps {
   pollMs?: number;
   /** recovery_runs watcher interval (ms). Reorgs are rare, so this is slower. */
   resyncMs?: number;
+  /** On connect, a recovery completed within this window triggers a re-snapshot. */
+  resyncGraceMs?: number;
   /** Max rows fetched per page; PostgREST caps at 1000. */
   pollLimit?: number;
   /** Max forward pages per tick (a large backlog spreads across ticks — no starvation). */
   maxForwardPages?: number;
-  /** Max overlap-rescan pages per tick (the window is bounded, so this rarely binds). */
+  /** Safety cap on overlap-rescan pages. The window is bounded; exceeding this means a pathological change rate → resync. */
   maxOverlapPages?: number;
 }
 
 interface Cmp {
   s: string;
   i: string;
+}
+
+interface ScanResult {
+  cmp: Cmp;
+  /** True if the scan reached the end of its range (a short page); false if it hit the page cap. */
+  exhausted: boolean;
 }
 
 interface PollerState {
@@ -101,9 +113,10 @@ export class StreamHub {
       overlapMs: 30_000,
       pollMs: 1_500,
       resyncMs: 5_000,
+      resyncGraceMs: 60_000,
       pollLimit: 500,
       maxForwardPages: 20,
-      maxOverlapPages: 10,
+      maxOverlapPages: 200,
       ...deps,
     };
   }
@@ -115,8 +128,6 @@ export class StreamHub {
     if (!state) {
       state = {
         subs: new Set(),
-        // Start from now — history is the connection's catch-up job. The first
-        // tick's overlap re-scan still sweeps the last `overlap` of changes.
         tip: { s: new Date().toISOString(), i: '0' },
         emitted: new Map(),
         polling: false,
@@ -131,8 +142,6 @@ export class StreamHub {
 
     this.totalSubs += 1;
     if (this.totalSubs === 1 && this.resyncTimer === undefined) {
-      // Baseline immediately (not after resyncMs) so a recovery completing right
-      // after the first subscriber connects isn't silently swallowed.
       this.resyncHighId = null;
       void this.pollResync();
       this.resyncTimer = setInterval(() => {
@@ -140,6 +149,11 @@ export class StreamHub {
       }, this.deps.resyncMs);
       this.resyncTimer.unref?.();
     }
+
+    // Per-subscriber: if a recovery completed in the grace window, this
+    // subscriber's REST snapshot may predate it — tell it to re-snapshot.
+    // Independent of the shared baseline, so it can't be swallowed by it.
+    void this.checkRecentRecovery(sub);
     return sub;
   }
 
@@ -163,14 +177,22 @@ export class StreamHub {
     if (!state || state.polling) return;
     state.polling = true;
     try {
-      // (1) Forward drain — strict `> tip`, advances tip. Never starves.
-      state.tip = await this.scan(name, state, state.tip, null, this.deps.maxForwardPages);
+      // (1) Forward drain — strict `> tip`, advances tip. A backlog larger than
+      // the budget just continues next tick (the tip moved). Never starves.
+      const forward = await this.scan(name, state, state.tip, null, this.deps.maxForwardPages);
+      state.tip = forward.cmp;
 
-      // (2) Overlap re-scan — recent window for late commits; does not move tip.
+      // (2) Overlap re-scan — drain the full recent window for late commits.
       const tipMs = Date.parse(state.tip.s);
       if (Number.isFinite(tipMs)) {
         const floorIso = new Date(Math.max(0, tipMs - this.deps.overlapMs)).toISOString();
-        await this.scan(name, state, { s: floorIso, i: '0' }, state.tip.s, this.deps.maxOverlapPages);
+        const overlap = await this.scan(name, state, { s: floorIso, i: '0' }, state.tip.s, this.deps.maxOverlapPages);
+        if (!overlap.exhausted) {
+          // The window is bigger than we can re-read in one tick — we can no
+          // longer guarantee late updates are caught. Force a re-snapshot.
+          logger.warn({ resource: name }, 'stream poller: overlap window exceeded page budget — resync');
+          this.resyncResource(state, 'overlap_window_too_large');
+        }
       }
       this.evict(state);
     } catch (err) {
@@ -182,7 +204,8 @@ export class StreamHub {
 
   /**
    * Page from `start` (exclusive keyset) up to `maxPages`, optionally capped at
-   * `upperTs` (inclusive). Emits each row, returns the furthest cursor reached.
+   * `upperTs` (inclusive). Emits each row; returns the furthest cursor reached
+   * and whether the range was exhausted (a short final page) vs hit the cap.
    */
   private async scan(
     name: StreamResourceName,
@@ -190,7 +213,7 @@ export class StreamHub {
     start: Cmp,
     upperTs: string | null,
     maxPages: number,
-  ): Promise<Cmp> {
+  ): Promise<ScanResult> {
     const resource = STREAM_RESOURCES[name];
     let cmp = start;
     for (let page = 0; page < maxPages; page += 1) {
@@ -206,17 +229,19 @@ export class StreamHub {
         .order('id', { ascending: true })
         .limit(this.deps.pollLimit);
       if (error) {
+        // Transient — log and stop; the next tick retries. Treat as exhausted so
+        // a one-off error doesn't trip the overflow resync.
         logger.error({ err: error.message, resource: name }, 'stream poller: query failed');
-        break;
+        return { cmp, exhausted: true };
       }
       const rows = (data ?? []) as unknown as StreamRow[];
       for (const row of rows) {
         this.emitRow(name, state, row);
         cmp = { s: row.row_updated_at, i: String(row.id) };
       }
-      if (rows.length < this.deps.pollLimit) break;
+      if (rows.length < this.deps.pollLimit) return { cmp, exhausted: true };
     }
-    return cmp;
+    return { cmp, exhausted: false };
   }
 
   /** Dedupe by event-cursor, then fan out to matching subscribers. */
@@ -247,6 +272,44 @@ export class StreamHub {
     const cutoff = tipMs - this.deps.overlapMs * 2;
     for (const [key, tsMs] of state.emitted) {
       if (tsMs < cutoff) state.emitted.delete(key);
+    }
+  }
+
+  private resyncResource(state: PollerState, reason: string): void {
+    for (const sub of state.subs) {
+      try {
+        sub.onResync(reason);
+      } catch (err) {
+        logger.error({ err: err instanceof Error ? err.message : String(err) }, 'stream resync: onResync threw');
+      }
+    }
+  }
+
+  /** On connect: if a recovery completed within the grace window, this subscriber re-snapshots. */
+  private async checkRecentRecovery(sub: Subscriber): Promise<void> {
+    try {
+      const cutoff = new Date(Date.now() - this.deps.resyncGraceMs).toISOString();
+      const { data, error } = await this.deps
+        .getClient()
+        .from('recovery_runs')
+        .select('id')
+        .eq('network', this.deps.getNetwork())
+        .eq('status', 'complete')
+        .gt('completed_at', cutoff)
+        .limit(1);
+      if (error) {
+        logger.error({ err: error.message }, 'stream resync: recent-recovery check failed');
+        return;
+      }
+      if ((data ?? []).length > 0) {
+        try {
+          sub.onResync('recovery');
+        } catch {
+          /* writer no-ops once the socket closes */
+        }
+      }
+    } catch (err) {
+      logger.error({ err: err instanceof Error ? err.message : String(err) }, 'stream resync: recent-recovery check threw');
     }
   }
 
@@ -300,13 +363,7 @@ export class StreamHub {
 
   private broadcastResync(reason: string): void {
     for (const state of this.pollers.values()) {
-      for (const sub of state.subs) {
-        try {
-          sub.onResync(reason);
-        } catch (err) {
-          logger.error({ err: err instanceof Error ? err.message : String(err) }, 'stream resync: onResync threw');
-        }
-      }
+      this.resyncResource(state, reason);
     }
   }
 

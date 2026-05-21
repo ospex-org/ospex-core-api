@@ -27,6 +27,7 @@ interface RRow {
   id: number;
   kind: string;
   status: string;
+  completed_at?: string;
 }
 
 /** Builder state captured from a query chain. */
@@ -34,6 +35,7 @@ interface QState {
   or?: string;
   lteTs?: string;
   gtId?: string;
+  gtCompletedAt?: string;
   limit: number;
   descId: boolean;
   eqStatus?: string;
@@ -45,6 +47,10 @@ function datasetClient(rows: () => DRow[], recovery: () => RRow[]): SupabaseClie
     if (table === 'recovery_runs') {
       let r = recovery().filter((x) => (st.eqStatus ? x.status === st.eqStatus : true));
       if (st.gtId !== undefined) r = r.filter((x) => BigInt(x.id) > BigInt(st.gtId as string));
+      if (st.gtCompletedAt !== undefined) {
+        const c = Date.parse(st.gtCompletedAt);
+        r = r.filter((x) => x.completed_at !== undefined && Date.parse(x.completed_at) > c);
+      }
       r = [...r].sort((a, b) => (st.descId ? b.id - a.id : a.id - b.id));
       return r.slice(0, st.limit);
     }
@@ -90,6 +96,7 @@ function datasetClient(rows: () => DRow[], recovery: () => RRow[]): SupabaseClie
     };
     b['gt'] = (col: string, val: unknown) => {
       if (col === 'id') st.gtId = String(val);
+      else if (col === 'completed_at') st.gtCompletedAt = String(val);
       return b;
     };
     b['order'] = (col: string, opts?: { ascending?: boolean }) => {
@@ -234,6 +241,90 @@ describe('StreamHub dedup + overlap', () => {
     const sub = hub.subscribe('speculations', c.filters, c.cb);
     await hub.pollResource('speculations');
     expect(c.deltas).toHaveLength(1);
+    hub.unsubscribe(sub);
+  });
+});
+
+describe('StreamHub overlap window (blocker 1)', () => {
+  it('drains a multi-page overlap window to reach a late row (no overlap starvation)', async () => {
+    const data = [fillRow(1, 1), fillRow(2, 2), fillRow(3, 3), fillRow(4, 4)];
+    const hub = new StreamHub({
+      getClient: () => datasetClient(() => data, () => []),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+      overlapMs: 60_000, // window covers all rows
+      pollLimit: 2, // small pages → the window spans multiple overlap pages
+    });
+    const c = collector('fills');
+    const sub = hub.subscribe('fills', c.filters, c.cb);
+
+    await hub.pollResource('fills'); // forward-emits 1-4
+    expect(c.deltas).toHaveLength(4);
+
+    // A late commit lands in the MIDDLE of the already-emitted window. The
+    // overlap re-scan must page past the deduped 1,2 to reach it.
+    data.push(fillRow(5, 2.5));
+    await hub.pollResource('fills');
+    const ids = c.deltas.map((d) => decodeCursor(d.cursorId, 'fills').i).sort((a, b) => Number(a) - Number(b));
+    expect(ids).toEqual(['1', '2', '3', '4', '5']);
+
+    hub.unsubscribe(sub);
+  });
+
+  it('broadcasts resync when the overlap window exceeds the page budget', async () => {
+    const data = [fillRow(1, 1), fillRow(2, 2)];
+    const hub = new StreamHub({
+      getClient: () => datasetClient(() => data, () => []),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+      overlapMs: 60_000,
+      pollLimit: 1,
+      maxOverlapPages: 1, // can't fully re-read a 2-row window in one tick
+    });
+    const c = collector('fills');
+    const sub = hub.subscribe('fills', c.filters, c.cb);
+    await hub.pollResource('fills');
+    expect(c.resyncs).toContain('overlap_window_too_large');
+    hub.unsubscribe(sub);
+  });
+});
+
+describe('StreamHub per-subscriber recovery check (blocker 3)', () => {
+  it('re-syncs a subscriber that connects soon after a recovery completed', async () => {
+    const recovery: RRow[] = [
+      { id: 1, kind: 'reorg', status: 'complete', completed_at: new Date(NOW - 5_000).toISOString() },
+    ];
+    const hub = new StreamHub({
+      getClient: () => datasetClient(() => [], () => recovery),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+      resyncGraceMs: 60_000,
+    });
+    const c = collector('positions');
+    const sub = hub.subscribe('positions', {}, c.cb);
+    await flush(); // checkRecentRecovery is async
+    expect(c.resyncs).toContain('recovery');
+    hub.unsubscribe(sub);
+  });
+
+  it('does NOT re-sync when the only recovery is older than the grace window', async () => {
+    const recovery: RRow[] = [
+      { id: 1, kind: 'reorg', status: 'complete', completed_at: new Date(NOW - 120_000).toISOString() },
+    ];
+    const hub = new StreamHub({
+      getClient: () => datasetClient(() => [], () => recovery),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+      resyncGraceMs: 60_000,
+    });
+    const c = collector('positions');
+    const sub = hub.subscribe('positions', {}, c.cb);
+    await flush();
+    expect(c.resyncs).toHaveLength(0);
     hub.unsubscribe(sub);
   });
 });

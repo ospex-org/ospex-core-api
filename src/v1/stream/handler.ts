@@ -6,19 +6,18 @@
  *      EventSource auto-reconnect, the `Last-Event-ID` header); enforce the
  *      concurrent-connection cap (429 when full).
  *   2. Open the SSE response.
- *   3. Subscribe to the shared poller BEFORE catch-up, buffering live deltas —
- *      this closes the gap between catch-up's last read and going live.
- *   4. Catch up: replay missed deltas from the cursor (overlap-aware for a
+ *   3. Catch up: replay missed deltas from the cursor (overlap-aware for a
  *      `live` cursor; strict keyset paging thereafter).
- *   5. Flush the buffer, emit `ready` (only if catch-up completed cleanly),
- *      then stream live.
- *   6. On disconnect: unsubscribe, clear the heartbeat, release the cap slot.
+ *   4. Attach to the shared poller for live deltas and emit `ready` (only when
+ *      catch-up completed cleanly). Deltas committed during catch-up are caught
+ *      by the poller's overlap re-scan (a fresh read), so no buffer is needed.
+ *   5. On disconnect: unsubscribe, clear the heartbeat, release the cap slot.
  *
  * Events: `delta` (id = opaque live cursor), `resync` (re-snapshot), `ready`
- * (catch-up complete, now live). Deltas are NOT guaranteed in cursor order — a
- * late-committed row can arrive after a newer one — so clients apply
- * last-write-wins keyed by natural key, comparing the event cursor (a delta
- * whose cursor ≤ the one already applied for that key is a no-op). Heartbeat
+ * (catch-up complete, now live). The cursor is OPAQUE — clients store the last
+ * `id` to resume and never decode it. Deltas are NOT ordered by cursor (a
+ * late-committed row can arrive after a newer one under the now()-based
+ * watermark), so clients apply **last-received-wins** per natural key. Heartbeat
  * comments keep the connection under the platform idle timeout.
  */
 
@@ -36,7 +35,7 @@ import {
 import { recoveryKeysetExpr } from '../../lib/recovery.js';
 import type { ApiError } from '../../middleware/errorHandler.js';
 import { acquire, release } from './connections.js';
-import { getStreamHub } from './hub.js';
+import { getStreamHub, type Subscriber } from './hub.js';
 import { initSse, writeComment, writeEvent } from './sse.js';
 import {
   STREAM_RESOURCES,
@@ -49,9 +48,6 @@ import {
 const HEARTBEAT_MS = 20_000;
 const CATCHUP_PAGE = 500;
 const CATCHUP_MAX_PAGES = 50;
-// Live deltas can pile up during catch-up. Beyond this we stop buffering and
-// tell the client to re-snapshot rather than hold unbounded memory per connection.
-const MAX_LIVE_BUFFER = 2_000;
 // Outbound buffer ceiling: a client that isn't draining gets shed (forced to reconnect).
 const MAX_PENDING_BYTES = 1_000_000;
 
@@ -105,7 +101,6 @@ export function getStreamHandler(req: Request, res: Response): void {
   initSse(res);
   writeComment(res, 'connected');
 
-  let closed = false;
   const shedIfSlow = (): void => {
     const pending = (res as { writableLength?: number }).writableLength;
     if (!res.writableEnded && typeof pending === 'number' && pending > MAX_PENDING_BYTES) {
@@ -114,33 +109,17 @@ export function getStreamHandler(req: Request, res: Response): void {
     }
   };
 
-  let liveMode = false;
-  let bufferOverflow = false;
-  const buffer: Array<{ body: unknown; cursorId: string }> = [];
-  const sub = getStreamHub().subscribe(name, filters, {
-    onDelta: (body, cursorId) => {
-      if (liveMode) {
-        writeEvent(res, 'delta', body, cursorId);
-        shedIfSlow();
-      } else if (buffer.length < MAX_LIVE_BUFFER) {
-        buffer.push({ body, cursorId });
-      } else {
-        bufferOverflow = true; // too much live activity during catch-up — resync instead
-      }
-    },
-    onResync: (reason) => writeEvent(res, 'resync', { reason }),
-  });
-
-  const heartbeat = setInterval(() => writeComment(res, 'hb'), HEARTBEAT_MS);
-  heartbeat.unref?.();
-
+  let sub: Subscriber | undefined;
+  let closed = false;
   const cleanup = (): void => {
     if (closed) return;
     closed = true;
     clearInterval(heartbeat);
-    getStreamHub().unsubscribe(sub);
+    if (sub) getStreamHub().unsubscribe(sub);
     release(ip);
   };
+  const heartbeat = setInterval(() => writeComment(res, 'hb'), HEARTBEAT_MS);
+  heartbeat.unref?.();
   res.on('close', cleanup);
   res.on('error', cleanup);
 
@@ -150,19 +129,22 @@ export function getStreamHandler(req: Request, res: Response): void {
       : 'complete';
     if (closed) return;
 
-    liveMode = true;
-    if (bufferOverflow) {
-      // The poller produced more live deltas than we'd buffer — the client's
-      // local view can't be reconstructed from this stream; re-snapshot.
-      buffer.length = 0;
-      writeEvent(res, 'resync', { reason: 'buffer_overflow' });
-    } else {
-      const buffered = buffer.splice(0);
-      for (const d of buffered) writeEvent(res, 'delta', d.body, d.cursorId);
-      shedIfSlow();
+    // Attach to live AFTER catch-up. Deltas committed during catch-up are
+    // re-read by the poller's overlap re-scan (last-received-wins), so there's
+    // no need to buffer them per-connection.
+    sub = getStreamHub().subscribe(name, filters, {
+      onDelta: (body, cursorId) => {
+        writeEvent(res, 'delta', body, cursorId);
+        shedIfSlow();
+      },
+      onResync: (reason) => writeEvent(res, 'resync', { reason }),
+    });
+    // Lost the race with a disconnect during catch-up/subscribe — don't leak.
+    if (closed) {
+      getStreamHub().unsubscribe(sub);
+      return;
     }
-    // `ready` means "catch-up complete, now live" — only when that's actually true.
-    if (status === 'complete' && !bufferOverflow) writeEvent(res, 'ready', { resource: name });
+    if (status === 'complete') writeEvent(res, 'ready', { resource: name });
   })();
 }
 
