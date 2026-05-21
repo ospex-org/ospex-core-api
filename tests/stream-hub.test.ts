@@ -39,6 +39,7 @@ interface QState {
   ltCompletedAt?: string;
   limit: number;
   descId: boolean;
+  descCompletedAt?: boolean;
   eqStatus?: string;
 }
 
@@ -56,7 +57,11 @@ function datasetClient(rows: () => DRow[], recovery: () => RRow[]): SupabaseClie
         const c = Date.parse(st.ltCompletedAt);
         r = r.filter((x) => x.completed_at !== undefined && Date.parse(x.completed_at) < c);
       }
-      r = [...r].sort((a, b) => (st.descId ? b.id - a.id : a.id - b.id));
+      r = [...r].sort((a, b) => {
+        const ta = a.completed_at ? Date.parse(a.completed_at) : 0;
+        const tb = b.completed_at ? Date.parse(b.completed_at) : 0;
+        return st.descCompletedAt ? tb - ta : ta - tb;
+      });
       return r.slice(0, st.limit);
     }
     let r = rows().slice();
@@ -110,6 +115,7 @@ function datasetClient(rows: () => DRow[], recovery: () => RRow[]): SupabaseClie
     };
     b['order'] = (col: string, opts?: { ascending?: boolean }) => {
       if (col === 'id' && opts && opts.ascending === false) st.descId = true;
+      if (col === 'completed_at' && opts && opts.ascending === false) st.descCompletedAt = true;
       return b;
     };
     b['limit'] = (n: number) => {
@@ -350,7 +356,10 @@ describe('StreamHub resync', () => {
     await flush(); // let the immediate baseline settle (resyncHighId = 0, empty dataset)
     expect(c.resyncs).toHaveLength(0);
 
-    recovery.push({ id: 6, kind: 'reorg', status: 'complete' }, { id: 7, kind: 'backfill', status: 'complete' });
+    recovery.push(
+      { id: 6, kind: 'reorg', status: 'complete', completed_at: new Date(NOW - 2_000).toISOString() },
+      { id: 7, kind: 'backfill', status: 'complete', completed_at: new Date(NOW - 1_000).toISOString() },
+    );
     await hub.pollResync();
     expect(c.resyncs).toEqual(['reorg', 'backfill']);
 
@@ -358,6 +367,30 @@ describe('StreamHub resync', () => {
     await hub.pollResync();
     expect(c.resyncs).toEqual(['reorg', 'backfill']);
 
+    hub.unsubscribe(sub);
+  });
+
+  it('broadcasts by completion time, not id (a lower-id recovery that completes later is not skipped)', async () => {
+    // recovery_runs.id is assigned at run start; a long-running lower-id run can
+    // complete after a higher-id one. An id-cursor would skip it — a completed_at
+    // cursor does not.
+    const recovery: RRow[] = [
+      { id: 2, kind: 'reorg', status: 'complete', completed_at: new Date(NOW - 4_000).toISOString() }, // higher id, earlier completion
+      { id: 1, kind: 'backfill', status: 'complete', completed_at: new Date(NOW - 2_000).toISOString() }, // lower id, later completion
+    ];
+    const hub = new StreamHub({
+      getClient: () => datasetClient(() => [], () => recovery),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+      resyncGraceMs: 60_000,
+    });
+    const c = collector('positions');
+    const sub = hub.subscribe('positions', {}, c.cb);
+    await flush();
+    // Both are broadcast, ordered by completion time — the lower-id one included.
+    expect(c.resyncs).toContain('reorg');
+    expect(c.resyncs).toContain('backfill');
     hub.unsubscribe(sub);
   });
 

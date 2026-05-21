@@ -9,7 +9,9 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 
 // Mutable catch-up response the handler's runCatchUp sees via getSupabase().
 const sb = vi.hoisted(() => {
-  const state: { response: { data: unknown; error: unknown }; lastOr?: string } = { response: { data: [], error: null } };
+  const state: { response: { data: unknown; error: unknown }; lastOr?: string; gate?: Promise<void> } = {
+    response: { data: [], error: null },
+  };
   const client = {
     from: () => {
       const b: Record<string, unknown> = {};
@@ -18,7 +20,12 @@ const sb = vi.hoisted(() => {
         state.lastOr = e; // capture the catch-up keyset to assert which cursor was used
         return b;
       };
-      b['then'] = (resolve: (v: unknown) => void) => resolve(state.response);
+      // `state.gate` (when set) defers catch-up resolution so tests can inject
+      // live deltas / resyncs mid-handoff.
+      b['then'] = (resolve: (v: unknown) => void) => {
+        if (state.gate) void state.gate.then(() => resolve(state.response));
+        else resolve(state.response);
+      };
       return b;
     },
   };
@@ -39,6 +46,31 @@ function emptyClient(): SupabaseClient {
   return { from: () => b } as unknown as SupabaseClient;
 }
 
+/**
+ * Hub client for abort tests: serves `recovery` rows for recovery_runs queries
+ * (drives onResync via checkRecentRecovery / the watcher) and `protocolOnce`
+ * rows on the first protocol query (drives one live onDelta via pollResource).
+ */
+function makeHubClient(opts: { protocolOnce?: Array<Record<string, unknown>>; recovery?: Array<Record<string, unknown>> }): SupabaseClient {
+  let served = false;
+  return {
+    from: (table: string) => {
+      const b: Record<string, unknown> = {};
+      for (const m of ['select', 'eq', 'or', 'gt', 'lt', 'lte', 'order', 'limit']) b[m] = () => b;
+      b['then'] = (resolve: (v: unknown) => void) => {
+        if (table === 'recovery_runs') {
+          resolve({ data: opts.recovery ?? [], error: null });
+          return;
+        }
+        const rows = served ? [] : (opts.protocolOnce ?? []);
+        served = true;
+        resolve({ data: rows, error: null });
+      };
+      return b;
+    },
+  } as unknown as SupabaseClient;
+}
+
 let hub: InstanceType<typeof StreamHub>;
 beforeEach(() => {
   __resetConnections();
@@ -46,6 +78,7 @@ beforeEach(() => {
   __setStreamHubForTest(hub);
   sb.state.response = { data: [], error: null };
   sb.state.lastOr = undefined;
+  sb.state.gate = undefined;
 });
 afterEach(() => {
   __setStreamHubForTest(undefined);
@@ -212,6 +245,55 @@ describe('GET /v1/stream/:resource lifecycle', () => {
     sb.state.response = { data: null, error: { message: 'boom' } };
     const res = makeRes();
     getStreamHandler(makeReq({ resource: 'fills', query: { cursor: fillCursor } }), res as unknown as Response);
+    await flush();
+    const ev = events(res);
+    expect(ev).toContain('resync');
+    expect(ev).not.toContain('ready');
+  });
+
+  it('a resync during catch-up is latched — no ready (#1)', async () => {
+    // A recovery within the grace window makes checkRecentRecovery fire onResync
+    // while catch-up is still gated. The handoff must abort to resync, not ready.
+    const recovHub = new StreamHub({
+      getClient: () => makeHubClient({ recovery: [{ id: 1, kind: 'reorg', status: 'complete', completed_at: new Date(Date.now() - 5_000).toISOString() }] }),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+      resyncGraceMs: 60_000,
+    });
+    __setStreamHubForTest(recovHub);
+    let release: () => void = () => {};
+    sb.state.gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const res = makeRes();
+    getStreamHandler(makeReq({ resource: 'fills', query: { cursor: fillCursor } }), res as unknown as Response);
+    await flush(); // checkRecentRecovery → onResync during gated catch-up → aborted
+    release();
+    await flush(); // catch-up resolves
+    const ev = events(res);
+    expect(ev).toContain('resync');
+    expect(ev).not.toContain('ready');
+  });
+
+  it('a live delta during catch-up aborts to resync — no ready, no stale (#2)', async () => {
+    const liveClient = makeHubClient({ protocolOnce: [fillRow(1)] });
+    const liveHub = new StreamHub({
+      getClient: () => liveClient,
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+    });
+    __setStreamHubForTest(liveHub);
+    let release: () => void = () => {};
+    sb.state.gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const res = makeRes();
+    getStreamHandler(makeReq({ resource: 'fills', query: { cursor: fillCursor } }), res as unknown as Response);
+    await flush(); // subscribed; catch-up gated
+    await liveHub.pollResource('fills'); // fans fillRow(1) → onDelta during catch-up → aborted
+    release();
     await flush();
     const ev = events(res);
     expect(ev).toContain('resync');

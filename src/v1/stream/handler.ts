@@ -1,26 +1,29 @@
 /**
  * GET /v1/stream/:resource — the SSE connect handler.
  *
- * Lifecycle:
- *   1. Validate resource + filters + resume cursor (the `Last-Event-ID` header
- *      — what a native EventSource auto-sends on reconnect — or `?cursor=`);
- *      enforce the concurrent-connection cap (429 when full).
- *   2. Open the SSE response.
- *   3. Subscribe to the shared poller, buffering live deltas. Subscribing
- *      BEFORE catch-up is what makes the handoff gap-free: the hub dedupes
- *      globally per resource, so a row the poller emits to another subscriber
- *      during this client's catch-up would otherwise be marked emitted and
- *      never fanned here. Buffering from before catch-up captures those.
- *   4. Catch up from the cursor (reads the DB directly, so it's independent of
- *      the poller's dedupe), then flush the buffer and emit `ready`.
- *   5. On disconnect: unsubscribe, clear the heartbeat, release the cap slot.
+ * The connect→catch-up→live handoff is an explicit two-phase state machine:
  *
- * Events: `delta` (id = opaque resume cursor), `resync` (re-snapshot), `ready`
- * (catch-up complete, now live). The cursor is OPAQUE — clients store the last
- * `id` to resume and never decode it. Deltas are NOT ordered by cursor (a
- * late-committed row can arrive after a newer one under the now()-based
- * watermark), so clients apply **last-received-wins** per natural key. Heartbeat
- * comments keep the connection under the platform idle timeout.
+ *   phase = 'catchup'  (from subscribe until catch-up resolves)
+ *   phase = 'live'     (clean handoff: `ready` emitted, deltas stream)
+ *
+ * Conservative barrier: the client subscribes to the hub BEFORE catch-up (so a
+ * live delta can't slip through the global dedupe), but during catch-up ANY
+ * live delta or resync sets `aborted` and is NOT merged into the stream —
+ * because the now()-based watermark can't tell us whether a buffered live row
+ * is newer or older than a catch-up row for the same key, merging risks a
+ * stale-at-`ready` state. Instead, an aborted handoff emits one `resync` and
+ * ends the connection, forcing the client through snapshot → reconnect. A
+ * clean handoff (no live activity, catch-up complete) emits `ready` and goes
+ * live. Invariants this guarantees:
+ *   - `ready` is emitted iff catch-up completed AND no live delta/resync raced
+ *     it, so at `ready` the client's state == the DB state catch-up observed;
+ *   - no `resync` path can be followed by `ready` on the same connection.
+ *
+ * Cursor source: `Last-Event-ID` header (native EventSource auto-reconnect)
+ * wins over a possibly-stale `?cursor=`. The cursor is OPAQUE — clients store
+ * the last `id` to resume and never decode it. Live deltas are NOT ordered by
+ * cursor (last-received-wins per natural key). Heartbeat comments keep the
+ * connection under the platform idle timeout.
  */
 
 import type { Request, Response } from 'express';
@@ -50,13 +53,11 @@ import {
 const HEARTBEAT_MS = 20_000;
 const CATCHUP_PAGE = 500;
 const CATCHUP_MAX_PAGES = 50;
-// Live deltas can pile up during catch-up. Beyond this we stop buffering and
-// tell the client to re-snapshot rather than hold unbounded memory per connection.
-const MAX_LIVE_BUFFER = 2_000;
 // Outbound buffer ceiling: a client that isn't draining gets shed (forced to reconnect).
 const MAX_PENDING_BYTES = 1_000_000;
 
 type CatchupStatus = 'complete' | 'resync';
+type Phase = 'catchup' | 'live';
 
 export function getStreamHandler(req: Request, res: Response): void {
   const name = String(req.params.resource ?? '');
@@ -88,10 +89,9 @@ export function getStreamHandler(req: Request, res: Response): void {
   }
 
   // Resume cursor: the Last-Event-ID header wins. A native EventSource reconnect
-  // reuses the original request URL (so a stale `?cursor=` would replay from the
-  // initial point) but sends Last-Event-ID = the last `id:` we emitted, which is
-  // the correct resume point. `?cursor=` is the fallback for first connect / the
-  // fetch-based SDK transport.
+  // reuses the original request URL (so its `?cursor=` is stale) but sends
+  // Last-Event-ID = the last `id:` we emitted, the true resume point. `?cursor=`
+  // is the fallback for first connect / the fetch-based SDK transport.
   const cursorRaw = req.header('Last-Event-ID') ?? (req.query.cursor !== undefined ? String(req.query.cursor) : undefined);
   let cursor: StreamCursor | null = null;
   if (cursorRaw !== undefined && cursorRaw !== '') {
@@ -116,23 +116,23 @@ export function getStreamHandler(req: Request, res: Response): void {
     }
   };
 
-  // Subscribe BEFORE catch-up so no live delta is lost to global dedupe (see
-  // header). Live deltas buffer until catch-up finishes, then flush in order.
-  let liveMode = false;
-  let bufferOverflow = false;
-  const buffer: Array<{ body: unknown; cursorId: string }> = [];
+  // Subscribe BEFORE catch-up so a live delta can't slip past the hub's global
+  // dedupe. During catch-up we don't merge live events — we abort to `resync`.
+  let phase: Phase = 'catchup';
+  let aborted = false;
   const sub = getStreamHub().subscribe(name, filters, {
     onDelta: (body, cursorId) => {
-      if (liveMode) {
+      if (phase === 'live') {
         writeEvent(res, 'delta', body, cursorId);
         shedIfSlow();
-      } else if (buffer.length < MAX_LIVE_BUFFER) {
-        buffer.push({ body, cursorId });
       } else {
-        bufferOverflow = true; // too much live activity during catch-up — resync instead
+        aborted = true; // live delta raced catch-up → can't safely order → resync
       }
     },
-    onResync: (reason) => writeEvent(res, 'resync', { reason }),
+    onResync: (reason) => {
+      if (phase === 'live') writeEvent(res, 'resync', { reason });
+      else aborted = true; // resync during catch-up → latch; never `ready` after
+    },
   });
 
   let closed = false;
@@ -155,20 +155,22 @@ export function getStreamHandler(req: Request, res: Response): void {
         : 'complete';
       if (closed) return;
 
-      liveMode = true;
-      if (bufferOverflow) {
-        buffer.length = 0;
-        writeEvent(res, 'resync', { reason: 'buffer_overflow' });
-      } else {
-        const buffered = buffer.splice(0);
-        for (const d of buffered) writeEvent(res, 'delta', d.body, d.cursorId);
-        shedIfSlow();
+      if (aborted || status === 'resync') {
+        // runCatchUp already emitted a resync on its own failure/backlog; only
+        // emit one here when the abort came from a raced live delta/resync.
+        if (status !== 'resync') writeEvent(res, 'resync', { reason: 'handoff_raced' });
+        res.end(); // force the client through snapshot → reconnect
+        return;
       }
-      // `ready` means "catch-up complete, now live" — only when that's true.
-      if (status === 'complete' && !bufferOverflow) writeEvent(res, 'ready', { resource: name });
+
+      // Clean handoff: nothing raced catch-up and it completed. Going live and
+      // emitting `ready` is now honest — the client is at catch-up's DB state.
+      phase = 'live';
+      writeEvent(res, 'ready', { resource: name });
     } catch (err) {
       logger.error({ err: err instanceof Error ? err.message : String(err), resource: name }, 'stream: catch-up/handoff failed');
       writeEvent(res, 'resync', { reason: 'internal_error' });
+      res.end();
     }
   })();
 }
@@ -177,8 +179,7 @@ export function getStreamHandler(req: Request, res: Response): void {
  * Replay missed deltas from `cursor`. First page is overlap-aware (a `live`
  * cursor re-scans `cursor.ts − overlap`); subsequent pages are strict keyset,
  * so it terminates. Returns `'resync'` (and emits a resync event) on query
- * failure or when the backlog exceeds the page budget — the caller then skips
- * `ready`. Otherwise `'complete'`.
+ * failure or when the backlog exceeds the page budget. Otherwise `'complete'`.
  */
 async function runCatchUp(
   res: Response,
