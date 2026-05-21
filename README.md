@@ -63,7 +63,7 @@ curl http://localhost:3000/readyz    # readiness — 200 only if Supabase is rea
 
 ## Endpoints
 
-All read endpoints share `readRateLimit` (600 req/min per IP); the write endpoint has its own tighter limit.
+Most read endpoints share `readRateLimit` (600 req/min per IP); the write endpoint has its own tighter limit. The SSE stream endpoints (`/v1/stream/*`) are intentionally exempt — a stream is one long-lived request, not a burst — and are bounded by a concurrent-connection cap instead (see "SSE streams").
 
 ### `POST /v1/commitments`
 
@@ -362,7 +362,7 @@ Pagination caveat: PostgREST returns at most 1000 rows per request, so `limit` i
 
 ### Cursor recovery reads (Phase 1.5)
 
-The catch-up side of the push contract. A client streams live deltas (forthcoming SSE) and, after a disconnect, asks for everything after its last cursor. These reads are intentionally distinct from the open-book list/snapshot endpoints above.
+The catch-up side of the push contract. A client streams live deltas (SSE — see "SSE streams") and, after a disconnect, asks for everything after its last cursor. These reads are intentionally distinct from the open-book list/snapshot endpoints above.
 
 - **Ordering** is keyset `(row_updated_at, id)` ascending — not offset. `row_updated_at` is trigger-maintained on every UPDATE, so a stored `open → filled/cancelled`, a `settleSpeculation`, or a `claimPosition` advances it and surfaces here. The `id` tie-breaker means same-millisecond updates are never skipped.
 - **Includes terminal rows.** Recovery does NOT apply the open-book `status`/`expiry`/`nonce_invalidated` defaults — a commitment that went `filled`/`cancelled`, or a speculation that `settled`, must surface so a client converges its local state.
@@ -392,13 +392,13 @@ Connect, e.g. `GET /v1/stream/fills?maker=0x…&cursor=<opaque>`:
 - **`cursor`** (optional, opaque): the resume point. With it the server replays missed deltas (catch-up) before going live; without it, snapshot first via the REST endpoints, then stream.
 
 Events:
-- `event: delta` — `id:` is the opaque (live) cursor; `data:` is the same body shape as the REST recovery/snapshot for that resource. Apply by natural key in cursor order; dedupe by the event cursor `(table, row_updated_at, id)`.
+- `event: delta` — `id:` is the opaque (live) cursor; `data:` is the same body shape as the REST recovery/snapshot for that resource. **Deltas are not guaranteed in cursor order** — a row committed late under the `now()`-based schema can arrive after a newer one — so apply **last-write-wins keyed by natural key**: ignore a delta whose event cursor `(table, row_updated_at, id)` is ≤ the one already applied for that key. (`position_fills` is append-only — dedupe by `(txHash, logIndex)`, no superseding.)
 - `event: ready` — catch-up complete; now streaming live.
 - `event: resync` (`data: { reason }`) — re-snapshot. Fires when a reorg/backfill recovery completes upstream (recovery hard-deletes rows, which polling can't observe) or the backlog was too large to replay.
 - `: hb` comment heartbeats (~20s) keep the connection under the platform idle timeout.
 
 Operational notes:
-- **Reconnect** with the last `id` you saw (a live cursor) as `?cursor=`; the server re-scans the overlap window so a row committed late under the `now()`-based schema isn't missed.
+- **Reconnect** with the last `id` you saw (a live cursor): either as `?cursor=` or via the standard `Last-Event-ID` header (a native `EventSource` sends it automatically). The server replays missed deltas from there, re-scanning the overlap window so a row committed late under the `now()`-based schema isn't missed, then emits `ready`.
 - SSE is **exempt from gzip** (compression buffers streams would defeat it) and from the request-rate limiter; a **concurrent-connection cap** (per-IP + total) bounds resource use instead — `429` when full.
 - `position_fills` is append-only (every event delivered); the other four are state-delta convergence (latest state per row).
 - Backed by the same `(network, row_updated_at, id)` indexes as recovery (indexer migration 048) — apply those before production stream traffic.

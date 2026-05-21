@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Response } from 'express';
 import { initSse, writeComment, writeEvent } from '../src/v1/stream/sse.js';
-import { __resetConnections, acquire, release } from '../src/v1/stream/connections.js';
+import { __resetConnections, acquire, connectionStats, release } from '../src/v1/stream/connections.js';
 
 interface FakeRes {
   statusCode: number;
@@ -87,5 +87,12 @@ describe('connection caps', () => {
     release('a');
     // b still holds its slot; acquiring for b again is fine
     expect(acquire('b').ok).toBe(true);
+  });
+
+  it('releasing an IP that holds no slot leaves the total intact (no undercount)', () => {
+    expect(acquire('a').ok).toBe(true);
+    expect(connectionStats().total).toBe(1);
+    release('b'); // 'b' never acquired — must be a no-op, not a total decrement
+    expect(connectionStats().total).toBe(1);
   });
 });

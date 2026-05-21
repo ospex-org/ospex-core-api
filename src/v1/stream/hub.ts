@@ -3,19 +3,29 @@
  * matching SSE subscribers. This is the N→1 collapse: many agents subscribe,
  * but each resource is polled once per tick regardless of subscriber count.
  *
- * Late-commit safety (the companion to A1's resume overlap): `now()` is
- * transaction-start time, so a slow writer tx can land a row whose
- * `row_updated_at` predates rows already emitted. Each tick re-scans an overlap
- * window (`highWater − overlap`) and dedupes by event-cursor `(row_updated_at,
- * id)`, so a late row is picked up on a subsequent tick and emitted exactly
- * once. Within a tick, paging is strict keyset (forward, terminating).
+ * Each tick has two phases:
  *
- * Reorg safety: a separate watcher polls `recovery_runs`; when a recovery
- * (reorg/backfill) completes, it broadcasts a `resync` to every subscriber —
- * recovery hard-DELETEs rows, which polling can't observe, so clients
- * re-snapshot. Pollers are ref-counted: started on the first subscriber for a
- * resource, stopped on the last; the resync watcher runs whenever any
- * subscriber exists.
+ *   1. Forward drain — strict keyset `(row_updated_at, id) > tip`, paged,
+ *      advancing `tip` per row. This always makes forward progress, so it can
+ *      never starve: a per-tick page budget just spreads a large backlog
+ *      across ticks (the next tick resumes past the new tip).
+ *
+ *   2. Overlap re-scan — the recent window `row_updated_at ∈ [tip − overlap,
+ *      tip]`, deduped by event-cursor `(row_updated_at, id)`. `now()` is
+ *      transaction-start time, so a slow writer tx can commit a row whose
+ *      `row_updated_at` predates `tip`; the forward drain (strictly `> tip`)
+ *      would miss it, so this bounded re-scan catches it. The window slides as
+ *      `tip` advances, so a late row is always reached within a tick or two.
+ *
+ * A late row is therefore emitted out of `row_updated_at` order (after newer
+ * rows). The contract is convergence, not wire-order: clients apply
+ * last-write-wins keyed by natural key, comparing the event cursor — a delta
+ * whose cursor is ≤ the one already applied for that key is a no-op.
+ *
+ * Reorg safety: a watcher polls `recovery_runs`; when a recovery completes it
+ * broadcasts `resync` to every subscriber (recovery hard-deletes rows, which
+ * polling can't observe). Pollers are ref-counted; the resync watcher runs
+ * whenever any subscriber exists and baselines immediately on the first one.
  *
  * Dependency-injected (client/network/intervals) so it unit-tests without
  * timers or a live DB.
@@ -57,15 +67,22 @@ export interface StreamHubDeps {
   resyncMs?: number;
   /** Max rows fetched per page; PostgREST caps at 1000. */
   pollLimit?: number;
-  /** Max pages drained per tick (burst guard; the next tick continues). */
-  maxPagesPerTick?: number;
+  /** Max forward pages per tick (a large backlog spreads across ticks — no starvation). */
+  maxForwardPages?: number;
+  /** Max overlap-rescan pages per tick (the window is bounded, so this rarely binds). */
+  maxOverlapPages?: number;
+}
+
+interface Cmp {
+  s: string;
+  i: string;
 }
 
 interface PollerState {
   subs: Set<Subscriber>;
   timer: ReturnType<typeof setInterval>;
-  /** Max row_updated_at (ms) ever fetched — the re-scan floor is this minus overlap. */
-  highTsMs: number;
+  /** Strict forward high-water — the furthest `(row_updated_at, id)` drained. */
+  tip: Cmp;
   /** event-key (`ts|id`) → row_updated_at ms, for dedupe + eviction. */
   emitted: Map<string, number>;
   polling: boolean;
@@ -85,7 +102,8 @@ export class StreamHub {
       pollMs: 1_500,
       resyncMs: 5_000,
       pollLimit: 500,
-      maxPagesPerTick: 20,
+      maxForwardPages: 20,
+      maxOverlapPages: 10,
       ...deps,
     };
   }
@@ -97,16 +115,15 @@ export class StreamHub {
     if (!state) {
       state = {
         subs: new Set(),
-        // Start from now: history is the connection's catch-up job. The first
-        // tick re-scans the overlap window to catch anything just committed.
-        highTsMs: Date.now(),
+        // Start from now — history is the connection's catch-up job. The first
+        // tick's overlap re-scan still sweeps the last `overlap` of changes.
+        tip: { s: new Date().toISOString(), i: '0' },
         emitted: new Map(),
         polling: false,
         timer: setInterval(() => {
           void this.pollResource(resource);
         }, this.deps.pollMs),
       };
-      // Don't keep the event loop alive on the timer alone.
       state.timer.unref?.();
       this.pollers.set(resource, state);
     }
@@ -114,7 +131,10 @@ export class StreamHub {
 
     this.totalSubs += 1;
     if (this.totalSubs === 1 && this.resyncTimer === undefined) {
-      this.resyncHighId = null; // re-baseline on next resync poll
+      // Baseline immediately (not after resyncMs) so a recovery completing right
+      // after the first subscriber connects isn't silently swallowed.
+      this.resyncHighId = null;
+      void this.pollResync();
       this.resyncTimer = setInterval(() => {
         void this.pollResync();
       }, this.deps.resyncMs);
@@ -137,40 +157,22 @@ export class StreamHub {
     }
   }
 
-  /** One poll tick for a resource: drain new/late deltas and fan them out. Public for tests. */
+  /** One poll tick: forward-drain new rows, then re-scan the overlap window. Public for tests. */
   async pollResource(name: StreamResourceName): Promise<void> {
     const state = this.pollers.get(name);
     if (!state || state.polling) return;
     state.polling = true;
     try {
-      const resource = STREAM_RESOURCES[name];
-      const floorIso = new Date(Math.max(0, state.highTsMs - this.deps.overlapMs)).toISOString();
-      let cmp: { s: string; i: string } = { s: floorIso, i: '0' };
-      const fresh: StreamRow[] = [];
+      // (1) Forward drain — strict `> tip`, advances tip. Never starves.
+      state.tip = await this.scan(name, state, state.tip, null, this.deps.maxForwardPages);
 
-      for (let page = 0; page < this.deps.maxPagesPerTick; page += 1) {
-        const { data, error } = await this.deps
-          .getClient()
-          .from(resource.table)
-          .select(resource.columns)
-          .eq('network', this.deps.getNetwork())
-          .or(keysetOrExpr(cmp.s, cmp.i))
-          .order('row_updated_at', { ascending: true })
-          .order('id', { ascending: true })
-          .limit(this.deps.pollLimit);
-        if (error) {
-          logger.error({ err: error.message, resource: name }, 'stream poller: query failed');
-          return;
-        }
-        const rows = (data ?? []) as unknown as StreamRow[];
-        for (const row of rows) {
-          fresh.push(row);
-          cmp = { s: row.row_updated_at, i: String(row.id) };
-        }
-        if (rows.length < this.deps.pollLimit) break;
+      // (2) Overlap re-scan — recent window for late commits; does not move tip.
+      const tipMs = Date.parse(state.tip.s);
+      if (Number.isFinite(tipMs)) {
+        const floorIso = new Date(Math.max(0, tipMs - this.deps.overlapMs)).toISOString();
+        await this.scan(name, state, { s: floorIso, i: '0' }, state.tip.s, this.deps.maxOverlapPages);
       }
-
-      this.processDeltas(name, state, fresh);
+      this.evict(state);
     } catch (err) {
       logger.error({ err: err instanceof Error ? err.message : String(err), resource: name }, 'stream poller: tick failed');
     } finally {
@@ -178,30 +180,71 @@ export class StreamHub {
     }
   }
 
-  /** Dedupe by event-cursor, fan out to matching subscribers, advance the watermark. */
-  private processDeltas(name: StreamResourceName, state: PollerState, rows: StreamRow[]): void {
+  /**
+   * Page from `start` (exclusive keyset) up to `maxPages`, optionally capped at
+   * `upperTs` (inclusive). Emits each row, returns the furthest cursor reached.
+   */
+  private async scan(
+    name: StreamResourceName,
+    state: PollerState,
+    start: Cmp,
+    upperTs: string | null,
+    maxPages: number,
+  ): Promise<Cmp> {
     const resource = STREAM_RESOURCES[name];
-    for (const row of rows) {
-      const tsMs = Date.parse(row.row_updated_at);
-      if (Number.isFinite(tsMs) && tsMs > state.highTsMs) state.highTsMs = tsMs;
-      const key = `${row.row_updated_at}|${String(row.id)}`;
-      if (state.emitted.has(key)) continue;
-      state.emitted.set(key, Number.isFinite(tsMs) ? tsMs : state.highTsMs);
+    let cmp = start;
+    for (let page = 0; page < maxPages; page += 1) {
+      let q = this.deps
+        .getClient()
+        .from(resource.table)
+        .select(resource.columns)
+        .eq('network', this.deps.getNetwork())
+        .or(keysetOrExpr(cmp.s, cmp.i));
+      if (upperTs !== null) q = q.lte('row_updated_at', upperTs);
+      const { data, error } = await q
+        .order('row_updated_at', { ascending: true })
+        .order('id', { ascending: true })
+        .limit(this.deps.pollLimit);
+      if (error) {
+        logger.error({ err: error.message, resource: name }, 'stream poller: query failed');
+        break;
+      }
+      const rows = (data ?? []) as unknown as StreamRow[];
+      for (const row of rows) {
+        this.emitRow(name, state, row);
+        cmp = { s: row.row_updated_at, i: String(row.id) };
+      }
+      if (rows.length < this.deps.pollLimit) break;
+    }
+    return cmp;
+  }
 
-      const body = resource.toBody(row);
-      if (body === null) continue; // e.g. an unenriched speculation
-      const cursorId = cursorFromRow(resource.cursorTable, row, 'live');
-      for (const sub of state.subs) {
-        if (!matchesRow(sub.filters, row)) continue;
-        try {
-          sub.onDelta(body, cursorId);
-        } catch (err) {
-          logger.error({ err: err instanceof Error ? err.message : String(err), resource: name }, 'stream fan-out: onDelta threw');
-        }
+  /** Dedupe by event-cursor, then fan out to matching subscribers. */
+  private emitRow(name: StreamResourceName, state: PollerState, row: StreamRow): void {
+    const tsMs = Date.parse(row.row_updated_at);
+    const key = `${row.row_updated_at}|${String(row.id)}`;
+    if (state.emitted.has(key)) return;
+    state.emitted.set(key, Number.isFinite(tsMs) ? tsMs : Date.now());
+
+    const resource = STREAM_RESOURCES[name];
+    const body = resource.toBody(row);
+    if (body === null) return; // e.g. an unenriched speculation
+    const cursorId = cursorFromRow(resource.cursorTable, row, 'live');
+    for (const sub of state.subs) {
+      if (!matchesRow(sub.filters, row)) continue;
+      try {
+        sub.onDelta(body, cursorId);
+      } catch (err) {
+        logger.error({ err: err instanceof Error ? err.message : String(err), resource: name }, 'stream fan-out: onDelta threw');
       }
     }
-    // Evict dedupe entries that can no longer be re-scanned (older than 2× overlap).
-    const cutoff = state.highTsMs - this.deps.overlapMs * 2;
+  }
+
+  /** Drop dedupe entries that can no longer be re-scanned (older than 2× overlap below tip). */
+  private evict(state: PollerState): void {
+    const tipMs = Date.parse(state.tip.s);
+    if (!Number.isFinite(tipMs)) return;
+    const cutoff = tipMs - this.deps.overlapMs * 2;
     for (const [key, tsMs] of state.emitted) {
       if (tsMs < cutoff) state.emitted.delete(key);
     }
@@ -215,7 +258,6 @@ export class StreamHub {
       const net = this.deps.getNetwork();
       const client = this.deps.getClient();
       if (this.resyncHighId === null) {
-        // Baseline: highest already-completed run, so we don't replay history.
         const { data, error } = await client
           .from('recovery_runs')
           .select('id')
@@ -284,4 +326,9 @@ export function getStreamHub(): StreamHub {
     });
   }
   return singleton;
+}
+
+/** Test-only: install an isolated hub (with mock deps) behind getStreamHub(). */
+export function __setStreamHubForTest(hub: StreamHub | undefined): void {
+  singleton = hub;
 }

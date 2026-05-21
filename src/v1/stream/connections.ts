@@ -29,9 +29,9 @@ export function acquire(ip: string): AcquireResult {
 
 /** Release a slot previously acquired for `ip`. Idempotent-safe against double-release. */
 export function release(ip: string): void {
-  if (total > 0) total -= 1;
   const n = perIp.get(ip);
-  if (n === undefined) return;
+  if (n === undefined) return; // nothing held for this ip — don't touch the total
+  if (total > 0) total -= 1;
   if (n <= 1) perIp.delete(ip);
   else perIp.set(ip, n - 1);
 }
