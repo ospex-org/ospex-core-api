@@ -46,7 +46,7 @@ vi.mock('../src/lib/env.js', () => ({ loadConfig: () => ({ network: 'polygon', c
 
 const { getOddsStreamHandler } = await import('../src/v1/stream/oddsHandler.js');
 const { __setOddsHubForTest } = await import('../src/v1/stream/oddsHub.js');
-const { __resetConnections, acquire, connectionStats } = await import('../src/v1/stream/connections.js');
+const { __resetConnections, acquire, closeAllStreams, connectionStats } = await import('../src/v1/stream/connections.js');
 
 interface FakeHub {
   hub: OddsHub;
@@ -511,6 +511,25 @@ describe('GET /v1/stream/odds snapshot + live', () => {
     expect(connectionStats().total).toBe(1);
 
     res.emitClose();
+    expect(fake.unsub).toHaveBeenCalledTimes(1);
+    expect(connectionStats().total).toBe(0);
+  });
+
+  it('on server shutdown, emits a server_shutdown comment, ends the stream, and cleans up', async () => {
+    sbMock.state.contest = { data: { jsonodds_id: 'jo-1' }, error: null };
+    sbMock.state.odds = { data: oddsRow(), error: null };
+    const res = makeRes();
+    await getOddsStreamHandler(makeReq({ contestId: '1', market: 'spread' }), res as unknown as Response);
+    fake.captured?.cb.onActive();
+    await flush();
+    expect(connectionStats().total).toBe(1);
+
+    closeAllStreams();
+
+    // Odds has no protocol resync event — shutdown sends a final comment, not an event.
+    expect(frames(res).some((f) => f.comment === 'server_shutdown')).toBe(true);
+    expect(eventsOf(res)).not.toContain('resync');
+    expect(res.writableEnded).toBe(true);
     expect(fake.unsub).toHaveBeenCalledTimes(1);
     expect(connectionStats().total).toBe(0);
   });

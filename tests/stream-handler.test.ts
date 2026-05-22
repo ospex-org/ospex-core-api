@@ -36,7 +36,7 @@ vi.mock('../src/lib/env.js', () => ({ loadConfig: () => ({ network: 'polygon', c
 
 const { getStreamHandler } = await import('../src/v1/stream/handler.js');
 const { StreamHub, __setStreamHubForTest } = await import('../src/v1/stream/hub.js');
-const { __resetConnections, acquire, connectionStats } = await import('../src/v1/stream/connections.js');
+const { __resetConnections, acquire, closeAllStreams, connectionStats } = await import('../src/v1/stream/connections.js');
 const { encodeCursor } = await import('../src/lib/cursor.js');
 
 function emptyClient(): SupabaseClient {
@@ -308,6 +308,23 @@ describe('GET /v1/stream/:resource lifecycle', () => {
     expect(hub.stats().subscribers).toBe(1);
 
     res.emitClose();
+    expect(connectionStats().total).toBe(0);
+    expect(hub.stats().subscribers).toBe(0);
+  });
+
+  it('on server shutdown, emits resync(server_shutdown), ends the stream, and cleans up', async () => {
+    const res = makeRes();
+    getStreamHandler(makeReq({ resource: 'fills' }), res as unknown as Response);
+    await flush();
+    expect(connectionStats().total).toBe(1);
+
+    closeAllStreams();
+
+    const ev = events(res);
+    expect(ev).toContain('resync');
+    expect(res.written.join('')).toContain('"reason":"server_shutdown"');
+    expect(res.writableEnded).toBe(true);
+    // The closer's res.end() drives 'close' → cleanup: slot released, unsubscribed.
     expect(connectionStats().total).toBe(0);
     expect(hub.stats().subscribers).toBe(0);
   });
