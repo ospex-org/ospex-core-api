@@ -1,7 +1,15 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Response } from 'express';
 import { initSse, writeComment, writeEvent } from '../src/v1/stream/sse.js';
-import { __resetConnections, acquire, connectionStats, release } from '../src/v1/stream/connections.js';
+import {
+  __resetConnections,
+  acquire,
+  closeAllStreams,
+  configureConnectionCaps,
+  connectionStats,
+  registerStream,
+  release,
+} from '../src/v1/stream/connections.js';
 
 interface FakeRes {
   statusCode: number;
@@ -94,5 +102,69 @@ describe('connection caps', () => {
     expect(connectionStats().total).toBe(1);
     release('b'); // 'b' never acquired — must be a no-op, not a total decrement
     expect(connectionStats().total).toBe(1);
+  });
+
+  it('reports the default caps (200 total / 10 per IP) until configured', () => {
+    expect(connectionStats()).toMatchObject({ maxTotal: 200, maxPerIp: 10 });
+  });
+
+  it('configureConnectionCaps overrides both caps and enforces the new limits', () => {
+    configureConnectionCaps({ maxTotal: 3, maxPerIp: 2 });
+    expect(connectionStats()).toMatchObject({ maxTotal: 3, maxPerIp: 2 });
+
+    const ip = '1.1.1.1';
+    expect(acquire(ip).ok).toBe(true);
+    expect(acquire(ip).ok).toBe(true);
+    const overIp = acquire(ip); // 3rd from this IP — over the per-IP cap (total untouched)
+    expect(overIp.ok).toBe(false);
+    expect(overIp.scope).toBe('ip');
+
+    expect(acquire('2.2.2.2').ok).toBe(true); // total now 3 (at the cap)
+    const overTotal = acquire('3.3.3.3'); // 4th total — over the total cap
+    expect(overTotal.ok).toBe(false);
+    expect(overTotal.scope).toBe('total');
+  });
+
+  it('configureConnectionCaps overrides only the cap provided', () => {
+    configureConnectionCaps({ maxPerIp: 1 });
+    expect(connectionStats()).toMatchObject({ maxTotal: 200, maxPerIp: 1 });
+  });
+});
+
+describe('graceful-shutdown stream registry', () => {
+  afterEach(() => __resetConnections());
+
+  it('closeAllStreams invokes every registered closer once, then clears the registry', () => {
+    const a = vi.fn();
+    const b = vi.fn();
+    registerStream(a);
+    registerStream(b);
+
+    closeAllStreams();
+    expect(a).toHaveBeenCalledTimes(1);
+    expect(b).toHaveBeenCalledTimes(1);
+
+    closeAllStreams(); // registry cleared — no re-invocation
+    expect(a).toHaveBeenCalledTimes(1);
+    expect(b).toHaveBeenCalledTimes(1);
+  });
+
+  it('deregister removes a closer so a later shutdown does not invoke it', () => {
+    const a = vi.fn();
+    const deregister = registerStream(a);
+    deregister();
+    closeAllStreams();
+    expect(a).not.toHaveBeenCalled();
+  });
+
+  it('a closer that throws does not abort the rest of the shutdown', () => {
+    const boom = vi.fn(() => {
+      throw new Error('boom');
+    });
+    const ok = vi.fn();
+    registerStream(boom);
+    registerStream(ok);
+    expect(() => closeAllStreams()).not.toThrow();
+    expect(ok).toHaveBeenCalledTimes(1);
   });
 });

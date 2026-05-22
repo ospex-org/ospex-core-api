@@ -8,6 +8,7 @@ import { getSupabase } from './lib/supabase.js';
 import { asyncHandler } from './middleware/asyncHandler.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { v1Router } from './v1/router.js';
+import { closeAllStreams, configureConnectionCaps } from './v1/stream/connections.js';
 
 interface LivenessResponse {
   ok: true;
@@ -136,6 +137,10 @@ function buildApp(config: ReturnType<typeof loadConfig>): express.Express {
 
 function main(): void {
   const config = loadConfig();
+  configureConnectionCaps({
+    maxTotal: config.maxStreamConnectionsTotal,
+    maxPerIp: config.maxStreamConnectionsPerIp,
+  });
   const app = buildApp(config);
 
   const server = app.listen(config.port, () => {
@@ -147,6 +152,9 @@ function main(): void {
 
   const shutdown = (signal: string): void => {
     logger.info({ signal }, 'shutting down');
+    // End open SSE responses first — they're long-lived, so without this
+    // server.close() waits on them until the force-exit timeout fires.
+    closeAllStreams();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(1), 10_000).unref();
   };

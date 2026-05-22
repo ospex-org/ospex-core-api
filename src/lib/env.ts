@@ -30,6 +30,9 @@ export interface Config {
   matchingModuleAddress?: string;
   positionModuleAddress?: string;
   scorers?: ScorerAddresses;
+  /** SSE concurrent-connection caps. Absent ⇒ the stream module's defaults apply. */
+  maxStreamConnectionsTotal?: number | undefined;
+  maxStreamConnectionsPerIp?: number | undefined;
 }
 
 function requireEnv(name: string): string {
@@ -77,6 +80,22 @@ function validateAddress(name: string, value: string | undefined): string | unde
 
 function optionalAddressEnv(name: string): string | undefined {
   return validateAddress(name, optionalEnv(name));
+}
+
+/**
+ * Optional positive-integer env var. Returns undefined when unset (caller falls
+ * back to a default); fails loud at boot when set to a non-positive / non-integer
+ * value, so a typo can't silently disable a cap.
+ */
+function optionalPositiveIntEnv(name: string): number | undefined {
+  const raw = optionalEnv(name);
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    logger.fatal({ var: name, value: raw }, `${name} must be a positive integer`);
+    process.exit(1);
+  }
+  return n;
 }
 
 let cached: Config | undefined;
@@ -142,6 +161,11 @@ export function loadConfig(): Config {
     process.exit(1);
   }
 
+  // SSE connection caps — optional; the stream module owns the defaults, so an
+  // unset var leaves the cap at its default rather than overriding it.
+  const maxStreamConnectionsTotal = optionalPositiveIntEnv('MAX_STREAM_CONNECTIONS_TOTAL');
+  const maxStreamConnectionsPerIp = optionalPositiveIntEnv('MAX_STREAM_CONNECTIONS_PER_IP');
+
   cached = {
     port,
     nodeEnv,
@@ -154,6 +178,8 @@ export function loadConfig(): Config {
     ...(matchingModuleAddress !== undefined ? { matchingModuleAddress } : {}),
     ...(positionModuleAddress !== undefined ? { positionModuleAddress } : {}),
     ...(scorers !== undefined ? { scorers } : {}),
+    ...(maxStreamConnectionsTotal !== undefined ? { maxStreamConnectionsTotal } : {}),
+    ...(maxStreamConnectionsPerIp !== undefined ? { maxStreamConnectionsPerIp } : {}),
   };
   return cached;
 }
