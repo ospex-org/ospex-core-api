@@ -30,6 +30,7 @@ In progress. Working today:
 - **Cursor recovery (Phase 1.5):** `?since=<cursor>` recovery mode on `GET /v1/commitments`, `/v1/speculations`, `/v1/contests`; bare `GET /v1/positions` (recovery) alongside the address-scoped snapshot; `GET /v1/fills` (append-only fill events). See "Cursor recovery reads" below.
 - **SSE streams (Phase 1.5):** `GET /v1/stream/{commitments,positions,fills,speculations,contests}` — live deltas + cursor catch-up + resync over Server-Sent Events. See "SSE streams" below.
 - **Odds stream (Phase 1.5):** `GET /v1/stream/odds?contestId=&market=` — snapshot then live `change`/`refresh` over Server-Sent Events (latest-state, no cursor). See "Odds stream" below.
+- `GET /v1/metrics` — operational stream / odds / connection counters (process-local). See "Metrics" below.
 
 Not ported (no R4 analog — see "Position helpers" section below): `/withdraw-params`, `/withdraw-result/:txHash`. Not ported in any batch yet (deferred or out of scope): everything else under `/v1/analytics/*`, `/v1/current-odds*` (the legacy `/v1/current-odds*` paths from agent-server are superseded by the contest-centric `/v1/contests/:contestId/odds`).
 
@@ -400,7 +401,8 @@ Events:
 
 Operational notes:
 - **Reconnect** with the last `id` you saw (a live cursor): a native `EventSource` resends it automatically as the `Last-Event-ID` header, or pass it as `?cursor=`. **`Last-Event-ID` takes precedence** over `?cursor=` — on an `EventSource` auto-reconnect the original URL's `?cursor=` is stale, while the header is the true resume point. The server replays missed deltas from there, re-scanning the overlap window so a row committed late under the `now()`-based schema isn't missed, then emits `ready`. **Under concurrent write activity** the cursor handoff conservatively aborts to `resync` rather than risk a stale-at-`ready` merge; on `resync` the client re-snapshots (REST) and reconnects (without a cursor, since the snapshot is current).
-- SSE is **exempt from gzip** (compression buffers streams would defeat it) and from the request-rate limiter; a **concurrent-connection cap** (per-IP + total) bounds resource use instead — `429` when full.
+- SSE is **exempt from gzip** (compression buffers streams would defeat it) and from the request-rate limiter; a **concurrent-connection cap** (per-IP + total) bounds resource use instead — `429` when full. The caps are env-tunable (`MAX_STREAM_CONNECTIONS_TOTAL` / `MAX_STREAM_CONNECTIONS_PER_IP`); the live values show on `GET /v1/metrics`.
+- **Graceful shutdown.** On `SIGTERM`/`SIGINT` the server proactively ends open streams — protocol streams get a final `resync` (`reason: "server_shutdown"`) then close — so it drains fast instead of waiting out the shutdown timeout. Reconnect as usual.
 - `position_fills` is append-only (every event delivered); the other four are state-delta convergence (latest state per row).
 - Backed by the same `(network, row_updated_at, id)` indexes as recovery (indexer migration 048) — apply those before production stream traffic.
 
@@ -422,6 +424,23 @@ Apply semantics:
 - **Latest-state convergence** — the server only emits a delta whose `pollCapturedAt` is strictly newer than the last one emitted for this stream, so duplicates and out-of-order delivery are already filtered. Treat each `change`/`refresh`/`snapshot` as the current value for `(contestId, market)`.
 - Unknown `market` (or non-numeric `contestId`) → `400`; unknown contest → `404`; both *before* the stream opens.
 - Same gzip exemption and concurrent-connection cap as the protocol streams (shared budget; `429` when full).
+- **Graceful shutdown.** On `SIGTERM`/`SIGINT` the server ends the stream with a final `: server_shutdown` comment (no event — odds is latest-state, so there's no protocol `resync`) then closes. Reconnect re-snapshots as usual.
+
+### `GET /v1/metrics`
+
+Operational counters for the SSE subsystem, surfaced as JSON. Kept separate from `/readyz` so readiness stays a pure up/down dependency check; this is the "how loaded is the stream stack" view. Read-rate-limited like the other `GET /v1/*` endpoints.
+
+```jsonc
+{
+  "stream":      { "resources": 0, "subscribers": 0 },                                  // protocol-stream hub: active pollers + total subscribers
+  "odds":        { "subscribers": 0, "channelOpen": false, "subscribed": false, "degraded": false }, // odds hub: Realtime channel state
+  "connections": { "total": 0, "ips": 0, "maxTotal": 200, "maxPerIp": 10 },             // concurrent SSE slots in use + the configured caps
+  "uptimeSeconds": 0,
+  "timestamp": "..."
+}
+```
+
+All counters are **process-local** — on a multi-dyno deploy, scrape each dyno rather than going through the load balancer. `connections.maxTotal` / `maxPerIp` echo the active caps (defaults, or the `MAX_STREAM_CONNECTIONS_*` overrides).
 
 ## Scripts
 
@@ -451,6 +470,8 @@ See `.env.example`. Required values are validated at boot — missing vars exit 
 | `SCORER_MONEYLINE_ADDRESS` | for `POST /v1/commitments` | All-or-nothing; partial config rejected at boot |
 | `SCORER_SPREAD_ADDRESS` | for `POST /v1/commitments` | |
 | `SCORER_TOTAL_ADDRESS` | for `POST /v1/commitments` | |
+| `MAX_STREAM_CONNECTIONS_TOTAL` | no | Max concurrent SSE streams process-wide. Positive integer; defaults to 200. Surfaced on `/v1/metrics`. |
+| `MAX_STREAM_CONNECTIONS_PER_IP` | no | Max concurrent SSE streams per client IP. Positive integer; defaults to 10. Surfaced on `/v1/metrics`. |
 
 ## Deployment
 
@@ -468,6 +489,7 @@ Set via `heroku config:set <var>=<value> --app ospex-core-api`. Mirrors `.env.ex
 - `MATCHING_MODULE_ADDRESS` — R4 matching module; verifying contract for the EIP-712 domain on `POST /v1/commitments` and `DELETE /v1/commitments/:hash`
 - `SCORER_MONEYLINE_ADDRESS`, `SCORER_SPREAD_ADDRESS`, `SCORER_TOTAL_ADDRESS` — required by `POST /v1/commitments` (all-or-nothing; partial config is rejected at boot)
 - `POSITION_MODULE_ADDRESS` — optional defensive log-source filter for tx parsers
+- `MAX_STREAM_CONNECTIONS_TOTAL`, `MAX_STREAM_CONNECTIONS_PER_IP` — optional SSE concurrent-connection caps (defaults 200 / 10); set either to tune the stream stack without a code change
 
 `NODE_ENV=production` and `LOG_LEVEL=info` are recommended. **Do not set `PORT`** — Heroku injects it; setting it as a config var creates a binding mismatch.
 
@@ -521,6 +543,7 @@ src/
     contests.ts        # GET /v1/contests, /:contestId, /scripts/approved
     speculations.ts    # GET /v1/speculations, /:speculationId
     protocol.ts        # GET /v1/protocol/info
+    metrics.ts         # GET /v1/metrics — stream/odds/connection counters
     positions.ts       # GET /v1/positions (recovery) + /:address + /status,
                        #   /claim-params, /by-tx/:txHash, /claim-result/:txHash
     fills.ts           # GET /v1/fills — append-only fill event recovery
@@ -531,7 +554,8 @@ src/
       oddsHandler.ts   #   GET /v1/stream/odds — snapshot + live change/refresh (latest-state)
       oddsHub.ts       #   one current_odds Realtime channel → classify → fan out (N→1)
       sse.ts           #   SSE wire helpers (event/comment frames)
-      connections.ts   #   concurrent-connection caps
+      common.ts        #   shared handler scaffolding (heartbeat/shed consts, 429 acquire)
+      connections.ts   #   concurrent-connection caps + graceful-shutdown stream registry
     leaderboard.ts     # GET /v1/leaderboard
     schedule.ts        # GET /v1/schedule
     teams.ts           # GET /v1/teams/aliases
