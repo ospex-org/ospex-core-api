@@ -43,13 +43,11 @@ import {
   type MarketOdds,
   type OddsMarket,
 } from '../utils/odds.js';
-import { acquire, release } from './connections.js';
+import { registerStream, release } from './connections.js';
+import { HEARTBEAT_MS, acquireStreamSlot, makeShedIfSlow } from './common.js';
 import { getOddsHub, type OddsSubscriber } from './oddsHub.js';
 import { initSse, writeComment, writeEvent } from './sse.js';
 
-const HEARTBEAT_MS = 20_000;
-// Outbound buffer ceiling: a client that isn't draining gets shed (reconnects).
-const MAX_PENDING_BYTES = 1_000_000;
 // Backoff between baseline-snapshot retries after a query failure.
 const SNAPSHOT_RETRY_MS = 2_000;
 
@@ -68,18 +66,8 @@ export async function getOddsStreamHandler(req: Request, res: Response): Promise
   }
   const market: OddsMarket = marketRaw;
 
-  const ip = req.ip ?? 'unknown';
-  const slot = acquire(ip);
-  if (!slot.ok) {
-    res.status(429).json({
-      error:
-        slot.scope === 'ip'
-          ? 'Too many concurrent streams from this client.'
-          : 'Server stream capacity reached, try again shortly.',
-      code: 'RATE_LIMIT_EXCEEDED',
-    } satisfies ApiError);
-    return;
-  }
+  const ip = acquireStreamSlot(req, res);
+  if (ip === null) return;
 
   // A slot is held from here — attach cleanup early so a disconnect during the
   // pre-stream resolve still releases it (and unsubscribes if we got that far).
@@ -87,6 +75,10 @@ export async function getOddsStreamHandler(req: Request, res: Response): Promise
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
+  // Set once the stream is open (after initSse); a graceful shutdown invokes it
+  // to end the response. No-op until then, so a disconnect during the pre-stream
+  // resolve is harmless.
+  let deregisterStream: () => void = () => {};
   const cleanup = (): void => {
     if (closed) return;
     closed = true;
@@ -94,6 +86,7 @@ export async function getOddsStreamHandler(req: Request, res: Response): Promise
     if (retryTimer) clearTimeout(retryTimer);
     if (sub) getOddsHub().unsubscribe(sub);
     release(ip);
+    deregisterStream();
   };
   res.on('close', cleanup);
   res.on('error', cleanup);
@@ -123,6 +116,14 @@ export async function getOddsStreamHandler(req: Request, res: Response): Promise
   writeComment(res, 'connected');
   heartbeat = setInterval(() => writeComment(res, 'hb'), HEARTBEAT_MS);
   heartbeat.unref?.();
+  // Stream is open — register the graceful-shutdown closer. Odds is latest-state
+  // with no protocol `resync` event, so we send a final comment (no wire-contract
+  // change) and end; the client reconnects and re-snapshots.
+  deregisterStream = registerStream(() => {
+    if (closed) return;
+    writeComment(res, 'server_shutdown');
+    res.end();
+  });
 
   // No upstream linkage: there's nothing to stream. Send an empty snapshot so
   // the client has a definitive "no odds for this contest" answer, then idle
@@ -148,13 +149,9 @@ export async function getOddsStreamHandler(req: Request, res: Response): Promise
   let bufferedPollMs = Number.NEGATIVE_INFINITY;
   let bufferedChangePollMs = Number.NEGATIVE_INFINITY;
 
-  const shedIfSlow = (): void => {
-    const len = (res as { writableLength?: number }).writableLength;
-    if (!res.writableEnded && typeof len === 'number' && len > MAX_PENDING_BYTES) {
-      logger.warn({ contestId, market, pending: len }, 'odds stream: shedding slow client (backpressure)');
-      res.end(); // → 'close' → cleanup; client reconnects + re-snapshots
-    }
-  };
+  const shedIfSlow = makeShedIfSlow(res, (pending) =>
+    logger.warn({ contestId, market, pending }, 'odds stream: shedding slow client (backpressure)'),
+  );
 
   const markDegraded = (reason: string): void => {
     if (clientDegraded || closed) return; // deduped: one degraded per outage

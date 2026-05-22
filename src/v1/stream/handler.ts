@@ -39,7 +39,8 @@ import {
 } from '../../lib/cursor.js';
 import { recoveryKeysetExpr } from '../../lib/recovery.js';
 import type { ApiError } from '../../middleware/errorHandler.js';
-import { acquire, release } from './connections.js';
+import { registerStream, release } from './connections.js';
+import { HEARTBEAT_MS, acquireStreamSlot, makeShedIfSlow } from './common.js';
 import { getStreamHub } from './hub.js';
 import { initSse, writeComment, writeEvent } from './sse.js';
 import {
@@ -50,11 +51,8 @@ import {
   type StreamRow,
 } from './resources.js';
 
-const HEARTBEAT_MS = 20_000;
 const CATCHUP_PAGE = 500;
 const CATCHUP_MAX_PAGES = 50;
-// Outbound buffer ceiling: a client that isn't draining gets shed (forced to reconnect).
-const MAX_PENDING_BYTES = 1_000_000;
 
 type CatchupStatus = 'complete' | 'resync';
 type Phase = 'catchup' | 'live';
@@ -67,18 +65,8 @@ export function getStreamHandler(req: Request, res: Response): void {
   }
   const resource = STREAM_RESOURCES[name];
 
-  const ip = req.ip ?? 'unknown';
-  const slot = acquire(ip);
-  if (!slot.ok) {
-    res.status(429).json({
-      error:
-        slot.scope === 'ip'
-          ? 'Too many concurrent streams from this client.'
-          : 'Server stream capacity reached, try again shortly.',
-      code: 'RATE_LIMIT_EXCEEDED',
-    } satisfies ApiError);
-    return;
-  }
+  const ip = acquireStreamSlot(req, res);
+  if (ip === null) return;
 
   // From here a slot is held — every early return must release it.
   const filters = resource.parseFilters(req);
@@ -108,13 +96,9 @@ export function getStreamHandler(req: Request, res: Response): void {
   initSse(res);
   writeComment(res, 'connected');
 
-  const shedIfSlow = (): void => {
-    const pending = (res as { writableLength?: number }).writableLength;
-    if (!res.writableEnded && typeof pending === 'number' && pending > MAX_PENDING_BYTES) {
-      logger.warn({ resource: name, pending }, 'stream: shedding slow client (backpressure)');
-      res.end(); // → 'close' → cleanup; client reconnects + catches up
-    }
-  };
+  const shedIfSlow = makeShedIfSlow(res, (pending) =>
+    logger.warn({ resource: name, pending }, 'stream: shedding slow client (backpressure)'),
+  );
 
   // Subscribe BEFORE catch-up so a live delta can't slip past the hub's global
   // dedupe. During catch-up we don't merge live events — we abort to `resync`.
@@ -136,12 +120,21 @@ export function getStreamHandler(req: Request, res: Response): void {
   });
 
   let closed = false;
+  // Graceful shutdown: end the stream cleanly with one resync (the client
+  // re-snapshots on reconnect), then close. Deregistered in cleanup so a
+  // normally-closed connection isn't left in the shutdown registry.
+  const deregisterStream = registerStream(() => {
+    if (closed) return;
+    writeEvent(res, 'resync', { reason: 'server_shutdown' });
+    res.end();
+  });
   const cleanup = (): void => {
     if (closed) return;
     closed = true;
     clearInterval(heartbeat);
     getStreamHub().unsubscribe(sub);
     release(ip);
+    deregisterStream();
   };
   const heartbeat = setInterval(() => writeComment(res, 'hb'), HEARTBEAT_MS);
   heartbeat.unref?.();

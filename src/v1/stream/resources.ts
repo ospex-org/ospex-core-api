@@ -5,7 +5,7 @@
  * mappers, so stream deltas and REST recovery agree shape-for-shape), how to
  * validate query filters, and which columns those filters constrain.
  *
- * Filters are identity/scope only (Hermes: not lifecycle-status). `parseFilters`
+ * Filters are identity/scope only (not lifecycle-status). `parseFilters`
  * returns a column→value map (snake_case columns, validated values); the same
  * map is applied as `.eq()` on the catch-up query and matched in-memory for
  * live fan-out — see `matchesRow`. All stream filters map to direct, indexed
