@@ -24,6 +24,7 @@ import { getTeamAliasesHandler } from './teams.js';
 import { getAuthDomainHandler } from './auth.js';
 import { getPublicConfigHandler } from './config.js';
 import { getProtocolInfoHandler } from './protocol.js';
+import { getMetricsHandler } from './metrics.js';
 import {
   getClaimParamsHandler,
   getClaimResultHandler,
@@ -90,6 +91,9 @@ v1Router.get('/protocol/info', readRateLimit, (req, res) => getProtocolInfoHandl
 v1Router.get('/auth/domain', readRateLimit, (req, res) => getAuthDomainHandler(req, res));
 
 v1Router.get('/config/public', readRateLimit, (req, res) => getPublicConfigHandler(req, res));
+
+// Operational metrics — process-local stream / odds / connection counters.
+v1Router.get('/metrics', readRateLimit, (req, res) => getMetricsHandler(req, res));
 
 // Bare /positions is the cursor-recovery endpoint (positions stream).
 // The :address routes below stay the snapshot/history surface.
