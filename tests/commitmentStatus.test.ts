@@ -15,9 +15,10 @@ function eff(
   storedStatus: string,
   expiry: string | null,
   nonceInvalidated = false,
+  bookVisible = true,
   nowMs = NOW,
 ): string {
-  return deriveEffectiveStatus({ storedStatus, expiry, nonceInvalidated, nowMs });
+  return deriveEffectiveStatus({ storedStatus, expiry, nonceInvalidated, bookVisible, nowMs });
 }
 
 describe('deriveEffectiveStatus', () => {
@@ -64,6 +65,27 @@ describe('deriveEffectiveStatus', () => {
 
   it('nonceInvalidated takes precedence over expiry (open + past + invalidated → cancelled)', () => {
     expect(eff('open', PAST, true)).toBe('cancelled');
+  });
+
+  // ── off-chain hidden (book_visible=false) → cancelled ────────────────────
+  it('open + hidden → cancelled (off-chain DELETE hides from book)', () => {
+    expect(eff('open', FUTURE, false, false)).toBe('cancelled');
+  });
+
+  it('partially_filled + hidden → cancelled', () => {
+    expect(eff('partially_filled', FUTURE, false, false)).toBe('cancelled');
+  });
+
+  it('hidden + past expiry → cancelled (hidden checked before expiry, matches pre-split DELETE)', () => {
+    expect(eff('open', PAST, false, false)).toBe('cancelled');
+  });
+
+  it('filled + hidden → filled (terminal wins; book visibility irrelevant)', () => {
+    expect(eff('filled', FUTURE, false, false)).toBe('filled');
+  });
+
+  it('explicit visible open → open (default-true path sanity)', () => {
+    expect(eff('open', FUTURE, false, true)).toBe('open');
   });
 
   // ── terminal stored states are immutable ─────────────────────────────────

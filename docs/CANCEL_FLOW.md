@@ -6,8 +6,8 @@ There are three ways to cancel an EIP-712 commitment in Ospex. Two are on-chain 
 
 | Method | Where | Effect | When to use |
 |---|---|---|---|
-| `DELETE /v1/commitments/:hash` | Off-chain, signed | Sets `commitments.status = 'cancelled'` so takers stop seeing it on the order book. Does NOT prevent on-chain matching by anyone holding the signature. | The default. The commitment hasn't been matched yet and you just want to retract it from the book. |
-| `MatchingModule.cancelCommitment(c)` | On-chain | Sets `s_cancelledCommitments[hash] = true` so any future `matchCommitment` call reverts. Indexer projects `COMMITMENT_CANCELLED` to `commitments.status = 'cancelled'`. | The definitive cancel. Use when the commitment was partially matched, when you don't trust the order book, or when you need to close the divergence window described below. |
+| `DELETE /v1/commitments/:hash` | Off-chain, signed | Sets `commitments.book_visible = false` so takers stop seeing it on the order book; leaves `status` (canonical on-chain lifecycle) untouched. Does NOT prevent on-chain matching by anyone holding the signature. | The default. The commitment hasn't been matched yet and you just want to retract it from the book. |
+| `MatchingModule.cancelCommitment(c)` | On-chain | Sets `s_cancelledCommitments[hash] = true` so any future `matchCommitment` call reverts. Indexer projects `COMMITMENT_CANCELLED` to `commitments.status = 'cancelled'`. | The definitive cancel. Use when the commitment was partially matched, when you don't trust the order book, or when you need a cancel that makes the commitment unmatchable on-chain (not just hidden from the book). |
 | `MatchingModule.raiseMinNonce(contestId, scorer, lineTicks, newMinNonce)` | On-chain | Bumps `s_minNonces[maker][speculationKey]`. Every commitment on that speculation with `nonce < newMinNonce` becomes unmatchable. Indexer mirrors to `maker_nonce_floors` and flips affected rows to `nonce_invalidated = true`. | Bulk cancel — you want to wipe many commitments on the same `(contestId, scorer, lineTicks)` triple in one tx. |
 
 ## Off-chain cancel — `DELETE /v1/commitments/:hash`
@@ -47,8 +47,8 @@ The signer's identity is recovered from the signature alone — there is no `mak
 
 | HTTP | `code` | When |
 |---|---|---|
-| `200` | — | Success. Returns the canonical commitment body with `status: "cancelled"`. Same shape as POST/GET. |
-| `200` | — | Idempotent — already `cancelled`. Returns the existing row unchanged. |
+| `200` | — | Success. Sets `book_visible=false`; returns the canonical commitment body — effective `status: "cancelled"`, `storedStatus: "open"`, `bookVisible: false`. Same shape as POST/GET. |
+| `200` | — | Idempotent — already hidden (`book_visible=false`) or already on-chain `cancelled`, **even if the row has since matched on-chain** (the body's `storedStatus` / `bookVisible` / fill fields carry the real state). Returns the existing row unchanged. |
 | `400` | `INVALID_PARAM` | Malformed URL hash, malformed signed action, expired/too-far-out signature, or path-vs-payload hash mismatch. |
 | `401` | `AUTH_INVALID` | Signature didn't recover (malformed, wrong domain, wrong chain). |
 | `403` | `FORBIDDEN` | Recovered signer doesn't match the commitment's maker. |
@@ -77,7 +77,7 @@ Once `s_cancelledCommitments[hash] = true`, `MatchingModule.matchCommitment` rev
 - The commitment has been partially matched (`partially_filled`) and you want to prevent further matches.
 - You don't trust the relay / off-chain book to honor a DELETE — e.g., you're a taker discovering a stale signed commitment off-chain and you want to ensure no one can fill it.
 - You've signed a commitment but never POSTed it to the API; on-chain cancel is the only way to invalidate it (no off-chain row exists to DELETE).
-- You want a definitive cancel that closes the divergence window described below.
+- You want a definitive cancel that makes the commitment unmatchable on-chain — an off-chain DELETE only hides it from the book.
 
 ## Bulk cancel — `MatchingModule.raiseMinNonce(...)`
 
@@ -103,27 +103,25 @@ The indexer:
 
 ## Indexer convergence and races
 
-The on-chain cancel path and the off-chain cancel path both write `commitments.status = 'cancelled'`. They're idempotent — the indexer's `handleCommitmentCancelled` UPDATEs to the same terminal value the API just wrote, and vice versa. But they are NOT equivalent: only `s_cancelledCommitments[hash] = true` (set by `MatchingModule.cancelCommitment`) prevents a taker from matching on-chain. An off-chain DELETE leaves the on-chain commitment matchable.
+The on-chain cancel path writes `commitments.status = 'cancelled'` (authoritative). The off-chain DELETE writes `book_visible = false` and leaves `status` untouched. They are now **different columns**, which removes the `filled_risk_amount` divergence that used to occur when an off-chain cancel raced an on-chain match (see *Known limitations*). Only `s_cancelledCommitments[hash] = true` (set by `MatchingModule.cancelCommitment`) prevents a taker from matching on-chain; an off-chain DELETE leaves the on-chain commitment matchable.
 
-| Sequence | Off-chain `commitments.status` | On-chain matchable? | Notes |
-|---|---|---|---|
-| DELETE (off-chain) only | `cancelled` | **Yes** | The signature is still valid; `s_cancelledCommitments[hash]` is still false. A taker who has the signature outside the order book can still call `matchCommitment`. |
-| `cancelCommitment` (on-chain) only | `cancelled` (after indexer projection) | No | `s_cancelledCommitments[hash] = true` causes `matchCommitment` to revert. |
-| DELETE then `cancelCommitment` | `cancelled` | No | Indexer's UPDATE is a no-op. |
-| `cancelCommitment` then DELETE | `cancelled` | No | Endpoint returns 200 idempotent. |
-| **DELETE then taker calls `matchCommitment`** | `cancelled` (stale `filled_risk_amount`) | n/a — already matched | **Known divergence.** Contract accepts the match (no on-chain cancel was issued). Indexer projects `COMMITMENT_MATCHED`, calls `fill_commitment`, which selects `WHERE status IN ('open', 'partially_filled')` and silently skips the cancelled row. `filled_risk_amount` does NOT advance. The taker's `position_fills` row IS still written (separate code path), so position tracking is correct — only the commitment row's `filled_risk_amount` is wrong. See *Known limitations* below. |
-| Taker calls `matchCommitment` then DELETE | depends on indexer lag | n/a | If the indexer projected the match before the DELETE arrives, `status` is `partially_filled`/`filled` and DELETE returns 409. If the indexer hasn't caught up, the DELETE succeeds (status was `open`); the indexer then hits the same `fill_commitment` skip and `filled_risk_amount` stays stale. Same divergence. |
-| Reorg drops a `COMMITMENT_CANCELLED` event after on-chain cancel | `cancelled` (off-chain cache) / not cancelled (chain) | depends on reorg outcome | The indexer's recovery pipeline replays from canonical `chain_events`. If the cancel event is no longer canonical, the indexer doesn't re-set `cancelled` — but if `commitments.status` was already `cancelled` (via earlier projection), it isn't reverted either. The on-chain state is authoritative; the off-chain row may need a corrective UPDATE on a follow-up event. This is a separate concern from the off-chain DELETE divergence. |
+| Sequence | `status` | `book_visible` | On-chain matchable? | Notes |
+|---|---|---|---|---|
+| DELETE (off-chain) only | `open` | `false` | **Yes** | Signature still valid; `s_cancelledCommitments[hash]` false. Hidden from the book, matchable by anyone holding the signature. Effective API `status` = `cancelled`. |
+| `cancelCommitment` (on-chain) only | `cancelled` | `false` | No | `s_cancelledCommitments[hash] = true` reverts `matchCommitment`. Indexer sets both `status='cancelled'` and `book_visible=false`. |
+| DELETE then `cancelCommitment` | `cancelled` | `false` | No | DELETE hides; the on-chain cancel then flips `status` to `cancelled`. |
+| `cancelCommitment` then DELETE | `cancelled` | `false` | No | Endpoint returns 200 idempotent (already `cancelled`). |
+| **DELETE then taker calls `matchCommitment`** | `partially_filled`/`filled` | `false` | n/a — matched | **No divergence.** The row is still `open` when the match lands, so `fill_commitment` applies it and advances `filled_risk_amount` normally; `book_visible` stays `false`, so the hidden remainder is correctly off the public book. A retry DELETE on this hidden row returns `200` idempotent (already hidden). |
+| Taker calls `matchCommitment` then DELETE | `partially_filled`/`filled` | unchanged | n/a | If the indexer projected the match first, DELETE returns 409. If the indexer lags (row still `open`), DELETE sets `book_visible=false`; the later match still applies because `status` was `open`. Either way `filled_risk_amount` is correct. |
+| Reorg drops a `COMMITMENT_CANCELLED` after on-chain cancel | depends on reorg | per rebuild | depends | The recovery pipeline replays from canonical `chain_events`. `book_visible` is off-chain and not chain-derived, so a rebuild can't reconstruct it — rebuilt / chain-derived rows default `book_visible=false` (fail closed). See *Known limitations*. |
 
-## Known limitations / divergence
+## Known limitations
 
-**`commitments.filled_risk_amount` can be stale on cancelled rows.** If an off-chain DELETE lands before a taker's on-chain `matchCommitment`, the contract accepts the match (it has no record of the off-chain cancel), but the indexer's `fill_commitment` PL/pgSQL function (`ospex-indexer/migrations/027_commitment_upsert_on_match.sql:159-198`) restricts its update to `status IN ('open', 'partially_filled')`. The matched amount is silently dropped from the commitment row.
+**The off-chain-cancel-then-match divergence is fixed.** Before the book-visibility split (indexer migration `049`), off-chain DELETE and on-chain `COMMITMENT_CANCELLED` both wrote `status='cancelled'`. An off-chain DELETE that beat the indexer made `fill_commitment` (gated `WHERE status IN ('open','partially_filled')`) skip the later match, so `filled_risk_amount` went stale while the taker's `position_fills` row was still written. Now the off-chain DELETE only sets `book_visible=false`; the canonical `status` stays `open`, so `fill_commitment` applies the match normally and the commitment row and `position_fills` agree.
 
-**What still works:** the taker's `position_fills` row is written by a separate handler (`commitment-matched.ts`) and is unaffected. `/v1/positions/:address` continues to surface the actual on-chain position correctly. The `commitments.filled_risk_amount` stale value only affects readers that consume it directly — primarily `/v1/commitments` queries with `?status=cancelled`. The default open-book filter (`status=['open', 'partially_filled']`) excludes cancelled rows, so the typical reader is unaffected.
+**Off-chain book visibility does not survive a chain rebuild.** `book_visible` is off-chain state with no `chain_events` record, so a recovery/reorg rebuild (which reconstructs rows from chain truth) cannot restore a prior off-chain hide. Chain-derived (never-POSTed) and rebuilt rows default `book_visible=false` — fail closed, since such a row is an accounting/projection row that should not be published to the book. A maker whose hidden quote is un-hidden by a rebuild re-hides it on its next reconcile.
 
-**Recommended user workaround:** if you need a *definitive* cancel that closes the divergence window, follow the off-chain DELETE with an on-chain `cancelCommitment` call. The on-chain cancel sets `s_cancelledCommitments[hash] = true`, which causes any future `matchCommitment` to revert at `MatchingModule.sol:490` — eliminating the race window entirely.
-
-**Tracked fix:** the cleanest fix is indexer-side — extend `fill_commitment`'s SELECT to include `'cancelled'` and have the CASE flip status back to `partially_filled`/`filled` when an on-chain match lands on a cancelled row. The chain is truth; the off-chain `cancelled` was wishful thinking. This change lives in `ospex-indexer/migrations/` and is out of scope for this PR.
+**Authoritative cancel is still on-chain.** An off-chain DELETE is a book-visibility signal only. To make a commitment genuinely unmatchable, call `MatchingModule.cancelCommitment(c)` — it sets `s_cancelledCommitments[hash] = true`, reverting any future `matchCommitment` at `MatchingModule.sol:490`.
 
 ## What this endpoint does NOT do
 

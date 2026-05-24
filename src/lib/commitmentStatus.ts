@@ -18,10 +18,19 @@
  * bulk-cancel lever, so we surface them as effectively `cancelled`.
  *
  * SCOPE: this is the *lifecycle* status (stored status + expiry + nonce
- * invalidation). It is intentionally **not** a complete matchability predicate —
- * a fully-consumed row can still read `partially_filled` with
- * `remainingRiskAmount = 0` (the indexer `risk_amount = 0` edge), which is a
- * separate, separately-tracked accounting concern and is NOT folded in here.
+ * invalidation + off-chain book visibility). It is intentionally **not** a
+ * complete matchability predicate — a fully-consumed row can still read
+ * `partially_filled` with `remainingRiskAmount = 0` (the indexer `risk_amount = 0`
+ * edge), which is a separate, separately-tracked accounting concern and is NOT
+ * folded in here.
+ *
+ * BOOK VISIBILITY: `commitments.book_visible=false` means the maker hid the
+ * commitment from the public book via an off-chain `DELETE /v1/commitments/:hash`.
+ * Canonically the row is still `open`/`partially_filled` (matchable on-chain), but
+ * for backward compatibility we surface a hidden live row as effective `cancelled`
+ * — the same value the off-chain DELETE used to write into `status` before the
+ * book-visibility split. Internal consumers that need chain truth must read
+ * `storedStatus` / `bookVisible` (or `/v1/fills`), not the effective status.
  */
 
 export type EffectiveCommitmentStatus =
@@ -44,6 +53,8 @@ export interface EffectiveStatusInput {
   expiry: string | null;
   /** Raw `commitments.nonce_invalidated`. */
   nonceInvalidated: boolean;
+  /** Raw `commitments.book_visible`. false = off-chain hidden from the book. */
+  bookVisible: boolean;
   /** Epoch ms captured ONCE per request (do not call Date.now() per row). */
   nowMs: number;
 }
@@ -55,13 +66,19 @@ export interface EffectiveStatusInput {
  * blindly casting a value into the public status field.
  */
 export function deriveEffectiveStatus(input: EffectiveStatusInput): string {
-  const { storedStatus, expiry, nonceInvalidated, nowMs } = input;
+  const { storedStatus, expiry, nonceInvalidated, bookVisible, nowMs } = input;
 
   // Terminal stored states win — including a stored `expired` (the CHECK
-  // constraint permits it even though no current writer produces it).
+  // constraint permits it even though no current writer produces it). On-chain
+  // `cancelled` is terminal here, so book visibility never overrides it.
   if (TERMINAL_STORED.has(storedStatus)) return storedStatus;
 
   if (LIVE_STORED.has(storedStatus)) {
+    // Off-chain hidden (DELETE /v1/commitments/:hash) ⇒ effectively cancelled.
+    // Checked first so a hidden row reads `cancelled` exactly as it did before
+    // the book-visibility split, regardless of expiry/nonce. (Canonically the
+    // row is still matchable on-chain — see BOOK VISIBILITY note above.)
+    if (!bookVisible) return 'cancelled';
     // Bulk-cancel via raiseMinNonce: reverts on match (NonceTooLow). Effectively cancelled.
     if (nonceInvalidated) return 'cancelled';
     // Temporal guard. Null/invalid expiry behaves as `expiry == 0` on chain → always expired.
