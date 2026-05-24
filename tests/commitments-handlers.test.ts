@@ -11,6 +11,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
+import type { AuthenticatedRequest } from '../src/middleware/eip712Auth.js';
 
 const NOW = Date.parse('2026-05-20T16:00:00.000Z');
 const NOW_ISO = new Date(NOW).toISOString();
@@ -25,9 +26,8 @@ const envMock = vi.hoisted(() => ({
 vi.mock('../src/lib/supabase.js', () => supabaseMock);
 vi.mock('../src/lib/env.js', () => envMock);
 
-const { rowToBody, getCommitmentByHashHandler, getCommitmentsHandler } = await import(
-  '../src/v1/commitments.js'
-);
+const { rowToBody, getCommitmentByHashHandler, getCommitmentsHandler, deleteCommitmentHandler } =
+  await import('../src/v1/commitments.js');
 
 // ── test doubles ────────────────────────────────────────────────────────
 interface FakeRes {
@@ -52,6 +52,13 @@ function makeRes(): FakeRes {
 function makeReq(query: Record<string, string> = {}, params: Record<string, string> = {}): Request {
   return { params, query } as unknown as Request;
 }
+function makeAuthReq(hash: string, signedHash: string, wallet: string): AuthenticatedRequest {
+  return {
+    params: { hash },
+    actionMessage: { commitmentHash: signedHash },
+    authenticatedWallet: wallet,
+  } as unknown as AuthenticatedRequest;
+}
 
 interface MockResponse {
   data: unknown;
@@ -63,9 +70,18 @@ interface RecordedCall {
   args: unknown[];
 }
 
-/** Supabase mock that records every builder call so branch/filter choices can be asserted. */
-function makeSupabase(response: MockResponse): { client: unknown; calls: RecordedCall[] } {
+/**
+ * Supabase mock that records every builder call so branch/filter choices can be
+ * asserted. Pass a single response (returned for every terminal call) or an array
+ * to return responses in sequence — needed for multi-step flows like DELETE
+ * (lookup → CAS update → re-read), where each terminal call wants a distinct row.
+ */
+function makeSupabase(response: MockResponse | MockResponse[]): { client: unknown; calls: RecordedCall[] } {
   const calls: RecordedCall[] = [];
+  const queue = Array.isArray(response) ? response : null;
+  let idx = 0;
+  const nextResp = (): MockResponse =>
+    queue ? (queue[Math.min(idx++, queue.length - 1)] as MockResponse) : (response as MockResponse);
   const builder: Record<string, unknown> = {};
   const chain =
     (method: string) =>
@@ -73,12 +89,12 @@ function makeSupabase(response: MockResponse): { client: unknown; calls: Recorde
       calls.push({ method, args });
       return builder;
     };
-  for (const m of ['select', 'eq', 'in', 'gt', 'gte', 'lte', 'order', 'range', 'limit']) {
+  for (const m of ['select', 'eq', 'in', 'gt', 'gte', 'lte', 'order', 'range', 'limit', 'update', 'delete', 'insert']) {
     builder[m] = chain(m);
   }
-  builder['maybeSingle'] = (): Promise<MockResponse> => Promise.resolve(response);
-  builder['single'] = (): Promise<MockResponse> => Promise.resolve(response);
-  builder['then'] = (resolve: (v: unknown) => void): void => resolve(response);
+  builder['maybeSingle'] = (): Promise<MockResponse> => Promise.resolve(nextResp());
+  builder['single'] = (): Promise<MockResponse> => Promise.resolve(nextResp());
+  builder['then'] = (resolve: (v: unknown) => void): void => resolve(nextResp());
   return { client: { from: () => builder }, calls };
 }
 
@@ -102,6 +118,7 @@ function row(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     source: 'agent',
     network: 'polygon',
     nonce_invalidated: false,
+    book_visible: true,
     created_at: '2026-05-20T10:00:00.000Z',
     ...overrides,
   };
@@ -161,6 +178,13 @@ describe('rowToBody effective status', () => {
     expect(b.status).toBe('filled');
     expect(b.storedStatus).toBe('filled');
   });
+
+  it('open + hidden (book_visible false) → status cancelled, storedStatus open, bookVisible false', () => {
+    const b = rowToBody(row({ status: 'open', expiry: FUTURE, book_visible: false }) as never, NOW);
+    expect(b.status).toBe('cancelled');
+    expect(b.storedStatus).toBe('open');
+    expect(b.bookVisible).toBe(false);
+  });
 });
 
 // ── GET /v1/commitments/:hash agrees with effective status ────────────────
@@ -202,6 +226,7 @@ describe('GET /v1/commitments list', () => {
     await getCommitmentsHandler(makeReq(), res as unknown as Response);
     expect(res.statusCode).toBe(200);
     expect(calls).toContainEqual({ method: 'in', args: ['status', ['open', 'partially_filled']] });
+    expect(calls).toContainEqual({ method: 'eq', args: ['book_visible', true] });
     expect(calls).toContainEqual({ method: 'eq', args: ['nonce_invalidated', false] });
     expect(calls).toContainEqual({ method: 'gt', args: ['expiry', NOW_ISO] });
   });
@@ -244,5 +269,104 @@ describe('GET /v1/commitments list', () => {
     expect(calls.some((c) => c.method === 'eq' && c.args[0] === 'nonce_invalidated')).toBe(false);
     const body = res.body as { commitments: Array<{ status: string; storedStatus: string; nonceInvalidated: boolean }> };
     expect(body.commitments[0]).toMatchObject({ status: 'cancelled', storedStatus: 'open', nonceInvalidated: true });
+  });
+
+  it('includeHidden=true drops the book_visible filter', async () => {
+    const { client, calls } = makeSupabase({ data: [row()], error: null, count: 1 });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await getCommitmentsHandler(makeReq({ includeHidden: 'true' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    expect(calls.some((c) => c.method === 'eq' && c.args[0] === 'book_visible')).toBe(false);
+  });
+});
+
+// ── DELETE /v1/commitments/:hash → off-chain cancel = book_visible=false ───
+describe('DELETE /v1/commitments/:hash', () => {
+  const hash = `0x${'a'.repeat(64)}`;
+  const maker = '0x1111111111111111111111111111111111111111';
+
+  it('open visible row → hides (book_visible=false), status untouched, 200', async () => {
+    const { client, calls } = makeSupabase([
+      { data: row({ status: 'open', book_visible: true }), error: null }, // lookup
+      { data: row({ status: 'open', book_visible: false }), error: null }, // CAS update
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await deleteCommitmentHandler(makeAuthReq(hash, hash, maker), res as unknown as Response);
+
+    expect(res.statusCode).toBe(200);
+    // off-chain cancel writes ONLY book_visible=false — never status='cancelled'
+    expect(calls.find((c) => c.method === 'update')?.args[0]).toEqual({ book_visible: false });
+    // CAS guard: only an open + currently-visible row
+    expect(calls).toContainEqual({ method: 'eq', args: ['status', 'open'] });
+    expect(calls).toContainEqual({ method: 'eq', args: ['book_visible', true] });
+    // response: effective cancelled (back-compat), stored open, hidden
+    expect(res.body).toMatchObject({ status: 'cancelled', storedStatus: 'open', bookVisible: false });
+  });
+
+  it('already-hidden row → idempotent 200, no update', async () => {
+    const { client, calls } = makeSupabase({
+      data: row({ status: 'open', book_visible: false }),
+      error: null,
+    });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await deleteCommitmentHandler(makeAuthReq(hash, hash, maker), res as unknown as Response);
+
+    expect(res.statusCode).toBe(200);
+    expect(calls.some((c) => c.method === 'update')).toBe(false);
+    expect(res.body).toMatchObject({ status: 'cancelled', storedStatus: 'open', bookVisible: false });
+  });
+
+  it('on-chain cancelled row → idempotent 200, no update', async () => {
+    const { client, calls } = makeSupabase({
+      data: row({ status: 'cancelled', book_visible: false }),
+      error: null,
+    });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await deleteCommitmentHandler(makeAuthReq(hash, hash, maker), res as unknown as Response);
+
+    expect(res.statusCode).toBe(200);
+    expect(calls.some((c) => c.method === 'update')).toBe(false);
+    expect(res.body).toMatchObject({ status: 'cancelled' });
+  });
+
+  it('partially_filled row → 409 COMMITMENT_MATCHED, no update', async () => {
+    const { client, calls } = makeSupabase({ data: row({ status: 'partially_filled' }), error: null });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await deleteCommitmentHandler(makeAuthReq(hash, hash, maker), res as unknown as Response);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toMatchObject({ code: 'COMMITMENT_MATCHED' });
+    expect(calls.some((c) => c.method === 'update')).toBe(false);
+  });
+
+  it('CAS lost to an on-chain match during update → 409 COMMITMENT_MATCHED', async () => {
+    const { client } = makeSupabase([
+      { data: row({ status: 'open', book_visible: true }), error: null }, // lookup
+      { data: null, error: null }, // CAS update misses
+      { data: row({ status: 'partially_filled' }), error: null }, // re-read: matched
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await deleteCommitmentHandler(makeAuthReq(hash, hash, maker), res as unknown as Response);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toMatchObject({ code: 'COMMITMENT_MATCHED' });
+  });
+
+  it('signer ≠ maker → 403 FORBIDDEN', async () => {
+    const { client } = makeSupabase({ data: row({ status: 'open' }), error: null });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await deleteCommitmentHandler(
+      makeAuthReq(hash, hash, '0x9999999999999999999999999999999999999999'),
+      res as unknown as Response,
+    );
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toMatchObject({ code: 'FORBIDDEN' });
   });
 });

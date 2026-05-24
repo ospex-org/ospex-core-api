@@ -362,6 +362,7 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
       .eq('network', config.network)
       .eq('speculation_key', speculationKey)
       .in('status', ['open', 'partially_filled'])
+      .eq('book_visible', true)
       .eq('nonce_invalidated', false)
       .gt('expiry', new Date(nowMs).toISOString())
       .order('created_at', { ascending: true })

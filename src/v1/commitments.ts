@@ -71,6 +71,7 @@ export interface CommitmentBody {
   source: string;
   network: string;
   nonceInvalidated: boolean;
+  bookVisible: boolean;           // off-chain orderbook visibility; false = hidden via off-chain DELETE
   createdAt: string;              // ISO 8601 — filled by DB default `now()`
 }
 
@@ -78,7 +79,7 @@ export const COMMITMENT_COLUMNS =
   'commitment_hash, maker, contest_id, scorer, line_ticks, position_type, ' +
   'odds_tick, market_type, risk_amount, filled_risk_amount, nonce, expiry, ' +
   'speculation_key, signature, status, source, network, nonce_invalidated, ' +
-  'created_at';
+  'book_visible, created_at';
 
 export interface CommitmentRow {
   commitment_hash: string;
@@ -99,6 +100,7 @@ export interface CommitmentRow {
   source: string;
   network: string;
   nonce_invalidated: boolean | null;
+  book_visible: boolean | null;
   created_at: string;
 }
 
@@ -121,10 +123,12 @@ export function rowToBody(row: CommitmentRow, nowMs: number): CommitmentBody {
   const filled = row.filled_risk_amount != null ? BigInt(String(row.filled_risk_amount)) : 0n;
   const remaining = risk > filled ? risk - filled : 0n;
   const storedStatus = row.status;
+  const bookVisible = row.book_visible !== false; // null/undefined (legacy) treated as visible
   const status = deriveEffectiveStatus({
     storedStatus,
     expiry: row.expiry,
     nonceInvalidated: Boolean(row.nonce_invalidated),
+    bookVisible,
     nowMs,
   });
   return {
@@ -148,6 +152,7 @@ export function rowToBody(row: CommitmentRow, nowMs: number): CommitmentBody {
     source: row.source,
     network: row.network,
     nonceInvalidated: Boolean(row.nonce_invalidated),
+    bookVisible,
     createdAt: row.created_at,
   };
 }
@@ -181,6 +186,7 @@ export async function fetchOpenCommitmentsByContestId(
     .eq('network', config.network)
     .eq('contest_id', contestId)
     .in('status', ['open', 'partially_filled'])
+    .eq('book_visible', true)
     .eq('nonce_invalidated', false)
     .gt('expiry', new Date(nowMs).toISOString())
     .limit(OPEN_BOOK_MAX_ROWS);
@@ -583,6 +589,17 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
     } satisfies ApiError);
     return;
   }
+  // Off-chain-hidden rows (book_visible=false) are excluded from the public book
+  // by default, the same way nonce-invalidated / expired rows are. Opt back in to
+  // see hidden rows (e.g. a maker auditing their own retracted/recovered quotes).
+  const includeHidden = parseBoolQuery(req.query.includeHidden);
+  if (req.query.includeHidden !== undefined && includeHidden === null) {
+    res.status(400).json({
+      error: 'includeHidden must be true|false|1|0.',
+      code: 'INVALID_PARAM',
+    } satisfies ApiError);
+    return;
+  }
 
   // Lowercase first so mixed-case input passes (see positions.ts comment).
   let maker: string | undefined;
@@ -702,6 +719,7 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
   if (scorer !== undefined) q = q.eq('scorer', scorer);
   if (contestId !== undefined) q = q.eq('contest_id', contestId);
   if (speculationKey !== undefined) q = q.eq('speculation_key', speculationKey);
+  if (!includeHidden) q = q.eq('book_visible', true);
   if (!includeInvalidated) q = q.eq('nonce_invalidated', false);
   if (!includeExpired) {
     // Postgres `>` is false (not null) for NULL operands, so this also excludes
@@ -791,21 +809,23 @@ export async function getCommitmentByHashHandler(req: Request, res: Response): P
 // ────────────────────────────────────────────────────────────────────────
 
 /**
- * Off-chain cancel. The maker signs a CancelCommitment action; we mark
- * the row as `cancelled` so it stops appearing in the open book. The
- * authoritative cancel is on-chain — once the indexer projects the
- * COMMITMENT_CANCELLED event, the row's `status` already lands on
- * `cancelled`, so this endpoint and the indexer converge on the same
- * terminal state.
+ * Off-chain cancel = remove from the public order book. The maker signs a
+ * CancelCommitment action; we set `book_visible=false` and leave the canonical
+ * on-chain `status` untouched. The commitment stays matchable on-chain until it
+ * expires, is nonce-invalidated, or is cancelled on-chain (COMMITMENT_CANCELLED);
+ * a later on-chain match is applied normally by the indexer's fill_commitment.
+ * See migration 049 / docs/CANCEL_FLOW.md.
+ *
+ * The response surfaces effective `status='cancelled'` for a hidden live row
+ * (backward compatible), with `storedStatus='open'` and `bookVisible=false`.
  *
  * Race notes (see docs/CANCEL_FLOW.md):
- *   - Off-chain DELETE then on-chain cancel: both write `status='cancelled'`.
- *     Idempotent.
+ *   - Off-chain DELETE while a taker has an in-flight matchCommitment tx: the
+ *     contract is the source of truth — the CAS guard (status='open' AND
+ *     book_visible=true) loses if the match projects first, and DELETE returns 409.
  *   - On-chain cancel then off-chain DELETE: handler sees `status='cancelled'`
  *     and returns 200 idempotent.
- *   - Off-chain DELETE while a taker has an in-flight matchCommitment tx:
- *     contract is the source of truth — if the on-chain match lands first,
- *     status flips to `partially_filled` / `filled`, and DELETE returns 409.
+ *   - Duplicate DELETE: handler sees `book_visible=false` and returns 200 idempotent.
  */
 export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Response): Promise<void> {
   const config = loadConfig();
@@ -869,12 +889,24 @@ export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Re
   }
 
   // ── Status branching ──────────────────────────────────────────────────
-  // Already cancelled → idempotent 200 with current row.
+  // Off-chain cancel = "hide from the public book" (book_visible=false). It must
+  // NOT touch the canonical on-chain `status`: a hidden row stays `open`, so a
+  // later on-chain match is applied normally by the indexer's fill_commitment.
+  // See migration 049 / docs/CANCEL_FLOW.md.
+  //
+  // Already hidden (off-chain DELETE already applied) → idempotent 200.
+  if (row.status === 'open' && row.book_visible === false) {
+    res.status(200).json(rowToBody(row, nowMs));
+    return;
+  }
+  // Authoritative on-chain cancel already projected (COMMITMENT_CANCELLED) →
+  // idempotent 200; nothing left to hide.
   if (row.status === 'cancelled') {
     res.status(200).json(rowToBody(row, nowMs));
     return;
   }
-  // Matched (filled or partially_filled) → on-chain only.
+  // Matched (filled or partially_filled) → on-chain only. A matched remainder is
+  // still matchable on-chain; hiding it off-chain would mask live exposure.
   if (row.status === 'filled' || row.status === 'partially_filled') {
     res.status(409).json({
       error: `Commitment is ${row.status}; off-chain cancel is not allowed once a match exists. Use MatchingModule.cancelCommitment(c) on chain.`,
@@ -895,16 +927,17 @@ export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Re
     return;
   }
 
-  // ── Mark cancelled ────────────────────────────────────────────────────
-  // `cancelled_at` column is not yet in the schema (see step5b flag).
-  // When the migration adds it, this UPDATE should also set
-  // `cancelled_at: new Date().toISOString()`.
+  // ── Hide from book ────────────────────────────────────────────────────
+  // Set book_visible=false; leave `status` untouched (canonical chain lifecycle).
+  // CAS-guarded on (status='open' AND book_visible=true) so we don't race a
+  // concurrent on-chain match projected by the indexer, or a duplicate DELETE.
   const update = await sb
     .from('commitments')
-    .update({ status: 'cancelled' })
+    .update({ book_visible: false })
     .eq('network', config.network)
     .eq('commitment_hash', urlHash)
-    .eq('status', 'open') // CAS guard against race with indexer match
+    .eq('status', 'open')
+    .eq('book_visible', true)
     .select(COMMITMENT_COLUMNS)
     .maybeSingle();
 
@@ -914,7 +947,7 @@ export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Re
     return;
   }
   if (!update.data) {
-    // CAS lost — between lookup and update the row stopped being `open`.
+    // CAS lost — between lookup and update the row stopped being open+visible.
     // Re-read and respond based on the new state.
     const reread = await sb
       .from('commitments')
@@ -927,10 +960,12 @@ export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Re
       return;
     }
     const fresh = reread.data as unknown as CommitmentRow;
-    if (fresh.status === 'cancelled') {
+    // Concurrently hidden, or authoritatively cancelled on-chain → idempotent 200.
+    if ((fresh.status === 'open' && fresh.book_visible === false) || fresh.status === 'cancelled') {
       res.status(200).json(rowToBody(fresh, nowMs));
       return;
     }
+    // Otherwise it matched (filled/partially_filled) → on-chain only.
     res.status(409).json({
       error: `Commitment status changed to ${fresh.status} during cancel; off-chain cancel is no longer applicable.`,
       code: 'COMMITMENT_MATCHED',
@@ -938,6 +973,6 @@ export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Re
     return;
   }
 
-  logger.info({ commitmentHash: urlHash, maker: row.maker }, 'commitments: off-chain cancel applied');
+  logger.info({ commitmentHash: urlHash, maker: row.maker }, 'commitments: off-chain book-hide applied');
   res.status(200).json(rowToBody(update.data as unknown as CommitmentRow, nowMs));
 }
