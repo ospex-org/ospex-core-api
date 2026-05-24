@@ -333,7 +333,7 @@ describe('DELETE /v1/commitments/:hash', () => {
     expect(res.body).toMatchObject({ status: 'cancelled' });
   });
 
-  it('partially_filled row → 409 COMMITMENT_MATCHED, no update', async () => {
+  it('VISIBLE partially_filled row → 409 COMMITMENT_MATCHED, no update', async () => {
     const { client, calls } = makeSupabase({ data: row({ status: 'partially_filled' }), error: null });
     supabaseMock.getSupabase.mockReturnValue(client);
     const res = makeRes();
@@ -342,6 +342,62 @@ describe('DELETE /v1/commitments/:hash', () => {
     expect(res.statusCode).toBe(409);
     expect(res.body).toMatchObject({ code: 'COMMITMENT_MATCHED' });
     expect(calls.some((c) => c.method === 'update')).toBe(false);
+  });
+
+  // The race this split fixes can leave a row hidden AND matched (book_visible=false,
+  // status partially_filled/filled). DELETE = "hide from book" — it's already hidden,
+  // so a retry is idempotent 200, NOT 409. The body surfaces the real fill state.
+  it('HIDDEN + matched (book_visible=false, partially_filled) → idempotent 200, no update', async () => {
+    const { client, calls } = makeSupabase({
+      data: row({
+        status: 'partially_filled',
+        book_visible: false,
+        risk_amount: '1000000',
+        filled_risk_amount: '37500',
+      }),
+      error: null,
+    });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await deleteCommitmentHandler(makeAuthReq(hash, hash, maker), res as unknown as Response);
+
+    expect(res.statusCode).toBe(200);
+    expect(calls.some((c) => c.method === 'update')).toBe(false);
+    // Effective status stays 'cancelled' (off-book), but storedStatus + bookVisible
+    // + fill accounting carry the truth (per review).
+    expect(res.body).toMatchObject({
+      status: 'cancelled',
+      storedStatus: 'partially_filled',
+      bookVisible: false,
+      filledRiskAmount: '37500',
+      remainingRiskAmount: '962500',
+    });
+  });
+
+  it('HIDDEN + filled (book_visible=false, filled) → idempotent 200, no update', async () => {
+    const { client, calls } = makeSupabase({
+      data: row({ status: 'filled', book_visible: false, risk_amount: '1000000', filled_risk_amount: '1000000' }),
+      error: null,
+    });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await deleteCommitmentHandler(makeAuthReq(hash, hash, maker), res as unknown as Response);
+
+    expect(res.statusCode).toBe(200);
+    expect(calls.some((c) => c.method === 'update')).toBe(false);
+    expect(res.body).toMatchObject({ status: 'filled', storedStatus: 'filled', bookVisible: false });
+  });
+
+  it('CAS reread shows the row already hidden (matched in the race) → idempotent 200', async () => {
+    const { client } = makeSupabase([
+      { data: row({ status: 'open', book_visible: true }), error: null }, // lookup
+      { data: null, error: null }, // CAS update misses
+      { data: row({ status: 'partially_filled', book_visible: false }), error: null }, // reread: hidden + matched
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await deleteCommitmentHandler(makeAuthReq(hash, hash, maker), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
   });
 
   it('CAS lost to an on-chain match during update → 409 COMMITMENT_MATCHED', async () => {

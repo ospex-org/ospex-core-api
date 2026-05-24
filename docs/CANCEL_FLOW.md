@@ -48,7 +48,7 @@ The signer's identity is recovered from the signature alone — there is no `mak
 | HTTP | `code` | When |
 |---|---|---|
 | `200` | — | Success. Sets `book_visible=false`; returns the canonical commitment body — effective `status: "cancelled"`, `storedStatus: "open"`, `bookVisible: false`. Same shape as POST/GET. |
-| `200` | — | Idempotent — already hidden (`book_visible=false`) or already on-chain `cancelled`. Returns the existing row unchanged. |
+| `200` | — | Idempotent — already hidden (`book_visible=false`) or already on-chain `cancelled`, **even if the row has since matched on-chain** (the body's `storedStatus` / `bookVisible` / fill fields carry the real state). Returns the existing row unchanged. |
 | `400` | `INVALID_PARAM` | Malformed URL hash, malformed signed action, expired/too-far-out signature, or path-vs-payload hash mismatch. |
 | `401` | `AUTH_INVALID` | Signature didn't recover (malformed, wrong domain, wrong chain). |
 | `403` | `FORBIDDEN` | Recovered signer doesn't match the commitment's maker. |
@@ -111,7 +111,7 @@ The on-chain cancel path writes `commitments.status = 'cancelled'` (authoritativ
 | `cancelCommitment` (on-chain) only | `cancelled` | `false` | No | `s_cancelledCommitments[hash] = true` reverts `matchCommitment`. Indexer sets both `status='cancelled'` and `book_visible=false`. |
 | DELETE then `cancelCommitment` | `cancelled` | `false` | No | DELETE hides; the on-chain cancel then flips `status` to `cancelled`. |
 | `cancelCommitment` then DELETE | `cancelled` | `false` | No | Endpoint returns 200 idempotent (already `cancelled`). |
-| **DELETE then taker calls `matchCommitment`** | `partially_filled`/`filled` | `false` | n/a — matched | **No divergence.** The row is still `open` when the match lands, so `fill_commitment` applies it and advances `filled_risk_amount` normally; `book_visible` stays `false`, so the hidden remainder is correctly off the public book. |
+| **DELETE then taker calls `matchCommitment`** | `partially_filled`/`filled` | `false` | n/a — matched | **No divergence.** The row is still `open` when the match lands, so `fill_commitment` applies it and advances `filled_risk_amount` normally; `book_visible` stays `false`, so the hidden remainder is correctly off the public book. A retry DELETE on this hidden row returns `200` idempotent (already hidden). |
 | Taker calls `matchCommitment` then DELETE | `partially_filled`/`filled` | unchanged | n/a | If the indexer projected the match first, DELETE returns 409. If the indexer lags (row still `open`), DELETE sets `book_visible=false`; the later match still applies because `status` was `open`. Either way `filled_risk_amount` is correct. |
 | Reorg drops a `COMMITMENT_CANCELLED` after on-chain cancel | depends on reorg | per rebuild | depends | The recovery pipeline replays from canonical `chain_events`. `book_visible` is off-chain and not chain-derived, so a rebuild can't reconstruct it — rebuilt / chain-derived rows default `book_visible=false` (fail closed). See *Known limitations*. |
 

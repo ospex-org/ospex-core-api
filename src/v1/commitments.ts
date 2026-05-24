@@ -23,8 +23,9 @@
  *                                   scanning the list.
  *
  *   DELETE /v1/commitments/:hash  — off-chain cancel via signed CancelCommitment
- *                                   action. Sets `status='cancelled'` so the row
- *                                   stops surfacing in the open book. Authoritative
+ *                                   action. Sets `book_visible=false` (leaving the
+ *                                   canonical on-chain `status` untouched) so the
+ *                                   row stops surfacing in the open book. Authoritative
  *                                   cancel is still on-chain (cancelCommitment /
  *                                   raiseMinNonce); see docs/CANCEL_FLOW.md.
  */
@@ -820,12 +821,17 @@ export async function getCommitmentByHashHandler(req: Request, res: Response): P
  * (backward compatible), with `storedStatus='open'` and `bookVisible=false`.
  *
  * Race notes (see docs/CANCEL_FLOW.md):
- *   - Off-chain DELETE while a taker has an in-flight matchCommitment tx: the
- *     contract is the source of truth — the CAS guard (status='open' AND
- *     book_visible=true) loses if the match projects first, and DELETE returns 409.
+ *   - Off-chain DELETE while a taker has an in-flight matchCommitment tx: the CAS
+ *     guard (status='open' AND book_visible=true) loses if the match projects
+ *     first, so a still-VISIBLE matched row returns 409 (use on-chain cancel).
+ *   - DELETE succeeds, the commitment then matches on-chain, then a retry DELETE:
+ *     the row is already hidden (book_visible=false), so the retry is idempotent
+ *     200 — even though storedStatus is now partially_filled/filled (surfaced in
+ *     the body). "Already hidden" wins over "matched"; 409 is reserved for hiding
+ *     a still-visible matched commitment.
  *   - On-chain cancel then off-chain DELETE: handler sees `status='cancelled'`
  *     and returns 200 idempotent.
- *   - Duplicate DELETE: handler sees `book_visible=false` and returns 200 idempotent.
+ *   - Duplicate DELETE: already hidden → 200 idempotent.
  */
 export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Response): Promise<void> {
   const config = loadConfig();
@@ -894,19 +900,19 @@ export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Re
   // later on-chain match is applied normally by the indexer's fill_commitment.
   // See migration 049 / docs/CANCEL_FLOW.md.
   //
-  // Already hidden (off-chain DELETE already applied) → idempotent 200.
-  if (row.status === 'open' && row.book_visible === false) {
+  // Already hidden from the book (off-chain DELETE applied), or authoritatively
+  // cancelled on-chain (COMMITMENT_CANCELLED) → idempotent 200, regardless of
+  // whether the row has since matched. DELETE means "hide from book"; if it's
+  // already hidden the request is satisfied. A hidden-then-matched row (the race
+  // this split fixes: book_visible=false, status partially_filled/filled) returns
+  // 200 too — the body still carries storedStatus + bookVisible + fill accounting,
+  // so the real fill state is visible to the caller.
+  if (row.book_visible === false || row.status === 'cancelled') {
     res.status(200).json(rowToBody(row, nowMs));
     return;
   }
-  // Authoritative on-chain cancel already projected (COMMITMENT_CANCELLED) →
-  // idempotent 200; nothing left to hide.
-  if (row.status === 'cancelled') {
-    res.status(200).json(rowToBody(row, nowMs));
-    return;
-  }
-  // Matched (filled or partially_filled) → on-chain only. A matched remainder is
-  // still matchable on-chain; hiding it off-chain would mask live exposure.
+  // Visible + matched (filled or partially_filled) → on-chain only. A matched
+  // remainder that is STILL on the public book can't be retracted off-chain.
   if (row.status === 'filled' || row.status === 'partially_filled') {
     res.status(409).json({
       error: `Commitment is ${row.status}; off-chain cancel is not allowed once a match exists. Use MatchingModule.cancelCommitment(c) on chain.`,
@@ -960,12 +966,13 @@ export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Re
       return;
     }
     const fresh = reread.data as unknown as CommitmentRow;
-    // Concurrently hidden, or authoritatively cancelled on-chain → idempotent 200.
-    if ((fresh.status === 'open' && fresh.book_visible === false) || fresh.status === 'cancelled') {
+    // Concurrently hidden (book_visible=false, even if it also matched in the race),
+    // or authoritatively cancelled on-chain → idempotent 200.
+    if (fresh.book_visible === false || fresh.status === 'cancelled') {
       res.status(200).json(rowToBody(fresh, nowMs));
       return;
     }
-    // Otherwise it matched (filled/partially_filled) → on-chain only.
+    // Otherwise it matched while still visible → on-chain only.
     res.status(409).json({
       error: `Commitment status changed to ${fresh.status} during cancel; off-chain cancel is no longer applicable.`,
       code: 'COMMITMENT_MATCHED',
