@@ -74,6 +74,12 @@ export interface CommitmentBody {
   nonceInvalidated: boolean;
   bookVisible: boolean;           // off-chain orderbook visibility; false = hidden via off-chain DELETE
   createdAt: string;              // ISO 8601 — filled by DB default `now()`
+  /**
+   * Advisory maker-funding fillability (Layer D). Present ONLY when the request
+   * passed `?includeFillability=true`. Derived from the indexer's ~30s
+   * `maker_funding` snapshot — advisory + point-in-time, NEVER folded into `status`.
+   */
+  fillability?: CommitmentFillability;
 }
 
 export const COMMITMENT_COLUMNS =
@@ -156,6 +162,166 @@ export function rowToBody(row: CommitmentRow, nowMs: number): CommitmentBody {
     bookVisible,
     createdAt: row.created_at,
   };
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Advisory maker-funding fillability (Layer D)
+//
+// Opt-in via `?includeFillability=true`. Each row gets a `fillability` object
+// derived from the indexer's ~30s `maker_funding` snapshot (USDC balance +
+// PositionModule allowance + the maker's visible committed book risk, per
+// migration 051). Advisory + point-in-time — NEVER folded into `status`.
+// ────────────────────────────────────────────────────────────────────────
+
+export type MakerFundingStatus = 'fully_backed' | 'overcommitted' | 'unknown' | 'stale';
+
+export interface CommitmentFillability {
+  /** Always true — a point-in-time advisory, never a guarantee. */
+  advisory: true;
+  /** Headline. `unknown` = no snapshot for this maker; `stale` = snapshot too old to trust. */
+  makerFundingStatus: MakerFundingStatus;
+  /** backing ≥ THIS order's remaining maker risk. `null` when unknown/stale — a
+   *  "now" assertion can't be made from a missing or stale snapshot. */
+  orderIndividuallyBackedNow: boolean | null;
+  /** backing ≥ the maker's whole VISIBLE committed book risk. `null` when unknown/stale. */
+  makerBookBackedNow: boolean | null;
+  /** min(USDC balance, USDC→PositionModule allowance), wei6 string. `null` when unknown. */
+  makerBackingWei6: string | null;
+  /** Σ remaining maker risk over the maker's visible matchable book, wei6 string. `null` when unknown. */
+  makerVisibleCommittedWei6: string | null;
+  /** backing / visibleCommitted, in basis points. `null` when unknown. */
+  makerCoverageRatioBps: number | null;
+  /** Chain block the balance/allowance were read at. `null` when unknown. */
+  checkedAtBlock: string | null;
+  /** Snapshot age exceeds the freshness threshold (or no snapshot). */
+  stale: boolean;
+}
+
+/** A maker_funding snapshot, normalized for the in-memory join. */
+interface MakerFundingSnapshot {
+  backingWei6: bigint;
+  visibleCommittedWei6: bigint;
+  checkedAtBlock: string;
+  updatedAtMs: number;
+}
+
+/** Raw maker_funding row as PostgREST returns it. */
+interface MakerFundingRowDb {
+  maker_address: string;
+  backing_wei6: string | number;
+  visible_committed_wei6: string | number;
+  checked_at_block: string | number;
+  updated_at: string;
+}
+
+/**
+ * Snapshot age past which a maker_funding row is flagged `stale`. The worker
+ * snapshots every ~30s, so 120s ≈ 4 missed snapshots before we stop trusting
+ * the backed/overcommitted verdict.
+ */
+export const FILLABILITY_STALE_MS = 120_000;
+
+/**
+ * Derive the advisory fillability for one commitment from its maker's snapshot.
+ * Pure. Rules:
+ *   - no snapshot     → `unknown` (never asserted backed or not-backed)
+ *   - snapshot stale  → `stale`   (numbers kept as last-known; "...Now" booleans null)
+ *   - fresh           → `fully_backed` | `overcommitted` + the "...Now" booleans
+ * The numeric fields (backing / committed / coverage / block) are last-known
+ * facts as-of `checkedAtBlock`, present whenever a snapshot exists; the "...Now"
+ * booleans assert CURRENT backed-ness and are computed only from a fresh
+ * snapshot, so a consumer can't act on stale data as if it were current.
+ */
+export function computeFillability(args: {
+  remainingRiskWei6: bigint;
+  funding: MakerFundingSnapshot | undefined;
+  nowMs: number;
+  staleThresholdMs: number;
+}): CommitmentFillability {
+  const { remainingRiskWei6, funding, nowMs, staleThresholdMs } = args;
+  if (!funding) {
+    return {
+      advisory: true,
+      makerFundingStatus: 'unknown',
+      orderIndividuallyBackedNow: null,
+      makerBookBackedNow: null,
+      makerBackingWei6: null,
+      makerVisibleCommittedWei6: null,
+      makerCoverageRatioBps: null,
+      checkedAtBlock: null,
+      stale: false,
+    };
+  }
+  const ageMs = nowMs - funding.updatedAtMs;
+  const stale = !Number.isFinite(ageMs) || ageMs > staleThresholdMs;
+  const coverageBps =
+    funding.visibleCommittedWei6 > 0n
+      ? Number((funding.backingWei6 * 10_000n) / funding.visibleCommittedWei6)
+      : null;
+  const makerBackingWei6 = funding.backingWei6.toString();
+  const makerVisibleCommittedWei6 = funding.visibleCommittedWei6.toString();
+  if (stale) {
+    return {
+      advisory: true,
+      makerFundingStatus: 'stale',
+      orderIndividuallyBackedNow: null,
+      makerBookBackedNow: null,
+      makerBackingWei6,
+      makerVisibleCommittedWei6,
+      makerCoverageRatioBps: coverageBps,
+      checkedAtBlock: funding.checkedAtBlock,
+      stale: true,
+    };
+  }
+  const orderIndividuallyBackedNow = funding.backingWei6 >= remainingRiskWei6;
+  const makerBookBackedNow = funding.backingWei6 >= funding.visibleCommittedWei6;
+  return {
+    advisory: true,
+    makerFundingStatus: makerBookBackedNow ? 'fully_backed' : 'overcommitted',
+    orderIndividuallyBackedNow,
+    makerBookBackedNow,
+    makerBackingWei6,
+    makerVisibleCommittedWei6,
+    makerCoverageRatioBps: coverageBps,
+    checkedAtBlock: funding.checkedAtBlock,
+    stale: false,
+  };
+}
+
+/**
+ * Fetch maker_funding snapshots for a page's makers, keyed (lowercased) by
+ * maker_address. A query failure logs and returns an EMPTY map → fillability
+ * degrades to `unknown` for every row rather than failing the list (advisory).
+ */
+async function fetchMakerFunding(
+  sb: ReturnType<typeof getSupabase>,
+  network: string,
+  makers: string[],
+): Promise<Map<string, MakerFundingSnapshot>> {
+  const map = new Map<string, MakerFundingSnapshot>();
+  const unique = [...new Set(makers.map((m) => m.toLowerCase()))];
+  if (unique.length === 0) return map;
+  const { data, error } = await sb
+    .from('maker_funding')
+    .select('maker_address, backing_wei6, visible_committed_wei6, checked_at_block, updated_at')
+    .eq('network', network)
+    .in('maker_address', unique);
+  if (error) {
+    logger.error(
+      { err: error.message },
+      'commitments: maker_funding lookup failed — fillability degraded to unknown',
+    );
+    return map;
+  }
+  for (const r of (data ?? []) as MakerFundingRowDb[]) {
+    map.set(r.maker_address.toLowerCase(), {
+      backingWei6: BigInt(String(r.backing_wei6)),
+      visibleCommittedWei6: BigInt(String(r.visible_committed_wei6)),
+      checkedAtBlock: String(r.checked_at_block),
+      updatedAtMs: Date.parse(r.updated_at),
+    });
+  }
+  return map;
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -601,6 +767,17 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
     } satisfies ApiError);
     return;
   }
+  // Opt-in advisory fillability (Layer D). When true, each row carries a
+  // `fillability` object from the maker_funding snapshot. Default off — the
+  // response is byte-identical without it (one extra query only when asked).
+  const includeFillability = parseBoolQuery(req.query.includeFillability);
+  if (req.query.includeFillability !== undefined && includeFillability === null) {
+    res.status(400).json({
+      error: 'includeFillability must be true|false|1|0.',
+      code: 'INVALID_PARAM',
+    } satisfies ApiError);
+    return;
+  }
 
   // Lowercase first so mixed-case input passes (see positions.ts comment).
   let maker: string | undefined;
@@ -741,13 +918,34 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
   }
 
   const total = count ?? 0;
+  const rows = (data ?? []) as unknown as CommitmentRow[];
+
+  // Advisory fillability: one extra indexed maker_funding query keyed by the
+  // page's makers, joined in memory. Failure degrades to `unknown` (the list
+  // still returns) — an advisory add-on must never break the core read.
+  let fundingByMaker = new Map<string, MakerFundingSnapshot>();
+  if (includeFillability && rows.length > 0) {
+    fundingByMaker = await fetchMakerFunding(sb, config.network, rows.map((r) => r.maker));
+  }
+
   const body: ListResponse = {
-    commitments: (data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow, nowMs)),
+    commitments: rows.map((r) => {
+      const cb = rowToBody(r, nowMs);
+      if (includeFillability) {
+        cb.fillability = computeFillability({
+          remainingRiskWei6: BigInt(cb.remainingRiskAmount),
+          funding: fundingByMaker.get(cb.maker.toLowerCase()),
+          nowMs,
+          staleThresholdMs: FILLABILITY_STALE_MS,
+        });
+      }
+      return cb;
+    }),
     pagination: {
       limit: limitRaw,
       offset: offsetRaw,
       total,
-      hasMore: offsetRaw + (data?.length ?? 0) < total,
+      hasMore: offsetRaw + rows.length < total,
     },
   };
   res.status(200).json(body);
