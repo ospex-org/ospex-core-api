@@ -26,7 +26,7 @@ const envMock = vi.hoisted(() => ({
 vi.mock('../src/lib/supabase.js', () => supabaseMock);
 vi.mock('../src/lib/env.js', () => envMock);
 
-const { rowToBody, getCommitmentByHashHandler, getCommitmentsHandler, deleteCommitmentHandler } =
+const { rowToBody, getCommitmentByHashHandler, getCommitmentsHandler, deleteCommitmentHandler, computeFillability } =
   await import('../src/v1/commitments.js');
 
 // ── test doubles ────────────────────────────────────────────────────────
@@ -424,5 +424,198 @@ describe('DELETE /v1/commitments/:hash', () => {
     );
     expect(res.statusCode).toBe(403);
     expect(res.body).toMatchObject({ code: 'FORBIDDEN' });
+  });
+});
+
+// ── GET /v1/commitments list: advisory fillability (Layer D) ──────────────
+describe('GET /v1/commitments list — fillability', () => {
+  const MAKER = '0x1111111111111111111111111111111111111111';
+  function fundingRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      maker_address: MAKER,
+      backing_wei6: '5000000',
+      visible_committed_wei6: '1000000',
+      checked_at_block: 73491234,
+      updated_at: NOW_ISO, // fresh under the pinned clock
+      ...overrides,
+    };
+  }
+
+  it('includeFillability=true attaches a fully_backed verdict + queries maker_funding by maker', async () => {
+    const { client, calls } = makeSupabase([
+      { data: [row({ maker: MAKER, risk_amount: '1000000', filled_risk_amount: '0' })], error: null, count: 1 },
+      { data: [fundingRow()], error: null },
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await getCommitmentsHandler(makeReq({ includeFillability: 'true' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    // one extra indexed query keyed by the page's makers
+    expect(calls).toContainEqual({ method: 'in', args: ['maker_address', [MAKER]] });
+    const body = res.body as { commitments: Array<{ fillability?: Record<string, unknown> }> };
+    expect(body.commitments[0]?.fillability).toMatchObject({
+      advisory: true,
+      makerFundingStatus: 'fully_backed',
+      orderIndividuallyBackedNow: true,
+      makerBookBackedNow: true,
+      makerBackingWei6: '5000000',
+      makerVisibleCommittedWei6: '1000000',
+      makerCoverageRatioBps: 50000,
+      checkedAtBlock: '73491234',
+      stale: false,
+    });
+  });
+
+  it('default (no param) attaches no fillability and issues no maker_funding query', async () => {
+    const { client, calls } = makeSupabase({ data: [row({ maker: MAKER })], error: null, count: 1 });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await getCommitmentsHandler(makeReq(), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    expect(calls.some((c) => c.method === 'in' && c.args[0] === 'maker_address')).toBe(false);
+    const body = res.body as { commitments: Array<{ fillability?: unknown }> };
+    expect(body.commitments[0]?.fillability).toBeUndefined();
+  });
+
+  it('maker with no snapshot → fillability unknown', async () => {
+    const { client } = makeSupabase([
+      { data: [row({ maker: MAKER })], error: null, count: 1 },
+      { data: [], error: null }, // no funding row for this maker
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await getCommitmentsHandler(makeReq({ includeFillability: 'true' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { commitments: Array<{ fillability?: Record<string, unknown> }> };
+    expect(body.commitments[0]?.fillability).toMatchObject({
+      makerFundingStatus: 'unknown',
+      orderIndividuallyBackedNow: null,
+      makerBackingWei6: null,
+      stale: false,
+    });
+  });
+
+  it('maker_funding query failure degrades to unknown — list still 200', async () => {
+    const { client } = makeSupabase([
+      { data: [row({ maker: MAKER })], error: null, count: 1 },
+      { data: null, error: { message: 'boom' } }, // funding query errors
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await getCommitmentsHandler(makeReq({ includeFillability: 'true' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { commitments: Array<{ fillability?: Record<string, unknown> }> };
+    expect(body.commitments[0]?.fillability).toMatchObject({ makerFundingStatus: 'unknown' });
+  });
+
+  it('includeFillability with a bad value → 400', async () => {
+    const { client } = makeSupabase({ data: [], error: null, count: 0 });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await getCommitmentsHandler(makeReq({ includeFillability: 'maybe' }), res as unknown as Response);
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toMatchObject({ code: 'INVALID_PARAM' });
+  });
+});
+
+// ── computeFillability (pure verdict logic) ───────────────────────────────
+describe('computeFillability', () => {
+  const STALE = 120_000;
+  const fresh = (
+    over: Partial<{ backingWei6: bigint; visibleCommittedWei6: bigint; checkedAtBlock: string; updatedAtMs: number }> = {},
+  ) => ({
+    backingWei6: 100_000_000n,
+    visibleCommittedWei6: 50_000_000n,
+    checkedAtBlock: '73491234',
+    updatedAtMs: NOW,
+    ...over,
+  });
+
+  it('fresh, backing ≥ whole book → fully_backed, both booleans true', () => {
+    const f = computeFillability({ remainingRiskWei6: 10_000_000n, funding: fresh(), nowMs: NOW, staleThresholdMs: STALE });
+    expect(f).toMatchObject({
+      advisory: true,
+      makerFundingStatus: 'fully_backed',
+      orderIndividuallyBackedNow: true,
+      makerBookBackedNow: true,
+      makerCoverageRatioBps: 20000, // 100M / 50M = 200%
+      stale: false,
+    });
+  });
+
+  it('fake-liquidity case: backing covers THIS order but not the whole book → overcommitted (individually-backed true, book-backed false)', () => {
+    const f = computeFillability({
+      remainingRiskWei6: 10_000_000n,
+      funding: fresh({ backingWei6: 15_000_000n, visibleCommittedWei6: 100_000_000n }),
+      nowMs: NOW,
+      staleThresholdMs: STALE,
+    });
+    expect(f.makerFundingStatus).toBe('overcommitted');
+    expect(f.orderIndividuallyBackedNow).toBe(true); // 15M ≥ 10M
+    expect(f.makerBookBackedNow).toBe(false); // 15M < 100M
+    expect(f.makerCoverageRatioBps).toBe(1500); // 15%
+  });
+
+  it('order not even individually backed → overcommitted, both booleans false', () => {
+    const f = computeFillability({
+      remainingRiskWei6: 20_000_000n,
+      funding: fresh({ backingWei6: 15_000_000n, visibleCommittedWei6: 100_000_000n }),
+      nowMs: NOW,
+      staleThresholdMs: STALE,
+    });
+    expect(f.orderIndividuallyBackedNow).toBe(false);
+    expect(f.makerBookBackedNow).toBe(false);
+  });
+
+  it('stale snapshot → status stale, "...Now" booleans null, numbers kept as last-known', () => {
+    const f = computeFillability({
+      remainingRiskWei6: 10_000_000n,
+      funding: fresh({ updatedAtMs: NOW - 200_000 }), // 200s old > 120s
+      nowMs: NOW,
+      staleThresholdMs: STALE,
+    });
+    expect(f.makerFundingStatus).toBe('stale');
+    expect(f.stale).toBe(true);
+    expect(f.orderIndividuallyBackedNow).toBeNull();
+    expect(f.makerBookBackedNow).toBeNull();
+    expect(f.makerBackingWei6).toBe('100000000'); // last-known kept
+    expect(f.checkedAtBlock).toBe('73491234');
+  });
+
+  it('no snapshot → unknown, everything null, stale false', () => {
+    const f = computeFillability({ remainingRiskWei6: 10_000_000n, funding: undefined, nowMs: NOW, staleThresholdMs: STALE });
+    expect(f).toMatchObject({
+      makerFundingStatus: 'unknown',
+      orderIndividuallyBackedNow: null,
+      makerBookBackedNow: null,
+      makerBackingWei6: null,
+      makerVisibleCommittedWei6: null,
+      makerCoverageRatioBps: null,
+      checkedAtBlock: null,
+      stale: false,
+    });
+  });
+
+  it('exact-coverage boundary (backing == committed == remaining) → fully_backed, both true (>= inclusive)', () => {
+    const f = computeFillability({
+      remainingRiskWei6: 50_000_000n,
+      funding: fresh({ backingWei6: 50_000_000n, visibleCommittedWei6: 50_000_000n }),
+      nowMs: NOW,
+      staleThresholdMs: STALE,
+    });
+    expect(f.makerFundingStatus).toBe('fully_backed');
+    expect(f.orderIndividuallyBackedNow).toBe(true);
+    expect(f.makerBookBackedNow).toBe(true);
+    expect(f.makerCoverageRatioBps).toBe(10000); // 100%
+  });
+
+  it('non-finite age (bad updated_at) → treated as stale (fail safe)', () => {
+    const f = computeFillability({
+      remainingRiskWei6: 10_000_000n,
+      funding: fresh({ updatedAtMs: NaN }),
+      nowMs: NOW,
+      staleThresholdMs: STALE,
+    });
+    expect(f.makerFundingStatus).toBe('stale');
   });
 });
