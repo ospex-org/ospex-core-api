@@ -37,13 +37,15 @@ const polygon: ScriptApprovalsBundle = {
   network: 'polygon',
   approvedSigner: '0xfd6C7Fc1F182de53AA636584f1c6B80d9D885886',
   verify: {
-    scriptHash: '0x01c48e15068b68b7d5986d5013edd83a243ac31a761567e9db0e57b513c26c01',
+    // Re-signed 2026-05-27 for the Athletics MLB teamLegend fix (was 0x01c48e15...,
+    // validUntil 1793030835). See ospex-foundry-matched-pairs POLYGON_MAINNET_R4_SCRIPT_APPROVALS.md.
+    scriptHash: '0xec6a7e9cdffa09fdcaa611220e2c99ba0ec58cc082812a01b5d321ccc1e5ebcf',
     purpose: 0,
     leagueId: 0,
     version: 1,
-    validUntil: 1793030835,
+    validUntil: 1795737600,
     signature:
-      '0xe34d613dd3901b6cf6f72dd5d7fac7dbae044e204d0b8853ecc91359292d2511757bf50d94d7513214c34aef5591b3ad5fb54efd17293c7e7b931d1b68ab51661b',
+      '0x0ab097985df80cc08e75e88af7b337b2e645a62c9a53eea96a38faf1fe4911d15dc731abbe099e7256d9f005860a6f48f22267f22286d032fbf6152fa9c6625e1b',
     sourceUrl:
       'https://raw.githubusercontent.com/ospex-org/ospex-source-files-and-other/master/src/contestCreation.js',
   },
