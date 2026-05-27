@@ -193,7 +193,10 @@ export interface CommitmentFillability {
   makerCoverageRatioBps: number | null;
   /** Chain block the balance/allowance were read at. `null` when unknown. */
   checkedAtBlock: string | null;
-  /** Snapshot age exceeds the freshness threshold (or no snapshot). */
+  /** True only when a snapshot exists but its age exceeds the freshness
+   *  threshold (paired with `makerFundingStatus: 'stale'`). A missing snapshot
+   *  is `makerFundingStatus: 'unknown'` with `stale: false` — use
+   *  `makerFundingStatus` as the discriminator, not `stale`. */
   stale: boolean;
 }
 
