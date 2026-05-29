@@ -534,7 +534,13 @@ describe('fetchCategorizedPositions — mixed and edge cases', () => {
       makeSupabase({ positions: [], speculations: [], contests: [] }),
     );
     const result = await fetchCategorizedPositions(ADDR);
-    expect(result).toEqual({ active: [], pendingSettle: [], claimable: [], hitCap: false });
+    expect(result).toEqual({
+      active: [],
+      pendingSettle: [],
+      claimable: [],
+      hitCap: false,
+      derivedStatuses: [],
+    });
   });
 
   // The DB-level `gt('risk_amount', 0)` filter in fetchCategorizedPositions

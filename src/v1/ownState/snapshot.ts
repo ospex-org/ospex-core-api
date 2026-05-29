@@ -69,6 +69,7 @@ import {
 import {
   fetchCategorizedPositions,
   type ClaimablePosition,
+  type DerivedPositionStatus,
   type PendingSettlePosition,
   type PositionBase,
 } from '../utils/positionFetch.js';
@@ -156,7 +157,20 @@ const CLAIMED_PAGE_CAP = 200;
 // ─────────────────────────────────────────────────────────────────────────
 
 export type LoadOwnStateSnapshotResult =
-  | { ok: true; body: OwnStateSnapshotBody }
+  | {
+      ok: true;
+      body: OwnStateSnapshotBody;
+      /**
+       * Derived (key, status, sourceUpdatedAt) for every actionable
+       * position the snapshot saw — computed from the SAME categorization
+       * join that built `body.positions`. The M4b stream handler hands
+       * this to `OwnStateHub.seedStatusCache` BEFORE starting the live
+       * timer so the seed and the wire body are guaranteed consistent
+       * (eliminating the cold-start race a separate post-snapshot
+       * derivation would have introduced).
+       */
+      seedRows: DerivedPositionStatus[];
+    }
   | { ok: false; status: number; error: ApiError };
 
 export async function loadOwnStateSnapshot(
@@ -324,12 +338,14 @@ export async function loadOwnStateSnapshot(
   let pendingSettle: PendingSettlePosition[];
   let claimable: ClaimablePosition[];
   let positionsHitCap: boolean;
+  let derivedStatuses: DerivedPositionStatus[];
   try {
     const categorized = await fetchCategorizedPositions(address);
     active = categorized.active;
     pendingSettle = categorized.pendingSettle;
     claimable = categorized.claimable;
     positionsHitCap = categorized.hitCap;
+    derivedStatuses = categorized.derivedStatuses;
   } catch (err) {
     logger.error({ err: formatError(err) }, 'ownState/snapshot: position categorization failed');
     return {
@@ -426,9 +442,42 @@ export async function loadOwnStateSnapshot(
     ? cursor.f
     : await maxWatermarkForFills(sb, config.network, address);
 
-  const pWatermark: ResourceWatermark = positionsTruncated
-    ? (cursor?.p ?? SENTINEL_WATERMARK)
-    : await maxWatermarkForPositions(sb, config.network, address);
+  // cursor.p reflects the maximum DERIVED `sourceUpdatedAt` across the
+  // snapshot's actionable positions — NOT raw `positions.row_updated_at`.
+  // The M4b stream advances `p` with `sourceUpdatedAt = max(position,
+  // speculation, contest)` and filters resume catch-up by `sourceMs >
+  // cursor.p`. Minting `p` from the same derived domain unifies the
+  // snapshot and stream cursor semantics. When `positionsTruncated`, we
+  // preserve the input cursor's `p` (or sentinel on cold start) so the
+  // SDK / MM treats the wallet as degraded per the documented contract;
+  // the stream also emits `event: degraded` in this case.
+  let pWatermark: ResourceWatermark;
+  if (positionsTruncated) {
+    pWatermark = cursor?.p ?? SENTINEL_WATERMARK;
+  } else if (derivedStatuses.length > 0) {
+    let bestS = derivedStatuses[0]!.sourceUpdatedAt;
+    let bestMs = Date.parse(bestS);
+    if (!Number.isFinite(bestMs)) bestMs = 0;
+    for (let i = 1; i < derivedStatuses.length; i += 1) {
+      const ms = Date.parse(derivedStatuses[i]!.sourceUpdatedAt);
+      if (Number.isFinite(ms) && ms > bestMs) {
+        bestMs = ms;
+        bestS = derivedStatuses[i]!.sourceUpdatedAt;
+      }
+    }
+    // i='0' is a permissive tie-breaker: the stream's catch-up filter
+    // (`sourceMs > p.ms` OR `sourceMs == p.ms AND id > p.i`) will re-emit
+    // any position whose source matches `p.s` and has id > 0 (i.e. every
+    // real DB row). The SDK reducer dedupes the over-emission via its
+    // semantic event key.
+    pWatermark = { s: bestS, i: '0' };
+  } else {
+    // No actionable positions and no truncation — preserve input cursor's
+    // p (resume) or sentinel (cold start) so the catch-up has nothing to
+    // filter against. Catch-up's terminal-since-cursor query then catches
+    // any recent terminal transitions.
+    pWatermark = cursor?.p ?? SENTINEL_WATERMARK;
+  }
 
   const responseCursor: OwnStateCursor =
     outputCAnchor !== undefined
@@ -457,7 +506,7 @@ export async function loadOwnStateSnapshot(
     truncated: truncatedCommitments,
     positionsTruncated,
   };
-  return { ok: true, body };
+  return { ok: true, body, seedRows: derivedStatuses };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -565,20 +614,3 @@ async function maxWatermarkForFills(
   return { s: String(res.data.row_updated_at), i: String(res.data.id) };
 }
 
-async function maxWatermarkForPositions(
-  sb: SbClient,
-  network: string,
-  address: string,
-): Promise<ResourceWatermark> {
-  const res = await sb
-    .from('positions')
-    .select('row_updated_at, id')
-    .eq('network', network)
-    .eq('user_address', address)
-    .order('row_updated_at', { ascending: false })
-    .order('id', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  if (res.error || !res.data) return SENTINEL_WATERMARK;
-  return { s: String(res.data.row_updated_at), i: String(res.data.id) };
-}

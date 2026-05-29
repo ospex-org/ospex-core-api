@@ -157,7 +157,13 @@ const sentinelWatermarkRow = { row_updated_at: '2026-05-29T15:30:00.000Z', id: 4
 const fillsWatermarkRow = { row_updated_at: '2026-05-29T15:31:00.000Z', id: 7 };
 const positionsWatermarkRow = { row_updated_at: '2026-05-29T15:32:00.000Z', id: 99 };
 
-const noPositions = { active: [], pendingSettle: [], claimable: [], hitCap: false };
+const noPositions = {
+  active: [],
+  pendingSettle: [],
+  claimable: [],
+  hitCap: false,
+  derivedStatuses: [],
+};
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -188,7 +194,6 @@ describe('GET /v1/own-state/snapshot — cold start (no cursor)', () => {
       { data: [commitmentRow()], error: null },         // active commitments
       { data: sentinelWatermarkRow, error: null },      // max watermark commitments
       { data: fillsWatermarkRow, error: null },         // max watermark fills
-      { data: positionsWatermarkRow, error: null },     // max watermark positions
     ]);
     supabaseMock.getSupabase.mockReturnValue(client);
 
@@ -206,7 +211,11 @@ describe('GET /v1/own-state/snapshot — cold start (no cursor)', () => {
     expect(decoded.v).toBe(OWN_STATE_CURSOR_VERSION);
     expect(decoded.c).toEqual({ s: sentinelWatermarkRow.row_updated_at, i: '42' });
     expect(decoded.f).toEqual({ s: fillsWatermarkRow.row_updated_at, i: '7' });
-    expect(decoded.p).toEqual({ s: positionsWatermarkRow.row_updated_at, i: '99' });
+    // No actionable positions (`derivedStatuses=[]`) → p falls back to
+    // SENTINEL. Snapshot no longer mints p from `positions.row_updated_at`;
+    // it mints from `max(sourceUpdatedAt)` across derived statuses, which
+    // is empty here.
+    expect(decoded.p).toEqual({ s: '1970-01-01T00:00:00.000Z', i: '0' });
   });
 
   it('queries commitments scoped to the authenticated address (the only address)', async () => {
@@ -514,6 +523,7 @@ describe('GET /v1/own-state/snapshot — position categorization', () => {
       pendingSettle: [{ positionId: 'B_x_1', speculationId: 'B', positionType: 1, team: 't', opponent: 'o', market: 'spread', oddsDecimal: null, riskAmountUSDC: 2, profitAmountUSDC: 0.5, result: 'won', predictedWinSide: 'home', estimatedPayoutUSDC: 2.5, estimatedPayoutWei6: '2500000' }],
       claimable: [{ positionId: 'C_x_0', speculationId: 'C', positionType: 0, team: 't', opponent: 'o', market: 'total', oddsDecimal: 3, riskAmountUSDC: 5, profitAmountUSDC: 10, result: 'won', estimatedPayoutUSDC: 15, estimatedPayoutWei6: '15000000' }],
       hitCap: false,
+      derivedStatuses: [],
     });
     const { client } = makeSupabase([
       { data: [], error: null },                          // active commitments
@@ -784,6 +794,7 @@ describe('GET /v1/own-state/snapshot — overlap floor + paging regressions', ()
       pendingSettle: [],
       claimable: [],
       hitCap: true, // raw-cap signal from helper — what `positionsTruncated` derives from
+      derivedStatuses: [],
     });
     const inputP = { s: '2026-05-29T10:00:00.000Z', i: '0' };
     const cursor = encodeOwnStateCursor({
@@ -1009,6 +1020,7 @@ describe('GET /v1/own-state/snapshot — overlap floor + paging regressions', ()
       pendingSettle: [],
       claimable: [],
       hitCap: true, // raw-cap signal from helper — what `positionsTruncated` derives from
+      derivedStatuses: [],
     });
     const { client } = makeSupabase([
       { data: [], error: null },                          // active

@@ -207,6 +207,7 @@ beforeEach(() => {
     pendingSettle: [],
     claimable: [],
     hitCap: false,
+    derivedStatuses: [],
   });
   envMock.loadConfig.mockReturnValue({
     network: 'polygon',
@@ -273,6 +274,58 @@ describe('GET /v1/stream/own-state — cold start (no cursor)', () => {
     expect((ev[0] as { data: { truncated: boolean } }).data.truncated).toBe(false);
   });
 
+  it('seedRows come from the SAME read as snapshot body (race-by-construction impossible)', async () => {
+    // Hermes review-32 round 3 blocker 1: the cold-start race where a
+    // fresh post-snapshot derivation observes a transition the snapshot
+    // missed. Fix: snapshot.seedRows is produced FROM the same
+    // categorization join that built body.positions. There is no second
+    // read; the seed and the wire body are equal by construction.
+    const snapPosition = {
+      positionId: '101_x_0',
+      speculationId: '101',
+      positionType: 0,
+      team: 't',
+      opponent: 'o',
+      market: 'moneyline' as const,
+      oddsDecimal: 2,
+      riskAmountUSDC: 1,
+      profitAmountUSDC: 1,
+    };
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: [snapPosition],
+      pendingSettle: [],
+      claimable: [],
+      hitCap: false,
+      // Same single derivation join produces both buckets AND
+      // derivedStatuses. The handler hands derivedStatuses to
+      // seedStatusCache — guaranteed consistent with the wire body.
+      derivedStatuses: [
+        {
+          key: '101_0',
+          status: 'active',
+          sourceUpdatedAt: '2026-05-29T15:00:00.000Z',
+        },
+      ],
+    });
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+    await flushTicks(64);
+    const ev = events(res);
+    expect(ev.find((e) => e.event === 'snapshot')).toBeDefined();
+    expect(ev.find((e) => e.event === 'ready')).toBeDefined();
+    // Snapshot body has the position in active bucket. Hub cache is
+    // seeded with the SAME row (status='active', sourceUpdatedAt the
+    // same join's max). Subsequent ticks emit only on derived-status
+    // change — a transition mid-handoff is delivered live (not silently
+    // swallowed). This test pins the structural invariant rather than
+    // re-racing the handler's IIFE.
+    const snap = ev.find((e) => e.event === 'snapshot') as {
+      data: { positions: Array<{ status: string }> };
+    };
+    expect(snap.data.positions).toHaveLength(1);
+    expect(snap.data.positions[0]!.status).toBe('active');
+  });
+
   it('emits snapshot + degraded + ready when positions truncated (defined terminal, no resync loop)', async () => {
     // positionsTruncated reconnect contract (PR2 round 2): a wallet at the
     // 200-actionable-position cap reaches a DEFINED terminal state instead
@@ -283,19 +336,20 @@ describe('GET /v1/stream/own-state — cold start (no cursor)', () => {
       pendingSettle: [],
       claimable: [],
       hitCap: true,
+      derivedStatuses: [],
     });
     supabaseMock.getSupabase.mockImplementation(() =>
       sequencedClient([
         // Snapshot: active commitments → maxWmCommitments → maxWmFills.
-        // (No maxWmPositions because positionsTruncated preserves cursor.p
-        // as SENTINEL_WATERMARK on cold start.)
+        // No maxWmPositions query: snapshot now mints cursor.p from
+        // max(sourceUpdatedAt) across derivedStatuses (unified with the
+        // stream's positionStatus filter domain).
+        // No separate seed-pass query either: the cold-start handler
+        // uses result.seedRows (from the same snapshot read) — race-
+        // eliminated by construction.
         { data: [], error: null }, // active commitments
         { data: null, error: null }, // maxWmCommitments .maybeSingle()
         { data: null, error: null }, // maxWmFills .maybeSingle()
-        // Cold-start seed pass: actionable positions query (empty),
-        // cached-key refresh skipped (empty cache), no specs/contests
-        // because the empty positions set short-circuits.
-        { data: [], error: null }, // actionable positions
       ]),
     );
     const res = makeRes();
@@ -423,14 +477,16 @@ describe('GET /v1/stream/own-state — resume catchup', () => {
       home_score: null,
       row_updated_at: '2026-05-29T13:00:00.000Z',
     };
-    // Catchup sequence: commitments empty → fills empty → positions list →
-    // speculations IN-list → contests IN-list. The first two return empty data;
-    // the positions query returns the single row; the joins return the spec/contest.
+    // Catch-up sequence: commitments → fills → actionable positions →
+    // terminal-since-cursor positions (RESUME-only; new) → speculations
+    // IN-list → contests IN-list. Position row still actionable
+    // (claimed=false, risk>0), so terminal-since-cursor returns [].
     supabaseMock.getSupabase.mockImplementation(() =>
       sequencedClient([
         { data: [], error: null }, // commitments catchup
         { data: [], error: null }, // fills catchup
-        { data: [positionRow], error: null }, // positions catchup
+        { data: [positionRow], error: null }, // actionable positions
+        { data: [], error: null }, // terminal-since-cursor (empty)
         { data: [specRowSettled], error: null }, // speculations join
         { data: [contestRowStatic], error: null }, // contests join
       ]),
@@ -449,6 +505,118 @@ describe('GET /v1/stream/own-state — resume catchup', () => {
     expect((ps as { data: { sourceUpdatedAt: string } }).data.sourceUpdatedAt).toBe(
       '2026-05-29T15:30:00.000Z',
     );
+    expect(ev.find((e) => e.event === 'ready')).toBeDefined();
+  });
+
+  it('resume catchup emits positionStatus:claimed for an OFFLINE claim transition (no live cache)', async () => {
+    // Hermes review-32 round 3 blocker 2: a position that became
+    // `claimed=true` while the client was offline must surface via
+    // `positionStatus:claimed` on resume — the actionable filter
+    // excludes it (`claimed=false`) and the live hub has no cached key
+    // for it on fresh reconnect, so the terminal-since-cursor query
+    // is the ONLY path that catches it.
+    const offlineClaimed = {
+      speculation_id: 101,
+      user_address: ADDRESS,
+      position_type: 'upper',
+      risk_amount: '0', // contract zeroes risk on claim
+      profit_amount: '500000',
+      claimed: true,
+      row_updated_at: '2026-05-29T15:45:00.000Z', // after cursor
+      id: 7,
+    };
+    const specClosed = {
+      speculation_id: 101,
+      contest_id: 42,
+      market_type: 'moneyline',
+      line_ticks: null,
+      speculation_status: 'closed',
+      win_side: 'away',
+      row_updated_at: '2026-05-29T15:30:00.000Z',
+    };
+    const contestStatic = {
+      contest_id: 42,
+      contest_status: 'verified',
+      away_score: null,
+      home_score: null,
+      row_updated_at: '2026-05-29T13:00:00.000Z',
+    };
+    supabaseMock.getSupabase.mockImplementation(() =>
+      sequencedClient([
+        { data: [], error: null }, // commitments catchup
+        { data: [], error: null }, // fills catchup
+        { data: [], error: null }, // actionable positions (none — already claimed)
+        { data: [offlineClaimed], error: null }, // terminal-since-cursor catches it
+        { data: [specClosed], error: null }, // speculations join
+        { data: [contestStatic], error: null }, // contests join
+      ]),
+    );
+    const res = makeRes();
+    getOwnStateStreamHandler(
+      makeReq({ query: { cursor: liveCursor() } }),
+      res as unknown as Response,
+    );
+    await flushTicks(64);
+    const ev = events(res);
+    const ps = ev.find((e) => e.event === 'positionStatus');
+    expect(ps).toBeDefined();
+    expect((ps as { data: { status: string } }).data.status).toBe('claimed');
+    expect(ev.find((e) => e.event === 'ready')).toBeDefined();
+  });
+
+  it('resume catchup emits settledLost for an OFFLINE transfer-out (claimed=false, risk=0)', async () => {
+    // Secondary-market transfer drained the position's stake while the
+    // client was offline. The row now has `claimed=false, risk=0` —
+    // excluded by the actionable filter (risk>0) but caught by the
+    // terminal-since-cursor query (`claimed=true OR risk=0`). Derived
+    // status is `settledLost` (zero-risk → terminal lost per
+    // derivePositionStatus contract).
+    const offlineTransferred = {
+      speculation_id: 101,
+      user_address: ADDRESS,
+      position_type: 'upper',
+      risk_amount: '0', // transferred-out
+      profit_amount: '0',
+      claimed: false,
+      row_updated_at: '2026-05-29T15:45:00.000Z',
+      id: 7,
+    };
+    const specOpen = {
+      speculation_id: 101,
+      contest_id: 42,
+      market_type: 'moneyline',
+      line_ticks: null,
+      speculation_status: 'open',
+      win_side: 'tbd',
+      row_updated_at: '2026-05-29T13:00:00.000Z',
+    };
+    const contestStatic = {
+      contest_id: 42,
+      contest_status: 'unverified',
+      away_score: null,
+      home_score: null,
+      row_updated_at: '2026-05-29T13:00:00.000Z',
+    };
+    supabaseMock.getSupabase.mockImplementation(() =>
+      sequencedClient([
+        { data: [], error: null }, // commitments catchup
+        { data: [], error: null }, // fills catchup
+        { data: [], error: null }, // actionable positions (excluded by risk>0)
+        { data: [offlineTransferred], error: null }, // terminal-since-cursor
+        { data: [specOpen], error: null },
+        { data: [contestStatic], error: null },
+      ]),
+    );
+    const res = makeRes();
+    getOwnStateStreamHandler(
+      makeReq({ query: { cursor: liveCursor() } }),
+      res as unknown as Response,
+    );
+    await flushTicks(64);
+    const ev = events(res);
+    const ps = ev.find((e) => e.event === 'positionStatus');
+    expect(ps).toBeDefined();
+    expect((ps as { data: { status: string } }).data.status).toBe('settledLost');
     expect(ev.find((e) => e.event === 'ready')).toBeDefined();
   });
 
