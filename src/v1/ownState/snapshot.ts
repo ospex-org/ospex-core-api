@@ -103,6 +103,7 @@ import {
   type OwnStateCursorKind,
   type ResourceWatermark,
 } from './cursor.js';
+import { maxIsoTimestamptz } from './timestamps.js';
 import type { ApiError } from '../../middleware/errorHandler.js';
 
 // ── Position wire shape — discriminated union by `status` ────────────────
@@ -436,10 +437,14 @@ export async function loadOwnStateSnapshot(
   //        terminal`; else → `live`.
   //
   // The `truncated` body field is COMMITMENTS-ONLY (decoupled from
-  // `positionsTruncated`). The SDK's "page until truncated: false" contract
-  // does not loop on positions-only truncation; positions truncation is
-  // informational and is converged by
-  // the M4b stream + a /v1/positions fallback per README.
+  // `positionsTruncated`). The SDK's "page until truncated: false"
+  // contract does not loop on positions-only truncation:
+  // `positionsTruncated:true` means position visibility is PARTIAL —
+  // the stream cold-start emits `event: degraded` before `ready` and
+  // the SDK / MM must quote-hold per spec §2.6 and treat owner-state
+  // as partial. There is no paging/convergence mechanism that drains
+  // positions beyond the actionable cap; full history is available
+  // out-of-band via `/v1/positions/:address` for operator tooling.
   let cWatermark: ResourceWatermark;
   let outputK: OwnStateCursorKind;
   let outputCAnchor: ResourceWatermark | undefined;
@@ -466,30 +471,27 @@ export async function loadOwnStateSnapshot(
   // cursor.p reflects the maximum DERIVED `sourceUpdatedAt` across the
   // snapshot's actionable positions — NOT raw `positions.row_updated_at`.
   // The M4b stream advances `p` with `sourceUpdatedAt = max(position,
-  // speculation, contest)` and filters resume catch-up by `sourceMs >
-  // cursor.p`. Minting `p` from the same derived domain unifies the
-  // snapshot and stream cursor semantics. When `positionsTruncated`, we
-  // preserve the input cursor's `p` (or sentinel on cold start) so the
-  // SDK / MM treats the wallet as degraded per the documented contract;
-  // the stream also emits `event: degraded` in this case.
+  // speculation, contest)` and the resume catch-up filters via
+  // `compareIsoTimestamptz` (microsecond-precise). Minting `p` here from
+  // the same derived domain via `maxIsoTimestamptz` keeps snapshot and
+  // stream cursors comparable end-to-end; `Date.parse`-based max would
+  // truncate Postgres's microsecond precision and let same-ms parent
+  // transitions freeze `p` even though a newer source actually advanced.
+  // When `positionsTruncated`, we preserve the input cursor's `p` (or
+  // sentinel on cold start) so the SDK / MM treats the wallet as
+  // degraded per the documented contract; the stream also emits
+  // `event: degraded` in this case.
   let pWatermark: ResourceWatermark;
   if (positionsTruncated) {
     pWatermark = cursor?.p ?? SENTINEL_WATERMARK;
   } else if (derivedStatuses.length > 0) {
-    let bestS = derivedStatuses[0]!.sourceUpdatedAt;
-    let bestMs = Date.parse(bestS);
-    if (!Number.isFinite(bestMs)) bestMs = 0;
-    for (let i = 1; i < derivedStatuses.length; i += 1) {
-      const ms = Date.parse(derivedStatuses[i]!.sourceUpdatedAt);
-      if (Number.isFinite(ms) && ms > bestMs) {
-        bestMs = ms;
-        bestS = derivedStatuses[i]!.sourceUpdatedAt;
-      }
-    }
+    const bestS = maxIsoTimestamptz(
+      ...derivedStatuses.map((d) => d.sourceUpdatedAt),
+    );
     // i='0' is a permissive tie-breaker: the stream's catch-up filter
-    // (`sourceMs > p.ms` OR `sourceMs == p.ms AND id > p.i`) will re-emit
-    // any position whose source matches `p.s` and has id > 0 (i.e. every
-    // real DB row). The SDK reducer dedupes the over-emission via its
+    // `(sourceUpdatedAt, id) > (p.s, p.i)` re-admits any position whose
+    // source matches `p.s` and has id > 0 (i.e. every real DB row).
+    // The SDK reducer dedupes the over-emission via the spec §2.1.2
     // semantic event key.
     pWatermark = { s: bestS, i: '0' };
   } else {

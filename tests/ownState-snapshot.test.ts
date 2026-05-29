@@ -1036,4 +1036,73 @@ describe('GET /v1/own-state/snapshot — overlap floor + paging regressions', ()
     const decoded = decodeOwnStateCursor(body.cursor);
     expect(decoded.p).toEqual({ s: '1970-01-01T00:00:00.000Z', i: '0' }); // sentinel
   });
+
+  it('cursor.p mint picks the microsecond-later sourceUpdatedAt across derivedStatuses (round-6 regression)', async () => {
+    // Two derived statuses with sourceUpdatedAt values that differ only
+    // in microseconds within the same millisecond. The snapshot's
+    // cursor.p mint MUST pick the later one — `Date.parse`-based max
+    // would tie them and pick whichever was iterated first, freezing
+    // `p` even though the actual newer source did advance.
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: [
+        {
+          positionId: 'A_x_0',
+          speculationId: '101',
+          positionType: 0,
+          team: 't',
+          opponent: 'o',
+          market: 'moneyline',
+          oddsDecimal: 2,
+          riskAmountUSDC: 1,
+          profitAmountUSDC: 1,
+        },
+        {
+          positionId: 'B_x_0',
+          speculationId: '202',
+          positionType: 0,
+          team: 't',
+          opponent: 'o',
+          market: 'moneyline',
+          oddsDecimal: 2,
+          riskAmountUSDC: 1,
+          profitAmountUSDC: 1,
+        },
+      ],
+      pendingSettle: [],
+      claimable: [],
+      hitCap: false,
+      // Iteration order: A first. A's sourceUpdatedAt is microsecond-
+      // EARLIER. The `Date.parse`-based max would pick A (same ms ⇒
+      // no update). `maxIsoTimestamptz` picks B (later microseconds).
+      derivedStatuses: [
+        {
+          key: '101_0',
+          status: 'active',
+          sourceUpdatedAt: '2026-05-29T15:00:00.000100Z',
+          result: undefined,
+          claimableAmount: undefined,
+        },
+        {
+          key: '202_0',
+          status: 'active',
+          sourceUpdatedAt: '2026-05-29T15:00:00.000200Z',
+          result: undefined,
+          claimableAmount: undefined,
+        },
+      ],
+    });
+    const { client } = makeSupabase([
+      { data: [], error: null }, // active commitments
+      { data: null, error: null }, // max commitments
+      { data: null, error: null }, // max fills
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await ownStateSnapshotHandler(makeReq(), res as unknown as Response);
+    const body = res.body as { cursor: string };
+    const decoded = decodeOwnStateCursor(body.cursor);
+    // p.s = .000200 (the microsecond-later one), NOT .000100.
+    expect(decoded.p.s).toBe('2026-05-29T15:00:00.000200Z');
+    expect(decoded.p.i).toBe('0');
+  });
 });
