@@ -27,6 +27,13 @@ const perIp = new Map<string, number>();
 /** Closers for currently-open SSE responses (one per connection). */
 const openStreams = new Set<() => void>();
 
+// Cumulative operational counters — reset only on process restart (process-local
+// metrics; see metrics.ts). Surfaced via connectionStats() for /v1/metrics.
+let rejectedTotal = 0;
+let rejectedByScopeIp = 0;
+let rejectedByScopeTotal = 0;
+let slowClientShedTotal = 0;
+
 export interface AcquireResult {
   ok: boolean;
   scope?: 'total' | 'ip';
@@ -43,12 +50,25 @@ export function configureConnectionCaps(caps: { maxTotal?: number | undefined; m
 
 /** Reserve a connection slot for `ip`. Returns ok:false (with the limiting scope) when full. */
 export function acquire(ip: string): AcquireResult {
-  if (total >= maxTotal) return { ok: false, scope: 'total' };
+  if (total >= maxTotal) {
+    rejectedTotal += 1;
+    rejectedByScopeTotal += 1;
+    return { ok: false, scope: 'total' };
+  }
   const n = perIp.get(ip) ?? 0;
-  if (n >= maxPerIp) return { ok: false, scope: 'ip' };
+  if (n >= maxPerIp) {
+    rejectedTotal += 1;
+    rejectedByScopeIp += 1;
+    return { ok: false, scope: 'ip' };
+  }
   total += 1;
   perIp.set(ip, n + 1);
   return { ok: true };
+}
+
+/** Record a slow-client shed event (called from common.ts:makeShedIfSlow). Bumps the cumulative counter. */
+export function recordSlowClientShed(): void {
+  slowClientShedTotal += 1;
 }
 
 /** Release a slot previously acquired for `ip`. Idempotent-safe against double-release. */
@@ -86,15 +106,36 @@ export function closeAllStreams(): void {
   openStreams.clear();
 }
 
-export function connectionStats(): { total: number; ips: number; maxTotal: number; maxPerIp: number } {
-  return { total, ips: perIp.size, maxTotal, maxPerIp };
+export function connectionStats(): {
+  total: number;
+  ips: number;
+  maxTotal: number;
+  maxPerIp: number;
+  rejectedTotal: number;
+  rejectedByScope: { ip: number; total: number };
+  slowClientShedTotal: number;
+} {
+  return {
+    total,
+    ips: perIp.size,
+    maxTotal,
+    maxPerIp,
+    rejectedTotal,
+    rejectedByScope: { ip: rejectedByScopeIp, total: rejectedByScopeTotal },
+    slowClientShedTotal,
+  };
 }
 
 // Test-only reset — clears live state and restores the default caps.
+// Also zeros the cumulative counters so tests can assert exact values.
 export function __resetConnections(): void {
   total = 0;
   perIp.clear();
   openStreams.clear();
   maxTotal = DEFAULT_MAX_TOTAL;
   maxPerIp = DEFAULT_MAX_PER_IP;
+  rejectedTotal = 0;
+  rejectedByScopeIp = 0;
+  rejectedByScopeTotal = 0;
+  slowClientShedTotal = 0;
 }

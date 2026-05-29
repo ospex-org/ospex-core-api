@@ -250,13 +250,17 @@ describe('OddsHub readiness + degradation', () => {
 
     channels[0]?.status('SUBSCRIBED'); // initial
     expect(c.actives).toBe(1);
+    expect(hub.stats().channelDegradedTotal).toBe(0);
 
     channels[0]?.status('CHANNEL_ERROR');
     expect(c.degraded).toEqual(['channel_error']);
     expect(hub.isDegraded()).toBe(true);
+    expect(hub.stats().channelDegradedTotal).toBe(1);
 
     channels[0]?.status('CHANNEL_ERROR'); // still degraded — must not re-fire
     expect(c.degraded).toHaveLength(1);
+    // Counter is gated by the same `if (!this.degraded)` guard — does not double-bump.
+    expect(hub.stats().channelDegradedTotal).toBe(1);
 
     channels[0]?.status('SUBSCRIBED'); // recovery
     expect(c.actives).toBe(2);
@@ -285,11 +289,13 @@ describe('OddsHub readiness + degradation', () => {
 
     channels[0]?.status('CHANNEL_ERROR');
     expect(c.degraded).toHaveLength(1);
+    expect(hub.stats().hardResetTotal).toBe(0); // backstop hasn't fired yet
 
     await vi.advanceTimersByTimeAsync(10_000); // reset backstop fires
 
     expect(channels[0]?.removed).toBe(true);
     expect(channels).toHaveLength(2);
+    expect(hub.stats().hardResetTotal).toBe(1);
 
     // A late status callback from the OLD channel must be ignored.
     channels[0]?.status('SUBSCRIBED');

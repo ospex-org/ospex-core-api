@@ -54,8 +54,40 @@ import {
 const CATCHUP_PAGE = 500;
 const CATCHUP_MAX_PAGES = 50;
 
-type CatchupStatus = 'complete' | 'resync';
+// `closed` covers two distinct termination paths that share the same metrics
+// treatment: the wrapper exits without bumping either completed or resynced.
+//   (1) caller-driven `isClosed()` — the runner's close-flag latched from
+//       `res.on('close')` / `res.on('error')` cleanup;
+//   (2) `res.writableEnded` — the slow-client shed inside the catch-up loop
+//       called `res.end()` synchronously, but in production the 'close' event
+//       fires asynchronously so the close-flag check would race the wrapper's
+//       counter bumps. Honest accounting: a shed mid-catchup is NOT a clean
+//       `ready` handoff and should be attributed to `slowClientShedTotal`, not
+//       `catchupCompletedTotal`.
+type CatchupStatus = 'complete' | 'resync' | 'closed';
 type Phase = 'catchup' | 'live';
+
+// Cumulative per-handler counters — process-local, surfaced via handlerStats()
+// for /v1/metrics. `started - completed - resynced` ≈ connections still in the
+// catchup phase OR disconnected before reaching live (operationally useful as a
+// hung-catchup signal). Reset on restart; __resetHandlerMetrics() for tests.
+let catchupStartedTotal = 0;
+let catchupCompletedTotal = 0;
+let catchupResyncedTotal = 0;
+
+export function handlerStats(): {
+  catchupStartedTotal: number;
+  catchupCompletedTotal: number;
+  catchupResyncedTotal: number;
+} {
+  return { catchupStartedTotal, catchupCompletedTotal, catchupResyncedTotal };
+}
+
+export function __resetHandlerMetrics(): void {
+  catchupStartedTotal = 0;
+  catchupCompletedTotal = 0;
+  catchupResyncedTotal = 0;
+}
 
 export function getStreamHandler(req: Request, res: Response): void {
   const name = String(req.params.resource ?? '');
@@ -142,16 +174,22 @@ export function getStreamHandler(req: Request, res: Response): void {
   res.on('error', cleanup);
 
   void (async () => {
+    catchupStartedTotal += 1;
     try {
       const status: CatchupStatus = cursor
         ? await runCatchUp(res, resource, filters, cursor, () => closed, shedIfSlow)
         : 'complete';
-      if (closed) return;
+      // Closed paths exit without bumping either completed or resynced. We check
+      // `res.writableEnded` in addition to `closed` and `status === 'closed'` as
+      // belt-and-braces against any future path that ends the response without
+      // routing through the status return value.
+      if (closed || status === 'closed' || res.writableEnded) return;
 
       if (aborted || status === 'resync') {
         // runCatchUp already emitted a resync on its own failure/backlog; only
         // emit one here when the abort came from a raced live delta/resync.
         if (status !== 'resync') writeEvent(res, 'resync', { reason: 'handoff_raced' });
+        catchupResyncedTotal += 1;
         res.end(); // force the client through snapshot → reconnect
         return;
       }
@@ -160,9 +198,11 @@ export function getStreamHandler(req: Request, res: Response): void {
       // emitting `ready` is now honest — the client is at catch-up's DB state.
       phase = 'live';
       writeEvent(res, 'ready', { resource: name });
+      catchupCompletedTotal += 1;
     } catch (err) {
       logger.error({ err: err instanceof Error ? err.message : String(err), resource: name }, 'stream: catch-up/handoff failed');
       writeEvent(res, 'resync', { reason: 'internal_error' });
+      catchupResyncedTotal += 1;
       res.end();
     }
   })();
@@ -187,7 +227,12 @@ async function runCatchUp(
   let orExpr = recoveryKeysetExpr(cursor);
 
   for (let page = 0; page < CATCHUP_MAX_PAGES; page += 1) {
-    if (isClosed()) return 'complete';
+    // `closed` covers connection cleanup (close/error fired); `writableEnded`
+    // covers a slow-client shed from a prior page in this same loop. Both stop
+    // paging immediately — no further DB queries, no no-op writes — and route
+    // the wrapper's metrics to the closed path instead of mis-counting as
+    // a clean completion.
+    if (isClosed() || res.writableEnded) return 'closed';
     let q = sb.from(resource.table).select(resource.columns).eq('network', net);
     for (const [col, val] of Object.entries(filters)) q = q.eq(col, val);
     q = q
@@ -208,6 +253,10 @@ async function runCatchUp(
       if (body !== null) writeEvent(res, 'delta', body, cursorFromRow(resource.cursorTable, row, 'live'));
     }
     shed();
+    // Shed inside the previous line may have called res.end() (slow client).
+    // Don't claim 'complete' on the short-page check below if the response is
+    // already ended — that would mis-count as a clean handoff in the wrapper.
+    if (res.writableEnded) return 'closed';
     if (rows.length < CATCHUP_PAGE) return 'complete'; // caught up
     const last = rows[rows.length - 1];
     if (!last) return 'complete';

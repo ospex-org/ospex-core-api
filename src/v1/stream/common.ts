@@ -8,7 +8,7 @@
 
 import type { Request, Response } from 'express';
 import type { ApiError } from '../../middleware/errorHandler.js';
-import { acquire } from './connections.js';
+import { acquire, recordSlowClientShed } from './connections.js';
 
 /** Heartbeat comment interval — keeps the connection under the platform idle timeout. */
 export const HEARTBEAT_MS = 20_000;
@@ -46,6 +46,7 @@ export function makeShedIfSlow(res: Response, onShed: (pending: number) => void)
   return () => {
     const pending = (res as { writableLength?: number }).writableLength;
     if (!res.writableEnded && typeof pending === 'number' && pending > MAX_PENDING_BYTES) {
+      recordSlowClientShed();
       onShed(pending);
       res.end();
     }

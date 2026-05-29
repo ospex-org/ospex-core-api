@@ -34,7 +34,7 @@ const sb = vi.hoisted(() => {
 vi.mock('../src/lib/supabase.js', () => ({ getSupabase: sb.getSupabase }));
 vi.mock('../src/lib/env.js', () => ({ loadConfig: () => ({ network: 'polygon', chainId: 137 }) }));
 
-const { getStreamHandler } = await import('../src/v1/stream/handler.js');
+const { getStreamHandler, handlerStats, __resetHandlerMetrics } = await import('../src/v1/stream/handler.js');
 const { StreamHub, __setStreamHubForTest } = await import('../src/v1/stream/hub.js');
 const { __resetConnections, acquire, closeAllStreams, connectionStats } = await import('../src/v1/stream/connections.js');
 const { encodeCursor } = await import('../src/lib/cursor.js');
@@ -74,6 +74,7 @@ function makeHubClient(opts: { protocolOnce?: Array<Record<string, unknown>>; re
 let hub: InstanceType<typeof StreamHub>;
 beforeEach(() => {
   __resetConnections();
+  __resetHandlerMetrics();
   hub = new StreamHub({ getClient: () => emptyClient(), getNetwork: () => 'polygon', pollMs: 1e9, resyncMs: 1e9 });
   __setStreamHubForTest(hub);
   sb.state.response = { data: [], error: null };
@@ -83,6 +84,7 @@ beforeEach(() => {
 afterEach(() => {
   __setStreamHubForTest(undefined);
   __resetConnections();
+  __resetHandlerMetrics();
   vi.restoreAllMocks();
 });
 
@@ -327,5 +329,100 @@ describe('GET /v1/stream/:resource lifecycle', () => {
     // The closer's res.end() drives 'close' → cleanup: slot released, unsubscribed.
     expect(connectionStats().total).toBe(0);
     expect(hub.stats().subscribers).toBe(0);
+  });
+});
+
+// ── M0 catchup counters ──────────────────────────────────────────────────────
+
+describe('catchup counters', () => {
+  it('a no-cursor handler → 1 started, 1 completed, 0 resynced', async () => {
+    expect(handlerStats()).toEqual({
+      catchupStartedTotal: 0,
+      catchupCompletedTotal: 0,
+      catchupResyncedTotal: 0,
+    });
+    const res = makeRes();
+    getStreamHandler(makeReq({ resource: 'fills' }), res as unknown as Response);
+    await flush();
+    expect(events(res)).toContain('ready');
+    expect(handlerStats()).toEqual({
+      catchupStartedTotal: 1,
+      catchupCompletedTotal: 1,
+      catchupResyncedTotal: 0,
+    });
+  });
+
+  it('catch-up failure path → started + resynced bump, completed does NOT', async () => {
+    sb.state.response = { data: null, error: { message: 'boom' } };
+    const res = makeRes();
+    getStreamHandler(makeReq({ resource: 'fills', query: { cursor: fillCursor } }), res as unknown as Response);
+    await flush();
+    expect(events(res)).toContain('resync');
+    expect(events(res)).not.toContain('ready');
+    expect(handlerStats()).toEqual({
+      catchupStartedTotal: 1,
+      catchupCompletedTotal: 0,
+      catchupResyncedTotal: 1,
+    });
+  });
+
+  it('counters accumulate cumulatively across multiple connections', async () => {
+    // Two ready connections + one resync connection → started=3, completed=2, resynced=1.
+    const r1 = makeRes();
+    getStreamHandler(makeReq({ resource: 'fills' }), r1 as unknown as Response);
+    await flush();
+    r1.emitClose();
+
+    const r2 = makeRes();
+    getStreamHandler(makeReq({ resource: 'fills' }), r2 as unknown as Response);
+    await flush();
+    r2.emitClose();
+
+    sb.state.response = { data: null, error: { message: 'boom' } };
+    const r3 = makeRes();
+    getStreamHandler(makeReq({ resource: 'fills', query: { cursor: fillCursor } }), r3 as unknown as Response);
+    await flush();
+
+    expect(handlerStats()).toEqual({
+      catchupStartedTotal: 3,
+      catchupCompletedTotal: 2,
+      catchupResyncedTotal: 1,
+    });
+  });
+
+  it('slow-client shed during catch-up is NOT counted as completed (Hermes review-28 blocker)', async () => {
+    // Production race: makeShedIfSlow calls res.end() synchronously but the 'close'
+    // event fires asynchronously, so the wrapper's `closed` flag stays false on the
+    // microtask boundary the IIFE re-enters on. Before the fix, runCatchUp returned
+    // 'complete' after the short page and the wrapper bumped catchupCompletedTotal
+    // even though no `ready` reached the client. The metric must attribute this to
+    // slowClientShedTotal only, not to completed/resynced.
+    const { MAX_PENDING_BYTES } = await import('../src/v1/stream/common.js');
+    sb.state.response = { data: [fillRow(1)], error: null };
+
+    const res = makeRes();
+    res.writableLength = MAX_PENDING_BYTES + 1; // first shed() inside runCatchUp trips
+    // Override end() so writableEnded is set but the 'close' event is NOT emitted
+    // synchronously — mirrors the production race.
+    res.end = function () {
+      (this as FakeRes).writableEnded = true;
+    };
+
+    getStreamHandler(
+      makeReq({ resource: 'fills', query: { cursor: fillCursor } }),
+      res as unknown as Response,
+    );
+    await flush();
+
+    expect(connectionStats().slowClientShedTotal).toBe(1);
+    expect(events(res)).not.toContain('ready');
+    expect(handlerStats()).toEqual({
+      catchupStartedTotal: 1,
+      catchupCompletedTotal: 0,
+      catchupResyncedTotal: 0,
+    });
+
+    // Clean up: emit close manually so the slot is released for subsequent tests.
+    res.emitClose();
   });
 });

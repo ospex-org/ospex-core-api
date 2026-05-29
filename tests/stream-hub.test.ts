@@ -314,8 +314,31 @@ describe('StreamHub overlap window (blocker 1)', () => {
     });
     const c = collector('fills');
     const sub = hub.subscribe('fills', c.filters, c.cb);
+    expect(hub.stats().resyncBroadcastTotal).toBe(0);
     await hub.pollResource('fills');
     expect(c.resyncs).toContain('overlap_window_too_large');
+    // Each resyncResource() call bumps the counter once (regardless of subscriber count).
+    expect(hub.stats().resyncBroadcastTotal).toBe(1);
+    hub.unsubscribe(sub);
+  });
+
+  it('cumulatively counts resyncBroadcastTotal across multiple overflow ticks', async () => {
+    const data = [fillRow(1, 1), fillRow(2, 2)];
+    const hub = new StreamHub({
+      getClient: () => datasetClient(() => data, () => []),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+      overlapMs: 60_000,
+      pollLimit: 1,
+      maxOverlapPages: 1,
+    });
+    const c = collector('fills');
+    const sub = hub.subscribe('fills', c.filters, c.cb);
+    await hub.pollResource('fills');
+    await hub.pollResource('fills');
+    await hub.pollResource('fills');
+    expect(hub.stats().resyncBroadcastTotal).toBe(3);
     hub.unsubscribe(sub);
   });
 });
@@ -346,13 +369,13 @@ describe('StreamHub poller ref-counting', () => {
     const a = hub.subscribe('fills', {}, collector('fills').cb);
     const b = hub.subscribe('fills', {}, collector('fills').cb);
     const c = hub.subscribe('commitments', {}, collector('commitments').cb);
-    expect(hub.stats()).toEqual({ resources: 2, subscribers: 3 });
+    expect(hub.stats()).toEqual({ resources: 2, subscribers: 3, resyncBroadcastTotal: 0 });
     hub.unsubscribe(a);
-    expect(hub.stats()).toEqual({ resources: 2, subscribers: 2 });
+    expect(hub.stats()).toEqual({ resources: 2, subscribers: 2, resyncBroadcastTotal: 0 });
     hub.unsubscribe(b);
-    expect(hub.stats()).toEqual({ resources: 1, subscribers: 1 });
+    expect(hub.stats()).toEqual({ resources: 1, subscribers: 1, resyncBroadcastTotal: 0 });
     hub.unsubscribe(c);
-    expect(hub.stats()).toEqual({ resources: 0, subscribers: 0 });
+    expect(hub.stats()).toEqual({ resources: 0, subscribers: 0, resyncBroadcastTotal: 0 });
   });
 });
 

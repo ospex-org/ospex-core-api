@@ -13,6 +13,7 @@ import { getMetricsHandler } from '../src/v1/metrics.js';
 import { __setStreamHubForTest } from '../src/v1/stream/hub.js';
 import { __setOddsHubForTest } from '../src/v1/stream/oddsHub.js';
 import { __resetConnections, acquire, configureConnectionCaps } from '../src/v1/stream/connections.js';
+import { __resetHandlerMetrics } from '../src/v1/stream/handler.js';
 
 interface FakeRes {
   statusCode: number;
@@ -35,20 +36,35 @@ function makeRes(): FakeRes {
 }
 const req = {} as unknown as Request;
 
-function fakeStreamHub(stats: { resources: number; subscribers: number }): StreamHub {
-  return { stats: () => stats } as unknown as StreamHub;
+function fakeStreamHub(stats: {
+  resources: number;
+  subscribers: number;
+  resyncBroadcastTotal?: number;
+}): StreamHub {
+  const full = { resyncBroadcastTotal: 0, ...stats };
+  return { stats: () => full } as unknown as StreamHub;
 }
-function fakeOddsHub(stats: { subscribers: number; channelOpen: boolean; subscribed: boolean; degraded: boolean }): OddsHub {
-  return { stats: () => stats } as unknown as OddsHub;
+function fakeOddsHub(stats: {
+  subscribers: number;
+  channelOpen: boolean;
+  subscribed: boolean;
+  degraded: boolean;
+  channelDegradedTotal?: number;
+  hardResetTotal?: number;
+}): OddsHub {
+  const full = { channelDegradedTotal: 0, hardResetTotal: 0, ...stats };
+  return { stats: () => full } as unknown as OddsHub;
 }
 
 beforeEach(() => {
   __resetConnections();
+  __resetHandlerMetrics();
 });
 afterEach(() => {
   __setStreamHubForTest(undefined);
   __setOddsHubForTest(undefined);
   __resetConnections();
+  __resetHandlerMetrics();
 });
 
 describe('GET /v1/metrics', () => {
@@ -85,6 +101,76 @@ describe('GET /v1/metrics', () => {
       stream: { resources: 2, subscribers: 5 },
       odds: { subscribers: 3, channelOpen: true, subscribed: true, degraded: false },
       connections: { total: 3, ips: 2, maxTotal: 50, maxPerIp: 4 },
+    });
+  });
+
+  // ── M0 cumulative counters ───────────────────────────────────────────────
+
+  it('exposes the M0 counters (cumulative; zero on a fresh process)', () => {
+    __setStreamHubForTest(fakeStreamHub({ resources: 0, subscribers: 0 }));
+    __setOddsHubForTest(fakeOddsHub({ subscribers: 0, channelOpen: false, subscribed: false, degraded: false }));
+
+    const res = makeRes();
+    getMetricsHandler(req, res as unknown as Response);
+
+    expect(res.body).toMatchObject({
+      stream: {
+        resyncBroadcastTotal: 0,
+        catchupStartedTotal: 0,
+        catchupCompletedTotal: 0,
+        catchupResyncedTotal: 0,
+      },
+      odds: {
+        channelDegradedTotal: 0,
+        hardResetTotal: 0,
+      },
+      connections: {
+        rejectedTotal: 0,
+        rejectedByScope: { ip: 0, total: 0 },
+        slowClientShedTotal: 0,
+      },
+    });
+  });
+
+  it('surfaces per-IP rejection counts (acquire failures bump rejectedTotal + rejectedByScope.ip)', () => {
+    __setStreamHubForTest(fakeStreamHub({ resources: 0, subscribers: 0 }));
+    __setOddsHubForTest(fakeOddsHub({ subscribers: 0, channelOpen: false, subscribed: false, degraded: false }));
+    configureConnectionCaps({ maxTotal: 10, maxPerIp: 2 });
+    acquire('1.2.3.4'); // ok
+    acquire('1.2.3.4'); // ok (at cap)
+    acquire('1.2.3.4'); // rejected — per-ip
+    acquire('1.2.3.4'); // rejected — per-ip
+
+    const res = makeRes();
+    getMetricsHandler(req, res as unknown as Response);
+
+    expect(res.body).toMatchObject({
+      connections: {
+        total: 2,
+        rejectedTotal: 2,
+        rejectedByScope: { ip: 2, total: 0 },
+      },
+    });
+  });
+
+  it('surfaces server-wide rejection counts (rejectedByScope.total when maxTotal hit)', () => {
+    __setStreamHubForTest(fakeStreamHub({ resources: 0, subscribers: 0 }));
+    __setOddsHubForTest(fakeOddsHub({ subscribers: 0, channelOpen: false, subscribed: false, degraded: false }));
+    configureConnectionCaps({ maxTotal: 2, maxPerIp: 10 });
+    acquire('1.1.1.1'); // ok
+    acquire('2.2.2.2'); // ok (at total cap)
+    acquire('3.3.3.3'); // rejected — total
+    acquire('4.4.4.4'); // rejected — total
+
+    const res = makeRes();
+    getMetricsHandler(req, res as unknown as Response);
+
+    expect(res.body).toMatchObject({
+      connections: {
+        total: 2,
+        rejectedTotal: 2,
+        rejectedByScope: { ip: 0, total: 2 },
+      },
     });
   });
 });
