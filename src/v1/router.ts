@@ -22,6 +22,7 @@ import { getCurrentOddsHandler } from './odds.js';
 import { getGameByIdHandler, getGamesHandler } from './games.js';
 import { getTeamAliasesHandler } from './teams.js';
 import { getAuthDomainHandler } from './auth.js';
+import { postStreamChallengeHandler, postStreamTokenHandler } from './streamAuth.js';
 import { getPublicConfigHandler } from './config.js';
 import { getProtocolInfoHandler } from './protocol.js';
 import { getMetricsHandler } from './metrics.js';
@@ -89,6 +90,17 @@ v1Router.get('/speculations/:speculationId', readRateLimit, asyncHandler(getSpec
 v1Router.get('/protocol/info', readRateLimit, (req, res) => getProtocolInfoHandler(req, res));
 
 v1Router.get('/auth/domain', readRateLimit, (req, res) => getAuthDomainHandler(req, res));
+
+// ── Stream-auth (M3): EIP-712 challenge → bearer token ──────────────
+// Owner-auth handshake for the M4 `/v1/own-state/*` surfaces. Both endpoints
+// share the same rate budget as signed-write commitments — moderate cost,
+// stops a bad actor from burning challenges or HMAC-grinding at request-rate.
+v1Router.post('/auth/stream-challenge', commitmentsRateLimit, (req, res) =>
+  postStreamChallengeHandler(req, res),
+);
+v1Router.post('/auth/stream-token', commitmentsRateLimit, (req, res) =>
+  postStreamTokenHandler(req, res),
+);
 
 v1Router.get('/config/public', readRateLimit, (req, res) => getPublicConfigHandler(req, res));
 

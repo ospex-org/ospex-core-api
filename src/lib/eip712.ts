@@ -91,6 +91,58 @@ export function buildDomain(chainId: ChainId, verifyingContract: string): TypedD
   };
 }
 
+/**
+ * Build the stream-auth EIP-712 domain. SEPARATE `domainSeparator` from the
+ * on-chain commitment domain (spec §3.2: namespace under `OspexStreamAuth`) —
+ * the `name` field differs, so an `OspexCommitment` signature can never be
+ * replayed as an `OspexStreamAuth` and vice-versa. The `verifyingContract`
+ * field reuses the matching-module address only to keep the domain shape
+ * identical to the existing idiom; nothing on chain reads stream-auth domains.
+ */
+export function buildStreamAuthDomain(chainId: ChainId, verifyingContract: string): TypedDataDomain {
+  return {
+    name: 'OspexStreamAuth',
+    version: '1',
+    chainId,
+    verifyingContract,
+  };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// OspexStreamAuth — stream-auth challenge (spec §3.2)
+//
+// Owner-auth own-state subscribers sign a server-minted challenge; the server
+// trades the signature for a short-lived bearer token. The challenge is a
+// NESTED typed-data struct (`network.chainId` is its own struct) so future
+// network metadata (`network.name`, etc.) doesn't require a breaking schema
+// change. Two struct sets get registered for ethers' EIP-712 walker:
+// `OspexStreamAuth` (primary) + `StreamAuthNetwork` (nested).
+// ────────────────────────────────────────────────────────────────────
+
+const STREAM_AUTH_NETWORK_FIELDS: TypedDataField[] = [
+  { name: 'chainId', type: 'uint256' },
+];
+
+const OSPEX_STREAM_AUTH_FIELDS: TypedDataField[] = [
+  { name: 'address', type: 'address' },
+  { name: 'resource', type: 'string' },
+  { name: 'scope', type: 'string' },
+  { name: 'network', type: 'StreamAuthNetwork' },
+  { name: 'audience', type: 'string' },
+  { name: 'challengeId', type: 'string' },
+  { name: 'issuedAt', type: 'uint256' },
+  { name: 'expiresAt', type: 'uint256' },
+];
+
+/**
+ * Multi-type types Record for an `OspexStreamAuth` challenge. Pass to
+ * `verifyTypedData(domain, STREAM_AUTH_TYPES, message, signature)`.
+ */
+export const STREAM_AUTH_TYPES: Readonly<Record<string, TypedDataField[]>> = {
+  OspexStreamAuth: OSPEX_STREAM_AUTH_FIELDS,
+  StreamAuthNetwork: STREAM_AUTH_NETWORK_FIELDS,
+};
+
 // ────────────────────────────────────────────────────────────────────
 // Verify + hash
 // ────────────────────────────────────────────────────────────────────
@@ -109,18 +161,21 @@ export type VerifyError =
  * Recover the signer of a typed-data message and compute its EIP-712
  * hash. Returns the recovered address (always — this function does NOT
  * compare against a claimed maker; the caller does that).
+ *
+ * `types` is the full Record (`{primaryType: fields, ...nestedTypes}`),
+ * not just a single action's fields, so callers with nested struct
+ * schemas (e.g. `OspexStreamAuth.network: StreamAuthNetwork`) can pass
+ * the complete graph in one call.
  */
 export function verifyTypedData(
   domain: TypedDataDomain,
-  action: ActionType,
+  types: Record<string, TypedDataField[]>,
   message: Record<string, unknown>,
   signature: string,
 ): VerifyResult | VerifyError {
   if (typeof signature !== 'string' || !signature.startsWith('0x')) {
     return { kind: 'invalid_signature_format' };
   }
-  const fields = getActionFields(action);
-  const types = { [action]: fields };
   let recoveredAddress: string;
   try {
     recoveredAddress = ethers.verifyTypedData(domain, types, message, signature);

@@ -31,6 +31,7 @@ In progress. Working today:
 - **SSE streams (Phase 1.5):** `GET /v1/stream/{commitments,positions,fills,speculations,contests}` — live deltas + cursor catch-up + resync over Server-Sent Events. See "SSE streams" below.
 - **Odds stream (Phase 1.5):** `GET /v1/stream/odds?contestId=&market=` — snapshot then live `change`/`refresh` over Server-Sent Events (latest-state, no cursor). See "Odds stream" below.
 - `GET /v1/metrics` — operational stream / odds / connection counters (process-local). See "Metrics" below.
+- **Stream auth (M3):** `POST /v1/auth/stream-challenge` + `POST /v1/auth/stream-token` — EIP-712 challenge/response that mints a ~15 min HMAC bearer token, scoped to `{address, audience, chainId}`. Required for the owner-auth `/v1/own-state/*` surfaces landing in M4; the public/anonymous reads above are unchanged.
 
 Not ported (no R4 analog — see "Position helpers" section below): `/withdraw-params`, `/withdraw-result/:txHash`. Not ported in any batch yet (deferred or out of scope): everything else under `/v1/analytics/*`, `/v1/current-odds*` (the legacy `/v1/current-odds*` paths from agent-server are superseded by the contest-centric `/v1/contests/:contestId/odds`).
 
@@ -508,11 +509,17 @@ Set via `heroku config:set <var>=<value> --app ospex-core-api`. Mirrors `.env.ex
 - `NETWORK` — `polygon` for production, `amoy` for testnet
 - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
 - `ALCHEMY_RPC_URL` — Polygon mainnet RPC (PAYG-tier — required by `/v1/positions/by-tx` and `/v1/positions/claim-result`)
-- `MATCHING_MODULE_ADDRESS` — R4 matching module; verifying contract for the EIP-712 domain on `POST /v1/commitments` and `DELETE /v1/commitments/:hash`
+- `MATCHING_MODULE_ADDRESS` — R4 matching module; verifying contract for the EIP-712 domain on `POST /v1/commitments` and `DELETE /v1/commitments/:hash`, **and** reused as the verifying contract of the separate `OspexStreamAuth` domain (M3 — see `STREAM_AUTH_*` below). The stream-auth endpoints return `503 NOT_READY` if this is unset
 - `SCORER_MONEYLINE_ADDRESS`, `SCORER_SPREAD_ADDRESS`, `SCORER_TOTAL_ADDRESS` — required by `POST /v1/commitments` (all-or-nothing; partial config is rejected at boot)
 - `POSITION_MODULE_ADDRESS` — optional defensive log-source filter for tx parsers
 - `MAX_STREAM_CONNECTIONS_TOTAL`, `MAX_STREAM_CONNECTIONS_PER_IP` — optional SSE concurrent-connection caps (defaults 200 / 10); set either to tune the stream stack without a code change
 - `REDACT_HIDDEN_PUBLIC` — optional bool, **default `true`** (redaction enforced). Short-lived rollout/rollback guard for the M2 hidden-row redaction. Setting `false` reverts every anonymous read path to the legacy "full body for all rows" behavior for a deploy window only; the flag is scheduled for removal post-M7 cutover
+- `STREAM_AUTH_HMAC_SECRET` — optional but required by **both** stream-auth POST endpoints AND the `verifyStreamToken` middleware (each returns `503 NOT_READY` if unset). HMAC-SHA256 secret used to sign + verify stream-auth bearer tokens; must be ≥ 32 characters of entropy (boot-time fatal otherwise). Rotation = add a second key and accept both during transition (follow-up; current `kid` is `v1`)
+- `STREAM_AUTH_AUDIENCE` — optional but required by both stream-auth POST endpoints (same `503 NOT_READY` rule). The canonical host string bound into both the challenge typed-data and the issued token (e.g. `https://api.ospex.org`); SDK clients derive the same string from their `baseUrl`, so a token minted for one deployment cannot be replayed against another
+- `STREAM_CHALLENGE_TTL_SECONDS` — optional, default `180` (3 min). Lifetime of a single-use challenge; **boot-fatal outside [120, 300]** per spec §3.3
+- `STREAM_TOKEN_TTL_SECONDS` — optional, default `900` (15 min). Lifetime of an issued bearer token; **boot-fatal outside [60, 1800]**
+
+The stream-auth challenge store is **in-memory, per-process**. A challenge minted on one dyno cannot be consumed on another — fine for the current single-dyno Heroku deployment, but horizontal scale-out requires moving challenges to Redis/Postgres or running with sticky routing first. The endpoint-level `503 NOT_READY` checks are deliberately separate from `/readyz` (next section) — `/readyz` keeps the meaning "the always-required dependencies are reachable", and stream-auth is opt-in at the operator level.
 
 `NODE_ENV=production` and `LOG_LEVEL=info` are recommended. **Do not set `PORT`** — Heroku injects it; setting it as a config var creates a binding mismatch.
 
@@ -526,7 +533,7 @@ curl -s "$URL/v1/protocol/info"    # mainnet contract addresses
 curl -s "$URL/v1/contests"         # paginated list (empty until indexer ingests data)
 ```
 
-`/readyz` is the canonical "everything wired" check — both Supabase reachability and EIP-712 relay env config are surfaced in the JSON.
+`/readyz` checks the always-required dependencies: Supabase reachability + EIP-712 relay env config for `POST /v1/commitments`. It does **not** include stream-auth (M3) readiness — those endpoints are opt-in at the operator level and surface their own `503 NOT_READY` per call when `STREAM_AUTH_HMAC_SECRET` / `STREAM_AUTH_AUDIENCE` / `MATCHING_MODULE_ADDRESS` are unset.
 
 ## Project conventions
 
