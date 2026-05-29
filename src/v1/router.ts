@@ -23,6 +23,8 @@ import { getGameByIdHandler, getGamesHandler } from './games.js';
 import { getTeamAliasesHandler } from './teams.js';
 import { getAuthDomainHandler } from './auth.js';
 import { postStreamChallengeHandler, postStreamTokenHandler } from './streamAuth.js';
+import { ownStateSnapshotHandler } from './ownState/snapshot.js';
+import { verifyStreamToken } from '../middleware/verifyStreamToken.js';
 import { getPublicConfigHandler } from './config.js';
 import { getProtocolInfoHandler } from './protocol.js';
 import { getMetricsHandler } from './metrics.js';
@@ -100,6 +102,17 @@ v1Router.post('/auth/stream-challenge', commitmentsRateLimit, (req, res) =>
 );
 v1Router.post('/auth/stream-token', commitmentsRateLimit, (req, res) =>
   postStreamTokenHandler(req, res),
+);
+
+// ── Own-state (M4): owner-auth snapshot + (M4b) SSE composite stream ──
+// Snapshot is paged owner-auth REST — `verifyStreamToken` middleware fronts
+// the route, attaching `req.streamAuth.address`. `readRateLimit` is shared
+// with the other GETs; an SDK does one-or-two snapshot calls per session.
+v1Router.get(
+  '/own-state/snapshot',
+  readRateLimit,
+  verifyStreamToken,
+  asyncHandler(ownStateSnapshotHandler),
 );
 
 v1Router.get('/config/public', readRateLimit, (req, res) => getPublicConfigHandler(req, res));

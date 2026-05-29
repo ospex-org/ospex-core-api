@@ -32,6 +32,7 @@ In progress. Working today:
 - **Odds stream (Phase 1.5):** `GET /v1/stream/odds?contestId=&market=` — snapshot then live `change`/`refresh` over Server-Sent Events (latest-state, no cursor). See "Odds stream" below.
 - `GET /v1/metrics` — operational stream / odds / connection counters (process-local). See "Metrics" below.
 - **Stream auth (M3):** `POST /v1/auth/stream-challenge` + `POST /v1/auth/stream-token` — EIP-712 challenge/response that mints a ~15 min HMAC bearer token, scoped to `{address, audience, chainId}`. Required for the owner-auth `/v1/own-state/*` surfaces landing in M4; the public/anonymous reads above are unchanged.
+- **Own-state snapshot (M4a):** `GET /v1/own-state/snapshot?cursor=<opt>` — owner-auth (`Authorization: Bearer <stream-token>`) paged snapshot of the maker's commitments + positions. Returns `{cursor, commitments[], positions[], truncated, positionsTruncated}` per spec §6.1. The composite cursor is the resume point for `/v1/stream/own-state` (M4b) or — when `truncated: true` (commitments-only) — the continuation key for the next page. `positionsTruncated` is informational and decoupled from `truncated`: positions beyond the helper's 200-row cap are converged by the M4b stream (cursor `p` watermark preserved) or the `/v1/positions/:address` fallback. **Passive expiry** (a commitment whose only terminal transition is `expiry <= now`) is NOT emitted by recovery — the indexer doesn't advance `row_updated_at` for time alone, so such rows fall outside both halves of the recovery response. The SDK reducer is responsible for computing effective status locally (same `deriveEffectiveStatus` pattern used by `/v1/commitments`) and pruning any locally-held active commitment whose stored expiry has lapsed; the active set the snapshot returns is authoritative of currently-matchable rows.
 
 Not ported (no R4 analog — see "Position helpers" section below): `/withdraw-params`, `/withdraw-result/:txHash`. Not ported in any batch yet (deferred or out of scope): everything else under `/v1/analytics/*`, `/v1/current-odds*` (the legacy `/v1/current-odds*` paths from agent-server are superseded by the contest-centric `/v1/contests/:contestId/odds`).
 
@@ -56,7 +57,7 @@ Then:
 
 ```bash
 curl http://localhost:3000/healthz   # liveness — always 200 if process is up
-curl http://localhost:3000/readyz    # readiness — 200 only if Supabase is reachable
+curl http://localhost:3000/readyz    # readiness — 200 when always-required deps (Supabase + EIP-712 relay env) are wired
 ```
 
 ## Health endpoints
@@ -518,6 +519,7 @@ Set via `heroku config:set <var>=<value> --app ospex-core-api`. Mirrors `.env.ex
 - `STREAM_AUTH_AUDIENCE` — optional but required by both stream-auth POST endpoints (same `503 NOT_READY` rule). The canonical host string bound into both the challenge typed-data and the issued token (e.g. `https://api.ospex.org`); SDK clients derive the same string from their `baseUrl`, so a token minted for one deployment cannot be replayed against another
 - `STREAM_CHALLENGE_TTL_SECONDS` — optional, default `180` (3 min). Lifetime of a single-use challenge; **boot-fatal outside [120, 300]** per spec §3.3
 - `STREAM_TOKEN_TTL_SECONDS` — optional, default `900` (15 min). Lifetime of an issued bearer token; **boot-fatal outside [60, 1800]**
+- `OWN_STATE_SNAPSHOT_MAX_COMMITMENTS` — optional, default `5000` per spec §6.2. Per-page commitments cap for `GET /v1/own-state/snapshot`; **boot-fatal outside [100, 50000]**. SDK pages with `?cursor=` until the response carries `truncated: false`
 
 The stream-auth challenge store is **in-memory, per-process**. A challenge minted on one dyno cannot be consumed on another — fine for the current single-dyno Heroku deployment, but horizontal scale-out requires moving challenges to Redis/Postgres or running with sticky routing first. The endpoint-level `503 NOT_READY` checks are deliberately separate from `/readyz` (next section) — `/readyz` keeps the meaning "the always-required dependencies are reachable", and stream-auth is opt-in at the operator level.
 

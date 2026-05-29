@@ -95,6 +95,16 @@ export interface PositionFetchResult {
   active: PositionBase[];
   pendingSettle: PendingSettlePosition[];
   claimable: ClaimablePosition[];
+  /**
+   * `true` when the raw `positions` DB query returned exactly
+   * `POSITION_QUERY_LIMIT` rows — the categorization happens AFTER that
+   * cap, so checking `active.length + pendingSettle.length +
+   * claimable.length` is unsafe (it under-detects truncation when the
+   * helper filters out lost rows below the cap). Callers that need to
+   * know whether more positions exist beyond what was categorized MUST
+   * read this field. Hermes review-31 round 2 blocker #3.
+   */
+  hitCap: boolean;
 }
 
 interface PositionRow {
@@ -218,7 +228,11 @@ export async function fetchCategorizedPositions(
 
   if (posRes.error) throw new Error(`fetchCategorizedPositions positions: ${posRes.error.message}`);
   const positions = (posRes.data ?? []) as unknown as PositionRow[];
-  if (positions.length === 0) return { active: [], pendingSettle: [], claimable: [] };
+  // Raw-cap signal — `>=` (not `===`) tolerates a future Supabase quirk where
+  // PostgREST returns 201 on a `limit(200)`; the predicate here is "did we
+  // saturate the cap budget?".
+  const hitCap = positions.length >= POSITION_QUERY_LIMIT;
+  if (positions.length === 0) return { active: [], pendingSettle: [], claimable: [], hitCap };
 
   // Step 2: batch-fetch related speculations.
   // `market_type` is read straight from the column (populated by the
@@ -384,7 +398,7 @@ export async function fetchCategorizedPositions(
     active.push(base);
   }
 
-  return { active, pendingSettle, claimable };
+  return { active, pendingSettle, claimable, hitCap };
 }
 
 /** Convenience for callers needing the on-chain enum string back from the int. */
