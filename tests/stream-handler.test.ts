@@ -389,4 +389,40 @@ describe('catchup counters', () => {
       catchupResyncedTotal: 1,
     });
   });
+
+  it('slow-client shed during catch-up is NOT counted as completed (Hermes review-28 blocker)', async () => {
+    // Production race: makeShedIfSlow calls res.end() synchronously but the 'close'
+    // event fires asynchronously, so the wrapper's `closed` flag stays false on the
+    // microtask boundary the IIFE re-enters on. Before the fix, runCatchUp returned
+    // 'complete' after the short page and the wrapper bumped catchupCompletedTotal
+    // even though no `ready` reached the client. The metric must attribute this to
+    // slowClientShedTotal only, not to completed/resynced.
+    const { MAX_PENDING_BYTES } = await import('../src/v1/stream/common.js');
+    sb.state.response = { data: [fillRow(1)], error: null };
+
+    const res = makeRes();
+    res.writableLength = MAX_PENDING_BYTES + 1; // first shed() inside runCatchUp trips
+    // Override end() so writableEnded is set but the 'close' event is NOT emitted
+    // synchronously — mirrors the production race.
+    res.end = function () {
+      (this as FakeRes).writableEnded = true;
+    };
+
+    getStreamHandler(
+      makeReq({ resource: 'fills', query: { cursor: fillCursor } }),
+      res as unknown as Response,
+    );
+    await flush();
+
+    expect(connectionStats().slowClientShedTotal).toBe(1);
+    expect(events(res)).not.toContain('ready');
+    expect(handlerStats()).toEqual({
+      catchupStartedTotal: 1,
+      catchupCompletedTotal: 0,
+      catchupResyncedTotal: 0,
+    });
+
+    // Clean up: emit close manually so the slot is released for subsequent tests.
+    res.emitClose();
+  });
 });
