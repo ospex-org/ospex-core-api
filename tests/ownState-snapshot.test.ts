@@ -260,7 +260,7 @@ describe('GET /v1/own-state/snapshot — cold start (no cursor)', () => {
     expect(activeQueryCalls.some((c) => c.method === 'eq' && c.args[0] === 'book_visible')).toBe(false);
   });
 
-  it('returns truncated=true + page cursor at the last returned row when result fills the cap', async () => {
+  it('returns truncated=true + page-active cursor at the last returned row when result fills the cap (cold start)', async () => {
     envMock.loadConfig.mockReturnValue({
       network: 'polygon',
       chainId: 137,
@@ -273,7 +273,7 @@ describe('GET /v1/own-state/snapshot — cold start (no cursor)', () => {
     ];
     const { client } = makeSupabase([
       { data: rows, error: null },                       // active
-      { data: fillsWatermarkRow, error: null },          // max fills (no max-commitments query in truncated path)
+      { data: fillsWatermarkRow, error: null },          // max fills (cold start — no input cursor)
       { data: positionsWatermarkRow, error: null },      // max positions
     ]);
     supabaseMock.getSupabase.mockReturnValue(client);
@@ -284,7 +284,8 @@ describe('GET /v1/own-state/snapshot — cold start (no cursor)', () => {
     expect(body.truncated).toBe(true);
     expect(body.commitments).toHaveLength(2);
     const decoded = decodeOwnStateCursor(body.cursor);
-    expect(decoded.k).toBe('page');
+    // Cold-start truncation → page-active (subsequent pages don't run terminal query).
+    expect(decoded.k).toBe('page-active');
     expect(decoded.c).toEqual({ s: '2026-05-29T14:00:01.000Z', i: '12' });
   });
 
@@ -397,29 +398,28 @@ describe('GET /v1/own-state/snapshot — cursor k=live (recovery)', () => {
 // Cursor with k='page' — paging through cold-start truncation
 // ─────────────────────────────────────────────────────────────────────────
 
-describe('GET /v1/own-state/snapshot — cursor k=page (paging)', () => {
-  function pageCursor(): string {
+describe('GET /v1/own-state/snapshot — cursor k=page-active (cold-start paging)', () => {
+  function pageActiveCursor(): string {
     return encodeOwnStateCursor({
       t: 'own-state',
       v: OWN_STATE_CURSOR_VERSION,
       c: { s: '2026-05-29T11:00:00.000Z', i: '12' },
       f: { s: '2026-05-29T10:00:00.000Z', i: '0' },
       p: { s: '2026-05-29T10:00:00.000Z', i: '0' },
-      k: 'page',
+      k: 'page-active',
     });
   }
 
   it('advances the active-set query past the page cursor — no terminal query', async () => {
     const { client, calls } = makeSupabase([
       { data: [], error: null },                          // active (past page cursor)
-      { data: null, error: null },                        // max commitments
-      { data: null, error: null },                        // max fills
-      { data: null, error: null },                        // max positions
+      { data: null, error: null },                        // max commitments (not truncated)
+      { data: null, error: null },                        // max positions (not positions_truncated)
     ]);
     supabaseMock.getSupabase.mockReturnValue(client);
 
     await ownStateSnapshotHandler(
-      makeReq({ query: { cursor: pageCursor() } }),
+      makeReq({ query: { cursor: pageActiveCursor() } }),
       makeRes() as unknown as Response,
     );
 
@@ -428,6 +428,27 @@ describe('GET /v1/own-state/snapshot — cursor k=page (paging)', () => {
     // ONE .or() for the active-set page (cursor watermark); no terminal .or().
     expect(orCalls).toHaveLength(1);
     expect(String(orCalls[0]?.args[0])).toContain('2026-05-29T11:00:00.000Z');
+  });
+
+  it('preserves f watermark from input cursor — never advances past undelivered fills (Hermes blocker #3)', async () => {
+    const inputF = { s: '2026-05-29T10:00:00.000Z', i: '0' };
+    const { client, calls } = makeSupabase([
+      { data: [], error: null },                          // active
+      { data: null, error: null },                        // max commitments
+      { data: null, error: null },                        // max positions
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+
+    const res = makeRes();
+    await ownStateSnapshotHandler(
+      makeReq({ query: { cursor: pageActiveCursor() } }),
+      res as unknown as Response,
+    );
+    const body = res.body as { cursor: string };
+    const decoded = decodeOwnStateCursor(body.cursor);
+    expect(decoded.f).toEqual(inputF);
+    // Critically: NO position_fills MAX query was issued on a cursor input.
+    expect(calls.some((c) => c.table === 'position_fills')).toBe(false);
   });
 });
 
@@ -502,8 +523,284 @@ describe('GET /v1/own-state/snapshot — position categorization', () => {
     const res = makeRes();
     await ownStateSnapshotHandler(makeReq(), res as unknown as Response);
 
-    const body = res.body as { positions: Array<{ status: string }> };
+    const body = res.body as { positions: Array<{ status: string }>; positionsTruncated: boolean };
     expect(body.positions).toHaveLength(3);
     expect(body.positions.map((p) => p.status)).toEqual(['active', 'pendingSettle', 'claimable']);
+    expect(body.positionsTruncated).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Hermes review-31 round 1 — blocker regressions
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', () => {
+  // Blocker 1: terminal-recovery keyset on k='live' input applies the
+  // 30s overlap floor — a late-committed row whose `row_updated_at` predates
+  // the cursor by < 30s is included rather than skipped forever.
+  it('k=live input → terminal-recovery keyset is FLOORED by 30s overlap (blocker #1)', async () => {
+    const cursor = encodeOwnStateCursor({
+      t: 'own-state',
+      v: OWN_STATE_CURSOR_VERSION,
+      c: { s: '2026-05-29T10:00:00.000Z', i: '500' },
+      f: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      p: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      k: 'live',
+    });
+    const { client, calls } = makeSupabase([
+      { data: [], error: null },                          // active
+      { data: [], error: null },                          // terminal
+      { data: [], error: null },                          // claimed
+      { data: null, error: null },                        // max commitments
+      { data: null, error: null },                        // max positions
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+
+    await ownStateSnapshotHandler(
+      makeReq({ query: { cursor } }),
+      makeRes() as unknown as Response,
+    );
+
+    // The terminal query's .or() calls = [terminal-predicate, keyset].
+    const commitmentsOrCalls = calls.filter((c) => c.method === 'or' && c.table === 'commitments');
+    expect(commitmentsOrCalls).toHaveLength(2);
+    // Second .or() is the keyset — must contain the FLOORED timestamp,
+    // NOT the cursor's raw 10:00:00.
+    const keysetArg = String(commitmentsOrCalls[1]?.args[0]);
+    expect(keysetArg).toContain('2026-05-29T09:59:30.000Z'); // 10:00:00 - 30s
+    expect(keysetArg).not.toContain('2026-05-29T10:00:00.000Z');
+  });
+
+  // Same on the claimed-positions keyset.
+  it('k=live input → claimed-position keyset is FLOORED by 30s overlap', async () => {
+    const cursor = encodeOwnStateCursor({
+      t: 'own-state',
+      v: OWN_STATE_CURSOR_VERSION,
+      c: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      f: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      p: { s: '2026-05-29T10:00:00.000Z', i: '500' },
+      k: 'live',
+    });
+    const { client, calls } = makeSupabase([
+      { data: [], error: null },                          // active
+      { data: [], error: null },                          // terminal
+      { data: [], error: null },                          // claimed
+      { data: null, error: null },                        // max commitments
+      { data: null, error: null },                        // max positions
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+
+    await ownStateSnapshotHandler(
+      makeReq({ query: { cursor } }),
+      makeRes() as unknown as Response,
+    );
+
+    const positionsOrCalls = calls.filter((c) => c.method === 'or' && c.table === 'positions');
+    // Single .or() on positions (claimed keyset).
+    expect(positionsOrCalls).toHaveLength(1);
+    expect(String(positionsOrCalls[0]?.args[0])).toContain('2026-05-29T09:59:30.000Z');
+  });
+
+  // Blocker 2: paging across truncation MUST keep terminals coming. After
+  // a recovery-mode truncation, the next page (k='page-recovery') runs the
+  // terminal query AGAIN, this time with STRICT keyset advance.
+  it('k=page-recovery input → terminal query still runs, with STRICT keyset (blocker #2)', async () => {
+    const cursor = encodeOwnStateCursor({
+      t: 'own-state',
+      v: OWN_STATE_CURSOR_VERSION,
+      c: { s: '2026-05-29T11:30:00.000Z', i: '300' },
+      f: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      p: { s: '2026-05-29T11:30:00.000Z', i: '0' },
+      k: 'page-recovery',
+    });
+    const { client, calls } = makeSupabase([
+      { data: [], error: null },                          // active
+      { data: [], error: null },                          // terminal (still runs!)
+      { data: [], error: null },                          // claimed (still runs!)
+      { data: null, error: null },                        // max commitments
+      { data: null, error: null },                        // max positions
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+
+    await ownStateSnapshotHandler(
+      makeReq({ query: { cursor } }),
+      makeRes() as unknown as Response,
+    );
+
+    // Active and terminal both ran — 2 .or() pairs on commitments, NOT just 1.
+    const commitmentsOrCalls = calls.filter((c) => c.method === 'or' && c.table === 'commitments');
+    // active .or() (keyset, strict) + terminal .or() pair (predicate + keyset, strict).
+    expect(commitmentsOrCalls).toHaveLength(3);
+    // Keyset arg must be STRICT (uses cursor.c.s exactly, NOT floored).
+    const keysetArgs = commitmentsOrCalls.map((c) => String(c.args[0]));
+    // At least one keyset arg references the cursor's raw timestamp.
+    expect(keysetArgs.some((a) => a.includes('2026-05-29T11:30:00.000Z'))).toBe(true);
+    // And none reference the FLOORED timestamp (no overlap on page-recovery).
+    expect(keysetArgs.some((a) => a.includes('2026-05-29T11:29:30.000Z'))).toBe(false);
+  });
+
+  // Blocker 2 (cont.): truncation during recovery emits k='page-recovery'
+  // (not 'page-active'), so paging stays in recovery mode.
+  it('truncation while recovering → output cursor.k = page-recovery, NOT page-active', async () => {
+    envMock.loadConfig.mockReturnValue({
+      network: 'polygon',
+      chainId: 137,
+      redactHiddenPublic: true,
+      ownStateSnapshotMaxCommitments: 2,
+    });
+    const cursor = encodeOwnStateCursor({
+      t: 'own-state',
+      v: OWN_STATE_CURSOR_VERSION,
+      c: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      f: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      p: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      k: 'live',
+    });
+    const activeRow1 = commitmentRow({
+      id: 11,
+      row_updated_at: '2026-05-29T14:00:00.000Z',
+      commitment_hash: `0x${'1'.repeat(64)}`,
+    });
+    const activeRow2 = commitmentRow({
+      id: 12,
+      row_updated_at: '2026-05-29T14:00:01.000Z',
+      commitment_hash: `0x${'2'.repeat(64)}`,
+    });
+    const { client } = makeSupabase([
+      { data: [activeRow1, activeRow2], error: null },    // active (hits cap=2)
+      { data: [], error: null },                          // claimed (no terminal query since cap reached)
+      { data: null, error: null },                        // max positions
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+
+    const res = makeRes();
+    await ownStateSnapshotHandler(
+      makeReq({ query: { cursor } }),
+      res as unknown as Response,
+    );
+    const body = res.body as { cursor: string; truncated: boolean };
+    expect(body.truncated).toBe(true);
+    const decoded = decodeOwnStateCursor(body.cursor);
+    expect(decoded.k).toBe('page-recovery');
+  });
+
+  // Blocker 3: f watermark NEVER advances past undelivered fills. Snapshot
+  // doesn't carry fills[], so the watermark either preserves (input cursor)
+  // or starts at MAX-in-DB (cold start), but it cannot move past the SDK's
+  // last-seen point on a recovery call.
+  it('input cursor.f is PRESERVED on the response cursor (blocker #3)', async () => {
+    const inputF = { s: '2026-05-29T10:00:00.000Z', i: '99' };
+    const cursor = encodeOwnStateCursor({
+      t: 'own-state',
+      v: OWN_STATE_CURSOR_VERSION,
+      c: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      f: inputF,
+      p: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      k: 'live',
+    });
+    const { client, calls } = makeSupabase([
+      { data: [], error: null },                          // active
+      { data: [], error: null },                          // terminal
+      { data: [], error: null },                          // claimed
+      { data: null, error: null },                        // max commitments
+      { data: null, error: null },                        // max positions
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+
+    const res = makeRes();
+    await ownStateSnapshotHandler(
+      makeReq({ query: { cursor } }),
+      res as unknown as Response,
+    );
+    const body = res.body as { cursor: string };
+    const decoded = decodeOwnStateCursor(body.cursor);
+    expect(decoded.f).toEqual(inputF);
+    // The handler must NOT query position_fills when f is preserved.
+    expect(calls.some((c) => c.table === 'position_fills')).toBe(false);
+  });
+
+  // Blocker 4: positions truncation surfaces via `positionsTruncated` flag,
+  // and the p watermark is preserved (or sentinel on cold start) so the
+  // M4b stream catches every position transition the snapshot couldn't.
+  it('positions categorized count at the 200 cap → positionsTruncated=true + p preserved', async () => {
+    // Build a 200-position categorized set (cap proxy).
+    const buildActive = (n: number) =>
+      Array.from({ length: n }, (_, i) => ({
+        positionId: `A_x_${i}`,
+        speculationId: `${i}`,
+        positionType: 0 as const,
+        team: 't',
+        opponent: 'o',
+        market: 'moneyline' as const,
+        oddsDecimal: 2,
+        riskAmountUSDC: 1,
+        profitAmountUSDC: 1,
+      }));
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: buildActive(200),
+      pendingSettle: [],
+      claimable: [],
+    });
+    const inputP = { s: '2026-05-29T10:00:00.000Z', i: '0' };
+    const cursor = encodeOwnStateCursor({
+      t: 'own-state',
+      v: OWN_STATE_CURSOR_VERSION,
+      c: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      f: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      p: inputP,
+      k: 'live',
+    });
+    const { client } = makeSupabase([
+      { data: [], error: null },                          // active commitments
+      { data: [], error: null },                          // terminal
+      { data: [], error: null },                          // claimed
+      { data: null, error: null },                        // max commitments
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+
+    const res = makeRes();
+    await ownStateSnapshotHandler(
+      makeReq({ query: { cursor } }),
+      res as unknown as Response,
+    );
+    const body = res.body as { cursor: string; truncated: boolean; positionsTruncated: boolean };
+    expect(body.positionsTruncated).toBe(true);
+    expect(body.truncated).toBe(true); // truncated = commitments_truncated OR positions_truncated
+    const decoded = decodeOwnStateCursor(body.cursor);
+    // p preserved at input value — stream replays every position transition since.
+    expect(decoded.p).toEqual(inputP);
+  });
+
+  it('cold start with positions at cap → positionsTruncated=true + p watermark = sentinel', async () => {
+    const buildActive = (n: number) =>
+      Array.from({ length: n }, (_, i) => ({
+        positionId: `A_x_${i}`,
+        speculationId: `${i}`,
+        positionType: 0 as const,
+        team: 't',
+        opponent: 'o',
+        market: 'moneyline' as const,
+        oddsDecimal: 2,
+        riskAmountUSDC: 1,
+        profitAmountUSDC: 1,
+      }));
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: buildActive(200),
+      pendingSettle: [],
+      claimable: [],
+    });
+    const { client } = makeSupabase([
+      { data: [], error: null },                          // active
+      { data: null, error: null },                        // max commitments
+      { data: null, error: null },                        // max fills (cold start)
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+
+    const res = makeRes();
+    await ownStateSnapshotHandler(makeReq(), res as unknown as Response);
+    const body = res.body as { cursor: string; positionsTruncated: boolean };
+    expect(body.positionsTruncated).toBe(true);
+    const decoded = decodeOwnStateCursor(body.cursor);
+    expect(decoded.p).toEqual({ s: '1970-01-01T00:00:00.000Z', i: '0' }); // sentinel
   });
 });

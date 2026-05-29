@@ -32,9 +32,41 @@
 import type { ApiError } from '../../middleware/errorHandler.js';
 
 /** Composite cursor version. Bumped on any wire-shape change. */
-export const OWN_STATE_CURSOR_VERSION = 1;
+export const OWN_STATE_CURSOR_VERSION = 2;
 
-export type OwnStateCursorKind = 'live' | 'page';
+/**
+ * Per-resource overlap window for `k='live'` initial recovery. Mirrors
+ * `RECOVERY_OVERLAP_MS` in `src/lib/recovery.ts` — Postgres `now()` is the
+ * transaction's start time, so a slow tx can commit with `row_updated_at`
+ * predating a freshly-issued cursor. A strict `>` keyset would skip those
+ * rows forever; the 30s floor catches them on the next read.
+ */
+export const RECOVERY_OVERLAP_MS = 30_000;
+
+/**
+ * Maximum bigint id permitted in a cursor — matches Postgres `bigint`
+ * (signed int64). Anything larger overflows the column type and PostgREST
+ * returns a 500 instead of a clean 400.
+ */
+const MAX_INT64 = 9_223_372_036_854_775_807n;
+
+/**
+ * Cursor `k` discriminant — distinguishes the four meaningful states.
+ *
+ *   `live`             — stream-ready; the SDK passes this to
+ *                        `/v1/stream/own-state` as `Last-Event-ID`. As INPUT
+ *                        to `/v1/own-state/snapshot`, it signals state-loss
+ *                        recovery: the server applies the overlap window
+ *                        and queries terminal rows since the floored watermark.
+ *   `page-active`      — paging through a cold-start (no recovery) snapshot
+ *                        whose active-set rows exceeded the per-page cap.
+ *                        Terminal query is NOT run.
+ *   `page-recovery`    — paging through a recovery snapshot whose merged
+ *                        active+terminal rows exceeded the per-page cap.
+ *                        Subsequent pages still run the terminal query,
+ *                        keyset-advanced past the prior page's last row.
+ */
+export type OwnStateCursorKind = 'live' | 'page-active' | 'page-recovery';
 
 export interface ResourceWatermark {
   /** `row_updated_at` verbatim from the source row, full precision. */
@@ -123,8 +155,10 @@ export function decodeOwnStateCursor(raw: string): OwnStateCursor {
   const f = validateWatermark(obj['f'], 'f');
   const p = validateWatermark(obj['p'], 'p');
   const k = obj['k'];
-  if (k !== 'live' && k !== 'page') {
-    throw new OwnStateCursorError('Malformed cursor: k must be "live" or "page".');
+  if (k !== 'live' && k !== 'page-active' && k !== 'page-recovery') {
+    throw new OwnStateCursorError(
+      'Malformed cursor: k must be "live", "page-active", or "page-recovery".',
+    );
   }
   return { t: 'own-state', v: OWN_STATE_CURSOR_VERSION, c, f, p, k };
 }
@@ -136,14 +170,38 @@ function validateWatermark(raw: unknown, label: string): ResourceWatermark {
   const o = raw as Record<string, unknown>;
   const s = o['s'];
   const i = o['i'];
+  // Shape gate — the regex keeps a crafted timestamp from reaching the
+  // PostgREST filter grammar.
   if (typeof s !== 'string' || !ISO_TIMESTAMP.test(s)) {
     throw new OwnStateCursorError(
       `Malformed cursor: ${label}.s must be an ISO-8601 timestamptz.`,
     );
   }
+  // Semantic gate — `2026-99-99T...` passes the shape regex but is not a
+  // real date; `Date.parse` returns NaN. Without this guard the cursor
+  // reaches PostgREST and surfaces as a 500 rather than a clean 400.
+  // Hermes review-31 round 1 verified the gap with a `2026-99-99T...` cursor.
+  if (!Number.isFinite(Date.parse(s))) {
+    throw new OwnStateCursorError(
+      `Malformed cursor: ${label}.s is not a real calendar timestamp.`,
+    );
+  }
   if (typeof i !== 'string' || !/^\d+$/.test(i)) {
     throw new OwnStateCursorError(
       `Malformed cursor: ${label}.i must be a non-negative integer string.`,
+    );
+  }
+  // Range gate — Postgres `bigint` is signed int64; an id beyond 2^63-1
+  // overflows the column type and PostgREST 500s on the cast.
+  let big: bigint;
+  try {
+    big = BigInt(i);
+  } catch {
+    throw new OwnStateCursorError(`Malformed cursor: ${label}.i is not parseable as bigint.`);
+  }
+  if (big > MAX_INT64) {
+    throw new OwnStateCursorError(
+      `Malformed cursor: ${label}.i exceeds Postgres bigint range (2^63 - 1).`,
     );
   }
   return { s, i };
@@ -160,4 +218,32 @@ function validateWatermark(raw: unknown, label: string): ResourceWatermark {
  */
 export function watermarkKeysetOr(w: ResourceWatermark): string {
   return `row_updated_at.gt.${w.s},and(row_updated_at.eq.${w.s},id.gt.${w.i})`;
+}
+
+/**
+ * Initial-recovery keyset that applies the {@link RECOVERY_OVERLAP_MS}
+ * floor. Use ONLY when the input cursor's `k === 'live'` — that's the
+ * first server call after the SDK reconnects with a stream-tail cursor.
+ * Subsequent paging continuations (`k='page-recovery'`) use the strict
+ * `watermarkKeysetOr` against the previous page's last delivered row.
+ *
+ * The floor returns rows `> (cursor.s − overlap, 0)`. Effectively this is
+ * `row_updated_at >= cursor.s − overlap`, catching any tx that committed
+ * late relative to its `row_updated_at`. Hermes review-31 round 1 blocker.
+ */
+export function watermarkLiveKeysetOr(w: ResourceWatermark): string {
+  const flooredMs = Date.parse(w.s) - RECOVERY_OVERLAP_MS;
+  return watermarkKeysetOr({ s: new Date(flooredMs).toISOString(), i: '0' });
+}
+
+/**
+ * Floor a watermark by the overlap window — for cases where the caller
+ * wants the floored values as a {@link ResourceWatermark} rather than as
+ * a PostgREST expression (e.g. when paging continuation needs to know the
+ * recovery start point). Date.parse returns finite ms because the
+ * cursor decoder rejected anything else.
+ */
+export function floorWatermarkByOverlap(w: ResourceWatermark): ResourceWatermark {
+  const flooredMs = Date.parse(w.s) - RECOVERY_OVERLAP_MS;
+  return { s: new Date(flooredMs).toISOString(), i: '0' };
 }

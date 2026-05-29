@@ -30,8 +30,13 @@ describe('encode/decode roundtrip', () => {
     expect(decodeOwnStateCursor(encoded)).toEqual(sample);
   });
 
-  it('survives the page discriminant', () => {
-    const paged = { ...sample, k: 'page' as const };
+  it('survives the page-active discriminant (cold-start truncation)', () => {
+    const paged = { ...sample, k: 'page-active' as const };
+    expect(decodeOwnStateCursor(encodeOwnStateCursor(paged))).toEqual(paged);
+  });
+
+  it('survives the page-recovery discriminant (recovery-mode continuation)', () => {
+    const paged = { ...sample, k: 'page-recovery' as const };
     expect(decodeOwnStateCursor(encodeOwnStateCursor(paged))).toEqual(paged);
   });
 
@@ -111,6 +116,35 @@ describe('decode — watermark rejections (each resource slot is validated)', ()
       'utf8',
     ).toString('base64url');
     expect(() => decodeOwnStateCursor(bad)).toThrow(OwnStateCursorError);
+  });
+
+  // Hermes review-31 round 1 blocker #5: the shape regex alone let
+  // `2026-99-99T...` through (passes ISO regex; Date.parse → NaN). The new
+  // semantic gate catches these before they reach PostgREST.
+  it('rejects a semantically-invalid calendar timestamp (shape-valid but Date.parse=NaN)', () => {
+    const bad = Buffer.from(
+      JSON.stringify({ ...sample, c: { s: '2026-99-99T99:99:99.000Z', i: '0' } }),
+      'utf8',
+    ).toString('base64url');
+    expect(() => decodeOwnStateCursor(bad)).toThrow(OwnStateCursorError);
+  });
+
+  it('rejects an id that overflows Postgres bigint (2^63)', () => {
+    const overflowingId = '9223372036854775808'; // 2^63
+    const bad = Buffer.from(
+      JSON.stringify({ ...sample, c: { s: sample.c.s, i: overflowingId } }),
+      'utf8',
+    ).toString('base64url');
+    expect(() => decodeOwnStateCursor(bad)).toThrow(OwnStateCursorError);
+  });
+
+  it('accepts an id exactly at Postgres bigint max (2^63 - 1)', () => {
+    const maxId = '9223372036854775807';
+    const ok = Buffer.from(
+      JSON.stringify({ ...sample, c: { s: sample.c.s, i: maxId } }),
+      'utf8',
+    ).toString('base64url');
+    expect(decodeOwnStateCursor(ok).c.i).toBe(maxId);
   });
 });
 

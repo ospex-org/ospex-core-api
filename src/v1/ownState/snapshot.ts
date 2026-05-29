@@ -54,7 +54,9 @@ import {
   decodeOwnStateCursor,
   encodeOwnStateCursor,
   watermarkKeysetOr,
+  watermarkLiveKeysetOr,
   type OwnStateCursor,
+  type OwnStateCursorKind,
   type ResourceWatermark,
 } from './cursor.js';
 import type { ApiError } from '../../middleware/errorHandler.js';
@@ -76,8 +78,30 @@ interface OwnStateSnapshotBody {
   cursor: string;
   commitments: CommitmentBody[];
   positions: OwnerPosition[];
+  /**
+   * True when ANY resource (commitments or positions) was capped and more
+   * pages exist. The SDK MUST NOT emit `ready` for trading until this is
+   * `false` (spec §6.2).
+   */
   truncated: boolean;
+  /**
+   * True when the position categorization helper hit its 200-row cap, so
+   * `positions[]` may be missing rows. M4a accepts this as a fail-closed
+   * contract: the cursor's `p` watermark is preserved (or sentinel on cold
+   * start) so the M4b stream replays every position transition since the
+   * preserved tail, eventually filling in any rows the snapshot dropped.
+   * SDK consumers paginating > 200 unclaimed positions should also fall
+   * back to `/v1/positions/:address` for full history during the M4a
+   * window.
+   */
+  positionsTruncated: boolean;
 }
+
+// Matches the cap inside `fetchCategorizedPositions` (200). When the helper
+// returns this many categorized rows we infer it ran into the cap — a
+// conservative proxy (the helper may filter "lost" positions out below the
+// cap, but those rows still count against it). Hermes review-31 blocker #4.
+const POSITIONS_CATEGORIZED_CAP = 200;
 
 // Columns for the claimed-since-cursor fast path. Trims the recovery-row
 // projection to what `mapClaimedRow` actually reads.
@@ -138,14 +162,33 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
   const nowMs = Date.now();
   const nowISO = new Date(nowMs).toISOString();
 
+  // ── Cursor state machine (Hermes review-31 round 1) ─────────────────
+  // The cursor's `k` field has three meanings as INPUT:
+  //
+  //   `live`           — initial state-loss recovery. The SDK is passing
+  //                       the last cursor it had from the stream. Server
+  //                       applies the {@link RECOVERY_OVERLAP_MS} floor to
+  //                       terminal/claimed queries so a late-committed row
+  //                       (Postgres `now()` is tx-start) is not skipped.
+  //   `page-recovery`  — continuation of a recovery snapshot. Terminal
+  //                       query still runs but with strict keyset advance.
+  //   `page-active`    — continuation of a cold-start snapshot. No terminal
+  //                       query (the SDK had no prior state to converge).
+  //
+  // No input cursor = cold start; no terminal query.
+  const recovering = cursor?.k === 'live' || cursor?.k === 'page-recovery';
+  const paging = cursor?.k === 'page-active' || cursor?.k === 'page-recovery';
+
   // ── 2. Active commitments ────────────────────────────────────────────
   // Active set = stored status open/partially_filled AND nonce not invalidated
   // AND not past expiry. `book_visible` is informational, NOT a filter — a
   // hidden-but-still-matchable row is in the active set per spec §6.1, because
   // the maker is still on the hook for it.
   //
-  // Paging: when a prior call returned k='page', we advance past the cursor's
-  // commitments watermark so the next page picks up where we left off.
+  // Paging (`k='page-active'` or `'page-recovery'`): strict keyset advance
+  // past the prior page's last delivered row. On initial recovery (`k='live'`)
+  // the keyset advance is NOT applied — the SDK has no prior state, so the
+  // full active set is delivered (subject to MAX).
   let activeQuery = sb
     .from('commitments')
     .select(COMMITMENT_RECOVERY_COLUMNS)
@@ -154,8 +197,8 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
     .in('status', ['open', 'partially_filled'])
     .eq('nonce_invalidated', false)
     .gt('expiry', nowISO);
-  if (cursor && cursor.k === 'page') {
-    activeQuery = activeQuery.or(watermarkKeysetOr(cursor.c));
+  if (paging) {
+    activeQuery = activeQuery.or(watermarkKeysetOr(cursor!.c));
   }
   activeQuery = activeQuery
     .order('row_updated_at', { ascending: true })
@@ -173,21 +216,24 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
   }
   const activeRows = (activeRes.data ?? []) as unknown as CommitmentRecoveryRow[];
 
-  // ── 3. Terminals-since-cursor (recovery only, k='live') ──────────────
-  // When the SDK reconnects with a stream-state cursor, the snapshot also
-  // carries any rows that transitioned to terminal since the cursor so the
-  // local state converges. During paging (`k='page'`) we skip this — the
-  // active set itself is what's getting paged.
+  // ── 3. Terminals-since-cursor (recovery only) ────────────────────────
+  // Runs whenever recovering (k='live' OR k='page-recovery'). Keyset depends
+  // on which: `live` floors by overlap to catch late-committed rows;
+  // `page-recovery` is strict (the prior page already crossed the overlap).
   let terminalRows: CommitmentRecoveryRow[] = [];
-  if (cursor && cursor.k === 'live' && activeRows.length < maxCommitments) {
+  if (recovering && activeRows.length < maxCommitments) {
     const budget = maxCommitments - activeRows.length;
+    const terminalKeyset =
+      cursor!.k === 'live'
+        ? watermarkLiveKeysetOr(cursor!.c)
+        : watermarkKeysetOr(cursor!.c);
     const terminalRes = await sb
       .from('commitments')
       .select(COMMITMENT_RECOVERY_COLUMNS)
       .eq('network', config.network)
       .eq('maker', address)
       .or(`status.in.(filled,cancelled),nonce_invalidated.eq.true,expiry.lte.${nowISO}`)
-      .or(watermarkKeysetOr(cursor.c))
+      .or(terminalKeyset)
       .order('row_updated_at', { ascending: true })
       .order('id', { ascending: true })
       .limit(budget);
@@ -234,16 +280,22 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
     return;
   }
 
-  // Claimed-since-cursor: same recovery convergence pattern as commitments.
+  // Claimed-since-cursor: only when recovering. Keyset matches the
+  // commitments terminal-query rule — `live` floors by overlap;
+  // `page-recovery` is strict.
   let claimedRows: ClaimedPositionRow[] = [];
-  if (cursor && cursor.k === 'live') {
+  if (recovering) {
+    const claimedKeyset =
+      cursor!.k === 'live'
+        ? watermarkLiveKeysetOr(cursor!.p)
+        : watermarkKeysetOr(cursor!.p);
     const claimedRes = await sb
       .from('positions')
       .select(POSITION_CLAIMED_COLUMNS)
       .eq('network', config.network)
       .eq('user_address', address)
       .eq('claimed', true)
-      .or(watermarkKeysetOr(cursor.p))
+      .or(claimedKeyset)
       .order('row_updated_at', { ascending: true })
       .order('id', { ascending: true })
       .limit(CLAIMED_PAGE_CAP);
@@ -261,6 +313,17 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
     claimedRows = (claimedRes.data ?? []) as unknown as ClaimedPositionRow[];
   }
 
+  // Positions truncation flag (Hermes blocker #4). The categorized helper
+  // caps the active set at 200; claimed-since-cursor caps at CLAIMED_PAGE_CAP.
+  // When either is at the cap we treat the positions response as incomplete
+  // and preserve the input `p` watermark below so the M4b stream replays
+  // every position transition (or, on cold start, falls back to sentinel
+  // — the stream replays from the beginning, slow but correct).
+  const categorizedCount = active.length + pendingSettle.length + claimable.length;
+  const positionsTruncated =
+    categorizedCount >= POSITIONS_CATEGORIZED_CAP ||
+    claimedRows.length >= CLAIMED_PAGE_CAP;
+
   const positions: OwnerPosition[] = [
     ...active.map((p): OwnerPosition => ({ status: 'active', ...p })),
     ...pendingSettle.map((p): OwnerPosition => ({ status: 'pendingSettle', ...p })),
@@ -268,17 +331,17 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
     ...claimedRows.map((r) => mapClaimedRow(r, address)),
   ];
 
-  // ── 5. Compute response cursor ───────────────────────────────────────
-  // Per-resource watermarks:
-  //   - commitments: truncated → last returned row's tuple; else max in DB
-  //   - fills: max in DB for this wallet (snapshot doesn't carry fill bodies
-  //            but the stream needs a tail point)
-  //   - positions: max in DB
+  // ── 5. Compute response cursor (Hermes review-31 round 1 — blockers 2,3,4) ──
   //
-  // `k='page'` only when we truncated commitments; otherwise `k='live'` (the
-  // SDK can open the stream from here). The truncation is determined by the
-  // commitments slot alone since fills/positions watermark queries are MAX
-  // lookups (single row), not pagination.
+  //   - c: truncated → last delivered row's (row_updated_at, id) so the next
+  //        page advances past it. Not truncated → MAX in DB.
+  //   - f: snapshot does NOT deliver fills, so it must NOT advance `f` past
+  //        any fill the SDK has not yet seen. Cold start: MAX in DB (no
+  //        prior state to converge). Input cursor: preserve `cursor.f` so
+  //        the M4b stream tail picks up exactly where the SDK left off.
+  //   - p: positions truncated → preserve input.p (or sentinel on cold
+  //        start) so the M4b stream replays every position transition
+  //        since the preserved tail. Not truncated → MAX in DB.
   let cWatermark: ResourceWatermark;
   if (truncated && finalRows.length > 0) {
     const last = finalRows[finalRows.length - 1]!;
@@ -286,8 +349,25 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
   } else {
     cWatermark = await maxWatermarkForCommitments(sb, config.network, address);
   }
-  const fWatermark = await maxWatermarkForFills(sb, config.network, address);
-  const pWatermark = await maxWatermarkForPositions(sb, config.network, address);
+
+  const fWatermark: ResourceWatermark = cursor
+    ? cursor.f
+    : await maxWatermarkForFills(sb, config.network, address);
+
+  const pWatermark: ResourceWatermark = positionsTruncated
+    ? (cursor?.p ?? SENTINEL_WATERMARK)
+    : await maxWatermarkForPositions(sb, config.network, address);
+
+  // Output `k` is determined by commitments truncation + recovery context.
+  // Positions truncation surfaces via `positionsTruncated` body field, not
+  // the cursor's `k` — there is no positions-paging path in M4a (fail-closed
+  // per Hermes review-31 blocker #4).
+  let kOut: OwnStateCursorKind;
+  if (truncated) {
+    kOut = recovering ? 'page-recovery' : 'page-active';
+  } else {
+    kOut = 'live';
+  }
 
   const responseCursor: OwnStateCursor = {
     t: 'own-state',
@@ -295,14 +375,15 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
     c: cWatermark,
     f: fWatermark,
     p: pWatermark,
-    k: truncated ? 'page' : 'live',
+    k: kOut,
   };
 
   const body: OwnStateSnapshotBody = {
     cursor: encodeOwnStateCursor(responseCursor),
     commitments,
     positions,
-    truncated,
+    truncated: truncated || positionsTruncated,
+    positionsTruncated,
   };
   res.status(200).json(body);
 }
