@@ -53,14 +53,14 @@ const MAX_INT64 = 9_223_372_036_854_775_807n;
 /**
  * Cursor `k` discriminant — the snapshot recovery state machine.
  *
- * Hermes review-31 round 2 forced the explicit-phase split: the previous
- * round-1 merge approach interleaved active + terminal rows by
- * `(row_updated_at, id)`, which allowed a long-lived active row to be
- * starved by older terminals on page 1 and then permanently excluded by
- * page 2's strict keyset advance. The two-phase model drains the entire
- * active set BEFORE any terminal row is delivered, so the `(row, id)`
- * watermark on each phase only ever advances past rows already on the
- * wire for THAT phase.
+ * The phase discriminant is load-bearing for safe recovery paging. A
+ * single merged stream interleaving active + terminal rows by
+ * `(row_updated_at, id)` would let a long-lived active row be starved by
+ * older terminals on page 1 and then permanently excluded by page 2's
+ * strict keyset advance. The two-phase model drains the entire active
+ * set BEFORE any terminal row is delivered, so the `(row, id)` watermark
+ * on each phase only ever advances past rows already on the wire for
+ * THAT phase.
  *
  *   `live`                   — stream-ready; SDK passes this to
  *                              `/v1/stream/own-state` as `Last-Event-ID`.
@@ -99,10 +99,10 @@ export interface OwnStateCursor {
   v: typeof OWN_STATE_CURSOR_VERSION;
   /**
    * Commitments progress watermark — advances through delivered rows only.
-   * Per spec §6.1 / Hermes review-31 round 2: NEVER advances past an
-   * undelivered row of either phase. Phase 1 advances `c` through active
-   * rows in `(row, id)` order; phase 2 advances `c` through terminal rows
-   * in `(row, id)` order. The two phases never compete for the watermark.
+   * Per spec §6.1: NEVER advances past an undelivered row of either phase.
+   * Phase 1 advances `c` through active rows in `(row, id)` order; phase 2
+   * advances `c` through terminal rows in `(row, id)` order. The two phases
+   * never compete for the watermark.
    */
   c: ResourceWatermark;
   /**
@@ -131,17 +131,19 @@ export const SENTINEL_WATERMARK: ResourceWatermark = {
   i: '0',
 };
 
-// UTC ISO 8601 with capture groups for component-wise validation. Hermes
-// review-31 round 3 caught the wire-contract self-compat gap: Supabase /
+// UTC ISO 8601 with capture groups for component-wise validation. The
+// wire-contract gate accepts both shapes the server can mint: Supabase /
 // PostgREST emits timestamptz as `2026-05-29T15:00:00.123456+00:00`
-// (microsecond precision, `+00:00` form) while the round-2 regex was
-// Z-only — the snapshot was minting cursors it then rejected on the very
-// next call, breaking paging. Accept both `Z` and `+00:00` (the only forms
-// the server-side write paths produce); both encode UTC so the component
-// comparison below works against `Date.getUTC*()` either way.
+// (microsecond precision, `+00:00` form) while `Date.toISOString()` and
+// many newer call sites emit the `Z` form. Accepting only one would let
+// the snapshot mint cursors it then rejects on the next call, breaking
+// paging. Both encode UTC, so the component comparison below works against
+// `Date.getUTC*()` either way.
+//
 // Non-zero offsets are still rejected — the server never emits them, and
 // accepting them would break the component-comparison invariant (the
 // input components are LOCAL to the offset, not UTC).
+//
 // Fractional seconds: up to 9 digits to cover Postgres's microseconds and
 // any future nanosecond extension. The raw string is preserved verbatim
 // (no `toISOString` round-trip) — that path would truncate microseconds
@@ -254,12 +256,12 @@ function validateWatermark(raw: unknown, label: string): ResourceWatermark {
       `Malformed cursor: ${label}.s must be an ISO-8601 timestamptz (Z or +00:00 form).`,
     );
   }
-  // Canonical-calendar gate (Hermes review-31 round 2). `Date.parse` silently
-  // normalizes `2026-02-30` → March 2, `Apr 31` → May 1, `24:00:00` → next
-  // day 00:00:00. Component-comparing the parsed date back against the
-  // input strings catches every normalization — only inputs that
-  // round-trip exactly are accepted. Equivalent to the canonical-encoding
-  // pattern in `[[feedback_bind_minted_fields_on_resubmit]]`.
+  // Canonical-calendar gate. `Date.parse` silently normalizes invalid
+  // calendar values: `2026-02-30` → March 2, `Apr 31` → May 1, `24:00:00`
+  // → next day 00:00:00. Component-comparing the parsed date back against
+  // the input strings catches every normalization — only inputs that
+  // round-trip exactly are accepted, mirroring the canonical-encoding
+  // pattern used for compact-token roundtrip validation.
   const [, Y, M, D, h, mi, sec] = m;
   const ms = Date.parse(s);
   if (!Number.isFinite(ms)) {
@@ -323,7 +325,7 @@ export function watermarkKeysetOr(w: ResourceWatermark): string {
  *
  * The floor returns rows `> (cursor.s − overlap, 0)`. Effectively this is
  * `row_updated_at >= cursor.s − overlap`, catching any tx that committed
- * late relative to its `row_updated_at`. Hermes review-31 round 1 blocker.
+ * late relative to its `row_updated_at`.
  */
 export function watermarkLiveKeysetOr(w: ResourceWatermark): string {
   const flooredMs = Date.parse(w.s) - RECOVERY_OVERLAP_MS;

@@ -110,9 +110,10 @@ export class ChallengeStore {
    * server set at mint time — `address`, `issuedAt`, `expiresAt` — so
    * `consume()` can prove the submitted typed-data is the exact challenge
    * the server minted (and not a client-mutated variant whose signature is
-   * still self-consistent). Hermes review-30 round 2 caught this gap: the
-   * server-trusts-client expiresAt path let an attacker submit a
-   * fresh-but-internally-consistent mutated challenge.
+   * still self-consistent). Trusting the client-supplied `expiresAt` instead
+   * would let an attacker submit a fresh-but-internally-consistent mutated
+   * challenge — a legitimate wallet can re-sign mutated typed-data, so signature
+   * recovery does not catch tampering on its own.
    */
   add(challengeId: string, challenge: StreamChallenge): void {
     this.maybeCleanup();
@@ -233,11 +234,11 @@ export type VerifyTokenResult =
  */
 /**
  * Canonical base64url round-trip. Subsumes a non-alphabet character check
- * AND closes the equivalent-pad-bit variant Hermes verified in review-30
- * round 2: a 32-byte HMAC encodes to 43 base64url chars with 2 unused bits
- * in the last char, so four distinct chars decode to the same byte sequence.
- * Forcing `Buffer.from(s, 'base64url').toString('base64url') === s` rejects
- * any non-canonical encoding, ensuring 1:1 between bytes and wire token.
+ * AND closes the equivalent-pad-bit variant: a 32-byte HMAC encodes to 43
+ * base64url chars with 2 unused bits in the last char, so four distinct
+ * chars decode to the same byte sequence. Forcing
+ * `Buffer.from(s, 'base64url').toString('base64url') === s` rejects any
+ * non-canonical encoding, ensuring 1:1 between bytes and wire token.
  */
 function isCanonicalBase64url(s: string): boolean {
   if (s.length === 0) return false;

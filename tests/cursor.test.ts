@@ -81,9 +81,9 @@ describe('cursor codec', () => {
     expect(() => decodeCursor(raw, 'fills')).toThrow(CursorError);
   });
 
-  // Hermes hardening: a Date.parse-valid timestamp containing the PostgREST
-  // `.or()` delimiter (comma) must be rejected as INVALID_CURSOR, not flow
-  // into the filter grammar and 500.
+  // Boundary hardening: a Date.parse-valid timestamp containing the
+  // PostgREST `.or()` delimiter (comma) must be rejected as
+  // INVALID_CURSOR, not flow into the filter grammar and 500.
   it('rejects an RFC-style timestamp with a comma', () => {
     const evil = 'Tue, 20 May 2026 12:00:00 GMT';
     expect(Number.isNaN(Date.parse(evil))).toBe(false); // Date.parse would accept it

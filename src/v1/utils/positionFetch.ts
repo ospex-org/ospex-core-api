@@ -49,6 +49,11 @@ import { getSupabase } from '../../lib/supabase.js';
 import { wei6ToUSDC } from '../../lib/sanitize.js';
 import type { MarketType } from '../../lib/speculation.js';
 import { loadConfig } from '../../lib/env.js';
+import {
+  derivePositionStatus,
+  type PositionStatus,
+} from '../ownState/positionStatus.js';
+import { maxIsoTimestamptz } from '../ownState/timestamps.js';
 
 const POSITION_QUERY_LIMIT = 200;
 
@@ -91,6 +96,39 @@ export interface PendingSettlePosition extends PositionBase {
   estimatedPayoutWei6: string;
 }
 
+/**
+ * One row's worth of derived state for the M4b own-state stream's
+ * positionStatus seeding. Computed from the SAME join the categorization
+ * uses, so the snapshot's wire body and the hub-cache seed cannot disagree
+ * about position state — that disagreement was the cold-start race
+ * blocker.
+ *
+ * `key` = `${speculationId}_${positionType}` matches the hub's
+ * `statusCache` keying convention. `sourceUpdatedAt` = the max of
+ * (position, speculation, contest) row_updated_at, so cursor.p minted
+ * from this matches the wire semantic the stream advances by.
+ */
+export interface DerivedPositionStatus {
+  key: string;
+  status: PositionStatus;
+  sourceUpdatedAt: string;
+  /**
+   * Advisory categorical result (won/lost/push/void). The M4b stream's
+   * dedup contract treats this as a payload field — a same-status event
+   * with a different `result` still emits, so a contest score correction
+   * that flips `pendingSettle` from `won` to `push` surfaces even though
+   * the status itself is unchanged.
+   */
+  result: 'won' | 'lost' | 'push' | 'void' | undefined;
+  /**
+   * wei6 claimable amount when the position has a non-zero payout
+   * (pendingSettle won/push, claimable, void). Same payload-dedup
+   * rationale as `result` — a score correction that changes the
+   * predicted payout must re-emit even at the same status.
+   */
+  claimableAmount: string | undefined;
+}
+
 export interface PositionFetchResult {
   active: PositionBase[];
   pendingSettle: PendingSettlePosition[];
@@ -102,9 +140,19 @@ export interface PositionFetchResult {
    * claimable.length` is unsafe (it under-detects truncation when the
    * helper filters out lost rows below the cap). Callers that need to
    * know whether more positions exist beyond what was categorized MUST
-   * read this field. Hermes review-31 round 2 blocker #3.
+   * read this field.
    */
   hitCap: boolean;
+  /**
+   * Derived positionStatus + sourceUpdatedAt for EVERY position the
+   * helper saw (including predicted-losers and zero-payout rows the
+   * buckets drop). Consumers seeding the M4b hub cache use this to
+   * eliminate the cold-start race between the snapshot's wire body and
+   * a separately-derived seed pass. `loadOwnStateSnapshot` also takes
+   * `max(sourceUpdatedAt)` over this list as the response cursor's `p`
+   * watermark so the snapshot and stream share one cursor domain.
+   */
+  derivedStatuses: DerivedPositionStatus[];
 }
 
 interface PositionRow {
@@ -115,6 +163,7 @@ interface PositionRow {
   profit_amount: string | number | null;
   claimed: boolean;
   position_created_at: string | null;
+  row_updated_at: string;
 }
 
 interface SpeculationRow {
@@ -124,6 +173,7 @@ interface SpeculationRow {
   line_ticks: number | null;
   speculation_status: 'open' | 'closed';
   win_side: 'tbd' | 'away' | 'home' | 'over' | 'under' | 'push' | 'void';
+  row_updated_at: string;
 }
 
 interface ContestRow {
@@ -133,7 +183,9 @@ interface ContestRow {
   contest_status: 'unverified' | 'verified' | 'scored' | 'voided';
   away_score: number | null;
   home_score: number | null;
+  row_updated_at: string;
 }
+
 
 function impliedOddsDecimal(risk: bigint, profit: bigint | null): number | null {
   if (profit == null || risk === 0n) return null;
@@ -218,7 +270,7 @@ export async function fetchCategorizedPositions(
   // PositionModule.sol:367-370.)
   const posRes = await sb
     .from('positions')
-    .select('speculation_id, user_address, position_type, risk_amount, profit_amount, claimed, position_created_at')
+    .select('speculation_id, user_address, position_type, risk_amount, profit_amount, claimed, position_created_at, row_updated_at')
     .eq('network', config.network)
     .eq('user_address', lowerAddress)
     .eq('claimed', false)
@@ -232,7 +284,9 @@ export async function fetchCategorizedPositions(
   // PostgREST returns 201 on a `limit(200)`; the predicate here is "did we
   // saturate the cap budget?".
   const hitCap = positions.length >= POSITION_QUERY_LIMIT;
-  if (positions.length === 0) return { active: [], pendingSettle: [], claimable: [], hitCap };
+  if (positions.length === 0) {
+    return { active: [], pendingSettle: [], claimable: [], hitCap, derivedStatuses: [] };
+  }
 
   // Step 2: batch-fetch related speculations.
   // `market_type` is read straight from the column (populated by the
@@ -243,7 +297,7 @@ export async function fetchCategorizedPositions(
   if (specIds.length > 0) {
     const specRes = await sb
       .from('speculations')
-      .select('speculation_id, contest_id, market_type, line_ticks, speculation_status, win_side')
+      .select('speculation_id, contest_id, market_type, line_ticks, speculation_status, win_side, row_updated_at')
       .eq('network', config.network)
       .in('speculation_id', specIds);
     if (specRes.error) throw new Error(`fetchCategorizedPositions speculations: ${specRes.error.message}`);
@@ -268,7 +322,7 @@ export async function fetchCategorizedPositions(
   if (contestIds.length > 0) {
     const contestRes = await sb
       .from('contests')
-      .select('contest_id, away_team, home_team, contest_status, away_score, home_score')
+      .select('contest_id, away_team, home_team, contest_status, away_score, home_score, row_updated_at')
       .eq('network', config.network)
       .in('contest_id', contestIds);
     if (contestRes.error) throw new Error(`fetchCategorizedPositions contests: ${contestRes.error.message}`);
@@ -276,14 +330,19 @@ export async function fetchCategorizedPositions(
     for (const c of contests) contestById.set(c.contest_id, c);
   }
 
-  // Step 4: categorize.
-  // Payout filter mirrors PositionModule.sol:367-370 exactly:
-  // `claimPosition` reverts only when `riskAmount == 0 || payout == 0`.
-  // We do the comparison in wei6 (bigint) so sub-cent payouts (which
-  // ARE claimable on-chain) aren't filtered by USDC-float rounding.
+  // Step 4: categorize + derive in one pass.
+  // Categorization (active/pendingSettle/claimable) mirrors the
+  // PositionModule.sol:367-370 payout contract.
+  // Derivation (derivedStatuses) also runs `derivePositionStatus` from
+  // the same join — this guarantees the snapshot's wire body and any
+  // M4b hub-cache seed built from the same call can never disagree
+  // about derived state, eliminating the cold-start race where a fresh
+  // post-snapshot derivation might see a transition the snapshot did
+  // not.
   const active: PositionBase[] = [];
   const pendingSettle: PendingSettlePosition[] = [];
   const claimable: ClaimablePosition[] = [];
+  const derivedStatuses: DerivedPositionStatus[] = [];
 
   for (const p of positions) {
     const spec = specById.get(p.speculation_id);
@@ -292,6 +351,51 @@ export async function fetchCategorizedPositions(
     const contest = spec.contest_id != null ? contestById.get(spec.contest_id) : undefined;
     const positionType = POSITION_TYPE_TO_INT[p.position_type];
     const market: MarketType = spec.market_type ?? 'moneyline';
+
+    // Compute derived state from the same join — pushed to
+    // derivedStatuses unconditionally, even when the row is dropped
+    // from the buckets below (e.g. settledLost predicted-losers).
+    const sourceUpdatedAt = maxIsoTimestamptz(
+      p.row_updated_at,
+      spec.row_updated_at,
+      contest?.row_updated_at,
+    );
+    const derivedBody = derivePositionStatus(
+      {
+        speculationId: String(p.speculation_id),
+        address: lowerAddress,
+        positionType,
+        riskAmount: typeof p.risk_amount === 'string' ? p.risk_amount : String(p.risk_amount),
+        profitAmount:
+          p.profit_amount == null
+            ? null
+            : typeof p.profit_amount === 'string'
+              ? p.profit_amount
+              : String(p.profit_amount),
+        claimed: p.claimed,
+      },
+      {
+        speculationStatus: spec.speculation_status,
+        winSide: spec.win_side,
+        marketType: spec.market_type ?? 'moneyline',
+        lineTicks: spec.line_ticks,
+      },
+      contest
+        ? {
+            contestStatus: contest.contest_status,
+            awayScore: contest.away_score,
+            homeScore: contest.home_score,
+          }
+        : null,
+      sourceUpdatedAt,
+    );
+    derivedStatuses.push({
+      key: `${String(p.speculation_id)}_${positionType}`,
+      status: derivedBody.status,
+      sourceUpdatedAt,
+      result: derivedBody.result,
+      claimableAmount: derivedBody.claimableAmount,
+    });
 
     const team = contest
       ? (positionType === 0 ? contest.away_team : contest.home_team) ?? 'Unknown'
@@ -398,7 +502,7 @@ export async function fetchCategorizedPositions(
     active.push(base);
   }
 
-  return { active, pendingSettle, claimable, hitCap };
+  return { active, pendingSettle, claimable, hitCap, derivedStatuses };
 }
 
 /** Convenience for callers needing the on-chain enum string back from the int. */

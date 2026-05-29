@@ -25,10 +25,25 @@
  *     positionsTruncated: boolean
  *   }
  *
- * Truncation is the maker's signal to keep paging via `?cursor=` until
- * `truncated: false`; the SDK MUST NOT emit `ready` until then (§6.2).
+ * Two distinct truncation discriminants — they are NOT interchangeable:
  *
- * ── Passive-expiry contract (Hermes review-31 round 4) ────────────────
+ *   - `truncated` (commitments-only): commitment pagination remains.
+ *     The SDK pages `/v1/own-state/snapshot?cursor=` until `truncated:
+ *     false`, THEN connects the stream with the final `k='live'`
+ *     cursor. The SDK MUST NOT emit `ready` for trading until paging
+ *     completes (spec §6.2).
+ *
+ *   - `positionsTruncated`: position visibility is incomplete because
+ *     `fetchCategorizedPositions` hit its 200-row cap. The SDK does
+ *     NOT keep paging the snapshot for this — `cursor.p` is preserved
+ *     (or sentinel on cold start) but the snapshot does not have a
+ *     mechanism to drain unseen positions. Consumers enter degraded /
+ *     quote-hold mode; the stream cold-start emits `event: degraded`
+ *     before `ready` so the SDK / MM treats the wallet's position view
+ *     as partial-visibility (spec §2.6). The `/v1/positions/:address`
+ *     fallback covers full history for operator tooling.
+ *
+ * ── Passive-expiry contract ────────────────────────────────────────────
  *
  * "Recently-terminal-since-cursor" recovery emits rows whose terminal
  * transition the INDEXER WROTE TO THE DB (status → filled/cancelled,
@@ -69,6 +84,7 @@ import {
 import {
   fetchCategorizedPositions,
   type ClaimablePosition,
+  type DerivedPositionStatus,
   type PendingSettlePosition,
   type PositionBase,
 } from '../utils/positionFetch.js';
@@ -87,6 +103,7 @@ import {
   type OwnStateCursorKind,
   type ResourceWatermark,
 } from './cursor.js';
+import { maxIsoTimestamptz } from './timestamps.js';
 import type { ApiError } from '../../middleware/errorHandler.js';
 
 // ── Position wire shape — discriminated union by `status` ────────────────
@@ -107,20 +124,26 @@ interface OwnStateSnapshotBody {
   commitments: CommitmentBody[];
   positions: OwnerPosition[];
   /**
-   * True when ANY resource (commitments or positions) was capped and more
-   * pages exist. The SDK MUST NOT emit `ready` for trading until this is
-   * `false` (spec §6.2).
+   * COMMITMENTS-ONLY truncation discriminant. True when the active or
+   * terminal commitments query saturated `ownStateSnapshotMaxCommitments`
+   * and more pages remain. The SDK pages `?cursor=` until `truncated:
+   * false`, then opens the stream with the final `k='live'` cursor.
+   * `truncated` does NOT include positions truncation — see
+   * `positionsTruncated` below for that.
    */
   truncated: boolean;
   /**
-   * True when the position categorization helper hit its 200-row cap, so
-   * `positions[]` may be missing rows. M4a accepts this as a fail-closed
-   * contract: the cursor's `p` watermark is preserved (or sentinel on cold
-   * start) so the M4b stream replays every position transition since the
-   * preserved tail, eventually filling in any rows the snapshot dropped.
-   * SDK consumers paginating > 200 unclaimed positions should also fall
-   * back to `/v1/positions/:address` for full history during the M4a
-   * window.
+   * Positions truncation discriminant. True when
+   * `fetchCategorizedPositions` hit its 200-row cap. The SDK does NOT
+   * page the snapshot for this — there's no analog to commitments'
+   * `?cursor=` paging on the actionable-positions filter. Instead the
+   * stream cold-start treats `positionsTruncated: true` as a degraded
+   * state: emits `event: degraded` then `ready`, and the SDK / MM
+   * enters quote-hold per spec §2.6. The `cursor.p` watermark is
+   * preserved (or sentinel on cold start) so resume catch-up still
+   * uses it for the terminal-since-cursor filter; the
+   * `/v1/positions/:address` REST endpoint covers operator-side full
+   * history.
    */
   positionsTruncated: boolean;
 }
@@ -148,47 +171,45 @@ const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower
 const CLAIMED_PAGE_CAP = 200;
 
 // ─────────────────────────────────────────────────────────────────────────
-// Handler
+// Helper — pure(ish) load, no express coupling
+//
+// Factored out from `ownStateSnapshotHandler` so the M4b SSE handler can
+// reuse the same query + cursor logic for its inline `event: snapshot` frame.
+// Returns a tagged result instead of writing to the response.
 // ─────────────────────────────────────────────────────────────────────────
 
-export async function ownStateSnapshotHandler(req: Request, res: Response): Promise<void> {
+export type LoadOwnStateSnapshotResult =
+  | {
+      ok: true;
+      body: OwnStateSnapshotBody;
+      /**
+       * Derived (key, status, sourceUpdatedAt) for every actionable
+       * position the snapshot saw — computed from the SAME categorization
+       * join that built `body.positions`. The M4b stream handler hands
+       * this to `OwnStateHub.seedStatusCache` BEFORE starting the live
+       * timer so the seed and the wire body are guaranteed consistent
+       * (eliminating the cold-start race a separate post-snapshot
+       * derivation would have introduced).
+       */
+      seedRows: DerivedPositionStatus[];
+    }
+  | { ok: false; status: number; error: ApiError };
+
+export async function loadOwnStateSnapshot(
+  address: string,
+  cursor: OwnStateCursor | null,
+  nowMs: number,
+): Promise<LoadOwnStateSnapshotResult> {
   const config = loadConfig();
   const sb = getSupabase();
-  // verifyStreamToken middleware guarantees this exists; the cast is the
-  // type-narrow with no runtime work.
-  const address = (req as StreamAuthRequest).streamAuth.address;
   const maxCommitments = config.ownStateSnapshotMaxCommitments;
-
-  // ── 1. Parse optional cursor ─────────────────────────────────────────
-  let cursor: OwnStateCursor | null = null;
-  if (req.query.cursor !== undefined) {
-    const raw = req.query.cursor;
-    if (typeof raw !== 'string' || raw.length === 0) {
-      res.status(400).json({
-        error: 'cursor must be a non-empty base64url string.',
-        code: 'INVALID_PARAM',
-      } satisfies ApiError);
-      return;
-    }
-    try {
-      cursor = decodeOwnStateCursor(raw);
-    } catch (err) {
-      if (err instanceof OwnStateCursorError) {
-        res.status(400).json(err.apiError);
-        return;
-      }
-      throw err;
-    }
-  }
-
-  const nowMs = Date.now();
   const nowISO = new Date(nowMs).toISOString();
 
-  // ── Cursor state machine (Hermes review-31 round 2 — explicit phases) ──
+  // ── Cursor state machine (explicit two-phase recovery) ───────────────
   //
-  // Round-1's merge approach interleaved active and terminal rows by
-  // (row_updated_at, id), which could starve a long-lived active row out
-  // of page 1's slice and then permanently exclude it on page 2's strict
+  // A merged stream interleaving active and terminal rows by
+  // (row_updated_at, id) would starve a long-lived active row out of
+  // page 1's slice and then permanently exclude it on page 2's strict
   // keyset. The two-phase model drains the entire active set BEFORE any
   // terminal row is delivered. Phase boundaries:
   //
@@ -246,11 +267,11 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
         { err: activeRes.error.message },
         'ownState/snapshot: active commitments query failed',
       );
-      res.status(500).json({
-        error: 'Failed to load own-state.',
-        code: 'INTERNAL_ERROR',
-      } satisfies ApiError);
-      return;
+      return {
+        ok: false,
+        status: 500,
+        error: { error: 'Failed to load own-state.', code: 'INTERNAL_ERROR' },
+      };
     }
     activeRows = (activeRes.data ?? []) as unknown as CommitmentRecoveryRow[];
     phase1Saturated = activeRows.length >= maxCommitments;
@@ -283,11 +304,11 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
         { err: terminalRes.error.message },
         'ownState/snapshot: terminal commitments query failed',
       );
-      res.status(500).json({
-        error: 'Failed to load own-state.',
-        code: 'INTERNAL_ERROR',
-      } satisfies ApiError);
-      return;
+      return {
+        ok: false,
+        status: 500,
+        error: { error: 'Failed to load own-state.', code: 'INTERNAL_ERROR' },
+      };
     }
     terminalRows = (terminalRes.data ?? []) as unknown as CommitmentRecoveryRow[];
     phase2Saturated = terminalRows.length >= maxCommitments;
@@ -309,11 +330,11 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
           { err: terminalRes.error.message },
           'ownState/snapshot: terminal commitments query failed',
         );
-        res.status(500).json({
-          error: 'Failed to load own-state.',
-          code: 'INTERNAL_ERROR',
-        } satisfies ApiError);
-        return;
+        return {
+          ok: false,
+          status: 500,
+          error: { error: 'Failed to load own-state.', code: 'INTERNAL_ERROR' },
+        };
       }
       terminalRows = (terminalRes.data ?? []) as unknown as CommitmentRecoveryRow[];
       phase2Saturated = terminalRows.length >= terminalBudget;
@@ -331,28 +352,29 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
   const truncatedCommitments = phase1Saturated || phase2Saturated;
 
   // ── Positions (delivered on every page; never paginated within snapshot) ──
-  // M4a fail-closed contract for positions: re-use the categorized fetcher.
-  // The raw query inside the helper caps at 200; `hitCap` surfaces the
-  // raw-cap signal (Hermes review-31 round 2 blocker #3 — counting
-  // post-filtered categorized rows under-detected truncation when the
-  // helper filtered "lost" positions below the cap).
+  // Re-use the categorized fetcher. The raw query inside the helper caps
+  // at 200; `hitCap` surfaces the raw-cap signal because counting
+  // post-filtered categorized rows under-detects truncation when the
+  // helper filters lost positions below the cap.
   let active: PositionBase[];
   let pendingSettle: PendingSettlePosition[];
   let claimable: ClaimablePosition[];
   let positionsHitCap: boolean;
+  let derivedStatuses: DerivedPositionStatus[];
   try {
     const categorized = await fetchCategorizedPositions(address);
     active = categorized.active;
     pendingSettle = categorized.pendingSettle;
     claimable = categorized.claimable;
     positionsHitCap = categorized.hitCap;
+    derivedStatuses = categorized.derivedStatuses;
   } catch (err) {
     logger.error({ err: formatError(err) }, 'ownState/snapshot: position categorization failed');
-    res.status(500).json({
-      error: 'Failed to load own-state.',
-      code: 'INTERNAL_ERROR',
-    } satisfies ApiError);
-    return;
+    return {
+      ok: false,
+      status: 500,
+      error: { error: 'Failed to load own-state.', code: 'INTERNAL_ERROR' },
+    };
   }
 
   // Claimed-since-cursor: only when recovering. Keyset matches the
@@ -379,11 +401,11 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
         { err: claimedRes.error.message },
         'ownState/snapshot: claimed positions query failed',
       );
-      res.status(500).json({
-        error: 'Failed to load own-state.',
-        code: 'INTERNAL_ERROR',
-      } satisfies ApiError);
-      return;
+      return {
+        ok: false,
+        status: 500,
+        error: { error: 'Failed to load own-state.', code: 'INTERNAL_ERROR' },
+      };
     }
     claimedRows = (claimedRes.data ?? []) as unknown as ClaimedPositionRow[];
   }
@@ -399,7 +421,7 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
     ...claimedRows.map((r) => mapClaimedRow(r, address)),
   ];
 
-  // ── Response cursor (Hermes review-31 round 2 — two-phase state machine) ──
+  // ── Response cursor (two-phase state machine) ────────────────────────
   //
   //   - c: phase 1 saturated → last activeRow's (row, id); phase 2 saturated
   //        (only) → last terminalRow's (row, id); neither → MAX in DB.
@@ -409,16 +431,20 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
   //        fill the SDK hasn't seen. Cold start: MAX in DB; input cursor:
   //        preserved verbatim.
   //   - p: positions truncated → preserve input.p (or sentinel on cold start)
-  //        so the M4b stream replays every position transition since.
+  //        so the live stream replays every position transition since.
   //   - k: phase 1 saturated → `page-recovery-active` (recovering) or
   //        `page-active` (cold start); phase 2 saturated → `page-recovery-
   //        terminal`; else → `live`.
   //
   // The `truncated` body field is COMMITMENTS-ONLY (decoupled from
-  // `positionsTruncated`, per Hermes review-31 round 2 blocker #4). The SDK's
-  // "page until truncated: false" contract no longer loops on positions-only
-  // truncation; positions truncation is informational and is converged by
-  // the M4b stream + a /v1/positions fallback per README.
+  // `positionsTruncated`). The SDK's "page until truncated: false"
+  // contract does not loop on positions-only truncation:
+  // `positionsTruncated:true` means position visibility is PARTIAL —
+  // the stream cold-start emits `event: degraded` before `ready` and
+  // the SDK / MM must quote-hold per spec §2.6 and treat owner-state
+  // as partial. There is no paging/convergence mechanism that drains
+  // positions beyond the actionable cap; full history is available
+  // out-of-band via `/v1/positions/:address` for operator tooling.
   let cWatermark: ResourceWatermark;
   let outputK: OwnStateCursorKind;
   let outputCAnchor: ResourceWatermark | undefined;
@@ -442,9 +468,39 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
     ? cursor.f
     : await maxWatermarkForFills(sb, config.network, address);
 
-  const pWatermark: ResourceWatermark = positionsTruncated
-    ? (cursor?.p ?? SENTINEL_WATERMARK)
-    : await maxWatermarkForPositions(sb, config.network, address);
+  // cursor.p reflects the maximum DERIVED `sourceUpdatedAt` across the
+  // snapshot's actionable positions — NOT raw `positions.row_updated_at`.
+  // The M4b stream advances `p` with `sourceUpdatedAt = max(position,
+  // speculation, contest)` and the resume catch-up filters via
+  // `compareIsoTimestamptz` (microsecond-precise). Minting `p` here from
+  // the same derived domain via `maxIsoTimestamptz` keeps snapshot and
+  // stream cursors comparable end-to-end; `Date.parse`-based max would
+  // truncate Postgres's microsecond precision and let same-ms parent
+  // transitions freeze `p` even though a newer source actually advanced.
+  // When `positionsTruncated`, we preserve the input cursor's `p` (or
+  // sentinel on cold start) so the SDK / MM treats the wallet as
+  // degraded per the documented contract; the stream also emits
+  // `event: degraded` in this case.
+  let pWatermark: ResourceWatermark;
+  if (positionsTruncated) {
+    pWatermark = cursor?.p ?? SENTINEL_WATERMARK;
+  } else if (derivedStatuses.length > 0) {
+    const bestS = maxIsoTimestamptz(
+      ...derivedStatuses.map((d) => d.sourceUpdatedAt),
+    );
+    // i='0' is a permissive tie-breaker: the stream's catch-up filter
+    // `(sourceUpdatedAt, id) > (p.s, p.i)` re-admits any position whose
+    // source matches `p.s` and has id > 0 (i.e. every real DB row).
+    // The SDK reducer dedupes the over-emission via the spec §2.1.2
+    // semantic event key.
+    pWatermark = { s: bestS, i: '0' };
+  } else {
+    // No actionable positions and no truncation — preserve input cursor's
+    // p (resume) or sentinel (cold start) so the catch-up has nothing to
+    // filter against. Catch-up's terminal-since-cursor query then catches
+    // any recent terminal transitions.
+    pWatermark = cursor?.p ?? SENTINEL_WATERMARK;
+  }
 
   const responseCursor: OwnStateCursor =
     outputCAnchor !== undefined
@@ -473,7 +529,47 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
     truncated: truncatedCommitments,
     positionsTruncated,
   };
-  res.status(200).json(body);
+  return { ok: true, body, seedRows: derivedStatuses };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Express adapter
+//
+// Wraps `loadOwnStateSnapshot` for the REST route. Owns input parsing
+// (cursor validation, 400s) and translates the tagged result into a JSON
+// response.
+// ─────────────────────────────────────────────────────────────────────────
+
+export async function ownStateSnapshotHandler(req: Request, res: Response): Promise<void> {
+  const address = (req as StreamAuthRequest).streamAuth.address;
+
+  let cursor: OwnStateCursor | null = null;
+  if (req.query.cursor !== undefined) {
+    const raw = req.query.cursor;
+    if (typeof raw !== 'string' || raw.length === 0) {
+      res.status(400).json({
+        error: 'cursor must be a non-empty base64url string.',
+        code: 'INVALID_PARAM',
+      } satisfies ApiError);
+      return;
+    }
+    try {
+      cursor = decodeOwnStateCursor(raw);
+    } catch (err) {
+      if (err instanceof OwnStateCursorError) {
+        res.status(400).json(err.apiError);
+        return;
+      }
+      throw err;
+    }
+  }
+
+  const result = await loadOwnStateSnapshot(address, cursor, Date.now());
+  if (!result.ok) {
+    res.status(result.status).json(result.error);
+    return;
+  }
+  res.status(200).json(result.body);
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -533,24 +629,6 @@ async function maxWatermarkForFills(
     .select('row_updated_at, id')
     .eq('network', network)
     .or(`maker_address.eq.${address},taker_address.eq.${address}`)
-    .order('row_updated_at', { ascending: false })
-    .order('id', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  if (res.error || !res.data) return SENTINEL_WATERMARK;
-  return { s: String(res.data.row_updated_at), i: String(res.data.id) };
-}
-
-async function maxWatermarkForPositions(
-  sb: SbClient,
-  network: string,
-  address: string,
-): Promise<ResourceWatermark> {
-  const res = await sb
-    .from('positions')
-    .select('row_updated_at, id')
-    .eq('network', network)
-    .eq('user_address', address)
     .order('row_updated_at', { ascending: false })
     .order('id', { ascending: false })
     .limit(1)

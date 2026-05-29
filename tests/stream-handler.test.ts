@@ -390,7 +390,7 @@ describe('catchup counters', () => {
     });
   });
 
-  it('slow-client shed during catch-up is NOT counted as completed (Hermes review-28 blocker)', async () => {
+  it('slow-client shed during catch-up is NOT counted as completed', async () => {
     // Production race: makeShedIfSlow calls res.end() synchronously but the 'close'
     // event fires asynchronously, so the wrapper's `closed` flag stays false on the
     // microtask boundary the IIFE re-enters on. Before the fix, runCatchUp returned

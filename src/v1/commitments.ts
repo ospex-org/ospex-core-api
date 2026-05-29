@@ -908,7 +908,7 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
     return;
   }
   // (`?includeHidden` is rejected at the top of `getCommitmentsHandler`
-  // above — Hermes review-29 caught that placing the check here let
+  // above — placing the check here would let
   // `?since=<cursor>&includeHidden=*` bypass the rejection.)
   // Opt-in advisory fillability (Layer D). When true, each row carries a
   // `fillability` object from the maker_funding snapshot. Default off — the

@@ -185,9 +185,9 @@ const flush = async (): Promise<void> => {
 
 describe('StreamHub forward drain — no starvation under a page budget', () => {
   it('reaches every row across ticks even when the per-tick budget is small', async () => {
-    // The bug Hermes reproduced: a small budget + floor re-scan kept re-reading
-    // rows 1-4 and never reached row 5. With a strict advancing tip, each tick
-    // makes forward progress.
+    // Starvation regression: a small budget + floor re-scan kept re-reading
+    // rows 1-4 and never reached row 5. With a strict advancing tip, each
+    // tick makes forward progress.
     const data = [fillRow(1, 1), fillRow(2, 2), fillRow(3, 3), fillRow(4, 4), fillRow(5, 5)];
     const hub = new StreamHub({
       getClient: () => datasetClient(() => data, () => []),

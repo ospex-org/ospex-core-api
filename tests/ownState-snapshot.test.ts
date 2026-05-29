@@ -157,7 +157,13 @@ const sentinelWatermarkRow = { row_updated_at: '2026-05-29T15:30:00.000Z', id: 4
 const fillsWatermarkRow = { row_updated_at: '2026-05-29T15:31:00.000Z', id: 7 };
 const positionsWatermarkRow = { row_updated_at: '2026-05-29T15:32:00.000Z', id: 99 };
 
-const noPositions = { active: [], pendingSettle: [], claimable: [], hitCap: false };
+const noPositions = {
+  active: [],
+  pendingSettle: [],
+  claimable: [],
+  hitCap: false,
+  derivedStatuses: [],
+};
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -188,7 +194,6 @@ describe('GET /v1/own-state/snapshot — cold start (no cursor)', () => {
       { data: [commitmentRow()], error: null },         // active commitments
       { data: sentinelWatermarkRow, error: null },      // max watermark commitments
       { data: fillsWatermarkRow, error: null },         // max watermark fills
-      { data: positionsWatermarkRow, error: null },     // max watermark positions
     ]);
     supabaseMock.getSupabase.mockReturnValue(client);
 
@@ -206,7 +211,11 @@ describe('GET /v1/own-state/snapshot — cold start (no cursor)', () => {
     expect(decoded.v).toBe(OWN_STATE_CURSOR_VERSION);
     expect(decoded.c).toEqual({ s: sentinelWatermarkRow.row_updated_at, i: '42' });
     expect(decoded.f).toEqual({ s: fillsWatermarkRow.row_updated_at, i: '7' });
-    expect(decoded.p).toEqual({ s: positionsWatermarkRow.row_updated_at, i: '99' });
+    // No actionable positions (`derivedStatuses=[]`) → p falls back to
+    // SENTINEL. Snapshot no longer mints p from `positions.row_updated_at`;
+    // it mints from `max(sourceUpdatedAt)` across derived statuses, which
+    // is empty here.
+    expect(decoded.p).toEqual({ s: '1970-01-01T00:00:00.000Z', i: '0' });
   });
 
   it('queries commitments scoped to the authenticated address (the only address)', async () => {
@@ -360,9 +369,9 @@ describe('GET /v1/own-state/snapshot — cursor k=live (recovery)', () => {
     expect(res.statusCode).toBe(200);
     const body = res.body as { commitments: Array<{ commitmentHash: string }>; truncated: boolean };
     expect(body.commitments).toHaveLength(2);
-    // Hermes review-31 round 2: two-phase wire ordering puts active first
-    // (in (row, id) ASC from the phase-1 query) then terminals
-    // (in (row, id) ASC from the phase-2 query). No merge interleaving.
+    // Two-phase wire ordering puts active first (in (row, id) ASC from the
+    // phase-1 query) then terminals (in (row, id) ASC from the phase-2
+    // query). No merge interleaving.
     expect(body.commitments[0]?.commitmentHash).toBe(activeRow.commitment_hash);
     expect(body.commitments[1]?.commitmentHash).toBe(terminalRow.commitment_hash);
     expect(body.truncated).toBe(false);
@@ -432,7 +441,7 @@ describe('GET /v1/own-state/snapshot — cursor k=page-active (cold-start paging
     expect(String(orCalls[0]?.args[0])).toContain('2026-05-29T11:00:00.000Z');
   });
 
-  it('preserves f watermark from input cursor — never advances past undelivered fills (Hermes blocker #3)', async () => {
+  it('preserves f watermark from input cursor — never advances past undelivered fills', async () => {
     const inputF = { s: '2026-05-29T10:00:00.000Z', i: '0' };
     const { client, calls } = makeSupabase([
       { data: [], error: null },                          // active
@@ -514,6 +523,7 @@ describe('GET /v1/own-state/snapshot — position categorization', () => {
       pendingSettle: [{ positionId: 'B_x_1', speculationId: 'B', positionType: 1, team: 't', opponent: 'o', market: 'spread', oddsDecimal: null, riskAmountUSDC: 2, profitAmountUSDC: 0.5, result: 'won', predictedWinSide: 'home', estimatedPayoutUSDC: 2.5, estimatedPayoutWei6: '2500000' }],
       claimable: [{ positionId: 'C_x_0', speculationId: 'C', positionType: 0, team: 't', opponent: 'o', market: 'total', oddsDecimal: 3, riskAmountUSDC: 5, profitAmountUSDC: 10, result: 'won', estimatedPayoutUSDC: 15, estimatedPayoutWei6: '15000000' }],
       hitCap: false,
+      derivedStatuses: [],
     });
     const { client } = makeSupabase([
       { data: [], error: null },                          // active commitments
@@ -534,14 +544,14 @@ describe('GET /v1/own-state/snapshot — position categorization', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
-// Hermes review-31 round 1 — blocker regressions
+// Cursor overlap-floor + recovery-paging regressions
 // ─────────────────────────────────────────────────────────────────────────
 
-describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', () => {
-  // Blocker 1: terminal-recovery keyset on k='live' input applies the
-  // 30s overlap floor — a late-committed row whose `row_updated_at` predates
-  // the cursor by < 30s is included rather than skipped forever.
-  it('k=live input → terminal-recovery keyset is FLOORED by 30s overlap (blocker #1)', async () => {
+describe('GET /v1/own-state/snapshot — overlap floor + paging regressions', () => {
+  // Terminal-recovery keyset on k='live' input applies the 30s overlap
+  // floor — a late-committed row whose `row_updated_at` predates the
+  // cursor by < 30s is included rather than skipped forever.
+  it('k=live input → terminal-recovery keyset is FLOORED by 30s overlap', async () => {
     const cursor = encodeOwnStateCursor({
       t: 'own-state',
       v: OWN_STATE_CURSOR_VERSION,
@@ -604,11 +614,10 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
     expect(String(positionsOrCalls[0]?.args[0])).toContain('2026-05-29T09:59:30.000Z');
   });
 
-  // Hermes review-31 round 2 blocker #2: paging across truncation MUST keep
-  // terminals coming. With the two-phase model: k='page-recovery-terminal'
-  // input continues phase 2 (terminal query with STRICT keyset advance) AND
-  // skips phase 1 entirely.
-  it('k=page-recovery-terminal input → phase-2 query runs with STRICT keyset, phase-1 skipped (blocker #2)', async () => {
+  // Paging across truncation MUST keep terminals coming. With the
+  // two-phase model: k='page-recovery-terminal' input continues phase 2
+  // (terminal query with STRICT keyset advance) AND skips phase 1 entirely.
+  it('k=page-recovery-terminal input → phase-2 query runs with STRICT keyset, phase-1 skipped', async () => {
     const cursor = encodeOwnStateCursor({
       t: 'own-state',
       v: OWN_STATE_CURSOR_VERSION,
@@ -641,9 +650,9 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
     expect(keysetArgs.some((a) => a.includes('2026-05-29T11:29:30.000Z'))).toBe(false);
   });
 
-  // Hermes review-31 round 2 blocker #1: active fills the page on recovery
-  // → output cursor.k = 'page-recovery-active' (not 'page-active') AND
-  // cAnchor is preserved so the next page can switch to phase-2 once active drains.
+  // Active fills the page on recovery → output cursor.k =
+  // 'page-recovery-active' (not 'page-active') AND cAnchor is preserved
+  // so the next page can switch to phase-2 once active drains.
   it('active saturates recovery page → output cursor.k = page-recovery-active + cAnchor preserved', async () => {
     envMock.loadConfig.mockReturnValue({
       network: 'polygon',
@@ -690,11 +699,11 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
     expect(decoded.cAnchor).toEqual({ s: '2026-05-29T09:59:30.000Z', i: '0' });
   });
 
-  // Hermes review-31 round 2 blocker #1: even when active fills the page,
-  // terminals are NOT permanently lost — they wait for phase 1 to drain.
-  // On the NEXT page (k='page-recovery-active' input), phase 1 query still
-  // runs (advancing past c) and, when phase 1 returns < MAX, phase 2 fires
-  // with the preserved cAnchor as its keyset start.
+  // Even when active fills the page, terminals are NOT permanently lost —
+  // they wait for phase 1 to drain. On the NEXT page (k='page-recovery-active'
+  // input), phase 1 query still runs (advancing past c) and, when phase 1
+  // returns < MAX, phase 2 fires with the preserved cAnchor as its keyset
+  // start.
   it('page-recovery-active continuation transitions to phase-2 when active drains', async () => {
     const cursor = encodeOwnStateCursor({
       t: 'own-state',
@@ -785,6 +794,7 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
       pendingSettle: [],
       claimable: [],
       hitCap: true, // raw-cap signal from helper — what `positionsTruncated` derives from
+      derivedStatuses: [],
     });
     const inputP = { s: '2026-05-29T10:00:00.000Z', i: '0' };
     const cursor = encodeOwnStateCursor({
@@ -810,19 +820,20 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
     );
     const body = res.body as { cursor: string; truncated: boolean; positionsTruncated: boolean };
     expect(body.positionsTruncated).toBe(true);
-    // Hermes review-31 round 2 blocker #4: truncated is COMMITMENTS-ONLY,
-    // decoupled from positionsTruncated. Commitments here are empty → false.
+    // `truncated` is COMMITMENTS-ONLY, decoupled from `positionsTruncated`.
+    // Commitments here are empty → false.
     expect(body.truncated).toBe(false);
     const decoded = decodeOwnStateCursor(body.cursor);
     // p preserved at input value — stream replays every position transition since.
     expect(decoded.p).toEqual(inputP);
   });
 
-  // Hermes review-31 round 3 wire-contract blocker: the snapshot was minting
-  // cursors using `+00:00`-form DB timestamps that the round-2 Z-only decoder
-  // then rejected on the very next call. This pins the self-compat invariant:
-  // a cursor the handler mints MUST round-trip through the handler.
-  it('cursor minted from DB-format (+00:00, microseconds) row_updated_at survives a round-trip (blocker #1 round 3)', async () => {
+  // Wire-contract regression: a snapshot mint that the cursor decoder
+  // then rejects breaks paging. A Z-only decoder regex rejected the
+  // `+00:00`-form DB timestamps the snapshot was minting. This pins the
+  // self-compat invariant: a cursor the handler mints MUST round-trip
+  // through the handler.
+  it('cursor minted from DB-format (+00:00, microseconds) row_updated_at survives a round-trip', async () => {
     const dbRow = commitmentRow({
       row_updated_at: '2026-05-29T15:00:00.123456+00:00',
       id: 42,
@@ -859,18 +870,17 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
     expect(decoded.c.s).toBe('2026-05-29T15:00:00.123456+00:00');
   });
 
-  // Hermes review-31 round 4: passive expiry contract. The indexer doesn't
-  // advance `row_updated_at` for time alone, so a commitment whose only
-  // terminal transition is `expiry <= now` appears in NEITHER half of
-  // recovery (active query excludes by `expiry > now`; terminal query's
-  // keyset excludes by `row_updated_at < anchor`). Documented contract:
-  // the snapshot's active set is authoritative of currently-matchable rows
-  // — the SDK reducer prunes locally-expired commitments using its own
-  // clock (same `deriveEffectiveStatus` pattern used everywhere else in
-  // the codebase, and matches the existing `/v1/commitments?since=`
-  // semantics — see snapshot.ts handler docstring).
+  // Passive expiry contract. The indexer doesn't advance `row_updated_at`
+  // for time alone, so a commitment whose only terminal transition is
+  // `expiry <= now` appears in NEITHER half of recovery (active query
+  // excludes by `expiry > now`; terminal query's keyset excludes by
+  // `row_updated_at < anchor`). Documented contract: the snapshot's
+  // active set is authoritative of currently-matchable rows — the SDK
+  // reducer prunes locally-expired commitments using its own clock (same
+  // `deriveEffectiveStatus` pattern used everywhere else in the codebase,
+  // and matches the existing `/v1/commitments?since=` semantics — see
+  // snapshot.ts handler docstring).
   it('passive expiry contract — open row that expired since the cursor with unchanged row_updated_at is NOT emitted (SDK time-prunes locally)', async () => {
-    // Hermes's exact scenario.
     vi.setSystemTime(new Date('2026-05-29T10:06:00.000Z'));
 
     const cursor = encodeOwnStateCursor({
@@ -918,10 +928,10 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
     // since prior cursor", scoping to rows the indexer WROTE).
   });
 
-  // Higher-level black-box pagination test per Hermes's round-3 spec: feed
-  // rows + DB-format timestamps through mocked pages, repeatedly call the
-  // handler until `truncated:false`, assert no skipped rows and every emitted
-  // cursor decodes.
+  // Higher-level black-box pagination test: feed rows + DB-format
+  // timestamps through mocked pages, repeatedly call the handler until
+  // `truncated:false`, assert no skipped rows and every emitted cursor
+  // decodes.
   it('full pagination loop with DB-format timestamps: all rows delivered, no duplicates, every cursor decodes', async () => {
     envMock.loadConfig.mockReturnValue({
       network: 'polygon',
@@ -1010,6 +1020,7 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
       pendingSettle: [],
       claimable: [],
       hitCap: true, // raw-cap signal from helper — what `positionsTruncated` derives from
+      derivedStatuses: [],
     });
     const { client } = makeSupabase([
       { data: [], error: null },                          // active
@@ -1024,5 +1035,74 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
     expect(body.positionsTruncated).toBe(true);
     const decoded = decodeOwnStateCursor(body.cursor);
     expect(decoded.p).toEqual({ s: '1970-01-01T00:00:00.000Z', i: '0' }); // sentinel
+  });
+
+  it('cursor.p mint picks the microsecond-later sourceUpdatedAt across derivedStatuses (round-6 regression)', async () => {
+    // Two derived statuses with sourceUpdatedAt values that differ only
+    // in microseconds within the same millisecond. The snapshot's
+    // cursor.p mint MUST pick the later one — `Date.parse`-based max
+    // would tie them and pick whichever was iterated first, freezing
+    // `p` even though the actual newer source did advance.
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: [
+        {
+          positionId: 'A_x_0',
+          speculationId: '101',
+          positionType: 0,
+          team: 't',
+          opponent: 'o',
+          market: 'moneyline',
+          oddsDecimal: 2,
+          riskAmountUSDC: 1,
+          profitAmountUSDC: 1,
+        },
+        {
+          positionId: 'B_x_0',
+          speculationId: '202',
+          positionType: 0,
+          team: 't',
+          opponent: 'o',
+          market: 'moneyline',
+          oddsDecimal: 2,
+          riskAmountUSDC: 1,
+          profitAmountUSDC: 1,
+        },
+      ],
+      pendingSettle: [],
+      claimable: [],
+      hitCap: false,
+      // Iteration order: A first. A's sourceUpdatedAt is microsecond-
+      // EARLIER. The `Date.parse`-based max would pick A (same ms ⇒
+      // no update). `maxIsoTimestamptz` picks B (later microseconds).
+      derivedStatuses: [
+        {
+          key: '101_0',
+          status: 'active',
+          sourceUpdatedAt: '2026-05-29T15:00:00.000100Z',
+          result: undefined,
+          claimableAmount: undefined,
+        },
+        {
+          key: '202_0',
+          status: 'active',
+          sourceUpdatedAt: '2026-05-29T15:00:00.000200Z',
+          result: undefined,
+          claimableAmount: undefined,
+        },
+      ],
+    });
+    const { client } = makeSupabase([
+      { data: [], error: null }, // active commitments
+      { data: null, error: null }, // max commitments
+      { data: null, error: null }, // max fills
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await ownStateSnapshotHandler(makeReq(), res as unknown as Response);
+    const body = res.body as { cursor: string };
+    const decoded = decodeOwnStateCursor(body.cursor);
+    // p.s = .000200 (the microsecond-later one), NOT .000100.
+    expect(decoded.p.s).toBe('2026-05-29T15:00:00.000200Z');
+    expect(decoded.p.i).toBe('0');
   });
 });

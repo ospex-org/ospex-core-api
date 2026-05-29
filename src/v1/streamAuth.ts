@@ -42,9 +42,9 @@ interface ChallengeResponseBody {
 export function postStreamChallengeHandler(req: Request, res: Response): void {
   const config = loadConfig();
   // Unified readiness contract: BOTH endpoints require all three env vars.
-  // A challenge that can be minted but never traded for a token is dead-end UX
-  // (the SDK can't recover); fail fast at the first call so the operator
-  // sees the misconfiguration immediately. Per Hermes review-30.
+  // A challenge that can be minted but never traded for a token is dead-end
+  // UX (the SDK can't recover); fail fast at the first call so the operator
+  // sees the misconfiguration immediately.
   if (
     !config.streamAuthHmacSecret ||
     !config.streamAuthAudience ||
@@ -206,9 +206,8 @@ export function postStreamTokenHandler(req: Request, res: Response): void {
   }
 
   // Single-use consumption — covers replay + expiry + address-binding +
-  // server-bound issuedAt/expiresAt comparison (Hermes review-30 round 2;
-  // the burn-DoS and tampered-timestamp defences live inside
-  // ChallengeStore.consume).
+  // server-bound issuedAt/expiresAt comparison. The burn-DoS and
+  // tampered-timestamp defences live inside ChallengeStore.consume.
   const nowSec = Math.floor(Date.now() / 1000);
   const consumed = challengeStore.consume(c.challengeId, c, nowSec);
   if (!consumed.ok) {
@@ -274,8 +273,8 @@ function parseChallenge(raw: unknown):
     return { ok: false, error: 'challenge.network must be an object.' };
   }
   const chainId = (network as Record<string, unknown>)['chainId'];
-  // Hermes review-30 blocker: typeof === 'number' alone lets fractional /
-  // Infinity / NaN through, and the BigInt() conversion downstream throws
+  // Strict numeric validation: `typeof === 'number'` alone lets fractional
+  // / Infinity / NaN through, and the BigInt() conversion downstream throws
   // RangeError → Express 500. Safe-integer + non-negative everywhere a
   // value flows into BigInt or into a JSON-roundtrip comparison.
   if (!Number.isSafeInteger(chainId) || (chainId as number) <= 0) {
