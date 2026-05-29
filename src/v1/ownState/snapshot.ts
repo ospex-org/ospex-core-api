@@ -21,11 +21,38 @@
  *     cursor: <base64url composite>,
  *     commitments: OwnerCommitment[],
  *     positions: OwnerPosition[],
- *     truncated: boolean
+ *     truncated: boolean,
+ *     positionsTruncated: boolean
  *   }
  *
  * Truncation is the maker's signal to keep paging via `?cursor=` until
  * `truncated: false`; the SDK MUST NOT emit `ready` until then (§6.2).
+ *
+ * ── Passive-expiry contract (Hermes review-31 round 4) ────────────────
+ *
+ * "Recently-terminal-since-cursor" recovery emits rows whose terminal
+ * transition the INDEXER WROTE TO THE DB (status → filled/cancelled,
+ * `nonce_invalidated=true`, `book_visible=false`). It does NOT emit
+ * passive time-based expiry, because the indexer does not advance
+ * `row_updated_at` when only time passes. A commitment whose only
+ * terminal transition is `expiry <= now` will appear in NEITHER half of
+ * the recovery response: the active query excludes it (`expiry > now`
+ * fails) and the terminal query's keyset filter excludes it
+ * (`row_updated_at < recovery anchor`).
+ *
+ * This matches the existing `/v1/commitments?since=` behavior and the
+ * server-derived effective-status pattern used everywhere else: server
+ * stores raw values, and effective lifecycle (`expired`/`cancelled`/etc.)
+ * is computed at read time using `nowMs` in `deriveEffectiveStatus`.
+ *
+ * SDK reducer obligation: for any locally-held commitment whose stored
+ * `expiry` has lapsed, transition it to terminal in local state. This
+ * is the same effective-status computation the SDK already does on the
+ * commitments it RECEIVES from the snapshot or the stream — applied to
+ * its own locally-held rows on a tick or on reconnect. The active set
+ * the snapshot returns is authoritative of CURRENTLY-MATCHABLE rows;
+ * anything the SDK is holding locally as "active" but that isn't in the
+ * returned active set OR has lapsed expiry MUST be pruned.
  */
 
 import type { Request, Response } from 'express';

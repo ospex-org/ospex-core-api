@@ -859,6 +859,65 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
     expect(decoded.c.s).toBe('2026-05-29T15:00:00.123456+00:00');
   });
 
+  // Hermes review-31 round 4: passive expiry contract. The indexer doesn't
+  // advance `row_updated_at` for time alone, so a commitment whose only
+  // terminal transition is `expiry <= now` appears in NEITHER half of
+  // recovery (active query excludes by `expiry > now`; terminal query's
+  // keyset excludes by `row_updated_at < anchor`). Documented contract:
+  // the snapshot's active set is authoritative of currently-matchable rows
+  // — the SDK reducer prunes locally-expired commitments using its own
+  // clock (same `deriveEffectiveStatus` pattern used everywhere else in
+  // the codebase, and matches the existing `/v1/commitments?since=`
+  // semantics — see snapshot.ts handler docstring).
+  it('passive expiry contract — open row that expired since the cursor with unchanged row_updated_at is NOT emitted (SDK time-prunes locally)', async () => {
+    // Hermes's exact scenario.
+    vi.setSystemTime(new Date('2026-05-29T10:06:00.000Z'));
+
+    const cursor = encodeOwnStateCursor({
+      t: 'own-state',
+      v: OWN_STATE_CURSOR_VERSION,
+      c: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      f: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      p: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      k: 'live',
+    });
+
+    // The expiring row exists in the DB. The handler's active query
+    // EXCLUDES it via `.gt('expiry', nowISO)` — the mock returns []
+    // because the test asserts the documented contract, not the raw query
+    // behavior. Similarly the terminal query's keyset (row_updated_at >
+    // floor(09:59:30) excludes a row updated at 09:00:00, so it also
+    // returns []. Both empty → the response carries no commitment for
+    // this row.
+    const { client } = makeSupabase([
+      { data: [], error: null },                                    // active (excludes by `expiry > now`)
+      { data: [], error: null },                                    // terminal (excludes by keyset row_updated_at)
+      { data: [], error: null },                                    // claimed
+      { data: null, error: null },                                  // max commitments
+      { data: null, error: null },                                  // max positions
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+
+    const res = makeRes();
+    await ownStateSnapshotHandler(
+      makeReq({ query: { cursor } }),
+      res as unknown as Response,
+    );
+
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { commitments: unknown[]; truncated: boolean };
+    expect(body.commitments).toHaveLength(0);
+    expect(body.truncated).toBe(false);
+
+    // Per the documented contract: the SDK reducer is responsible for
+    // computing effective status locally on each tick / on reconnect and
+    // marking any locally-held commitment with stored `expiry <= now` as
+    // terminal. The server emitting it would require a third recovery
+    // phase keyed by `expiry` rather than `row_updated_at` — out of scope
+    // for M4a and not required by the spec (which says "recently terminal
+    // since prior cursor", scoping to rows the indexer WROTE).
+  });
+
   // Higher-level black-box pagination test per Hermes's round-3 spec: feed
   // rows + DB-format timestamps through mocked pages, repeatedly call the
   // handler until `truncated:false`, assert no skipped rows and every emitted
