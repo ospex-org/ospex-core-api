@@ -613,4 +613,3 @@ async function maxWatermarkForFills(
   if (res.error || !res.data) return SENTINEL_WATERMARK;
   return { s: String(res.data.row_updated_at), i: String(res.data.id) };
 }
-

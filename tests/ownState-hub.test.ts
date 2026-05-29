@@ -278,13 +278,18 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
     });
     const cb = makeCallbacks();
     hub.subscribe(ADDRESS, cb);
-    // Pre-seed with the same status the derivation will produce
-    // (away 10 / home 5 + upper position ⇒ pendingSettle).
+    // Pre-seed with the FULL payload the derivation will produce
+    // (away 10 / home 5 + upper position ⇒ pendingSettle, result='won',
+    // claimableAmount = risk + profit = 1M + 500k = 1.5M wei6). The
+    // dedup now compares result + claimableAmount too, so missing fields
+    // in the seed would force a spurious emit on the first tick.
     hub.seedStatusCache(ADDRESS, [
       {
         key: `${row.speculation_id}_0`,
         status: 'pendingSettle',
         sourceUpdatedAt: row.row_updated_at as string,
+        result: 'won',
+        claimableAmount: '1500000',
       },
     ]);
     await hub.pollWallet(ADDRESS);
@@ -509,6 +514,71 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
         status: 'claimable',
       },
     ]);
+  });
+
+  it('re-emits on a same-status payload change (score correction flips pendingSettle from won to push)', async () => {
+    // Hermes review-32 round 4 blocker 3: the prior dedup compared
+    // only `status`. A contest score correction that keeps the
+    // position at `pendingSettle` but flips its predicted result/payout
+    // would have been suppressed, leaving the SDK with a stale payload.
+    // The fix compares (status, sourceUpdatedAt, result, claimableAmount).
+    const row = positionRow({ row_updated_at: '2026-05-29T15:00:00.000Z' });
+    const spec = speculationRow({
+      speculation_status: 'open',
+      win_side: 'tbd',
+      row_updated_at: '2026-05-29T15:00:00.000Z',
+    });
+    // Initial contest: away 10, home 5 → upper position predicted to win.
+    let contests: Row[] = [
+      contestRow({
+        contest_status: 'scored',
+        away_score: 10,
+        home_score: 5,
+        row_updated_at: '2026-05-29T15:30:00.000Z',
+      }),
+    ];
+
+    const hub = new OwnStateHub({
+      getClient: () =>
+        makeClient({
+          positions: [row],
+          speculations: [spec],
+          contests: contests,
+        }),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+    });
+    const cb = makeCallbacks();
+    hub.subscribe(ADDRESS, cb);
+    // Seed with current state (pendingSettle, result='won',
+    // claimableAmount = 1M + 500k = 1.5M).
+    hub.seedStatusCache(ADDRESS, [
+      {
+        key: '101_0',
+        status: 'pendingSettle',
+        sourceUpdatedAt: '2026-05-29T15:30:00.000Z',
+        result: 'won',
+        claimableAmount: '1500000',
+      },
+    ]);
+    await hub.pollWallet(ADDRESS);
+    expect(cb.positionStatuses).toEqual([]);
+    // Score correction: away 7, home 7 → predicted push (status still
+    // pendingSettle, but result='push' and claimableAmount=1M (risk only).
+    contests.length = 0;
+    contests.push(
+      contestRow({
+        contest_status: 'scored',
+        away_score: 7,
+        home_score: 7,
+        row_updated_at: '2026-05-29T15:40:00.000Z',
+      }),
+    );
+    await hub.pollWallet(ADDRESS);
+    expect(cb.positionStatuses).toHaveLength(1);
+    expect(cb.positionStatuses[0]!.status).toBe('pendingSettle');
+    expect(cb.positionStatuses[0]!.ts).toBe('2026-05-29T15:40:00.000Z');
   });
 
   it('beginLive starts the per-wallet timer (idempotent on second call)', async () => {

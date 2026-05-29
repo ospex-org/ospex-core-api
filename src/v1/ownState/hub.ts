@@ -138,6 +138,19 @@ interface StatusCacheEntry {
   status: import('./positionStatus.js').PositionStatus;
   /** `max(positions.row_updated_at, speculations.row_updated_at, contests.row_updated_at)` at emit time. */
   sourceUpdatedAt: string;
+  /**
+   * Advisory categorical result (won/lost/push/void) — part of the
+   * payload-level dedup. A same-status event with a different `result`
+   * still emits (e.g. score correction flipping pendingSettle's
+   * prediction). Per spec §2.1.2 the SDK reducer's dedup key is
+   * (addr, specId, ptype, status, sourceUpdatedAt); we include `result`
+   * + `claimableAmount` here as belt-and-braces against any derivation
+   * that could change the payload while keeping the same (status,
+   * sourceUpdatedAt) pair.
+   */
+  result: 'won' | 'lost' | 'push' | 'void' | undefined;
+  /** wei6 claimable amount — part of the payload-level dedup. */
+  claimableAmount: string | undefined;
 }
 
 interface WalletPoller {
@@ -297,12 +310,23 @@ export class OwnStateHub {
    */
   seedStatusCache(
     address: string,
-    entries: Array<{ key: string; status: import('./positionStatus.js').PositionStatus; sourceUpdatedAt: string }>,
+    entries: Array<{
+      key: string;
+      status: import('./positionStatus.js').PositionStatus;
+      sourceUpdatedAt: string;
+      result?: 'won' | 'lost' | 'push' | 'void' | undefined;
+      claimableAmount?: string | undefined;
+    }>,
   ): void {
     const state = this.pollers.get(address.toLowerCase());
     if (!state) return;
     for (const e of entries) {
-      state.statusCache.set(e.key, { status: e.status, sourceUpdatedAt: e.sourceUpdatedAt });
+      state.statusCache.set(e.key, {
+        status: e.status,
+        sourceUpdatedAt: e.sourceUpdatedAt,
+        result: e.result,
+        claimableAmount: e.claimableAmount,
+      });
     }
   }
 
@@ -648,15 +672,32 @@ export class OwnStateHub {
       );
       const key = `${String(row.speculation_id)}_${positionType}`;
       const prior = state.statusCache.get(key);
-      state.statusCache.set(key, { status: body.status, sourceUpdatedAt });
-      // Emit when derived status differs from the seeded/cached entry.
-      // Covers both raw position transitions AND spec/contest-driven
-      // transitions on unchanged position rows. A previously-unseen key
-      // (prior === undefined) also emits — the handler is responsible for
-      // seeding every position it discovered, so an unseen key means a
-      // genuinely new position OR a tick that raced the handoff (in which
-      // case the subscriber's preReady abort path catches it).
-      if (prior && prior.status === body.status) continue;
+      state.statusCache.set(key, {
+        status: body.status,
+        sourceUpdatedAt,
+        result: body.result,
+        claimableAmount: body.claimableAmount,
+      });
+      // Emit when ANY semantic field differs from the seeded/cached entry.
+      // The SDK reducer's dedup key (spec §2.1.2) is (addr, specId,
+      // positionType, status, sourceUpdatedAt); we additionally compare
+      // `result` and `claimableAmount` so a same-status payload-only
+      // change (e.g. a contest score correction flipping
+      // pendingSettle's predicted result from `won` to `push`, or
+      // changing the claimable amount) still surfaces. A previously-
+      // unseen key (prior === undefined) also emits — the handler is
+      // responsible for seeding every position it discovered, so an
+      // unseen key means a genuinely new position OR a tick that raced
+      // the handoff (the preReady abort path then catches it).
+      if (
+        prior &&
+        prior.status === body.status &&
+        prior.sourceUpdatedAt === sourceUpdatedAt &&
+        prior.result === body.result &&
+        prior.claimableAmount === body.claimableAmount
+      ) {
+        continue;
+      }
       for (const sub of state.subs) {
         try {
           sub.onPositionStatus(body, sourceUpdatedAt, String(row.id));

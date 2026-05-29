@@ -111,6 +111,21 @@ export interface DerivedPositionStatus {
   key: string;
   status: PositionStatus;
   sourceUpdatedAt: string;
+  /**
+   * Advisory categorical result (won/lost/push/void). The M4b stream's
+   * dedup contract treats this as a payload field — a same-status event
+   * with a different `result` still emits, so a contest score correction
+   * that flips `pendingSettle` from `won` to `push` surfaces even though
+   * the status itself is unchanged.
+   */
+  result: 'won' | 'lost' | 'push' | 'void' | undefined;
+  /**
+   * wei6 claimable amount when the position has a non-zero payout
+   * (pendingSettle won/push, claimable, void). Same payload-dedup
+   * rationale as `result` — a score correction that changes the
+   * predicted payout must re-emit even at the same status.
+   */
+  claimableAmount: string | undefined;
 }
 
 export interface PositionFetchResult {
@@ -395,6 +410,8 @@ export async function fetchCategorizedPositions(
       key: `${String(p.speculation_id)}_${positionType}`,
       status: derivedBody.status,
       sourceUpdatedAt,
+      result: derivedBody.result,
+      claimableAmount: derivedBody.claimableAmount,
     });
 
     const team = contest

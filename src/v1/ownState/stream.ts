@@ -363,12 +363,18 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
 
       // Seed hub cache from the catch-up's derivation BEFORE starting the
       // poll timer (same race-protection rationale as cold-start above).
+      // Include `result` + `claimableAmount` so the hub's payload-level
+      // dedup has a complete baseline — a same-status / different-payload
+      // change on the next tick (e.g. score-correction-driven prediction
+      // flip) then surfaces instead of being suppressed.
       getOwnStateHub().seedStatusCache(
         address,
         catchupResult.seedRows.map((r) => ({
           key: r.key,
           status: r.body.status,
           sourceUpdatedAt: r.sourceUpdatedAt,
+          result: r.body.result,
+          claimableAmount: r.body.claimableAmount,
         })),
       );
       if (catchupResult.degraded) {
@@ -772,7 +778,20 @@ export async function derivePositionsForWallet(
   let terminalRows: typeof actionable = [];
   let terminalSaturated = false;
   if (options.recentTerminalSince) {
-    const since = options.recentTerminalSince;
+    // Apply the same `(row_updated_at, id) > floor(cursor.p)` keyset +
+    // 30s overlap floor the rest of the recovery paths use. A naive
+    // `.gt('row_updated_at', since.s)` would miss:
+    //   - same-timestamp rows with higher id (id tie-breaker);
+    //   - rows whose row_updated_at landed in the 30s overlap window
+    //     (a writer-tx that committed late vs. `now()` semantics).
+    // Combine `(claimed=true OR risk_amount=0) AND keyset` as ONE
+    // PostgREST `.or()` expression — supabase-js chains, but using a
+    // single DNF expression with nested `or(...)` inside `and(...)` is
+    // the same pattern the fills catch-up uses for sided keyset.
+    const floored = floorBaseWatermark(options.recentTerminalSince);
+    const keyset = `row_updated_at.gt.${floored.s},and(row_updated_at.eq.${floored.s},id.gt.${floored.i})`;
+    const terminalExpr =
+      `and(claimed.eq.true,or(${keyset})),and(risk_amount.eq.0,or(${keyset}))`;
     const terminalRes = await sb
       .from('positions')
       .select(
@@ -781,8 +800,7 @@ export async function derivePositionsForWallet(
       )
       .eq('network', net)
       .eq('user_address', address)
-      .or('claimed.eq.true,risk_amount.eq.0')
-      .gt('row_updated_at', since.s)
+      .or(terminalExpr)
       .order('row_updated_at', { ascending: false })
       .order('id', { ascending: false })
       .limit(CATCHUP_POSITIONS_LIMIT);

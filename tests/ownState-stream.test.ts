@@ -564,6 +564,53 @@ describe('GET /v1/stream/own-state — resume catchup', () => {
     expect(ev.find((e) => e.event === 'ready')).toBeDefined();
   });
 
+  it('resume terminal-since query uses keyset + 30s overlap floor (not naive .gt)', async () => {
+    // Hermes review-32 round 4 blocker 2: the prior `.gt('row_updated_at',
+    // since.s)` filter missed (a) same-timestamp rows with higher id and
+    // (b) rows whose row_updated_at landed inside the 30s overlap window
+    // due to writer-tx-commit-vs-now() lag. The fix folds
+    // `(claimed=true OR risk_amount=0) AND keyset(floor(cursor.p))` into
+    // one PostgREST `.or()` expression. This test captures the
+    // expression and asserts it expresses the right shape.
+    let capturedOr: string | undefined;
+    const captureClient = {
+      from: (): unknown => {
+        const builder: Record<string, unknown> = {};
+        for (const m of ['select', 'eq', 'in', 'gt', 'gte', 'lt', 'lte', 'order', 'limit', 'is']) {
+          builder[m] = (): unknown => builder;
+        }
+        builder['maybeSingle'] = (): Promise<unknown> =>
+          Promise.resolve({ data: null, error: null });
+        builder['then'] = (resolve: (v: unknown) => void): void =>
+          resolve({ data: [], error: null });
+        builder['or'] = (expr: string): unknown => {
+          // Terminal-since query is the ONLY one whose .or() expression
+          // mentions both `claimed.eq.true` AND `risk_amount.eq.0`.
+          if (expr.includes('claimed.eq.true') && expr.includes('risk_amount.eq.0')) {
+            capturedOr = expr;
+          }
+          return builder;
+        };
+        return builder;
+      },
+    };
+    supabaseMock.getSupabase.mockImplementation(() => captureClient as never);
+    const res = makeRes();
+    getOwnStateStreamHandler(
+      makeReq({ query: { cursor: liveCursor() } }),
+      res as unknown as Response,
+    );
+    await flushTicks(64);
+    expect(capturedOr).toBeDefined();
+    // liveCursor()'s p = '2026-05-29T14:00:00.000Z'. Floor by 30s →
+    // '2026-05-29T13:59:30.000Z' with id='0'.
+    expect(capturedOr).toContain('claimed.eq.true');
+    expect(capturedOr).toContain('risk_amount.eq.0');
+    expect(capturedOr).toContain('row_updated_at.gt.2026-05-29T13:59:30.000Z');
+    // Same-timestamp id tie-breaker present (id.gt.0 because floored.i='0').
+    expect(capturedOr).toContain('id.gt.0');
+  });
+
   it('resume catchup emits settledLost for an OFFLINE transfer-out (claimed=false, risk=0)', async () => {
     // Secondary-market transfer drained the position's stake while the
     // client was offline. The row now has `claimed=false, risk=0` —
