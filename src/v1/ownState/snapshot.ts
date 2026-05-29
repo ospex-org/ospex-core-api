@@ -148,40 +148,25 @@ const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower
 const CLAIMED_PAGE_CAP = 200;
 
 // ─────────────────────────────────────────────────────────────────────────
-// Handler
+// Helper — pure(ish) load, no express coupling
+//
+// Factored out from `ownStateSnapshotHandler` so the M4b SSE handler can
+// reuse the same query + cursor logic for its inline `event: snapshot` frame.
+// Returns a tagged result instead of writing to the response.
 // ─────────────────────────────────────────────────────────────────────────
 
-export async function ownStateSnapshotHandler(req: Request, res: Response): Promise<void> {
+export type LoadOwnStateSnapshotResult =
+  | { ok: true; body: OwnStateSnapshotBody }
+  | { ok: false; status: number; error: ApiError };
+
+export async function loadOwnStateSnapshot(
+  address: string,
+  cursor: OwnStateCursor | null,
+  nowMs: number,
+): Promise<LoadOwnStateSnapshotResult> {
   const config = loadConfig();
   const sb = getSupabase();
-  // verifyStreamToken middleware guarantees this exists; the cast is the
-  // type-narrow with no runtime work.
-  const address = (req as StreamAuthRequest).streamAuth.address;
   const maxCommitments = config.ownStateSnapshotMaxCommitments;
-
-  // ── 1. Parse optional cursor ─────────────────────────────────────────
-  let cursor: OwnStateCursor | null = null;
-  if (req.query.cursor !== undefined) {
-    const raw = req.query.cursor;
-    if (typeof raw !== 'string' || raw.length === 0) {
-      res.status(400).json({
-        error: 'cursor must be a non-empty base64url string.',
-        code: 'INVALID_PARAM',
-      } satisfies ApiError);
-      return;
-    }
-    try {
-      cursor = decodeOwnStateCursor(raw);
-    } catch (err) {
-      if (err instanceof OwnStateCursorError) {
-        res.status(400).json(err.apiError);
-        return;
-      }
-      throw err;
-    }
-  }
-
-  const nowMs = Date.now();
   const nowISO = new Date(nowMs).toISOString();
 
   // ── Cursor state machine (Hermes review-31 round 2 — explicit phases) ──
@@ -246,11 +231,11 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
         { err: activeRes.error.message },
         'ownState/snapshot: active commitments query failed',
       );
-      res.status(500).json({
-        error: 'Failed to load own-state.',
-        code: 'INTERNAL_ERROR',
-      } satisfies ApiError);
-      return;
+      return {
+        ok: false,
+        status: 500,
+        error: { error: 'Failed to load own-state.', code: 'INTERNAL_ERROR' },
+      };
     }
     activeRows = (activeRes.data ?? []) as unknown as CommitmentRecoveryRow[];
     phase1Saturated = activeRows.length >= maxCommitments;
@@ -283,11 +268,11 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
         { err: terminalRes.error.message },
         'ownState/snapshot: terminal commitments query failed',
       );
-      res.status(500).json({
-        error: 'Failed to load own-state.',
-        code: 'INTERNAL_ERROR',
-      } satisfies ApiError);
-      return;
+      return {
+        ok: false,
+        status: 500,
+        error: { error: 'Failed to load own-state.', code: 'INTERNAL_ERROR' },
+      };
     }
     terminalRows = (terminalRes.data ?? []) as unknown as CommitmentRecoveryRow[];
     phase2Saturated = terminalRows.length >= maxCommitments;
@@ -309,11 +294,11 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
           { err: terminalRes.error.message },
           'ownState/snapshot: terminal commitments query failed',
         );
-        res.status(500).json({
-          error: 'Failed to load own-state.',
-          code: 'INTERNAL_ERROR',
-        } satisfies ApiError);
-        return;
+        return {
+          ok: false,
+          status: 500,
+          error: { error: 'Failed to load own-state.', code: 'INTERNAL_ERROR' },
+        };
       }
       terminalRows = (terminalRes.data ?? []) as unknown as CommitmentRecoveryRow[];
       phase2Saturated = terminalRows.length >= terminalBudget;
@@ -348,11 +333,11 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
     positionsHitCap = categorized.hitCap;
   } catch (err) {
     logger.error({ err: formatError(err) }, 'ownState/snapshot: position categorization failed');
-    res.status(500).json({
-      error: 'Failed to load own-state.',
-      code: 'INTERNAL_ERROR',
-    } satisfies ApiError);
-    return;
+    return {
+      ok: false,
+      status: 500,
+      error: { error: 'Failed to load own-state.', code: 'INTERNAL_ERROR' },
+    };
   }
 
   // Claimed-since-cursor: only when recovering. Keyset matches the
@@ -379,11 +364,11 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
         { err: claimedRes.error.message },
         'ownState/snapshot: claimed positions query failed',
       );
-      res.status(500).json({
-        error: 'Failed to load own-state.',
-        code: 'INTERNAL_ERROR',
-      } satisfies ApiError);
-      return;
+      return {
+        ok: false,
+        status: 500,
+        error: { error: 'Failed to load own-state.', code: 'INTERNAL_ERROR' },
+      };
     }
     claimedRows = (claimedRes.data ?? []) as unknown as ClaimedPositionRow[];
   }
@@ -473,7 +458,47 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
     truncated: truncatedCommitments,
     positionsTruncated,
   };
-  res.status(200).json(body);
+  return { ok: true, body };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Express adapter
+//
+// Wraps `loadOwnStateSnapshot` for the REST route. Owns input parsing
+// (cursor validation, 400s) and translates the tagged result into a JSON
+// response.
+// ─────────────────────────────────────────────────────────────────────────
+
+export async function ownStateSnapshotHandler(req: Request, res: Response): Promise<void> {
+  const address = (req as StreamAuthRequest).streamAuth.address;
+
+  let cursor: OwnStateCursor | null = null;
+  if (req.query.cursor !== undefined) {
+    const raw = req.query.cursor;
+    if (typeof raw !== 'string' || raw.length === 0) {
+      res.status(400).json({
+        error: 'cursor must be a non-empty base64url string.',
+        code: 'INVALID_PARAM',
+      } satisfies ApiError);
+      return;
+    }
+    try {
+      cursor = decodeOwnStateCursor(raw);
+    } catch (err) {
+      if (err instanceof OwnStateCursorError) {
+        res.status(400).json(err.apiError);
+        return;
+      }
+      throw err;
+    }
+  }
+
+  const result = await loadOwnStateSnapshot(address, cursor, Date.now());
+  if (!result.ok) {
+    res.status(result.status).json(result.error);
+    return;
+  }
+  res.status(200).json(result.body);
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────

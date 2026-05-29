@@ -24,6 +24,7 @@ import { getTeamAliasesHandler } from './teams.js';
 import { getAuthDomainHandler } from './auth.js';
 import { postStreamChallengeHandler, postStreamTokenHandler } from './streamAuth.js';
 import { ownStateSnapshotHandler } from './ownState/snapshot.js';
+import { getOwnStateStreamHandler } from './ownState/stream.js';
 import { verifyStreamToken } from '../middleware/verifyStreamToken.js';
 import { getPublicConfigHandler } from './config.js';
 import { getProtocolInfoHandler } from './protocol.js';
@@ -145,6 +146,13 @@ v1Router.get('/fills', readRateLimit, asyncHandler(getFillsHandler));
 v1Router.get('/stream/odds', (req, res) => {
   void getOddsStreamHandler(req, res);
 });
+// Owner-auth composite SSE (M4b). Same registration-order rule as `/stream/odds`:
+// the `verifyStreamToken` middleware fronts the route, and the static `own-state`
+// segment must beat `:resource`. No `readRateLimit` — long-lived SSE; the handler
+// uses the concurrent-connection cap via `acquireStreamSlot`.
+v1Router.get('/stream/own-state', verifyStreamToken, (req, res) =>
+  getOwnStateStreamHandler(req, res),
+);
 // Protocol streams: live deltas + cursor catch-up + resync. `:resource` is
 // validated against the stream registry (404 otherwise).
 v1Router.get('/stream/:resource', (req, res) => getStreamHandler(req, res));
