@@ -186,11 +186,66 @@ describe('decode — watermark rejections (each resource slot is validated)', ()
     expect(() => decodeOwnStateCursor(bad)).toThrow(OwnStateCursorError);
   });
 
-  it('rejects the offset form (+HH:MM) — server only ever emits Z form', () => {
+  it('rejects non-UTC offsets (e.g. +07:00) — component check needs UTC components', () => {
     const bad = Buffer.from(
       JSON.stringify({
         ...sample,
-        c: { s: '2026-05-28T16:00:00.000+00:00', i: '0' },
+        c: { s: '2026-05-28T16:00:00.000+07:00', i: '0' },
+      }),
+      'utf8',
+    ).toString('base64url');
+    expect(() => decodeOwnStateCursor(bad)).toThrow(OwnStateCursorError);
+  });
+
+  // Hermes review-31 round 3 wire-contract blocker: Supabase / PostgREST
+  // emits timestamptz as `...+00:00` with microsecond fractional seconds.
+  // The round-2 Z-only regex made the snapshot mint cursors it rejected on
+  // the next call, breaking paging. Both wire shapes the server can emit
+  // MUST round-trip cleanly.
+  it('accepts the +00:00 wire form Supabase actually emits', () => {
+    const ok = Buffer.from(
+      JSON.stringify({
+        ...sample,
+        c: { s: '2026-05-29T15:00:00.123+00:00', i: '7' },
+      }),
+      'utf8',
+    ).toString('base64url');
+    expect(decodeOwnStateCursor(ok).c).toEqual({
+      s: '2026-05-29T15:00:00.123+00:00',
+      i: '7',
+    });
+  });
+
+  it('accepts microsecond precision (6 decimal digits — what Postgres timestamptz produces)', () => {
+    const ok = Buffer.from(
+      JSON.stringify({
+        ...sample,
+        c: { s: '2026-05-29T15:00:00.123456+00:00', i: '7' },
+      }),
+      'utf8',
+    ).toString('base64url');
+    // Raw string preserved verbatim (NOT normalized through Date.toISOString,
+    // which would truncate to 3 fractional digits and weaken keyset pagination).
+    expect(decodeOwnStateCursor(ok).c.s).toBe('2026-05-29T15:00:00.123456+00:00');
+  });
+
+  // Wire-contract self-compat: every shape we accept must round-trip.
+  it('round-trips a cursor built from a DB-style row_updated_at (+00:00 + microseconds)', () => {
+    const dbCursor = {
+      ...sample,
+      c: { s: '2026-05-29T15:00:00.123456+00:00', i: '12345' },
+      f: { s: '2026-05-29T15:00:00.000+00:00', i: '7' },
+      p: { s: '2026-05-29T15:00:00.999999+00:00', i: '99' },
+    };
+    expect(decodeOwnStateCursor(encodeOwnStateCursor(dbCursor))).toEqual(dbCursor);
+  });
+
+  // Calendar-validation still works on the +00:00 form (same UTC components).
+  it('rejects an impossible date in the +00:00 form (Feb 30)', () => {
+    const bad = Buffer.from(
+      JSON.stringify({
+        ...sample,
+        c: { s: '2026-02-30T00:00:00.000+00:00', i: '0' },
       }),
       'utf8',
     ).toString('base64url');

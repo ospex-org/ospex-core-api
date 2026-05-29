@@ -240,9 +240,7 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
   //       "row > floor", which is exactly the overlap window's semantics).
   let terminalRows: CommitmentRecoveryRow[] = [];
   let phase2Saturated = false;
-  let phase2Ran = false;
   if (isPagingTerminalPhase) {
-    phase2Ran = true;
     const terminalRes = await sb
       .from('commitments')
       .select(COMMITMENT_RECOVERY_COLUMNS)
@@ -267,7 +265,6 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
     terminalRows = (terminalRes.data ?? []) as unknown as CommitmentRecoveryRow[];
     phase2Saturated = terminalRows.length >= maxCommitments;
   } else if (isRecovering && !phase1Saturated && recoveryAnchor !== null) {
-    phase2Ran = true;
     const terminalBudget = maxCommitments - activeRows.length;
     if (terminalBudget > 0) {
       const terminalRes = await sb
@@ -453,15 +450,6 @@ export async function ownStateSnapshotHandler(req: Request, res: Response): Prom
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
-
-function sortRecoveryRows(a: CommitmentRecoveryRow, b: CommitmentRecoveryRow): number {
-  const tCmp = a.row_updated_at.localeCompare(b.row_updated_at);
-  if (tCmp !== 0) return tCmp;
-  const ai = BigInt(String(a.id));
-  const bi = BigInt(String(b.id));
-  if (ai === bi) return 0;
-  return ai < bi ? -1 : 1;
-}
 
 function mapClaimedRow(row: ClaimedPositionRow, address: string): OwnerClaimedPosition {
   const positionType = row.position_type ? POSITION_TYPE_TO_INT[row.position_type] : 0;

@@ -818,6 +818,121 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
     expect(decoded.p).toEqual(inputP);
   });
 
+  // Hermes review-31 round 3 wire-contract blocker: the snapshot was minting
+  // cursors using `+00:00`-form DB timestamps that the round-2 Z-only decoder
+  // then rejected on the very next call. This pins the self-compat invariant:
+  // a cursor the handler mints MUST round-trip through the handler.
+  it('cursor minted from DB-format (+00:00, microseconds) row_updated_at survives a round-trip (blocker #1 round 3)', async () => {
+    const dbRow = commitmentRow({
+      row_updated_at: '2026-05-29T15:00:00.123456+00:00',
+      id: 42,
+    });
+    const { client } = makeSupabase([
+      { data: [dbRow], error: null },                                                              // active
+      { data: { row_updated_at: '2026-05-29T15:00:00.123456+00:00', id: 42 }, error: null },        // max c
+      { data: { row_updated_at: '2026-05-29T15:00:00.000+00:00', id: 7 }, error: null },           // max f
+      { data: { row_updated_at: '2026-05-29T15:00:00.000+00:00', id: 99 }, error: null },          // max p
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+
+    const res1 = makeRes();
+    await ownStateSnapshotHandler(makeReq(), res1 as unknown as Response);
+    expect(res1.statusCode).toBe(200);
+    const body1 = res1.body as { cursor: string };
+
+    // Re-present the cursor to the handler — server MUST not reject its own mint.
+    const { client: client2 } = makeSupabase([
+      { data: [], error: null },                                                                    // active
+      { data: null, error: null },                                                                  // max c
+      { data: null, error: null },                                                                  // max p
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client2);
+
+    const res2 = makeRes();
+    await ownStateSnapshotHandler(
+      makeReq({ query: { cursor: body1.cursor } }),
+      res2 as unknown as Response,
+    );
+    expect(res2.statusCode).toBe(200); // not 400 INVALID_CURSOR
+    // Microsecond precision preserved on the response — never normalized through Date.toISOString.
+    const decoded = decodeOwnStateCursor(body1.cursor);
+    expect(decoded.c.s).toBe('2026-05-29T15:00:00.123456+00:00');
+  });
+
+  // Higher-level black-box pagination test per Hermes's round-3 spec: feed
+  // rows + DB-format timestamps through mocked pages, repeatedly call the
+  // handler until `truncated:false`, assert no skipped rows and every emitted
+  // cursor decodes.
+  it('full pagination loop with DB-format timestamps: all rows delivered, no duplicates, every cursor decodes', async () => {
+    envMock.loadConfig.mockReturnValue({
+      network: 'polygon',
+      chainId: 137,
+      redactHiddenPublic: true,
+      ownStateSnapshotMaxCommitments: 2,
+    });
+    // Page 1: 2 active rows (saturates the cap=2).
+    const page1Rows = [
+      commitmentRow({
+        id: 1,
+        row_updated_at: '2026-05-29T10:00:00.111111+00:00',
+        commitment_hash: `0x${'1'.repeat(64)}`,
+      }),
+      commitmentRow({
+        id: 2,
+        row_updated_at: '2026-05-29T11:00:00.222222+00:00',
+        commitment_hash: `0x${'2'.repeat(64)}`,
+      }),
+    ];
+    const { client: client1 } = makeSupabase([
+      { data: page1Rows, error: null },                                                             // active
+      // no max-c query (commitments truncated)
+      { data: { row_updated_at: '2026-05-29T15:00:00.123456+00:00', id: 7 }, error: null },          // max f
+      { data: { row_updated_at: '2026-05-29T15:00:00.000+00:00', id: 99 }, error: null },           // max p
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client1);
+    const res1 = makeRes();
+    await ownStateSnapshotHandler(makeReq(), res1 as unknown as Response);
+    const body1 = res1.body as { cursor: string; truncated: boolean; commitments: Array<{ commitmentHash: string }> };
+    expect(body1.truncated).toBe(true);
+    expect(body1.commitments).toHaveLength(2);
+    // Cursor decodes — wire contract.
+    expect(() => decodeOwnStateCursor(body1.cursor)).not.toThrow();
+
+    // Page 2: 1 active row, then drained.
+    const page2Rows = [
+      commitmentRow({
+        id: 3,
+        row_updated_at: '2026-05-29T12:00:00.333333+00:00',
+        commitment_hash: `0x${'3'.repeat(64)}`,
+      }),
+    ];
+    const { client: client2 } = makeSupabase([
+      { data: page2Rows, error: null },                                                              // active (drained)
+      { data: { row_updated_at: '2026-05-29T12:00:00.333333+00:00', id: 3 }, error: null },          // max c
+      { data: { row_updated_at: '2026-05-29T15:00:00.000+00:00', id: 99 }, error: null },           // max p
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client2);
+    const res2 = makeRes();
+    await ownStateSnapshotHandler(
+      makeReq({ query: { cursor: body1.cursor } }),
+      res2 as unknown as Response,
+    );
+    const body2 = res2.body as { cursor: string; truncated: boolean; commitments: Array<{ commitmentHash: string }> };
+    expect(body2.truncated).toBe(false);
+    expect(body2.commitments).toHaveLength(1);
+    expect(() => decodeOwnStateCursor(body2.cursor)).not.toThrow();
+    expect(decodeOwnStateCursor(body2.cursor).k).toBe('live');
+
+    // All rows delivered, no duplicates.
+    const allHashes = [...body1.commitments, ...body2.commitments].map((c) => c.commitmentHash);
+    expect(allHashes).toEqual([
+      `0x${'1'.repeat(64)}`,
+      `0x${'2'.repeat(64)}`,
+      `0x${'3'.repeat(64)}`,
+    ]);
+    expect(new Set(allHashes).size).toBe(allHashes.length);
+  });
+
   it('cold start with positions at cap → positionsTruncated=true + p watermark = sentinel', async () => {
     const buildActive = (n: number) =>
       Array.from({ length: n }, (_, i) => ({

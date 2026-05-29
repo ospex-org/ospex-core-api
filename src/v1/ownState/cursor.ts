@@ -131,15 +131,23 @@ export const SENTINEL_WATERMARK: ResourceWatermark = {
   i: '0',
 };
 
-// Z-form ISO 8601 with capture groups for component-wise validation. Hermes
-// review-31 round 2 caught that `Date.parse` silently NORMALIZES impossible
-// dates (e.g. `2026-02-30` → March 2) so the shape regex + `isFinite` alone
-// still passed crafted inputs. Restricting to the Z form (the only thing
-// `Date.prototype.toISOString` ever emits) lets us pin the canonical encoding
-// via direct component comparison below; offset-form ISO ("+HH:MM") is
-// rejected — no internal code path ever produces it for a cursor.
-const ISO_TIMESTAMP_Z =
-  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/;
+// UTC ISO 8601 with capture groups for component-wise validation. Hermes
+// review-31 round 3 caught the wire-contract self-compat gap: Supabase /
+// PostgREST emits timestamptz as `2026-05-29T15:00:00.123456+00:00`
+// (microsecond precision, `+00:00` form) while the round-2 regex was
+// Z-only — the snapshot was minting cursors it then rejected on the very
+// next call, breaking paging. Accept both `Z` and `+00:00` (the only forms
+// the server-side write paths produce); both encode UTC so the component
+// comparison below works against `Date.getUTC*()` either way.
+// Non-zero offsets are still rejected — the server never emits them, and
+// accepting them would break the component-comparison invariant (the
+// input components are LOCAL to the offset, not UTC).
+// Fractional seconds: up to 9 digits to cover Postgres's microseconds and
+// any future nanosecond extension. The raw string is preserved verbatim
+// (no `toISOString` round-trip) — that path would truncate microseconds
+// to milliseconds and weaken keyset pagination.
+const ISO_TIMESTAMP_UTC =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|\+00:00)$/;
 
 /**
  * Thrown when a client-supplied `?cursor=` value can't be decoded or fails
@@ -232,17 +240,18 @@ function validateWatermark(raw: unknown, label: string): ResourceWatermark {
   const o = raw as Record<string, unknown>;
   const s = o['s'];
   const i = o['i'];
-  // Shape gate — the Z-only regex keeps a crafted timestamp from reaching
-  // the PostgREST filter grammar.
+  // Shape gate — the UTC-only regex keeps a crafted timestamp from reaching
+  // the PostgREST filter grammar while still admitting both wire shapes the
+  // server can emit (`...Z` and `...+00:00`).
   if (typeof s !== 'string') {
     throw new OwnStateCursorError(
-      `Malformed cursor: ${label}.s must be an ISO-8601 timestamptz (Z form).`,
+      `Malformed cursor: ${label}.s must be an ISO-8601 timestamptz (Z or +00:00 form).`,
     );
   }
-  const m = s.match(ISO_TIMESTAMP_Z);
+  const m = s.match(ISO_TIMESTAMP_UTC);
   if (!m) {
     throw new OwnStateCursorError(
-      `Malformed cursor: ${label}.s must be an ISO-8601 timestamptz (Z form).`,
+      `Malformed cursor: ${label}.s must be an ISO-8601 timestamptz (Z or +00:00 form).`,
     );
   }
   // Canonical-calendar gate (Hermes review-31 round 2). `Date.parse` silently
