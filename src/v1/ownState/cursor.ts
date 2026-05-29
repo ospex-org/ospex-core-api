@@ -32,7 +32,7 @@
 import type { ApiError } from '../../middleware/errorHandler.js';
 
 /** Composite cursor version. Bumped on any wire-shape change. */
-export const OWN_STATE_CURSOR_VERSION = 2;
+export const OWN_STATE_CURSOR_VERSION = 3;
 
 /**
  * Per-resource overlap window for `k='live'` initial recovery. Mirrors
@@ -51,22 +51,39 @@ export const RECOVERY_OVERLAP_MS = 30_000;
 const MAX_INT64 = 9_223_372_036_854_775_807n;
 
 /**
- * Cursor `k` discriminant — distinguishes the four meaningful states.
+ * Cursor `k` discriminant — the snapshot recovery state machine.
  *
- *   `live`             — stream-ready; the SDK passes this to
- *                        `/v1/stream/own-state` as `Last-Event-ID`. As INPUT
- *                        to `/v1/own-state/snapshot`, it signals state-loss
- *                        recovery: the server applies the overlap window
- *                        and queries terminal rows since the floored watermark.
- *   `page-active`      — paging through a cold-start (no recovery) snapshot
- *                        whose active-set rows exceeded the per-page cap.
- *                        Terminal query is NOT run.
- *   `page-recovery`    — paging through a recovery snapshot whose merged
- *                        active+terminal rows exceeded the per-page cap.
- *                        Subsequent pages still run the terminal query,
- *                        keyset-advanced past the prior page's last row.
+ * Hermes review-31 round 2 forced the explicit-phase split: the previous
+ * round-1 merge approach interleaved active + terminal rows by
+ * `(row_updated_at, id)`, which allowed a long-lived active row to be
+ * starved by older terminals on page 1 and then permanently excluded by
+ * page 2's strict keyset advance. The two-phase model drains the entire
+ * active set BEFORE any terminal row is delivered, so the `(row, id)`
+ * watermark on each phase only ever advances past rows already on the
+ * wire for THAT phase.
+ *
+ *   `live`                   — stream-ready; SDK passes this to
+ *                              `/v1/stream/own-state` as `Last-Event-ID`.
+ *                              As INPUT, signals initial state-loss
+ *                              recovery: server applies the overlap floor
+ *                              to compute `cAnchor` and starts phase 1.
+ *   `page-active`            — cold-start active-set paging. No recovery,
+ *                              no terminal phase.
+ *   `page-recovery-active`   — phase 1 of recovery — active-set paging
+ *                              with `cAnchor` preserved on the cursor for
+ *                              the phase-2 handoff once active drains.
+ *   `page-recovery-terminal` — phase 2 of recovery — terminal-set paging.
+ *                              Started either when phase 1 active drains
+ *                              on the same page (and any remaining budget
+ *                              is spent on terminals) or on the next call
+ *                              after a page-recovery-active page that
+ *                              exactly fills its budget.
  */
-export type OwnStateCursorKind = 'live' | 'page-active' | 'page-recovery';
+export type OwnStateCursorKind =
+  | 'live'
+  | 'page-active'
+  | 'page-recovery-active'
+  | 'page-recovery-terminal';
 
 export interface ResourceWatermark {
   /** `row_updated_at` verbatim from the source row, full precision. */
@@ -80,13 +97,27 @@ export interface OwnStateCursor {
   t: 'own-state';
   /** Schema version. */
   v: typeof OWN_STATE_CURSOR_VERSION;
-  /** Commitments watermark. */
+  /**
+   * Commitments progress watermark — advances through delivered rows only.
+   * Per spec §6.1 / Hermes review-31 round 2: NEVER advances past an
+   * undelivered row of either phase. Phase 1 advances `c` through active
+   * rows in `(row, id)` order; phase 2 advances `c` through terminal rows
+   * in `(row, id)` order. The two phases never compete for the watermark.
+   */
   c: ResourceWatermark;
+  /**
+   * Recovery floor — present iff k ∈ {page-recovery-active, page-recovery-
+   * terminal}. Preserved verbatim across every page of the recovery so the
+   * server knows where the original recovery scope started, no matter how
+   * far `c` has advanced through active rows. Set to `floor(input.c)` (by
+   * `RECOVERY_OVERLAP_MS`) on the very first recovery call (input k='live').
+   */
+  cAnchor?: ResourceWatermark;
   /** Position-fills watermark. */
   f: ResourceWatermark;
   /** Positions watermark. */
   p: ResourceWatermark;
-  /** `page` = snapshot truncated, continue paging; `live` = ready for stream `Last-Event-ID`. */
+  /** Phase indicator — see {@link OwnStateCursorKind}. */
   k: OwnStateCursorKind;
 }
 
@@ -100,10 +131,15 @@ export const SENTINEL_WATERMARK: ResourceWatermark = {
   i: '0',
 };
 
-// The exact ISO-8601 timestamptz shapes PostgREST/supabase-js mint (mirrors
-// `src/lib/cursor.ts`). Validating against this — not the permissive
-// `Date.parse` — keeps a crafted timestamp from reaching the filter grammar.
-const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})$/;
+// Z-form ISO 8601 with capture groups for component-wise validation. Hermes
+// review-31 round 2 caught that `Date.parse` silently NORMALIZES impossible
+// dates (e.g. `2026-02-30` → March 2) so the shape regex + `isFinite` alone
+// still passed crafted inputs. Restricting to the Z form (the only thing
+// `Date.prototype.toISOString` ever emits) lets us pin the canonical encoding
+// via direct component comparison below; offset-form ISO ("+HH:MM") is
+// rejected — no internal code path ever produces it for a cursor.
+const ISO_TIMESTAMP_Z =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/;
 
 /**
  * Thrown when a client-supplied `?cursor=` value can't be decoded or fails
@@ -120,10 +156,14 @@ export class OwnStateCursorError extends Error {
 }
 
 export function encodeOwnStateCursor(c: OwnStateCursor): string {
-  return Buffer.from(
-    JSON.stringify({ t: c.t, v: c.v, c: c.c, f: c.f, p: c.p, k: c.k }),
-    'utf8',
-  ).toString('base64url');
+  // `cAnchor` is omitted from the JSON when undefined — the decode side
+  // validates it iff `k` is a recovery-paging kind. Stable key order.
+  const obj: Record<string, unknown> = { t: c.t, v: c.v, c: c.c };
+  if (c.cAnchor !== undefined) obj['cAnchor'] = c.cAnchor;
+  obj['f'] = c.f;
+  obj['p'] = c.p;
+  obj['k'] = c.k;
+  return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
 }
 
 /**
@@ -155,12 +195,34 @@ export function decodeOwnStateCursor(raw: string): OwnStateCursor {
   const f = validateWatermark(obj['f'], 'f');
   const p = validateWatermark(obj['p'], 'p');
   const k = obj['k'];
-  if (k !== 'live' && k !== 'page-active' && k !== 'page-recovery') {
+  if (
+    k !== 'live' &&
+    k !== 'page-active' &&
+    k !== 'page-recovery-active' &&
+    k !== 'page-recovery-terminal'
+  ) {
     throw new OwnStateCursorError(
-      'Malformed cursor: k must be "live", "page-active", or "page-recovery".',
+      'Malformed cursor: k must be "live", "page-active", "page-recovery-active", or "page-recovery-terminal".',
     );
   }
-  return { t: 'own-state', v: OWN_STATE_CURSOR_VERSION, c, f, p, k };
+  // cAnchor: required iff k is a recovery-paging kind; forbidden otherwise.
+  const isRecoveryPaging = k === 'page-recovery-active' || k === 'page-recovery-terminal';
+  let cAnchor: ResourceWatermark | undefined;
+  if ('cAnchor' in obj && obj['cAnchor'] !== undefined) {
+    if (!isRecoveryPaging) {
+      throw new OwnStateCursorError(
+        `Malformed cursor: cAnchor is only valid when k is a recovery-paging kind, not "${k}".`,
+      );
+    }
+    cAnchor = validateWatermark(obj['cAnchor'], 'cAnchor');
+  } else if (isRecoveryPaging) {
+    throw new OwnStateCursorError(
+      `Malformed cursor: cAnchor is required when k is "${k}".`,
+    );
+  }
+  return cAnchor !== undefined
+    ? { t: 'own-state', v: OWN_STATE_CURSOR_VERSION, c, cAnchor, f, p, k }
+    : { t: 'own-state', v: OWN_STATE_CURSOR_VERSION, c, f, p, k };
 }
 
 function validateWatermark(raw: unknown, label: string): ResourceWatermark {
@@ -170,20 +232,43 @@ function validateWatermark(raw: unknown, label: string): ResourceWatermark {
   const o = raw as Record<string, unknown>;
   const s = o['s'];
   const i = o['i'];
-  // Shape gate — the regex keeps a crafted timestamp from reaching the
-  // PostgREST filter grammar.
-  if (typeof s !== 'string' || !ISO_TIMESTAMP.test(s)) {
+  // Shape gate — the Z-only regex keeps a crafted timestamp from reaching
+  // the PostgREST filter grammar.
+  if (typeof s !== 'string') {
     throw new OwnStateCursorError(
-      `Malformed cursor: ${label}.s must be an ISO-8601 timestamptz.`,
+      `Malformed cursor: ${label}.s must be an ISO-8601 timestamptz (Z form).`,
     );
   }
-  // Semantic gate — `2026-99-99T...` passes the shape regex but is not a
-  // real date; `Date.parse` returns NaN. Without this guard the cursor
-  // reaches PostgREST and surfaces as a 500 rather than a clean 400.
-  // Hermes review-31 round 1 verified the gap with a `2026-99-99T...` cursor.
-  if (!Number.isFinite(Date.parse(s))) {
+  const m = s.match(ISO_TIMESTAMP_Z);
+  if (!m) {
     throw new OwnStateCursorError(
-      `Malformed cursor: ${label}.s is not a real calendar timestamp.`,
+      `Malformed cursor: ${label}.s must be an ISO-8601 timestamptz (Z form).`,
+    );
+  }
+  // Canonical-calendar gate (Hermes review-31 round 2). `Date.parse` silently
+  // normalizes `2026-02-30` → March 2, `Apr 31` → May 1, `24:00:00` → next
+  // day 00:00:00. Component-comparing the parsed date back against the
+  // input strings catches every normalization — only inputs that
+  // round-trip exactly are accepted. Equivalent to the canonical-encoding
+  // pattern in `[[feedback_bind_minted_fields_on_resubmit]]`.
+  const [, Y, M, D, h, mi, sec] = m;
+  const ms = Date.parse(s);
+  if (!Number.isFinite(ms)) {
+    throw new OwnStateCursorError(
+      `Malformed cursor: ${label}.s is not a parseable timestamp.`,
+    );
+  }
+  const d = new Date(ms);
+  if (
+    d.getUTCFullYear() !== Number(Y) ||
+    d.getUTCMonth() + 1 !== Number(M) ||
+    d.getUTCDate() !== Number(D) ||
+    d.getUTCHours() !== Number(h) ||
+    d.getUTCMinutes() !== Number(mi) ||
+    d.getUTCSeconds() !== Number(sec)
+  ) {
+    throw new OwnStateCursorError(
+      `Malformed cursor: ${label}.s is not a real calendar timestamp (Date.parse normalized it).`,
     );
   }
   if (typeof i !== 'string' || !/^\d+$/.test(i)) {

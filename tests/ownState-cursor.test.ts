@@ -35,9 +35,38 @@ describe('encode/decode roundtrip', () => {
     expect(decodeOwnStateCursor(encodeOwnStateCursor(paged))).toEqual(paged);
   });
 
-  it('survives the page-recovery discriminant (recovery-mode continuation)', () => {
-    const paged = { ...sample, k: 'page-recovery' as const };
+  it('survives the page-recovery-active discriminant (active-phase continuation)', () => {
+    const paged = {
+      ...sample,
+      k: 'page-recovery-active' as const,
+      cAnchor: { s: '2026-05-28T15:59:30.000Z', i: '0' },
+    };
     expect(decodeOwnStateCursor(encodeOwnStateCursor(paged))).toEqual(paged);
+  });
+
+  it('survives the page-recovery-terminal discriminant (terminal-phase continuation)', () => {
+    const paged = {
+      ...sample,
+      k: 'page-recovery-terminal' as const,
+      cAnchor: { s: '2026-05-28T15:59:30.000Z', i: '0' },
+    };
+    expect(decodeOwnStateCursor(encodeOwnStateCursor(paged))).toEqual(paged);
+  });
+
+  it('rejects a recovery-paging cursor that is missing cAnchor', () => {
+    const bad = Buffer.from(
+      JSON.stringify({ ...sample, k: 'page-recovery-active' }),
+      'utf8',
+    ).toString('base64url');
+    expect(() => decodeOwnStateCursor(bad)).toThrow(OwnStateCursorError);
+  });
+
+  it('rejects a non-recovery cursor that includes cAnchor', () => {
+    const bad = Buffer.from(
+      JSON.stringify({ ...sample, cAnchor: sample.c, k: 'live' }),
+      'utf8',
+    ).toString('base64url');
+    expect(() => decodeOwnStateCursor(bad)).toThrow(OwnStateCursorError);
   });
 
   it('encodes to a URL-safe (base64url, no padding) string', () => {
@@ -124,6 +153,45 @@ describe('decode — watermark rejections (each resource slot is validated)', ()
   it('rejects a semantically-invalid calendar timestamp (shape-valid but Date.parse=NaN)', () => {
     const bad = Buffer.from(
       JSON.stringify({ ...sample, c: { s: '2026-99-99T99:99:99.000Z', i: '0' } }),
+      'utf8',
+    ).toString('base64url');
+    expect(() => decodeOwnStateCursor(bad)).toThrow(OwnStateCursorError);
+  });
+
+  // Hermes review-31 round 2 blocker #5: `Date.parse` silently NORMALIZES
+  // impossible dates (Feb 30 → Mar 2, etc.). The component-comparison gate
+  // catches all of these by round-tripping the parsed Date back to its
+  // components and requiring an exact match against the input.
+  it('rejects Feb 30 (normalizes to Mar 2)', () => {
+    const bad = Buffer.from(
+      JSON.stringify({ ...sample, c: { s: '2026-02-30T00:00:00.000Z', i: '0' } }),
+      'utf8',
+    ).toString('base64url');
+    expect(() => decodeOwnStateCursor(bad)).toThrow(OwnStateCursorError);
+  });
+
+  it('rejects Apr 31 (normalizes to May 1)', () => {
+    const bad = Buffer.from(
+      JSON.stringify({ ...sample, c: { s: '2026-04-31T00:00:00.000Z', i: '0' } }),
+      'utf8',
+    ).toString('base64url');
+    expect(() => decodeOwnStateCursor(bad)).toThrow(OwnStateCursorError);
+  });
+
+  it('rejects 24:00:00 (normalizes to next-day 00:00:00)', () => {
+    const bad = Buffer.from(
+      JSON.stringify({ ...sample, c: { s: '2026-01-01T24:00:00.000Z', i: '0' } }),
+      'utf8',
+    ).toString('base64url');
+    expect(() => decodeOwnStateCursor(bad)).toThrow(OwnStateCursorError);
+  });
+
+  it('rejects the offset form (+HH:MM) — server only ever emits Z form', () => {
+    const bad = Buffer.from(
+      JSON.stringify({
+        ...sample,
+        c: { s: '2026-05-28T16:00:00.000+00:00', i: '0' },
+      }),
       'utf8',
     ).toString('base64url');
     expect(() => decodeOwnStateCursor(bad)).toThrow(OwnStateCursorError);

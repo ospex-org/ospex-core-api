@@ -157,7 +157,7 @@ const sentinelWatermarkRow = { row_updated_at: '2026-05-29T15:30:00.000Z', id: 4
 const fillsWatermarkRow = { row_updated_at: '2026-05-29T15:31:00.000Z', id: 7 };
 const positionsWatermarkRow = { row_updated_at: '2026-05-29T15:32:00.000Z', id: 99 };
 
-const noPositions = { active: [], pendingSettle: [], claimable: [] };
+const noPositions = { active: [], pendingSettle: [], claimable: [], hitCap: false };
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -360,9 +360,11 @@ describe('GET /v1/own-state/snapshot — cursor k=live (recovery)', () => {
     expect(res.statusCode).toBe(200);
     const body = res.body as { commitments: Array<{ commitmentHash: string }>; truncated: boolean };
     expect(body.commitments).toHaveLength(2);
-    // Sorted by (row_updated_at, id) ASC → terminal (earlier ts) first.
-    expect(body.commitments[0]?.commitmentHash).toBe(terminalRow.commitment_hash);
-    expect(body.commitments[1]?.commitmentHash).toBe(activeRow.commitment_hash);
+    // Hermes review-31 round 2: two-phase wire ordering puts active first
+    // (in (row, id) ASC from the phase-1 query) then terminals
+    // (in (row, id) ASC from the phase-2 query). No merge interleaving.
+    expect(body.commitments[0]?.commitmentHash).toBe(activeRow.commitment_hash);
+    expect(body.commitments[1]?.commitmentHash).toBe(terminalRow.commitment_hash);
     expect(body.truncated).toBe(false);
 
     const orCalls = calls.filter((c) => c.method === 'or' && c.table === 'commitments');
@@ -511,6 +513,7 @@ describe('GET /v1/own-state/snapshot — position categorization', () => {
       active: [{ positionId: 'A_x_0', speculationId: 'A', positionType: 0, team: 't', opponent: 'o', market: 'moneyline', oddsDecimal: 2, riskAmountUSDC: 1, profitAmountUSDC: 1 }],
       pendingSettle: [{ positionId: 'B_x_1', speculationId: 'B', positionType: 1, team: 't', opponent: 'o', market: 'spread', oddsDecimal: null, riskAmountUSDC: 2, profitAmountUSDC: 0.5, result: 'won', predictedWinSide: 'home', estimatedPayoutUSDC: 2.5, estimatedPayoutWei6: '2500000' }],
       claimable: [{ positionId: 'C_x_0', speculationId: 'C', positionType: 0, team: 't', opponent: 'o', market: 'total', oddsDecimal: 3, riskAmountUSDC: 5, profitAmountUSDC: 10, result: 'won', estimatedPayoutUSDC: 15, estimatedPayoutWei6: '15000000' }],
+      hitCap: false,
     });
     const { client } = makeSupabase([
       { data: [], error: null },                          // active commitments
@@ -601,22 +604,23 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
     expect(String(positionsOrCalls[0]?.args[0])).toContain('2026-05-29T09:59:30.000Z');
   });
 
-  // Blocker 2: paging across truncation MUST keep terminals coming. After
-  // a recovery-mode truncation, the next page (k='page-recovery') runs the
-  // terminal query AGAIN, this time with STRICT keyset advance.
-  it('k=page-recovery input → terminal query still runs, with STRICT keyset (blocker #2)', async () => {
+  // Hermes review-31 round 2 blocker #2: paging across truncation MUST keep
+  // terminals coming. With the two-phase model: k='page-recovery-terminal'
+  // input continues phase 2 (terminal query with STRICT keyset advance) AND
+  // skips phase 1 entirely.
+  it('k=page-recovery-terminal input → phase-2 query runs with STRICT keyset, phase-1 skipped (blocker #2)', async () => {
     const cursor = encodeOwnStateCursor({
       t: 'own-state',
       v: OWN_STATE_CURSOR_VERSION,
       c: { s: '2026-05-29T11:30:00.000Z', i: '300' },
+      cAnchor: { s: '2026-05-29T09:59:30.000Z', i: '0' },
       f: { s: '2026-05-29T10:00:00.000Z', i: '0' },
       p: { s: '2026-05-29T11:30:00.000Z', i: '0' },
-      k: 'page-recovery',
+      k: 'page-recovery-terminal',
     });
     const { client, calls } = makeSupabase([
-      { data: [], error: null },                          // active
-      { data: [], error: null },                          // terminal (still runs!)
-      { data: [], error: null },                          // claimed (still runs!)
+      { data: [], error: null },                          // terminal query (phase 2 only)
+      { data: [], error: null },                          // claimed
       { data: null, error: null },                        // max commitments
       { data: null, error: null },                        // max positions
     ]);
@@ -627,21 +631,20 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
       makeRes() as unknown as Response,
     );
 
-    // Active and terminal both ran — 2 .or() pairs on commitments, NOT just 1.
     const commitmentsOrCalls = calls.filter((c) => c.method === 'or' && c.table === 'commitments');
-    // active .or() (keyset, strict) + terminal .or() pair (predicate + keyset, strict).
-    expect(commitmentsOrCalls).toHaveLength(3);
-    // Keyset arg must be STRICT (uses cursor.c.s exactly, NOT floored).
+    // Exactly ONE phase-2 query → 2 .or() calls (terminal-predicate + keyset).
+    // The active query is SKIPPED entirely (phase-1 done on a prior page).
+    expect(commitmentsOrCalls).toHaveLength(2);
+    // Keyset arg must be STRICT against the cursor's raw c (NOT floored).
     const keysetArgs = commitmentsOrCalls.map((c) => String(c.args[0]));
-    // At least one keyset arg references the cursor's raw timestamp.
     expect(keysetArgs.some((a) => a.includes('2026-05-29T11:30:00.000Z'))).toBe(true);
-    // And none reference the FLOORED timestamp (no overlap on page-recovery).
     expect(keysetArgs.some((a) => a.includes('2026-05-29T11:29:30.000Z'))).toBe(false);
   });
 
-  // Blocker 2 (cont.): truncation during recovery emits k='page-recovery'
-  // (not 'page-active'), so paging stays in recovery mode.
-  it('truncation while recovering → output cursor.k = page-recovery, NOT page-active', async () => {
+  // Hermes review-31 round 2 blocker #1: active fills the page on recovery
+  // → output cursor.k = 'page-recovery-active' (not 'page-active') AND
+  // cAnchor is preserved so the next page can switch to phase-2 once active drains.
+  it('active saturates recovery page → output cursor.k = page-recovery-active + cAnchor preserved', async () => {
     envMock.loadConfig.mockReturnValue({
       network: 'polygon',
       chainId: 137,
@@ -668,7 +671,8 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
     });
     const { client } = makeSupabase([
       { data: [activeRow1, activeRow2], error: null },    // active (hits cap=2)
-      { data: [], error: null },                          // claimed (no terminal query since cap reached)
+      // phase-2 skipped because phase-1 saturated
+      { data: [], error: null },                          // claimed
       { data: null, error: null },                        // max positions
     ]);
     supabaseMock.getSupabase.mockReturnValue(client);
@@ -681,7 +685,47 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
     const body = res.body as { cursor: string; truncated: boolean };
     expect(body.truncated).toBe(true);
     const decoded = decodeOwnStateCursor(body.cursor);
-    expect(decoded.k).toBe('page-recovery');
+    expect(decoded.k).toBe('page-recovery-active');
+    // cAnchor present, preserves the floored recovery start point.
+    expect(decoded.cAnchor).toEqual({ s: '2026-05-29T09:59:30.000Z', i: '0' });
+  });
+
+  // Hermes review-31 round 2 blocker #1: even when active fills the page,
+  // terminals are NOT permanently lost — they wait for phase 1 to drain.
+  // On the NEXT page (k='page-recovery-active' input), phase 1 query still
+  // runs (advancing past c) and, when phase 1 returns < MAX, phase 2 fires
+  // with the preserved cAnchor as its keyset start.
+  it('page-recovery-active continuation transitions to phase-2 when active drains', async () => {
+    const cursor = encodeOwnStateCursor({
+      t: 'own-state',
+      v: OWN_STATE_CURSOR_VERSION,
+      c: { s: '2026-05-29T14:00:01.000Z', i: '12' },
+      cAnchor: { s: '2026-05-29T09:59:30.000Z', i: '0' },
+      f: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      p: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      k: 'page-recovery-active',
+    });
+    const { client, calls } = makeSupabase([
+      { data: [], error: null },                          // active (drained)
+      { data: [], error: null },                          // phase-2 terminal query
+      { data: [], error: null },                          // claimed
+      { data: null, error: null },                        // max commitments
+      { data: null, error: null },                        // max positions
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+
+    await ownStateSnapshotHandler(
+      makeReq({ query: { cursor } }),
+      makeRes() as unknown as Response,
+    );
+
+    // Phase-2 terminal query DID fire with cAnchor as keyset start.
+    const commitmentsOrCalls = calls.filter((c) => c.method === 'or' && c.table === 'commitments');
+    // active .or() (strict keyset) + phase-2 .or() pair (predicate + keyset).
+    expect(commitmentsOrCalls).toHaveLength(3);
+    const keysetArgs = commitmentsOrCalls.map((c) => String(c.args[0]));
+    // Phase-2 keyset uses cAnchor (the floored recovery start).
+    expect(keysetArgs.some((a) => a.includes('2026-05-29T09:59:30.000Z'))).toBe(true);
   });
 
   // Blocker 3: f watermark NEVER advances past undelivered fills. Snapshot
@@ -740,6 +784,7 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
       active: buildActive(200),
       pendingSettle: [],
       claimable: [],
+      hitCap: true, // raw-cap signal from helper — what `positionsTruncated` derives from
     });
     const inputP = { s: '2026-05-29T10:00:00.000Z', i: '0' };
     const cursor = encodeOwnStateCursor({
@@ -765,7 +810,9 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
     );
     const body = res.body as { cursor: string; truncated: boolean; positionsTruncated: boolean };
     expect(body.positionsTruncated).toBe(true);
-    expect(body.truncated).toBe(true); // truncated = commitments_truncated OR positions_truncated
+    // Hermes review-31 round 2 blocker #4: truncated is COMMITMENTS-ONLY,
+    // decoupled from positionsTruncated. Commitments here are empty → false.
+    expect(body.truncated).toBe(false);
     const decoded = decodeOwnStateCursor(body.cursor);
     // p preserved at input value — stream replays every position transition since.
     expect(decoded.p).toEqual(inputP);
@@ -788,6 +835,7 @@ describe('GET /v1/own-state/snapshot — Hermes review-31 round 1 regressions', 
       active: buildActive(200),
       pendingSettle: [],
       claimable: [],
+      hitCap: true, // raw-cap signal from helper — what `positionsTruncated` derives from
     });
     const { client } = makeSupabase([
       { data: [], error: null },                          // active

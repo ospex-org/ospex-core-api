@@ -534,7 +534,7 @@ describe('fetchCategorizedPositions — mixed and edge cases', () => {
       makeSupabase({ positions: [], speculations: [], contests: [] }),
     );
     const result = await fetchCategorizedPositions(ADDR);
-    expect(result).toEqual({ active: [], pendingSettle: [], claimable: [] });
+    expect(result).toEqual({ active: [], pendingSettle: [], claimable: [], hitCap: false });
   });
 
   it('throws when the positions query reports an error', async () => {
