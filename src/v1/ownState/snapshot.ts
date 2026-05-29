@@ -25,8 +25,23 @@
  *     positionsTruncated: boolean
  *   }
  *
- * Truncation is the maker's signal to keep paging via `?cursor=` until
- * `truncated: false`; the SDK MUST NOT emit `ready` until then (§6.2).
+ * Two distinct truncation discriminants — they are NOT interchangeable:
+ *
+ *   - `truncated` (commitments-only): commitment pagination remains.
+ *     The SDK pages `/v1/own-state/snapshot?cursor=` until `truncated:
+ *     false`, THEN connects the stream with the final `k='live'`
+ *     cursor. The SDK MUST NOT emit `ready` for trading until paging
+ *     completes (spec §6.2).
+ *
+ *   - `positionsTruncated`: position visibility is incomplete because
+ *     `fetchCategorizedPositions` hit its 200-row cap. The SDK does
+ *     NOT keep paging the snapshot for this — `cursor.p` is preserved
+ *     (or sentinel on cold start) but the snapshot does not have a
+ *     mechanism to drain unseen positions. Consumers enter degraded /
+ *     quote-hold mode; the stream cold-start emits `event: degraded`
+ *     before `ready` so the SDK / MM treats the wallet's position view
+ *     as partial-visibility (spec §2.6). The `/v1/positions/:address`
+ *     fallback covers full history for operator tooling.
  *
  * ── Passive-expiry contract ────────────────────────────────────────────
  *
@@ -108,20 +123,26 @@ interface OwnStateSnapshotBody {
   commitments: CommitmentBody[];
   positions: OwnerPosition[];
   /**
-   * True when ANY resource (commitments or positions) was capped and more
-   * pages exist. The SDK MUST NOT emit `ready` for trading until this is
-   * `false` (spec §6.2).
+   * COMMITMENTS-ONLY truncation discriminant. True when the active or
+   * terminal commitments query saturated `ownStateSnapshotMaxCommitments`
+   * and more pages remain. The SDK pages `?cursor=` until `truncated:
+   * false`, then opens the stream with the final `k='live'` cursor.
+   * `truncated` does NOT include positions truncation — see
+   * `positionsTruncated` below for that.
    */
   truncated: boolean;
   /**
-   * True when the position categorization helper hit its 200-row cap, so
-   * `positions[]` may be missing rows. M4a accepts this as a fail-closed
-   * contract: the cursor's `p` watermark is preserved (or sentinel on cold
-   * start) so the M4b stream replays every position transition since the
-   * preserved tail, eventually filling in any rows the snapshot dropped.
-   * SDK consumers paginating > 200 unclaimed positions should also fall
-   * back to `/v1/positions/:address` for full history during the M4a
-   * window.
+   * Positions truncation discriminant. True when
+   * `fetchCategorizedPositions` hit its 200-row cap. The SDK does NOT
+   * page the snapshot for this — there's no analog to commitments'
+   * `?cursor=` paging on the actionable-positions filter. Instead the
+   * stream cold-start treats `positionsTruncated: true` as a degraded
+   * state: emits `event: degraded` then `ready`, and the SDK / MM
+   * enters quote-hold per spec §2.6. The `cursor.p` watermark is
+   * preserved (or sentinel on cold start) so resume catch-up still
+   * uses it for the terminal-since-cursor filter; the
+   * `/v1/positions/:address` REST endpoint covers operator-side full
+   * history.
    */
   positionsTruncated: boolean;
 }

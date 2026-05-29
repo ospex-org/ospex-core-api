@@ -31,12 +31,14 @@
  * them out of whatever it has in hand. The dedup contract (spec §2.1.2)
  * keys positionStatus events on
  *   `(address, speculationId, positionType, status, sourceUpdatedAt)`
- * so `sourceUpdatedAt` MUST be the underlying source's last-updated
- * timestamp the caller has — typically `positions.row_updated_at`,
- * but on a speculation-driven transition the caller may supply
- * `speculations.row_updated_at` so the new event isn't deduped against
- * a stale prior positions-driven event. The hub stamps a single value
- * per emit; this module just propagates it.
+ * so `sourceUpdatedAt` MUST be the MAX of every source row that
+ * contributes to the derivation — `max(positions.row_updated_at,
+ * speculations.row_updated_at, contests.row_updated_at)` — preserved
+ * verbatim with microsecond precision (use `compareIsoTimestamptz` /
+ * `maxIsoTimestamptz` from `timestamps.ts`, NOT `Date.parse` which
+ * truncates to ms and would collapse same-ms parent transitions).
+ * Callers compute the max once and pass it in here; this module just
+ * propagates it.
  *
  * Same scorer logic as `positionFetch.ts` so the SSE-derived status
  * agrees with the snapshot's categorization. The duplication is

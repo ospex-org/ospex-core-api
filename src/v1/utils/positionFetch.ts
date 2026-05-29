@@ -53,6 +53,7 @@ import {
   derivePositionStatus,
   type PositionStatus,
 } from '../ownState/positionStatus.js';
+import { maxIsoTimestamptz } from '../ownState/timestamps.js';
 
 const POSITION_QUERY_LIMIT = 200;
 
@@ -185,24 +186,6 @@ interface ContestRow {
   row_updated_at: string;
 }
 
-/**
- * Returns the largest ISO-8601 timestamp by parsed epoch ms. Used for
- * `sourceUpdatedAt` derivation across (position, speculation, contest)
- * row_updated_at values. The wire format admits `Z` and `+00:00` shapes
- * (PostgREST quirk) so lexicographic comparison is unsafe.
- */
-function maxIsoTimestamp(
-  ...values: Array<string | null | undefined>
-): string {
-  let best: { s: string; ms: number } | null = null;
-  for (const v of values) {
-    if (!v) continue;
-    const ms = Date.parse(v);
-    if (!Number.isFinite(ms)) continue;
-    if (best === null || ms > best.ms) best = { s: v, ms };
-  }
-  return best ? best.s : new Date(0).toISOString();
-}
 
 function impliedOddsDecimal(risk: bigint, profit: bigint | null): number | null {
   if (profit == null || risk === 0n) return null;
@@ -372,7 +355,7 @@ export async function fetchCategorizedPositions(
     // Compute derived state from the same join — pushed to
     // derivedStatuses unconditionally, even when the row is dropped
     // from the buckets below (e.g. settledLost predicted-losers).
-    const sourceUpdatedAt = maxIsoTimestamp(
+    const sourceUpdatedAt = maxIsoTimestamptz(
       p.row_updated_at,
       spec.row_updated_at,
       contest?.row_updated_at,

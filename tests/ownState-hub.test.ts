@@ -581,6 +581,99 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
     expect(cb.positionStatuses[0]!.ts).toBe('2026-05-29T15:40:00.000Z');
   });
 
+  it('emits sorted by (sourceUpdatedAt, id) ASC even when positions query returns them in row_updated_at DESC order', async () => {
+    // Hermes review-32 round 5 blocker 1: positions are queried in
+    // `row_updated_at DESC` order, but `sourceUpdatedAt = max(pos, spec,
+    // contest)` can reorder them. Emitting in query order risks a
+    // mid-tick disconnect leaving the subscriber's cursor past an
+    // undelivered earlier-source event. The fix collects changed rows
+    // into a pending list, sorts by (sourceUpdatedAt, idBig) ASC, then
+    // emits.
+    //
+    // Setup: two positions whose POSITION row_updated_at orders them
+    // [B (newer), A (older)] but whose derived sourceUpdatedAt is
+    // [A's spec ts (newest overall), B's pos ts (older)] — opposite
+    // order. Use timestamps > 30s apart so the reconnect-risk is
+    // explicit (outside the overlap window).
+    const rowA = {
+      speculation_id: 101,
+      user_address: ADDRESS,
+      position_type: 'upper',
+      risk_amount: '1000000',
+      profit_amount: '500000',
+      claimed: false,
+      // Older position row, but its SPEC is the newest signal.
+      row_updated_at: '2026-05-29T15:00:00.000Z',
+      id: 7,
+    };
+    const rowB = {
+      speculation_id: 202,
+      user_address: ADDRESS,
+      position_type: 'upper',
+      risk_amount: '1000000',
+      profit_amount: '500000',
+      claimed: false,
+      row_updated_at: '2026-05-29T15:10:00.000Z',
+      id: 9,
+    };
+    const specA = speculationRow({
+      speculation_id: 101,
+      speculation_status: 'closed',
+      win_side: 'away',
+      // NEWEST signal in the whole tick → A must be emitted SECOND
+      // (after B's emit-by-spec-time which is older).
+      row_updated_at: '2026-05-29T16:00:00.000Z',
+    });
+    const specB = speculationRow({
+      speculation_id: 202,
+      speculation_status: 'closed',
+      win_side: 'away',
+      row_updated_at: '2026-05-29T15:11:00.000Z',
+    });
+    const contestA = contestRow({ contest_id: 42, row_updated_at: '2026-05-29T13:00:00.000Z' });
+    const contestB = contestRow({ contest_id: 43, row_updated_at: '2026-05-29T13:00:00.000Z' });
+
+    // Mock returns positions [B, A] (DESC by position row_updated_at).
+    const hub = new OwnStateHub({
+      getClient: () =>
+        makeClient({
+          positions: [rowB, rowA],
+          speculations: [specA, specB],
+          contests: [contestA, contestB],
+        }),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+    });
+    const cb = makeCallbacks();
+    hub.subscribe(ADDRESS, cb);
+    // Seed both as 'active' so the spec-settlement is a real transition.
+    hub.seedStatusCache(ADDRESS, [
+      {
+        key: '101_0',
+        status: 'active',
+        sourceUpdatedAt: rowA.row_updated_at,
+        result: undefined,
+        claimableAmount: undefined,
+      },
+      {
+        key: '202_0',
+        status: 'active',
+        sourceUpdatedAt: rowB.row_updated_at,
+        result: undefined,
+        claimableAmount: undefined,
+      },
+    ]);
+    await hub.pollWallet(ADDRESS);
+    // Both transition to claimable. Emission order must be
+    // (B's sourceUpdatedAt=15:11) before (A's sourceUpdatedAt=16:00).
+    expect(cb.positionStatuses).toHaveLength(2);
+    expect(cb.positionStatuses[0]!.ts).toBe('2026-05-29T15:11:00.000Z');
+    expect(cb.positionStatuses[0]!.id).toBe('9');
+    expect(cb.positionStatuses[1]!.ts).toBe('2026-05-29T16:00:00.000Z');
+    expect(cb.positionStatuses[1]!.id).toBe('7');
+  });
+
   it('beginLive starts the per-wallet timer (idempotent on second call)', async () => {
     const hub = new OwnStateHub({
       getClient: () => makeClient({}),

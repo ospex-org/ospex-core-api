@@ -26,16 +26,16 @@
  * its `speculations` + `contests` row at tick time and derives the canonical
  * spec §2.1.3 enum via `derivePositionStatus`.
  *
- * Limitation (PR1): the cursor's `p` watermark advances on
- * `positions.row_updated_at`. A pure speculation-status transition (e.g.
- * settled → win_side set) that does NOT propagate to the position row will
- * not bump the cursor; the next tick still re-reads via the overlap window
- * and the SDK reducer's dedup key
+ * Cursor `p` advances on the DERIVED `sourceUpdatedAt = max(positions,
+ * speculations, contests)` row_updated_at — not raw
+ * `positions.row_updated_at`. The hub queries actionable positions every
+ * tick (matching `fetchCategorizedPositions`' filter) plus, when the
+ * cache tracks keys that left the actionable set, a refresh by id. The
+ * derivation emits in sorted `(sourceUpdatedAt, id)` ASC order so a
+ * mid-tick disconnect cannot leave the subscriber's cursor past an
+ * undelivered earlier-source event. The SDK reducer's dedup key
  *   `(address, speculationId, positionType, status, sourceUpdatedAt)`
- * absorbs the re-emit. The MM accepts this — `positionStatus` is canonical
- * (`to` only); the SDK reducer is monotonic per rank. If real-world drift
- * surfaces, a future PR adds a periodic speculation-row poll keyed by the
- * wallet's tracked speculationIds.
+ * absorbs any over-emission from overlap re-scans.
  *
  * Dependency-injected (client/network/intervals) so it unit-tests against
  * a recorded mock with no timers or live DB.
@@ -64,6 +64,10 @@ import {
   type PositionStatusEventBody,
   type SpeculationInput,
 } from './positionStatus.js';
+import {
+  compareIsoTimestamptz,
+  maxIsoTimestamptz,
+} from './timestamps.js';
 import type { MarketType } from '../../lib/speculation.js';
 
 // ── Subscriber surface ───────────────────────────────────────────────────
@@ -73,7 +77,13 @@ export interface OwnStateCallbacks {
   onCommitment: (body: CommitmentBody, ts: string, id: string) => void;
   /** A maker or taker side fill row. */
   onFill: (body: FillBody, ts: string, id: string) => void;
-  /** A derived position-status transition. `ts`/`id` are positions.row_updated_at / positions.id. */
+  /**
+   * A derived position-status transition. `ts` is the derived
+   * `sourceUpdatedAt = max(positions.row_updated_at,
+   * speculations.row_updated_at, contests.row_updated_at)` — preserved
+   * verbatim with microsecond precision; `id` is the position row's
+   * `id` as a tie-breaker for same-`sourceUpdatedAt` events.
+   */
   onPositionStatus: (body: PositionStatusEventBody, ts: string, id: string) => void;
   /**
    * Upstream recovery completed (reorg) or the hub couldn't keep its
@@ -196,26 +206,6 @@ interface ScanResult {
  */
 const STATUS_DERIVATION_LIMIT = 200;
 
-/**
- * Returns the largest ISO-8601 timestamp by parsed epoch ms. Used for
- * `sourceUpdatedAt` derivation across (position, speculation, contest)
- * row_updated_at values. Different rows may emit `Z` vs `+00:00` shapes
- * (PostgREST quirk — see `cursor.ts` self-compat note), so we compare on
- * the parsed numeric value, not lexicographically. The original string
- * is preserved verbatim so cursor pagination keeps full precision.
- */
-function maxIsoTimestamp(
-  ...values: Array<string | null | undefined>
-): string {
-  let best: { s: string; ms: number } | null = null;
-  for (const v of values) {
-    if (!v) continue;
-    const ms = Date.parse(v);
-    if (!Number.isFinite(ms)) continue;
-    if (best === null || ms > best.ms) best = { s: v, ms };
-  }
-  return best ? best.s : new Date(0).toISOString();
-}
 
 export class OwnStateHub {
   private readonly deps: Required<OwnStateHubDeps>;
@@ -636,12 +626,34 @@ export class OwnStateHub {
       }
     }
 
+    // Two-phase emission. Phase 1: derive every row, collect rows whose
+    // derived (status, sourceUpdatedAt, result, claimableAmount) differs
+    // from the cached entry. Phase 2: SORT collected emissions by
+    // (sourceUpdatedAt, idBig) ASC, then iterate emit + cache.set.
+    //
+    // The sort is load-bearing for no-loss reconnect: positions are
+    // queried in `positions.row_updated_at DESC` order but
+    // `sourceUpdatedAt = max(pos, spec, contest)` can reorder. Emitting
+    // a later-source row first and dropping the connection before the
+    // earlier-source row means the subscriber's cursor.p advances past
+    // the earlier row, and reconnect catch-up filters it out as
+    // "already covered" — silently losing the event.
+    interface PendingEmission {
+      key: string;
+      body: PositionStatusEventBody;
+      sourceUpdatedAt: string;
+      id: string;
+      idBig: bigint;
+      nextCacheEntry: StatusCacheEntry;
+    }
+    const emissions: PendingEmission[] = [];
+
     for (const row of positions) {
       const spec = specsById.get(Number(row.speculation_id));
       if (!spec) continue; // orphan — defensive skip
       const contest = spec.contest_id != null ? contestsById.get(spec.contest_id) ?? null : null;
       const positionType: 0 | 1 = row.position_type === 'upper' ? 0 : 1;
-      const sourceUpdatedAt = maxIsoTimestamp(
+      const sourceUpdatedAt = maxIsoTimestamptz(
         row.row_updated_at,
         spec.row_updated_at,
         contest?.row_updated_at,
@@ -672,19 +684,19 @@ export class OwnStateHub {
       );
       const key = `${String(row.speculation_id)}_${positionType}`;
       const prior = state.statusCache.get(key);
-      state.statusCache.set(key, {
+      const nextCacheEntry: StatusCacheEntry = {
         status: body.status,
         sourceUpdatedAt,
         result: body.result,
         claimableAmount: body.claimableAmount,
-      });
-      // Emit when ANY semantic field differs from the seeded/cached entry.
-      // The SDK reducer's dedup key (spec §2.1.2) is (addr, specId,
-      // positionType, status, sourceUpdatedAt); we additionally compare
-      // `result` and `claimableAmount` so a same-status payload-only
-      // change (e.g. a contest score correction flipping
-      // pendingSettle's predicted result from `won` to `push`, or
-      // changing the claimable amount) still surfaces. A previously-
+      };
+      // Dedup contract: we emit when ANY semantic field differs from the
+      // seeded/cached entry. The SDK reducer's dedup key (spec §2.1.2) is
+      // (addr, specId, positionType, status, sourceUpdatedAt); we
+      // additionally compare `result` and `claimableAmount` so a same-
+      // status payload-only change (e.g. a contest score correction
+      // flipping pendingSettle's predicted result from `won` to `push`,
+      // or changing the claimable amount) still surfaces. A previously-
       // unseen key (prior === undefined) also emits — the handler is
       // responsible for seeding every position it discovered, so an
       // unseen key means a genuinely new position OR a tick that raced
@@ -698,9 +710,37 @@ export class OwnStateHub {
       ) {
         continue;
       }
+      let idBig: bigint;
+      try {
+        idBig = BigInt(String(row.id));
+      } catch {
+        idBig = 0n;
+      }
+      emissions.push({
+        key,
+        body,
+        sourceUpdatedAt,
+        id: String(row.id),
+        idBig,
+        nextCacheEntry,
+      });
+    }
+
+    // Sort by (sourceUpdatedAt, idBig) ASC. Microsecond-aware via
+    // `compareIsoTimestamptz` — Date.parse would collapse same-ms parent
+    // transitions and break the monotonic-cursor guarantee.
+    emissions.sort((a, b) => {
+      const byTs = compareIsoTimestamptz(a.sourceUpdatedAt, b.sourceUpdatedAt);
+      if (byTs !== 0) return byTs;
+      if (a.idBig === b.idBig) return 0;
+      return a.idBig < b.idBig ? -1 : 1;
+    });
+
+    for (const e of emissions) {
+      state.statusCache.set(e.key, e.nextCacheEntry);
       for (const sub of state.subs) {
         try {
-          sub.onPositionStatus(body, sourceUpdatedAt, String(row.id));
+          sub.onPositionStatus(e.body, e.sourceUpdatedAt, e.id);
         } catch (err) {
           logger.error(
             { err: err instanceof Error ? err.message : String(err), address },

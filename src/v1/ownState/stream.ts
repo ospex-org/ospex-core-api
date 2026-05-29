@@ -13,11 +13,14 @@
  *   emitted and the connection ends — per spec §6.2 the SDK pages REST
  *   `/v1/own-state/snapshot?cursor=` until untruncated, then reconnects to
  *   this stream with the final cursor. Otherwise:
- *   - Server seeds the hub's positionStatus cache from a fresh derivation
- *     pass (so the first hub tick has a baseline and can't silently absorb
- *     a transition that happened during the handoff).
- *   - If `positionsTruncated:true` or the live derivation also saturated
- *     the actionable cap, emit `event: degraded` first.
+ *   - Server seeds the hub's positionStatus cache from `result.seedRows`
+ *     produced by the SAME `loadOwnStateSnapshot()` read that built the
+ *     wire body — NOT a fresh post-snapshot derivation. The seed and
+ *     the wire body are equal by construction, so a derived-state
+ *     transition cannot land between the two reads and silently
+ *     populate the cache with a status the SDK never received.
+ *   - If `positionsTruncated:true`, emit `event: degraded` first so
+ *     SDK/MM enters quote-hold (spec §2.6).
  *   - Start the per-wallet poll timer (`hub.beginLive(sub)`).
  *   - Emit `event: ready` and transition to live.
  *
@@ -81,6 +84,10 @@ import {
   type PositionStatusEventBody,
   type SpeculationInput,
 } from './positionStatus.js';
+import {
+  compareIsoTimestamptz,
+  maxIsoTimestamptz,
+} from './timestamps.js';
 import { loadOwnStateSnapshot } from './snapshot.js';
 import { getOwnStateHub, type OwnStateSubscriber } from './hub.js';
 import type { MarketType } from '../../lib/speculation.js';
@@ -420,12 +427,41 @@ function advanceFills(
   return { ...cur, f: { s: ts, i: id } };
 }
 
-function advancePositions(
+/**
+ * Advance the running cursor's `p` watermark for a delivered
+ * positionStatus event. Exported for direct unit testing of the
+ * monotonic guard.
+ */
+export function advancePositions(
   cur: OwnStateCursor | null,
   ts: string,
   id: string,
 ): OwnStateCursor | null {
   if (cur === null) return null;
+  // Monotonic guard: never move `p` backwards. The hub emits sorted by
+  // (sourceUpdatedAt, id) ASC so we shouldn't reach a backwards advance
+  // in practice — this is belt-and-braces against accidental future
+  // out-of-order callbacks. We still emit the event body (the caller
+  // wraps this in writeOwnStateEvent unconditionally); we only pin
+  // `id:` to the existing higher cursor. The SDK reducer dedupes the
+  // event by its semantic key.
+  const byTs = compareIsoTimestamptz(ts, cur.p.s);
+  if (byTs < 0) return cur;
+  if (byTs === 0) {
+    let curBig: bigint;
+    let newBig: bigint;
+    try {
+      curBig = BigInt(cur.p.i);
+    } catch {
+      curBig = 0n;
+    }
+    try {
+      newBig = BigInt(id);
+    } catch {
+      newBig = 0n;
+    }
+    if (newBig <= curBig) return cur;
+  }
   return { ...cur, p: { s: ts, i: id } };
 }
 
@@ -618,8 +654,15 @@ export interface DerivedPositionRow {
   /** `${speculationId}_${positionType}` — the hub-cache key. */
   key: string;
   body: PositionStatusEventBody;
+  /**
+   * `max(positions.row_updated_at, speculations.row_updated_at,
+   * contests.row_updated_at)` preserved verbatim — microseconds
+   * intact. Comparisons go through `compareIsoTimestamptz` so the
+   * wire-contract precision is honored end-to-end (Date.parse would
+   * truncate to milliseconds, causing same-ms parent transitions to
+   * mis-sort / mis-filter).
+   */
   sourceUpdatedAt: string;
-  sourceMs: number;
   id: string;
   idBig: bigint;
 }
@@ -912,21 +955,21 @@ export async function derivePositionsForWallet(
     }
   }
 
-  // Derivation + assembly. Sorted by (sourceMs, id) ASC for monotonic
-  // cursor advance.
+  // Derivation + assembly. Sorted by (sourceUpdatedAt, id) ASC via the
+  // microsecond-safe `compareIsoTimestamptz` so same-ms parent
+  // transitions order correctly — `Date.parse`-based sort would
+  // collapse them and let cursor.p re-emit drift.
   const rows: DerivedPositionRow[] = [];
   for (const row of positions) {
     const spec = specsById.get(Number(row.speculation_id));
     if (!spec) continue; // orphan — defensive skip
     const contest = spec.contest_id != null ? contestsById.get(spec.contest_id) ?? null : null;
     const positionType: 0 | 1 = row.position_type === 'upper' ? 0 : 1;
-    const sourceUpdatedAt = maxIsoTimestampStream(
+    const sourceUpdatedAt = maxIsoTimestamptz(
       row.row_updated_at,
       spec.row_updated_at,
       contest?.row_updated_at,
     );
-    const sourceMs = Date.parse(sourceUpdatedAt);
-    if (!Number.isFinite(sourceMs)) continue;
     let idBig: bigint;
     try {
       idBig = BigInt(String(row.id));
@@ -961,14 +1004,15 @@ export async function derivePositionsForWallet(
       key: `${String(row.speculation_id)}_${positionType}`,
       body,
       sourceUpdatedAt,
-      sourceMs,
       id: String(row.id),
       idBig,
     });
   }
   rows.sort((a, b) => {
-    if (a.sourceMs !== b.sourceMs) return a.sourceMs - b.sourceMs;
-    return Number(a.idBig - b.idBig);
+    const byTs = compareIsoTimestamptz(a.sourceUpdatedAt, b.sourceUpdatedAt);
+    if (byTs !== 0) return byTs;
+    if (a.idBig === b.idBig) return 0;
+    return a.idBig < b.idBig ? -1 : 1;
   });
   return { rows, saturated, queryFailed: false, terminalSaturated };
 }
@@ -1014,8 +1058,10 @@ async function catchUpPositions(
   // Overlap floor on the first call (input cursor.k='live' is validated
   // upstream) — catches a late-committing source row whose effective
   // timestamp predates the cursor by < RECOVERY_OVERLAP_MS.
+  // `compareIsoTimestamptz` preserves the microseconds the wire
+  // contract honors; a `Date.parse`-based comparison would let a
+  // same-ms-but-micros-newer row be filtered out as equal.
   const flooredCursor = floorBaseWatermark(cursorWatermark);
-  const flooredMs = Date.parse(flooredCursor.s);
   const flooredId = (() => {
     try {
       return BigInt(flooredCursor.i);
@@ -1031,9 +1077,11 @@ async function catchUpPositions(
         degraded: derivation.saturated || derivation.terminalSaturated,
       };
     }
-    // (sourceMs, id) > (flooredMs, flooredId).
-    if (r.sourceMs < flooredMs) continue;
-    if (r.sourceMs === flooredMs && r.idBig <= flooredId) continue;
+    // (sourceUpdatedAt, id) > (flooredCursor.s, flooredId) — strict
+    // microsecond-aware keyset advance.
+    const byTs = compareIsoTimestamptz(r.sourceUpdatedAt, flooredCursor.s);
+    if (byTs < 0) continue;
+    if (byTs === 0 && r.idBig <= flooredId) continue;
     emit(r.body, r.sourceUpdatedAt, r.id);
     shed();
   }
@@ -1049,24 +1097,6 @@ async function catchUpPositions(
     seedRows: derivation.rows,
     degraded: derivation.saturated || derivation.terminalSaturated,
   };
-}
-
-/**
- * Local `max` for ISO-8601 timestamps. Same parse-and-compare approach as
- * `hub.ts:maxIsoTimestamp` — the wire format admits `Z` and `+00:00`
- * shapes (PostgREST quirk), so lexicographic comparison is unsafe.
- */
-function maxIsoTimestampStream(
-  ...values: Array<string | null | undefined>
-): string {
-  let best: { s: string; ms: number } | null = null;
-  for (const v of values) {
-    if (!v) continue;
-    const ms = Date.parse(v);
-    if (!Number.isFinite(ms)) continue;
-    if (best === null || ms > best.ms) best = { s: v, ms };
-  }
-  return best ? best.s : new Date(0).toISOString();
 }
 
 /** Mirrors `STATUS_DERIVATION_LIMIT` in hub.ts + `POSITION_QUERY_LIMIT` in positionFetch.ts. */

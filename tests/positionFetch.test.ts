@@ -609,6 +609,56 @@ describe('fetchCategorizedPositions — mixed and edge cases', () => {
     expect(result.active.length + result.pendingSettle.length + result.claimable.length).toBe(1);
   });
 
+  it('derivedStatuses picks the contest sourceUpdatedAt when it is later by microseconds than the position', async () => {
+    // Hermes review-32 round 5 blocker 2: maxIsoTimestamptz must compare
+    // microsecond-precise. With `Date.parse`-based max, two same-ms
+    // timestamps (one position, one contest) differing only in
+    // micros would be tied — and whichever was iterated first would
+    // win. Pin that the LATER micros wins, regardless of input order.
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabase({
+        positions: [
+          {
+            speculation_id: 1,
+            user_address: ADDR,
+            position_type: 'upper',
+            risk_amount: '100000000',
+            profit_amount: '50000000',
+            claimed: false,
+            position_created_at: '2026-01-01T00:00:00Z',
+            row_updated_at: '2026-05-29T15:00:00.123456Z',
+          },
+        ],
+        speculations: [
+          {
+            speculation_id: 1,
+            contest_id: 42,
+            market_type: 'moneyline',
+            line_ticks: 0,
+            speculation_status: 'open',
+            win_side: 'tbd',
+            row_updated_at: '2026-05-29T14:00:00.000000Z',
+          },
+        ],
+        contests: [
+          {
+            contest_id: 42,
+            away_team: 'A',
+            home_team: 'B',
+            contest_status: 'unverified',
+            away_score: null,
+            home_score: null,
+            // Same ms as position, but 1 microsecond LATER.
+            row_updated_at: '2026-05-29T15:00:00.123457Z',
+          },
+        ],
+      }),
+    );
+    const result = await fetchCategorizedPositions(ADDR);
+    expect(result.derivedStatuses).toHaveLength(1);
+    expect(result.derivedStatuses[0]!.sourceUpdatedAt).toBe('2026-05-29T15:00:00.123457Z');
+  });
+
   it('throws when the positions query reports an error', async () => {
     supabaseMock.getSupabase.mockReturnValue({
       from() {

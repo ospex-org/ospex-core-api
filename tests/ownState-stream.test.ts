@@ -759,6 +759,81 @@ describe('GET /v1/stream/own-state — resume catchup', () => {
   });
 });
 
+describe('advancePositions — monotonic guard', () => {
+  it('does not move cur.p backwards when a later cursor is followed by an earlier one', async () => {
+    // Hermes review-32 round 5 blocker 1 (defensive guard): the hub
+    // sorts emissions so this case should not arise in practice. This
+    // test pins the belt-and-braces behavior — if a future code path
+    // accidentally emits out of order, the cursor stays at the higher
+    // value rather than regressing (which would cause reconnect to
+    // skip the earlier-but-already-delivered event).
+    const { advancePositions } = await import('../src/v1/ownState/stream.js');
+    const { OWN_STATE_CURSOR_VERSION } = await import('../src/v1/ownState/cursor.js');
+    const initial = {
+      t: 'own-state' as const,
+      v: OWN_STATE_CURSOR_VERSION,
+      c: { s: '2026-05-29T14:00:00.000Z', i: '0' },
+      f: { s: '2026-05-29T14:00:00.000Z', i: '0' },
+      p: { s: '2026-05-29T15:00:00.000Z', i: '5' },
+      k: 'live' as const,
+    };
+    // Advance to a NEWER cursor (T2 > T1): allowed.
+    const afterB = advancePositions(initial, '2026-05-29T16:00:00.000Z', '9');
+    expect(afterB!.p).toEqual({ s: '2026-05-29T16:00:00.000Z', i: '9' });
+    // Now an EARLIER event (T1 < T2): cursor must stay at the
+    // already-advanced higher value.
+    const afterA = advancePositions(afterB, '2026-05-29T15:30:00.000Z', '7');
+    expect(afterA!.p).toEqual({ s: '2026-05-29T16:00:00.000Z', i: '9' });
+  });
+
+  it('respects microsecond precision on the guard', async () => {
+    const { advancePositions } = await import('../src/v1/ownState/stream.js');
+    const { OWN_STATE_CURSOR_VERSION } = await import('../src/v1/ownState/cursor.js');
+    const initial = {
+      t: 'own-state' as const,
+      v: OWN_STATE_CURSOR_VERSION,
+      c: { s: '2026-05-29T14:00:00.000Z', i: '0' },
+      f: { s: '2026-05-29T14:00:00.000Z', i: '0' },
+      p: { s: '2026-05-29T15:00:00.000200Z', i: '5' },
+      k: 'live' as const,
+    };
+    // Same-ms but microsecond-earlier event should be rejected.
+    const next = advancePositions(initial, '2026-05-29T15:00:00.000100Z', '9');
+    expect(next!.p).toEqual({ s: '2026-05-29T15:00:00.000200Z', i: '5' });
+    // Same-ms but microsecond-newer event should advance.
+    const after = advancePositions(initial, '2026-05-29T15:00:00.000300Z', '9');
+    expect(after!.p).toEqual({ s: '2026-05-29T15:00:00.000300Z', i: '9' });
+  });
+
+  it('uses id as tie-breaker when sourceUpdatedAt is equal (microsecond-exact)', async () => {
+    const { advancePositions } = await import('../src/v1/ownState/stream.js');
+    const { OWN_STATE_CURSOR_VERSION } = await import('../src/v1/ownState/cursor.js');
+    const initial = {
+      t: 'own-state' as const,
+      v: OWN_STATE_CURSOR_VERSION,
+      c: { s: '2026-05-29T14:00:00.000Z', i: '0' },
+      f: { s: '2026-05-29T14:00:00.000Z', i: '0' },
+      p: { s: '2026-05-29T15:00:00.123456Z', i: '5' },
+      k: 'live' as const,
+    };
+    // Same ts, lower id → preserve.
+    expect(advancePositions(initial, '2026-05-29T15:00:00.123456Z', '3')!.p).toEqual({
+      s: '2026-05-29T15:00:00.123456Z',
+      i: '5',
+    });
+    // Same ts, equal id → preserve (strict >).
+    expect(advancePositions(initial, '2026-05-29T15:00:00.123456Z', '5')!.p).toEqual({
+      s: '2026-05-29T15:00:00.123456Z',
+      i: '5',
+    });
+    // Same ts, higher id → advance.
+    expect(advancePositions(initial, '2026-05-29T15:00:00.123456Z', '9')!.p).toEqual({
+      s: '2026-05-29T15:00:00.123456Z',
+      i: '9',
+    });
+  });
+});
+
 describe('GET /v1/stream/own-state — live deltas', () => {
   it('writes commitment events with the running composite cursor as id:', async () => {
     const res = makeRes();
