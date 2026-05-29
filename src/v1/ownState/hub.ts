@@ -142,19 +142,24 @@ interface StatusCacheEntry {
 
 interface WalletPoller {
   subs: Set<OwnStateSubscriber>;
-  timer: ReturnType<typeof setInterval>;
+  /**
+   * Per-wallet poll timer. NULL until {@link OwnStateHub.beginLive} is
+   * called for the first subscriber on this wallet — the handler invokes
+   * `beginLive` only AFTER its catch-up has seeded the cache, so a tick
+   * cannot silently absorb a derived-state transition that happened during
+   * the handoff (the preReady-race blocker from review-32 round 2).
+   */
+  timer: ReturnType<typeof setInterval> | null;
   commitments: ResourceTipState;
   fills: ResourceTipState;
   /**
-   * Cache of last-emitted (status, sourceUpdatedAt) per `${speculationId}_${positionType}`.
-   * Populated on the first tick WITHOUT emitting — the SDK's prior
-   * snapshot/catchup already covered the bootstrap state and re-emitting
-   * the same statuses would spam reducers. Subsequent ticks emit only on
-   * derived-status change.
+   * Last-emitted (status, sourceUpdatedAt) per `${speculationId}_${positionType}`.
+   * Seeded by the handler from its catch-up / cold-start derivation BEFORE
+   * the timer starts (see `seedStatusCache`). Ticks emit when the
+   * re-derived status differs from the cached entry; new keys are emitted
+   * as the appearance of a previously-unknown position.
    */
   statusCache: Map<string, StatusCacheEntry>;
-  /** Toggled true after the first successful re-derivation pass. */
-  cachePopulated: boolean;
   polling: boolean;
 }
 
@@ -233,13 +238,18 @@ export class OwnStateHub {
         commitments: { tip: { s: nowIso, i: '0' }, emitted: new Map() },
         fills: { tip: { s: nowIso, i: '0' }, emitted: new Map() },
         statusCache: new Map(),
-        cachePopulated: false,
         polling: false,
-        timer: setInterval(() => {
-          void this.pollWallet(addr);
-        }, this.deps.pollMs),
+        // Timer is deliberately NOT started here — the handler calls
+        // `beginLive(sub)` after seeding the status cache. Starting the
+        // timer at subscribe time would let a tick run before the cache
+        // was seeded, silently caching whatever current state it observed
+        // and missing transitions that happened during the catch-up
+        // handoff. Commitments/fills don't have this hazard (their
+        // callbacks correctly set `aborted=true` during preReady), but
+        // positionStatus is derived — a tick without a seeded baseline
+        // can't tell "new transition" from "first observation".
+        timer: null,
       };
-      state.timer.unref?.();
       this.pollers.set(addr, state);
     }
     state.subs.add(sub);
@@ -263,13 +273,53 @@ export class OwnStateHub {
     if (!state || !state.subs.delete(sub)) return;
     this.totalSubs = Math.max(0, this.totalSubs - 1);
     if (state.subs.size === 0) {
-      clearInterval(state.timer);
+      if (state.timer !== null) clearInterval(state.timer);
       this.pollers.delete(sub.address);
     }
     if (this.totalSubs === 0 && this.resyncTimer !== undefined) {
       clearInterval(this.resyncTimer);
       this.resyncTimer = undefined;
     }
+  }
+
+  /**
+   * Seed the wallet's positionStatus cache from the handler's catch-up /
+   * cold-start derivation. Called BEFORE {@link beginLive} so the first
+   * tick has a valid comparison baseline. Idempotent across re-seeding:
+   * later seeds overwrite earlier ones, which lets a fresh catch-up's
+   * derivation take precedence over a stale cache entry.
+   *
+   * The handler MUST seed every position it discovered (whether it
+   * emitted a positionStatus event for it or not). Anything missing from
+   * the seed will be treated as "newly observed" on the first tick and
+   * emit unconditionally — which, during a same-tick preReady race,
+   * trips the abort signal and forces a resync.
+   */
+  seedStatusCache(
+    address: string,
+    entries: Array<{ key: string; status: import('./positionStatus.js').PositionStatus; sourceUpdatedAt: string }>,
+  ): void {
+    const state = this.pollers.get(address.toLowerCase());
+    if (!state) return;
+    for (const e of entries) {
+      state.statusCache.set(e.key, { status: e.status, sourceUpdatedAt: e.sourceUpdatedAt });
+    }
+  }
+
+  /**
+   * Idempotently start the per-wallet poll timer for `sub`'s wallet.
+   * Called by the handler AFTER catch-up / snapshot seeding completes and
+   * BEFORE `ready` is emitted. Subsequent calls on the same wallet
+   * (multi-subscriber case) are no-ops.
+   */
+  beginLive(sub: OwnStateSubscriber): void {
+    const state = this.pollers.get(sub.address);
+    if (!state || state.timer !== null) return;
+    const addr = sub.address;
+    state.timer = setInterval(() => {
+      void this.pollWallet(addr);
+    }, this.deps.pollMs);
+    state.timer.unref?.();
   }
 
   /** Poll all 3 resources for `address`. Public for tests. */
@@ -366,23 +416,26 @@ export class OwnStateHub {
    * speculations → contests) so the stream and snapshot agree on derived
    * state.
    *
+   * Population: `claimed=false AND risk_amount>0` (the actionable set,
+   * matching `fetchCategorizedPositions`) UNION currently-cached keys.
+   * Cached keys carry forward any position the handler seeded — so a
+   * recent transition that has just left the actionable filter (e.g.
+   * `claimed` just flipped to true and the row has `risk_amount=0`) is
+   * still re-derived against current spec/contest data, and the resulting
+   * terminal status (`claimed`) is emitted before the row falls out of
+   * tracking.
+   *
    * Per-tick cost: one positions query (capped at 200 by
-   * `STATUS_DERIVATION_LIMIT`) + one speculations IN-list query + one
-   * contests IN-list query. Bounded; safe to run at the standard poll
-   * cadence.
+   * `STATUS_DERIVATION_LIMIT`) + one positions IN-list query for stale
+   * cached keys + one speculations IN-list query + one contests IN-list
+   * query. Bounded.
    *
-   * First-tick semantics: the cache is populated WITHOUT emitting. The
-   * SDK has just received either the cold-start snapshot or the resume
-   * catch-up's full re-derivation; re-emitting bootstrap state would only
-   * trigger reducer-dedup work. Subsequent ticks emit on derived-status
-   * change.
-   *
-   * 200-row cap: the snapshot helper's `fetchCategorizedPositions` uses
-   * the same cap. A wallet with more rows ORDERS BY `row_updated_at DESC`
-   * so the most-recent transitions still surface; long-quiet claimed
-   * positions naturally fall out of the window (they're terminal and
-   * never transition again, so missing them post-cap can't lose
-   * a future event).
+   * Emit contract: handler seeds the cache before `beginLive`, so on the
+   * first tick the cache reflects the catch-up's view of derived state.
+   * A derived-status difference emits a `positionStatus` event — during
+   * preReady this trips the handler's abort signal (which is the desired
+   * behavior; the catch-up's view was stale). During live phase the SDK
+   * sees the transition.
    */
   private async reDerivePositionStatuses(
     address: string,
@@ -390,7 +443,10 @@ export class OwnStateHub {
   ): Promise<void> {
     const sb = this.deps.getClient();
     const net = this.deps.getNetwork();
-    const positionsRes = await sb
+    // Phase A — actionable population (matches snapshot's
+    // `fetchCategorizedPositions` filter so the live view and the
+    // snapshot view always cover the same rows).
+    const actionableRes = await sb
       .from('positions')
       .select(
         'speculation_id, user_address, position_type, risk_amount, profit_amount, ' +
@@ -398,17 +454,19 @@ export class OwnStateHub {
       )
       .eq('network', net)
       .eq('user_address', address)
+      .eq('claimed', false)
+      .gt('risk_amount', 0)
       .order('row_updated_at', { ascending: false })
       .order('id', { ascending: false })
       .limit(STATUS_DERIVATION_LIMIT);
-    if (positionsRes.error) {
+    if (actionableRes.error) {
       logger.error(
-        { err: positionsRes.error.message, address },
-        'ownStateHub positionStatus: positions query failed',
+        { err: actionableRes.error.message, address },
+        'ownStateHub positionStatus: actionable positions query failed',
       );
       return;
     }
-    const positions = (positionsRes.data ?? []) as unknown as Array<{
+    const actionable = (actionableRes.data ?? []) as unknown as Array<{
       speculation_id: string | number;
       user_address: string;
       position_type: 'upper' | 'lower';
@@ -418,8 +476,58 @@ export class OwnStateHub {
       row_updated_at: string;
       id: string | number;
     }>;
+    // Phase B — currently-cached keys that are NOT in the actionable set
+    // any more. These are positions whose status may have transitioned
+    // (e.g. just claimed; just transferred-out) — we need to re-fetch their
+    // current row so the derivation reflects the transition before the
+    // cache entry falls out of tracking.
+    const actionableKeys = new Set(
+      actionable.map(
+        (p) =>
+          `${String(p.speculation_id)}_${p.position_type === 'upper' ? 0 : 1}`,
+      ),
+    );
+    const staleCachedSpecIds: number[] = [];
+    for (const key of state.statusCache.keys()) {
+      if (actionableKeys.has(key)) continue;
+      const specPart = key.slice(0, key.lastIndexOf('_'));
+      const id = Number(specPart);
+      if (Number.isFinite(id)) staleCachedSpecIds.push(id);
+    }
+    let staleRows: typeof actionable = [];
+    if (staleCachedSpecIds.length > 0) {
+      const staleRes = await sb
+        .from('positions')
+        .select(
+          'speculation_id, user_address, position_type, risk_amount, profit_amount, ' +
+            'claimed, row_updated_at, id',
+        )
+        .eq('network', net)
+        .eq('user_address', address)
+        .in('speculation_id', staleCachedSpecIds)
+        .limit(STATUS_DERIVATION_LIMIT);
+      if (staleRes.error) {
+        logger.error(
+          { err: staleRes.error.message, address },
+          'ownStateHub positionStatus: cached-key refresh query failed',
+        );
+        return;
+      }
+      staleRows = (staleRes.data ?? []) as unknown as typeof actionable;
+    }
+    // Dedupe across the two queries by (speculation_id, position_type).
+    const positionsByKey = new Map<string, (typeof actionable)[number]>();
+    for (const row of [...actionable, ...staleRows]) {
+      const key = `${String(row.speculation_id)}_${row.position_type === 'upper' ? 0 : 1}`;
+      // Actionable rows come first; keep their data over the stale refresh
+      // (they're the same row from concurrent queries, but actionable's
+      // strict filters guarantee freshness).
+      if (!positionsByKey.has(key)) positionsByKey.set(key, row);
+    }
+    const positions = [...positionsByKey.values()];
     if (positions.length === 0) {
-      state.cachePopulated = true;
+      // No actionable rows and no cached keys to refresh — wallet is empty
+      // or fully terminal. Nothing to emit.
       return;
     }
     const specIds = [...new Set(positions.map((p) => Number(p.speculation_id)))];
@@ -541,16 +649,13 @@ export class OwnStateHub {
       const key = `${String(row.speculation_id)}_${positionType}`;
       const prior = state.statusCache.get(key);
       state.statusCache.set(key, { status: body.status, sourceUpdatedAt });
-      // Bootstrap: populate cache without emitting on the first tick. The
-      // SDK has just received the bootstrap state from the snapshot or
-      // catch-up; re-emitting it would only spend reducer-dedup work.
-      if (!state.cachePopulated) continue;
-      // Steady state: emit when derived status differs from the cache
-      // (covers both raw position transitions AND spec/contest-driven
-      // transitions on unchanged position rows). Equal-status repeats are
-      // dropped here, matching the dedup contract — the SDK reducer
-      // already keys on `(addr, specId, positionType, status,
-      // sourceUpdatedAt)` for cross-replay dedup.
+      // Emit when derived status differs from the seeded/cached entry.
+      // Covers both raw position transitions AND spec/contest-driven
+      // transitions on unchanged position rows. A previously-unseen key
+      // (prior === undefined) also emits — the handler is responsible for
+      // seeding every position it discovered, so an unseen key means a
+      // genuinely new position OR a tick that raced the handoff (in which
+      // case the subscriber's preReady abort path catches it).
       if (prior && prior.status === body.status) continue;
       for (const sub of state.subs) {
         try {
@@ -563,8 +668,6 @@ export class OwnStateHub {
         }
       }
     }
-
-    state.cachePopulated = true;
   }
 
   // ── per-resource scans ────────────────────────────────────────────────

@@ -273,10 +273,11 @@ describe('GET /v1/stream/own-state — cold start (no cursor)', () => {
     expect((ev[0] as { data: { truncated: boolean } }).data.truncated).toBe(false);
   });
 
-  it('emits snapshot WITHOUT ready when positions truncated; ends the connection', async () => {
-    // Force positions truncation: position helper signals hitCap=true; commitments
-    // stay clean. SDK reconnects with the cursor (p preserved as SENTINEL) and the
-    // resume catch-up replays position transitions before `ready`.
+  it('emits snapshot + degraded + ready when positions truncated (defined terminal, no resync loop)', async () => {
+    // positionsTruncated reconnect contract (PR2 round 2): a wallet at the
+    // 200-actionable-position cap reaches a DEFINED terminal state instead
+    // of resync-looping. The stream emits `event: degraded` so the
+    // SDK / MM enters quote-hold per spec §2.6, then proceeds to `ready`.
     positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
       active: [],
       pendingSettle: [],
@@ -285,10 +286,16 @@ describe('GET /v1/stream/own-state — cold start (no cursor)', () => {
     });
     supabaseMock.getSupabase.mockImplementation(() =>
       sequencedClient([
-        { data: [], error: null }, // active commitments query
-        { data: null, error: null }, // maxFills
-        // No maxPositions query — when positionsTruncated, snapshot preserves
-        // cursor.p as SENTINEL_WATERMARK (cold start) instead of querying.
+        // Snapshot: active commitments → maxWmCommitments → maxWmFills.
+        // (No maxWmPositions because positionsTruncated preserves cursor.p
+        // as SENTINEL_WATERMARK on cold start.)
+        { data: [], error: null }, // active commitments
+        { data: null, error: null }, // maxWmCommitments .maybeSingle()
+        { data: null, error: null }, // maxWmFills .maybeSingle()
+        // Cold-start seed pass: actionable positions query (empty),
+        // cached-key refresh skipped (empty cache), no specs/contests
+        // because the empty positions set short-circuits.
+        { data: [], error: null }, // actionable positions
       ]),
     );
     const res = makeRes();
@@ -299,8 +306,18 @@ describe('GET /v1/stream/own-state — cold start (no cursor)', () => {
     expect(snap).toBeDefined();
     expect((snap as { data: { positionsTruncated: boolean } }).data.positionsTruncated).toBe(true);
     expect((snap as { data: { truncated: boolean } }).data.truncated).toBe(false);
-    expect(ev.find((e) => e.event === 'ready')).toBeUndefined();
-    expect(res.writableEnded).toBe(true);
+    // Degraded comes BEFORE ready so the SDK knows the wallet is in
+    // partial-visibility mode when it transitions to live.
+    const degradedIdx = ev.findIndex((e) => e.event === 'degraded');
+    const readyIdx = ev.findIndex((e) => e.event === 'ready');
+    expect(degradedIdx).toBeGreaterThanOrEqual(0);
+    expect(readyIdx).toBeGreaterThanOrEqual(0);
+    expect(degradedIdx).toBeLessThan(readyIdx);
+    expect((ev[degradedIdx] as { data: { reason: string } }).data.reason).toBe(
+      'positionsTruncated',
+    );
+    // Connection STAYS OPEN for live deltas (no res.end after ready).
+    expect(res.writableEnded).toBe(false);
   });
 
   it('emits snapshot WITHOUT ready when commitments truncated; ends the connection', async () => {
@@ -433,6 +450,60 @@ describe('GET /v1/stream/own-state — resume catchup', () => {
       '2026-05-29T15:30:00.000Z',
     );
     expect(ev.find((e) => e.event === 'ready')).toBeDefined();
+  });
+
+  it('preReady positionStatus race aborts to resync (handoff-race protection)', async () => {
+    // Snapshot/catch-up observed status A; before `ready`, the hub fires
+    // onPositionStatus with status B (because the seeded cache differs
+    // from the current derivation). The handler must NOT silently cache
+    // and emit ready — that's the convergence hole called out in
+    // review-32 round 2. The onPositionStatus callback during preReady
+    // sets `aborted=true`, the handler emits resync, ends the connection,
+    // and the SDK reconnects with fresh state.
+    class RacingPositionHub extends OwnStateHub {
+      subscribe(
+        address: string,
+        cb: Parameters<OwnStateHub['subscribe']>[1],
+      ): ReturnType<OwnStateHub['subscribe']> {
+        const sub = super.subscribe(address, cb);
+        // Fire a derived-status event synchronously BEFORE the handler's
+        // catch-up has run. The handler's onPositionStatus runs with
+        // `phase === 'preReady'`, sets aborted=true.
+        cb.onPositionStatus(
+          {
+            address: '0x1111111111111111111111111111111111111111',
+            speculationId: '101',
+            positionType: 0,
+            status: 'claimable',
+            result: 'won',
+            claimableAmount: '1500000',
+            sourceUpdatedAt: '2026-05-29T15:45:00.000Z',
+          },
+          '2026-05-29T15:45:00.000Z',
+          '7',
+        );
+        return sub;
+      }
+    }
+    const racing = new RacingPositionHub({
+      getClient: () => emptyClient(),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+    });
+    __setOwnStateHubForTest(racing);
+
+    const res = makeRes();
+    getOwnStateStreamHandler(
+      makeReq({ query: { cursor: liveCursor() } }),
+      res as unknown as Response,
+    );
+    await flushTicks(64);
+    const ev = events(res);
+    const resync = ev.find((e) => e.event === 'resync');
+    expect(resync).toBeDefined();
+    expect(ev.find((e) => e.event === 'ready')).toBeUndefined();
+    expect(res.writableEnded).toBe(true);
   });
 
   it('aborts catchup to resync if a live delta lands during catchup', async () => {

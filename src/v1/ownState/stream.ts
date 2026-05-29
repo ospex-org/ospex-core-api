@@ -9,23 +9,29 @@
  *
  *   COLD START (no cursor) — server emits an inline `event: snapshot` carrying
  *   the maker's complete current state via the shared `loadOwnStateSnapshot`
- *   helper. If the snapshot was complete (`truncated: false` AND
- *   `positionsTruncated: false`), the server immediately emits `event: ready`
- *   and transitions to live. If EITHER `truncated` or `positionsTruncated` is
- *   true, NO `ready` is emitted and the connection ends:
- *     - `truncated` (commitments): per spec §6.2 the SDK pages REST
- *       `/v1/own-state/snapshot?cursor=` until untruncated, then reconnects
- *       to this stream with the final cursor.
- *     - `positionsTruncated`: the snapshot preserves `cursor.p` as sentinel
- *       (cold start) or input value, so the SDK reconnects to this stream
- *       with the emitted cursor and resume catch-up replays every position
- *       transition from the preserved tail before `ready`.
+ *   helper. If commitments are truncated (`truncated: true`), NO `ready` is
+ *   emitted and the connection ends — per spec §6.2 the SDK pages REST
+ *   `/v1/own-state/snapshot?cursor=` until untruncated, then reconnects to
+ *   this stream with the final cursor. Otherwise:
+ *   - Server seeds the hub's positionStatus cache from a fresh derivation
+ *     pass (so the first hub tick has a baseline and can't silently absorb
+ *     a transition that happened during the handoff).
+ *   - If `positionsTruncated:true` or the live derivation also saturated
+ *     the actionable cap, emit `event: degraded` first.
+ *   - Start the per-wallet poll timer (`hub.beginLive(sub)`).
+ *   - Emit `event: ready` and transition to live.
  *
- *   RESUME (cursor present) — server runs per-resource catch-up replay from the
- *   cursor's watermarks (commitments, position_fills, positions). Each replayed
- *   row is emitted as a typed delta with the running composite cursor in `id:`.
- *   On clean catch-up: `ready` and live. On race with a live delta or upstream
- *   resync: `event: resync` and end (forcing client reconnect/re-snapshot).
+ *   RESUME (cursor present) — server runs per-resource catch-up replay from
+ *   the cursor's watermarks (commitments, position_fills, positions). The
+ *   positions catch-up is a derived event over (positions, speculations,
+ *   contests) and emits the subset past `cursor.p`; saturation surfaces as
+ *   `event: degraded` followed by `ready` (not `resync`), giving the SDK a
+ *   defined terminal state instead of an infinite reconnect loop for
+ *   wallets at the actionable-position cap. The catch-up's full derivation
+ *   also seeds the hub cache before `beginLive` for the same race-
+ *   protection rationale as cold-start. On race with a live delta or
+ *   upstream resync during catch-up, `event: resync` is emitted and the
+ *   connection ends.
  *
  * Only `k='live'` cursors are valid input. A `page-*` cursor indicates the SDK
  * hasn't finished paging through a truncated snapshot — we 400 with
@@ -294,26 +300,56 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
           res.end();
           return;
         }
-        if (result.body.truncated || result.body.positionsTruncated) {
-          // Snapshot incomplete on at least one resource — must NOT emit
-          // `ready`. The two truncation kinds end on different paths:
-          //
-          //   - `truncated` (commitments): SDK pages REST
-          //     `/v1/own-state/snapshot?cursor=` until untruncated, then
-          //     reconnects to this stream with the final cursor.
-          //
-          //   - `positionsTruncated`: the snapshot helper preserves
-          //     `cursor.p` as sentinel (cold start) or the input cursor's
-          //     value, so the SDK reconnects to this stream WITH the
-          //     emitted cursor, and resume catch-up replays every position
-          //     transition from the preserved tail before `ready`.
-          //
-          // Either way we end this connection so the SDK doesn't hold a
-          // slot while it transitions to the recovery path.
+        if (result.body.truncated) {
+          // Commitments truncated — SDK pages REST
+          // `/v1/own-state/snapshot?cursor=` until untruncated, then
+          // reconnects to this stream with the final cursor. End the
+          // connection so the SDK doesn't hold a slot during paging.
           preReadyCompletedTotal += 1;
           res.end();
           return;
         }
+
+        // Seed the hub's positionStatus cache from the wallet's current
+        // derived state BEFORE starting the per-wallet poll timer.
+        // Without this seed the first tick would silently absorb every
+        // current position as "newly observed", defeating the abort
+        // signal that protects preReady against derived-state races.
+        //
+        // The cold-start derivation also detects `positionsTruncated`
+        // saturation: when the actionable population caps at 200, the
+        // stream emits `event: degraded` and proceeds to `ready` so the
+        // SDK reaches a defined terminal state (the SDK / MM treats
+        // degraded as quote-hold per spec §2.6). This breaks the
+        // earlier `positionsTruncated → reconnect → resync → reconnect`
+        // loop for wallets at the cap.
+        const sb = getSupabase();
+        const net = loadConfig().network;
+        const seedResult = await derivePositionsForWallet(sb, net, address, []);
+        if (closed || res.writableEnded) return;
+        if (seedResult.queryFailed) {
+          writeOwnStateEvent(res, 'resync', { reason: 'snapshot_failed' });
+          preReadyResyncedTotal += 1;
+          res.end();
+          return;
+        }
+        getOwnStateHub().seedStatusCache(
+          address,
+          seedResult.rows.map((r) => ({
+            key: r.key,
+            status: r.body.status,
+            sourceUpdatedAt: r.sourceUpdatedAt,
+          })),
+        );
+        if (result.body.positionsTruncated || seedResult.saturated) {
+          // The snapshot exposed `positionsTruncated:true` to the SDK
+          // OR the live derivation saturated at the same cap. Emit a
+          // `degraded` event so the SDK / MM enters quote-hold mode,
+          // then proceed to `ready` — the connection has delivered
+          // every row we could observe.
+          writeOwnStateEvent(res, 'degraded', { reason: 'positionsTruncated' });
+        }
+        getOwnStateHub().beginLive(sub);
         phase = 'live';
         writeOwnStateEvent(res, 'ready', {});
         preReadyCompletedTotal += 1;
@@ -325,7 +361,7 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
       // applies the overlap floor on the first page (live cursor); strict
       // forward on subsequent pages. `running` is mutated per delta.
       running = cursor;
-      const status = await runCatchUpWithCursor(
+      const catchupResult = await runCatchUpWithCursor(
         res,
         address,
         cursor,
@@ -335,10 +371,10 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
           running = next;
         },
       );
-      if (closed || status === 'closed' || res.writableEnded) return;
+      if (closed || catchupResult.status === 'closed' || res.writableEnded) return;
 
-      if (aborted || status === 'resync') {
-        if (status !== 'resync') {
+      if (aborted || catchupResult.status === 'resync') {
+        if (catchupResult.status !== 'resync') {
           writeOwnStateEvent(res, 'resync', { reason: 'handoff_raced' });
         }
         preReadyResyncedTotal += 1;
@@ -346,6 +382,24 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
         return;
       }
 
+      // Seed hub cache from the catch-up's derivation BEFORE starting the
+      // poll timer (same race-protection rationale as cold-start above).
+      getOwnStateHub().seedStatusCache(
+        address,
+        catchupResult.seedRows.map((r) => ({
+          key: r.key,
+          status: r.body.status,
+          sourceUpdatedAt: r.sourceUpdatedAt,
+        })),
+      );
+      if (catchupResult.degraded) {
+        // Actionable population saturated during catch-up — same defined
+        // terminal state as cold-start positionsTruncated. Emit
+        // `degraded` so the SDK reaches `ready` without looping back
+        // through resync.
+        writeOwnStateEvent(res, 'degraded', { reason: 'positionsTruncated' });
+      }
+      getOwnStateHub().beginLive(sub);
       phase = 'live';
       writeOwnStateEvent(res, 'ready', {});
       preReadyCompletedTotal += 1;
@@ -410,7 +464,7 @@ async function runCatchUpWithCursor(
   isClosed: () => boolean,
   shed: () => void,
   updateRunning: (next: OwnStateCursor) => void,
-): Promise<CatchupStatus> {
+): Promise<{ status: CatchupStatus; seedRows: DerivedPositionRow[]; degraded: boolean }> {
   let running: OwnStateCursor = initial;
   const sb = getSupabase();
   const net = loadConfig().network;
@@ -433,7 +487,7 @@ async function runCatchUpWithCursor(
         writeOwnStateEvent(res, 'commitment', body, encodeOwnStateCursor(running));
       },
     );
-    if (status !== 'complete') return status;
+    if (status !== 'complete') return { status, seedRows: [], degraded: false };
   }
 
   // ── fills ──
@@ -452,29 +506,25 @@ async function runCatchUpWithCursor(
         writeOwnStateEvent(res, 'fill', body, encodeOwnStateCursor(running));
       },
     );
-    if (status !== 'complete') return status;
+    if (status !== 'complete') return { status, seedRows: [], degraded: false };
   }
 
-  // ── positions (with speculation/contest join for status derivation) ──
-  {
-    const status = await catchUpPositions(
-      res,
-      sb,
-      net,
-      address,
-      running.p,
-      isClosed,
-      shed,
-      (body, ts, id) => {
-        running = { ...running, p: { s: ts, i: id } };
-        updateRunning(running);
-        writeOwnStateEvent(res, 'positionStatus', body, encodeOwnStateCursor(running));
-      },
-    );
-    if (status !== 'complete') return status;
-  }
-
-  return 'complete';
+  // ── positions (derived event over positions + speculations + contests) ──
+  const positionsResult = await catchUpPositions(
+    res,
+    sb,
+    net,
+    address,
+    running.p,
+    isClosed,
+    shed,
+    (body, ts, id) => {
+      running = { ...running, p: { s: ts, i: id } };
+      updateRunning(running);
+      writeOwnStateEvent(res, 'positionStatus', body, encodeOwnStateCursor(running));
+    },
+  );
+  return positionsResult;
 }
 
 async function catchUpCommitments(
@@ -573,48 +623,69 @@ async function catchUpFills(
 }
 
 /**
- * Catch up `positionStatus` since `cursorWatermark` (cursor `p`).
+ * One derived `positionStatus` row produced by {@link derivePositionsForWallet}.
  *
- * `positionStatus` is a DERIVED event over (positions, speculations,
- * contests) — a transition can be caused by any of the three source rows
- * (position claim/transfer, speculation settling, contest scoring).
- * Keyset-paging on `positions.row_updated_at` alone would miss every
- * speculation/contest-driven transition since the position row doesn't
- * move. The catch-up mirrors `OwnStateHub.reDerivePositionStatuses`:
- *
- *   1. Query the wallet's positions (capped 200, ORDER BY row_updated_at DESC).
- *   2. Batch-join speculations + contests.
- *   3. Compute `sourceUpdatedAt = max(pos.row, spec.row, contest.row)` per row.
- *   4. Emit current derived status for every row whose
- *      `(sourceUpdatedAt, position.id) > (cursor.p, cursor.p.i)`, with an
- *      overlap floor on the first call (`watermarkLiveKeysetOr` semantics).
- *
- * Cursor `p` then carries the highest-effective `sourceUpdatedAt` covered
- * (advanced by `emit`). The SDK reducer dedupes the catch-up against its
- * own snapshot state via the semantic event key
- * `(addr, specId, positionType, status, sourceUpdatedAt)`; over-emission
- * (e.g. unchanged statuses) is benign.
- *
- * Saturation: when the position query returns the full 200-row cap, the
- * wallet may have more positions whose effective timestamps we couldn't
- * inspect. Emit `resync` so the SDK re-snapshots — the snapshot helper
- * will hit `positionsTruncated: true` and the SDK's recovery flow takes
- * over (see snapshot.ts `positionsTruncated` contract).
+ * Used by both the resume catch-up (which emits a subset filtered by
+ * cursor.p) and the cold-start seed pass (which emits nothing, just hands
+ * the entries to {@link OwnStateHub.seedStatusCache}).
  */
-async function catchUpPositions(
-  res: Response,
+export interface DerivedPositionRow {
+  /** `${speculationId}_${positionType}` — the hub-cache key. */
+  key: string;
+  body: PositionStatusEventBody;
+  sourceUpdatedAt: string;
+  sourceMs: number;
+  id: string;
+  idBig: bigint;
+}
+
+export interface DerivedPositionStateResult {
+  rows: DerivedPositionRow[];
+  /**
+   * `true` when the actionable-set query saturated the 200-row cap. The
+   * stream still has VALID data for the rows it has; we just can't
+   * guarantee complete coverage. Surfaced to the SDK via an `event:
+   * degraded` so the MM holds quoting per spec §2.6 instead of looping
+   * the SDK through endless reconnects.
+   */
+  saturated: boolean;
+  /** Set when an upstream query failed; caller emits `resync`. */
+  queryFailed: boolean;
+}
+
+/**
+ * Derive current `positionStatus` for every actionable + recently-cached
+ * position in the wallet. Position population matches
+ * `loadOwnStateSnapshot` (via `fetchCategorizedPositions` filter) PLUS
+ * recently-changed cached keys — so the snapshot and the stream always
+ * cover the same population:
+ *
+ *   1. Query actionable: `claimed=false AND risk_amount>0`, cap 200,
+ *      ORDER BY row_updated_at DESC.
+ *   2. Query cached keys that are NOT in the actionable result (the
+ *      hub may already track positions that have just transitioned out
+ *      of the actionable filter — claimed flip, transfer-out).
+ *   3. Batch-join speculations + contests (both carry `row_updated_at`
+ *      so the derivation's `sourceUpdatedAt = max(...)` reflects every
+ *      transition source).
+ *   4. Derive status per position; assemble {@link DerivedPositionRow}
+ *      entries sorted by (sourceUpdatedAt, id) ASC so any caller emitting
+ *      a subset still advances the cursor monotonically.
+ *
+ * Saturation: `saturated=true` when the actionable query returned a full
+ * 200-row page. The stream emits `event: degraded` and proceeds with
+ * `ready`; the SDK / MM treats the wallet as quote-held per the stream-
+ * health gate (spec §2.6). This breaks the infinite-resync loop the
+ * earlier `positions_cap_exceeded` path produced for wallets at the cap.
+ */
+export async function derivePositionsForWallet(
   sb: ReturnType<typeof getSupabase>,
   net: string,
   address: string,
-  cursorWatermark: ResourceWatermark,
-  isClosed: () => boolean,
-  shed: () => void,
-  emit: (body: PositionStatusEventBody, ts: string, id: string) => void,
-): Promise<CatchupStatus> {
-  if (isClosed() || res.writableEnded) return 'closed';
-
-  // Step 1: positions (the full snapshot-equivalent population).
-  const positionsRes = await sb
+  cachedKeys: Iterable<string>,
+): Promise<DerivedPositionStateResult> {
+  // Phase 1: actionable population.
+  const actionableRes = await sb
     .from('positions')
     .select(
       'speculation_id, user_address, position_type, risk_amount, profit_amount, ' +
@@ -622,18 +693,19 @@ async function catchUpPositions(
     )
     .eq('network', net)
     .eq('user_address', address)
+    .eq('claimed', false)
+    .gt('risk_amount', 0)
     .order('row_updated_at', { ascending: false })
     .order('id', { ascending: false })
     .limit(CATCHUP_POSITIONS_LIMIT);
-  if (positionsRes.error) {
+  if (actionableRes.error) {
     logger.error(
-      { err: positionsRes.error.message, address },
-      'ownState/stream catchup: positions query failed',
+      { err: actionableRes.error.message, address },
+      'ownState/stream catchup: actionable positions query failed',
     );
-    writeOwnStateEvent(res, 'resync', { reason: 'catchup_failed' });
-    return 'resync';
+    return { rows: [], saturated: false, queryFailed: true };
   }
-  const positions = (positionsRes.data ?? []) as unknown as Array<{
+  const actionable = (actionableRes.data ?? []) as unknown as Array<{
     speculation_id: string | number;
     user_address: string;
     position_type: 'upper' | 'lower';
@@ -643,10 +715,58 @@ async function catchUpPositions(
     row_updated_at: string;
     id: string | number;
   }>;
-  if (positions.length === 0) return 'complete';
+  const saturated = actionable.length >= CATCHUP_POSITIONS_LIMIT;
 
-  // Step 2a: batch speculation join (carries row_updated_at for the
-  // source-timestamp derivation).
+  // Phase 2: cached keys NOT in the actionable result — re-fetch their
+  // current row so a just-claimed / just-transferred-out transition shows
+  // up before the cache entry falls out of tracking.
+  const actionableKeys = new Set(
+    actionable.map(
+      (p) =>
+        `${String(p.speculation_id)}_${p.position_type === 'upper' ? 0 : 1}`,
+    ),
+  );
+  const staleSpecIds: number[] = [];
+  for (const key of cachedKeys) {
+    if (actionableKeys.has(key)) continue;
+    const specPart = key.slice(0, key.lastIndexOf('_'));
+    const id = Number(specPart);
+    if (Number.isFinite(id)) staleSpecIds.push(id);
+  }
+  let stale: typeof actionable = [];
+  if (staleSpecIds.length > 0) {
+    const staleRes = await sb
+      .from('positions')
+      .select(
+        'speculation_id, user_address, position_type, risk_amount, profit_amount, ' +
+          'claimed, row_updated_at, id',
+      )
+      .eq('network', net)
+      .eq('user_address', address)
+      .in('speculation_id', staleSpecIds)
+      .limit(CATCHUP_POSITIONS_LIMIT);
+    if (staleRes.error) {
+      logger.error(
+        { err: staleRes.error.message, address },
+        'ownState/stream catchup: cached-key refresh query failed',
+      );
+      return { rows: [], saturated, queryFailed: true };
+    }
+    stale = (staleRes.data ?? []) as unknown as typeof actionable;
+  }
+
+  // Merge into a unique-per-key list (actionable wins on conflict).
+  const positionsByKey = new Map<string, (typeof actionable)[number]>();
+  for (const row of [...actionable, ...stale]) {
+    const key = `${String(row.speculation_id)}_${row.position_type === 'upper' ? 0 : 1}`;
+    if (!positionsByKey.has(key)) positionsByKey.set(key, row);
+  }
+  const positions = [...positionsByKey.values()];
+  if (positions.length === 0) {
+    return { rows: [], saturated, queryFailed: false };
+  }
+
+  // Speculation join.
   const specIds = [...new Set(positions.map((p) => Number(p.speculation_id)))];
   const specsById = new Map<
     number,
@@ -674,8 +794,7 @@ async function catchUpPositions(
         { err: specRes.error.message, address },
         'ownState/stream catchup: speculations join failed',
       );
-      writeOwnStateEvent(res, 'resync', { reason: 'catchup_failed' });
-      return 'resync';
+      return { rows: [], saturated, queryFailed: true };
     }
     for (const s of (specRes.data ?? []) as unknown as Array<{
       speculation_id: number;
@@ -690,7 +809,7 @@ async function catchUpPositions(
     }
   }
 
-  // Step 2b: batch contest join (carries row_updated_at).
+  // Contest join.
   const contestIds = [
     ...new Set(
       [...specsById.values()]
@@ -719,8 +838,7 @@ async function catchUpPositions(
         { err: contestRes.error.message, address },
         'ownState/stream catchup: contests join failed',
       );
-      writeOwnStateEvent(res, 'resync', { reason: 'catchup_failed' });
-      return 'resync';
+      return { rows: [], saturated, queryFailed: true };
     }
     for (const c of (contestRes.data ?? []) as unknown as Array<{
       contest_id: number;
@@ -733,43 +851,32 @@ async function catchUpPositions(
     }
   }
 
-  // Step 3: cursor floor for the "deliver if newer" filter. The input
-  // cursor is `k='live'` (validated upstream), so the first call applies
-  // the overlap floor — a late-committing tx whose effective timestamp
-  // predates the cursor still surfaces.
-  const flooredCursor = floorBaseWatermark(cursorWatermark);
-  const flooredMs = Date.parse(flooredCursor.s);
-  const flooredId = (() => {
-    try {
-      return BigInt(flooredCursor.i);
-    } catch {
-      return 0n;
-    }
-  })();
-
-  // Step 4: derive, filter, emit. Sort by (sourceUpdatedAt, id) ASC so
-  // the cursor advances monotonically for the SDK's reducer.
-  type DerivedRow = {
-    body: PositionStatusEventBody;
-    sourceUpdatedAt: string;
-    sourceMs: number;
-    id: string;
-  };
-  const derived: DerivedRow[] = [];
+  // Derivation + assembly. Sorted by (sourceMs, id) ASC for monotonic
+  // cursor advance.
+  const rows: DerivedPositionRow[] = [];
   for (const row of positions) {
     const spec = specsById.get(Number(row.speculation_id));
     if (!spec) continue; // orphan — defensive skip
     const contest = spec.contest_id != null ? contestsById.get(spec.contest_id) ?? null : null;
+    const positionType: 0 | 1 = row.position_type === 'upper' ? 0 : 1;
     const sourceUpdatedAt = maxIsoTimestampStream(
       row.row_updated_at,
       spec.row_updated_at,
       contest?.row_updated_at,
     );
+    const sourceMs = Date.parse(sourceUpdatedAt);
+    if (!Number.isFinite(sourceMs)) continue;
+    let idBig: bigint;
+    try {
+      idBig = BigInt(String(row.id));
+    } catch {
+      idBig = 0n;
+    }
     const body = derivePositionStatus(
       {
         speculationId: String(row.speculation_id),
         address: row.user_address.toLowerCase(),
-        positionType: row.position_type === 'upper' ? 0 : 1,
+        positionType,
         riskAmount: row.risk_amount as string | null,
         profitAmount: row.profit_amount as string | null,
         claimed: row.claimed,
@@ -789,39 +896,79 @@ async function catchUpPositions(
         : null,
       sourceUpdatedAt,
     );
-    const sourceMs = Date.parse(sourceUpdatedAt);
-    if (!Number.isFinite(sourceMs)) continue;
-    // (sourceMs, id) > (flooredMs, flooredId) — strict greater-than for the
-    // semantic keyset advance. Equal-source AND equal-id can't happen for
-    // distinct positions but the comparison is still well-defined.
-    let idBig: bigint;
-    try {
-      idBig = BigInt(String(row.id));
-    } catch {
-      idBig = 0n;
-    }
-    if (sourceMs < flooredMs) continue;
-    if (sourceMs === flooredMs && idBig <= flooredId) continue;
-    derived.push({ body, sourceUpdatedAt, sourceMs, id: String(row.id) });
+    rows.push({
+      key: `${String(row.speculation_id)}_${positionType}`,
+      body,
+      sourceUpdatedAt,
+      sourceMs,
+      id: String(row.id),
+      idBig,
+    });
   }
-  derived.sort((a, b) => {
+  rows.sort((a, b) => {
     if (a.sourceMs !== b.sourceMs) return a.sourceMs - b.sourceMs;
-    return Number(BigInt(a.id) - BigInt(b.id));
+    return Number(a.idBig - b.idBig);
   });
-  for (const d of derived) {
-    if (isClosed() || res.writableEnded) return 'closed';
-    emit(d.body, d.sourceUpdatedAt, d.id);
+  return { rows, saturated, queryFailed: false };
+}
+
+/**
+ * Resume catch-up for `positionStatus`: derives current state for the
+ * wallet, emits the subset past `cursorWatermark` (with overlap floor on
+ * the first page since the input cursor is always `k='live'`), and
+ * returns the full row list so the handler can seed
+ * {@link OwnStateHub.seedStatusCache}.
+ *
+ * Returns a `degraded` outcome (status='complete') when the actionable
+ * query saturated — the handler emits `event: degraded` then `ready` so
+ * the SDK has a defined terminal state instead of an endless resync
+ * loop. The MM's quote-hold rules (spec §2.6) handle the operational
+ * consequence.
+ */
+async function catchUpPositions(
+  res: Response,
+  sb: ReturnType<typeof getSupabase>,
+  net: string,
+  address: string,
+  cursorWatermark: ResourceWatermark,
+  isClosed: () => boolean,
+  shed: () => void,
+  emit: (body: PositionStatusEventBody, ts: string, id: string) => void,
+): Promise<{ status: CatchupStatus; seedRows: DerivedPositionRow[]; degraded: boolean }> {
+  if (isClosed() || res.writableEnded) {
+    return { status: 'closed', seedRows: [], degraded: false };
+  }
+  const derivation = await derivePositionsForWallet(sb, net, address, []);
+  if (derivation.queryFailed) {
+    writeOwnStateEvent(res, 'resync', { reason: 'catchup_failed' });
+    return { status: 'resync', seedRows: [], degraded: false };
+  }
+  // Overlap floor on the first call (input cursor.k='live' is validated
+  // upstream) — catches a late-committing source row whose effective
+  // timestamp predates the cursor by < RECOVERY_OVERLAP_MS.
+  const flooredCursor = floorBaseWatermark(cursorWatermark);
+  const flooredMs = Date.parse(flooredCursor.s);
+  const flooredId = (() => {
+    try {
+      return BigInt(flooredCursor.i);
+    } catch {
+      return 0n;
+    }
+  })();
+  for (const r of derivation.rows) {
+    if (isClosed() || res.writableEnded) {
+      return { status: 'closed', seedRows: derivation.rows, degraded: derivation.saturated };
+    }
+    // (sourceMs, id) > (flooredMs, flooredId).
+    if (r.sourceMs < flooredMs) continue;
+    if (r.sourceMs === flooredMs && r.idBig <= flooredId) continue;
+    emit(r.body, r.sourceUpdatedAt, r.id);
     shed();
   }
-  if (res.writableEnded) return 'closed';
-
-  // Saturation: hit the cap; more positions may exist whose status we
-  // couldn't inspect → re-snapshot is the safe path.
-  if (positions.length >= CATCHUP_POSITIONS_LIMIT) {
-    writeOwnStateEvent(res, 'resync', { reason: 'positions_cap_exceeded' });
-    return 'resync';
+  if (res.writableEnded) {
+    return { status: 'closed', seedRows: derivation.rows, degraded: derivation.saturated };
   }
-  return 'complete';
+  return { status: 'complete', seedRows: derivation.rows, degraded: derivation.saturated };
 }
 
 /**

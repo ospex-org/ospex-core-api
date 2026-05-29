@@ -233,12 +233,12 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
     ]);
   });
 
-  it('first tick populates statusCache WITHOUT emitting; second tick with no change still no-ops', async () => {
-    // Bootstrap contract: the SDK already has the snapshot's positions[]
-    // when the hub starts polling, so re-emitting the bootstrap state on
-    // first tick would only spend reducer-dedup work. The hub populates
-    // its cache on tick 1 silently and only emits on subsequent ticks
-    // when the derived status differs.
+  it('without a seeded cache, first tick emits every observed position (preReady-abort signal)', async () => {
+    // Contract change vs M4b PR1: there is no bootstrap-silent mode. If
+    // the handler forgot to seed the cache before `beginLive`, every
+    // tick emits the current derivation — those emits arrive in the
+    // subscriber's preReady phase and trip the handler's `aborted=true`,
+    // forcing `resync` rather than a silent miss.
     const row = positionRow();
     const spec = speculationRow();
     const contest = contestRow();
@@ -256,21 +256,48 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
     const cb = makeCallbacks();
     hub.subscribe(ADDRESS, cb);
     await hub.pollWallet(ADDRESS);
-    expect(cb.positionStatuses).toEqual([]);
+    expect(cb.positionStatuses).toHaveLength(1);
+  });
+
+  it('seedStatusCache + matching tick = no-op (no emit)', async () => {
+    // The handler's catch-up seeds every position it discovered; if the
+    // hub's first tick observes the same statuses, no emit fires.
+    const row = positionRow();
+    const spec = speculationRow();
+    const contest = contestRow();
+    const hub = new OwnStateHub({
+      getClient: () =>
+        makeClient({
+          positions: [row],
+          speculations: [spec],
+          contests: [contest],
+        }),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+    });
+    const cb = makeCallbacks();
+    hub.subscribe(ADDRESS, cb);
+    // Pre-seed with the same status the derivation will produce
+    // (away 10 / home 5 + upper position ⇒ pendingSettle).
+    hub.seedStatusCache(ADDRESS, [
+      {
+        key: `${row.speculation_id}_0`,
+        status: 'pendingSettle',
+        sourceUpdatedAt: row.row_updated_at as string,
+      },
+    ]);
     await hub.pollWallet(ADDRESS);
     expect(cb.positionStatuses).toEqual([]);
   });
 
-  it('emits onPositionStatus when derived status changes (claim flip after bootstrap)', async () => {
+  it('emits onPositionStatus when derived status differs from seeded entry (claim flip)', async () => {
     const row = positionRow();
     const spec = speculationRow();
     const contest = contestRow();
     let positionsData: Row[] = [row];
 
     const hub = new OwnStateHub({
-      // Fresh client per call so each tick reads the current `positionsData`
-      // value via closure — supabase-js's promise resolves at .then() time,
-      // which captures the array contents as of the call to the mock.
       getClient: () =>
         makeClient({
           positions: positionsData,
@@ -283,9 +310,18 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
     });
     const cb = makeCallbacks();
     hub.subscribe(ADDRESS, cb);
-    await hub.pollWallet(ADDRESS); // tick 1: bootstrap status='pendingSettle' (no emit)
-    expect(cb.positionStatuses).toEqual([]);
+    // Seed with the status the catch-up would have observed (active/pendingSettle).
+    hub.seedStatusCache(ADDRESS, [
+      {
+        key: `${row.speculation_id}_0`,
+        status: 'pendingSettle',
+        sourceUpdatedAt: row.row_updated_at as string,
+      },
+    ]);
     // Flip claimed=true with bumped row_updated_at on the position row.
+    // The new row is `claimed=true`, so the actionable filter drops it —
+    // but the cached-key refresh phase re-fetches by spec_id and surfaces
+    // the transition before the cache entry falls out of tracking.
     const claimedRow = {
       ...row,
       claimed: true,
@@ -293,7 +329,7 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
     };
     positionsData.length = 0;
     positionsData.push(claimedRow);
-    await hub.pollWallet(ADDRESS); // tick 2: status transitioned pendingSettle → claimed
+    await hub.pollWallet(ADDRESS);
     expect(cb.positionStatuses).toEqual([
       { ts: '2026-05-29T15:40:00.000Z', id: String(row.id), status: 'claimed' },
     ]);
@@ -301,7 +337,6 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
 
   it('spec-only transition (speculation_status open→closed, position row unchanged) ⇒ emit', async () => {
     const row = positionRow();
-    // Tick 1: spec open, no win_side, contest unscored
     const specBefore = speculationRow({ speculation_status: 'open', win_side: 'tbd' });
     const contestBefore = contestRow({ contest_status: 'unverified', away_score: null, home_score: null });
     let specs: Row[] = [specBefore];
@@ -320,11 +355,19 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
     });
     const cb = makeCallbacks();
     hub.subscribe(ADDRESS, cb);
-    await hub.pollWallet(ADDRESS); // bootstrap: status='active'
+    // Seed with the status the catch-up would have observed (active).
+    hub.seedStatusCache(ADDRESS, [
+      {
+        key: `${row.speculation_id}_0`,
+        status: 'active',
+        sourceUpdatedAt: row.row_updated_at as string,
+      },
+    ]);
+    // Tick now: spec hasn't changed yet → still 'active' → no emit.
+    await hub.pollWallet(ADDRESS);
     expect(cb.positionStatuses).toEqual([]);
-    // Tick 2: speculation closed with win_side='away' (upper position wins).
-    // Position row.row_updated_at UNCHANGED — the raw-row dedup of the old
-    // code would have missed this. The semantic-event-key dedup catches it.
+    // Spec settles. Position row.row_updated_at UNCHANGED — raw-row
+    // dedup would have missed this; the semantic-key dedup catches it.
     const specAfter = speculationRow({
       speculation_status: 'closed',
       win_side: 'away',
@@ -335,7 +378,7 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
     await hub.pollWallet(ADDRESS);
     expect(cb.positionStatuses).toEqual([
       {
-        // sourceUpdatedAt is the MAX of (position, spec, contest) row_updated_ats — here the spec.
+        // sourceUpdatedAt is max of (position, spec, contest) — the spec here.
         ts: '2026-05-29T15:30:00.000Z',
         id: String(row.id),
         status: 'claimable',
@@ -362,9 +405,16 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
     });
     const cb = makeCallbacks();
     hub.subscribe(ADDRESS, cb);
-    await hub.pollWallet(ADDRESS); // bootstrap: active
+    hub.seedStatusCache(ADDRESS, [
+      {
+        key: `${row.speculation_id}_0`,
+        status: 'active',
+        sourceUpdatedAt: row.row_updated_at as string,
+      },
+    ]);
+    await hub.pollWallet(ADDRESS);
     expect(cb.positionStatuses).toEqual([]);
-    // Tick 2: contest scored (upper/away predicted winner).
+    // Contest scored (upper/away predicted winner).
     const contestAfter = contestRow({
       contest_status: 'scored',
       away_score: 10,
@@ -381,6 +431,100 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
         status: 'pendingSettle',
       },
     ]);
+  });
+
+  it('population unification: spec transition on actionable position emits even when many newer claimed rows exist', async () => {
+    // Scenario from review-32 round 2 blocker 3: a wallet has many recent
+    // claimed positions whose row_updated_at dominates the table, plus a
+    // few older actionable positions. The previous top-200-by-row_updated_at
+    // window could miss the older actives; the new `claimed=false AND
+    // risk>0` filter guarantees they're always queried. A spec transition
+    // on the OLD active position then surfaces.
+    const oldActive = {
+      speculation_id: 101,
+      user_address: ADDRESS,
+      position_type: 'upper',
+      risk_amount: '1000000',
+      profit_amount: '500000',
+      claimed: false,
+      // Older than every recent claimed row.
+      row_updated_at: '2026-04-01T10:00:00.000Z',
+      id: 7,
+    };
+    const specBefore = speculationRow({
+      speculation_id: 101,
+      speculation_status: 'open',
+      win_side: 'tbd',
+      row_updated_at: '2026-04-01T10:00:00.000Z',
+    });
+    const contestBefore = contestRow({
+      contest_id: 42,
+      contest_status: 'unverified',
+      away_score: null,
+      home_score: null,
+      row_updated_at: '2026-04-01T10:00:00.000Z',
+    });
+    let specs: Row[] = [specBefore];
+    let contests: Row[] = [contestBefore];
+    // The actionable query (claimed=false, risk>0) ONLY returns the old
+    // active row regardless of how many recent claimed rows the wallet
+    // has — the mock's data returned for the `positions` table reflects
+    // the filtered population.
+    const hub = new OwnStateHub({
+      getClient: () =>
+        makeClient({
+          positions: [oldActive],
+          speculations: specs,
+          contests: contests,
+        }),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+    });
+    const cb = makeCallbacks();
+    hub.subscribe(ADDRESS, cb);
+    hub.seedStatusCache(ADDRESS, [
+      {
+        key: '101_0',
+        status: 'active',
+        sourceUpdatedAt: oldActive.row_updated_at,
+      },
+    ]);
+    await hub.pollWallet(ADDRESS);
+    expect(cb.positionStatuses).toEqual([]);
+    // Spec settles (claimable for the upper-position winner).
+    const specAfter = speculationRow({
+      speculation_id: 101,
+      speculation_status: 'closed',
+      win_side: 'away',
+      row_updated_at: '2026-05-29T15:30:00.000Z',
+    });
+    specs.length = 0;
+    specs.push(specAfter);
+    await hub.pollWallet(ADDRESS);
+    expect(cb.positionStatuses).toEqual([
+      {
+        ts: '2026-05-29T15:30:00.000Z',
+        id: '7',
+        status: 'claimable',
+      },
+    ]);
+  });
+
+  it('beginLive starts the per-wallet timer (idempotent on second call)', async () => {
+    const hub = new OwnStateHub({
+      getClient: () => makeClient({}),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+    });
+    const sub = hub.subscribe(ADDRESS, makeCallbacks());
+    expect(hub.stats().wallets).toBe(1);
+    // No-op if called twice; the second call doesn't double-start.
+    hub.beginLive(sub);
+    hub.beginLive(sub);
+    hub.unsubscribe(sub);
+    expect(hub.stats().wallets).toBe(0);
   });
 
   it('does not re-emit on a second tick — dedup catches the overlap re-scan', async () => {
