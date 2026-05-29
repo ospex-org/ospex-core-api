@@ -185,6 +185,8 @@ async function mintAndSign(opts: {
   wallet: ethers.HDNodeWallet;
   audienceOverride?: string;
   chainIdOverride?: number;
+  issuedAtOverride?: number;
+  expiresAtOverride?: number;
 }): Promise<{ challenge: Record<string, unknown>; signature: string }> {
   const res = makeRes();
   postStreamChallengeHandler(
@@ -197,6 +199,8 @@ async function mintAndSign(opts: {
   if (opts.chainIdOverride !== undefined) {
     challenge['network'] = { chainId: opts.chainIdOverride };
   }
+  if (opts.issuedAtOverride !== undefined) challenge['issuedAt'] = opts.issuedAtOverride;
+  if (opts.expiresAtOverride !== undefined) challenge['expiresAt'] = opts.expiresAtOverride;
   const domain = buildStreamAuthDomain(137, MATCHING_MODULE);
   const message = {
     address: challenge['address'],
@@ -315,6 +319,58 @@ describe('POST /v1/auth/stream-token', () => {
     postStreamTokenHandler(makeReq({ body: { challenge, signature } }), res as unknown as Response);
     expect(res.statusCode).toBe(401);
     expect(res.body).toMatchObject({ code: 'AUTH_CHALLENGE_EXPIRED' });
+  });
+
+  // ── Hermes review-30 round 2 BLOCKER ─────────────────────────────────
+  // A valid wallet that re-signs a CLIENT-MUTATED challenge (e.g. flipped
+  // expiresAt) used to succeed because the server stored only address +
+  // expiresAt and trusted client-supplied timestamps. The exchange now binds
+  // every server-minted field, so the mutated typed-data hits
+  // AUTH_CHALLENGE_TAMPERED before the token is issued.
+  describe('signed-but-tampered challenge timestamps (review-30 round 2)', () => {
+    it('expiresAt mutated to the past → 401 AUTH_CHALLENGE_TAMPERED (Hermes repro)', async () => {
+      const wallet = ethers.Wallet.createRandom();
+      const nowSec = Math.floor(Date.now() / 1000);
+      const { challenge, signature } = await mintAndSign({
+        wallet,
+        expiresAtOverride: nowSec - 1, // claim "already expired"
+      });
+      const res = makeRes();
+      postStreamTokenHandler(
+        makeReq({ body: { challenge, signature } }),
+        res as unknown as Response,
+      );
+      expect(res.statusCode).toBe(401);
+      expect(res.body).toMatchObject({ code: 'AUTH_CHALLENGE_TAMPERED' });
+    });
+
+    it('expiresAt mutated to a far-future extension → 401 AUTH_CHALLENGE_TAMPERED', async () => {
+      const wallet = ethers.Wallet.createRandom();
+      const nowSec = Math.floor(Date.now() / 1000);
+      const { challenge, signature } = await mintAndSign({
+        wallet,
+        expiresAtOverride: nowSec + 365 * 24 * 3600,
+      });
+      const res = makeRes();
+      postStreamTokenHandler(
+        makeReq({ body: { challenge, signature } }),
+        res as unknown as Response,
+      );
+      expect(res.statusCode).toBe(401);
+      expect(res.body).toMatchObject({ code: 'AUTH_CHALLENGE_TAMPERED' });
+    });
+
+    it('issuedAt mutated → 401 AUTH_CHALLENGE_TAMPERED', async () => {
+      const wallet = ethers.Wallet.createRandom();
+      const { challenge, signature } = await mintAndSign({ wallet, issuedAtOverride: 0 });
+      const res = makeRes();
+      postStreamTokenHandler(
+        makeReq({ body: { challenge, signature } }),
+        res as unknown as Response,
+      );
+      expect(res.statusCode).toBe(401);
+      expect(res.body).toMatchObject({ code: 'AUTH_CHALLENGE_TAMPERED' });
+    });
   });
 
   it('malformed body → 400 INVALID_PARAM', () => {

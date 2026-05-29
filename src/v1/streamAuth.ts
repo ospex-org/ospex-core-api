@@ -97,7 +97,7 @@ export function postStreamChallengeHandler(req: Request, res: Response): void {
     issuedAt: nowSec,
     expiresAt,
   };
-  challengeStore.add(challengeId, addressLower, expiresAt);
+  challengeStore.add(challengeId, challenge);
   const responseBody: ChallengeResponseBody = { challenge, expiresAt };
   res.status(200).json(responseBody);
 }
@@ -205,16 +205,19 @@ export function postStreamTokenHandler(req: Request, res: Response): void {
     return;
   }
 
-  // Single-use consumption — covers replay + expiry + address-binding
-  // (the burn-DoS defence is inside ChallengeStore.consume).
+  // Single-use consumption — covers replay + expiry + address-binding +
+  // server-bound issuedAt/expiresAt comparison (Hermes review-30 round 2;
+  // the burn-DoS and tampered-timestamp defences live inside
+  // ChallengeStore.consume).
   const nowSec = Math.floor(Date.now() / 1000);
-  const consumed = challengeStore.consume(c.challengeId, c.address, nowSec);
+  const consumed = challengeStore.consume(c.challengeId, c, nowSec);
   if (!consumed.ok) {
     const codeMap = {
       unknown: 'AUTH_CHALLENGE_UNKNOWN',
       expired: 'AUTH_CHALLENGE_EXPIRED',
       already_used: 'AUTH_CHALLENGE_REPLAY',
       address_mismatch: 'AUTH_CHALLENGE_ADDRESS_MISMATCH',
+      tampered: 'AUTH_CHALLENGE_TAMPERED',
     } as const;
     res.status(401).json({
       error: `Challenge consume rejected: ${consumed.reason}.`,

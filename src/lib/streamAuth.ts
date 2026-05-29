@@ -74,13 +74,22 @@ export function generateChallengeId(): string {
 
 interface ChallengeRecord {
   address: string;     // lowercase
-  expiresAt: number;   // unix seconds
+  issuedAt: number;    // unix seconds — exactly as minted
+  expiresAt: number;   // unix seconds — exactly as minted
   consumed: boolean;
 }
 
 export type ConsumeResult =
   | { ok: true }
-  | { ok: false; reason: 'unknown' | 'expired' | 'already_used' | 'address_mismatch' };
+  | {
+      ok: false;
+      reason:
+        | 'unknown'
+        | 'expired'
+        | 'already_used'
+        | 'address_mismatch'
+        | 'tampered';
+    };
 
 export class ChallengeStore {
   private readonly store = new Map<string, ChallengeRecord>();
@@ -97,37 +106,46 @@ export class ChallengeStore {
   }
 
   /**
-   * Register a freshly minted challenge. Caller has already generated the id
-   * via `generateChallengeId()`; the store does not deduplicate (the id is
-   * 128 bits of entropy, collisions are not a realistic concern).
+   * Register a freshly minted challenge. The store records EVERY field the
+   * server set at mint time — `address`, `issuedAt`, `expiresAt` — so
+   * `consume()` can prove the submitted typed-data is the exact challenge
+   * the server minted (and not a client-mutated variant whose signature is
+   * still self-consistent). Hermes review-30 round 2 caught this gap: the
+   * server-trusts-client expiresAt path let an attacker submit a
+   * fresh-but-internally-consistent mutated challenge.
    */
-  add(challengeId: string, address: string, expiresAt: number): void {
+  add(challengeId: string, challenge: StreamChallenge): void {
     this.maybeCleanup();
     if (this.store.size >= this.maxEntries) {
       const oldest = this.store.keys().next().value;
       if (oldest !== undefined) this.store.delete(oldest);
     }
     this.store.set(challengeId, {
-      address: address.toLowerCase(),
-      expiresAt,
+      address: challenge.address.toLowerCase(),
+      issuedAt: challenge.issuedAt,
+      expiresAt: challenge.expiresAt,
       consumed: false,
     });
   }
 
   /**
-   * Single-use consume. Verifies the stored entry's `address` matches the
-   * one supplied by the caller — defends against a "challenge burning" DoS
-   * where an attacker takes a stolen challengeId, swaps address in the
-   * request body, and signs with their own key (signature verification
-   * passes because everything in the body is self-consistent; the
-   * caller-supplied address differs from what the server minted).
+   * Single-use consume. Beyond the original single-use + expiry +
+   * address-binding checks, this now ALSO requires the submitted challenge's
+   * server-minted fields (`issuedAt`, `expiresAt`) to exactly match the
+   * stored record. A mismatch returns `tampered` — the audience + chainId
+   * are still config-validated at the handler layer (defense-in-depth), so
+   * this catches the one remaining attack: a mutated timestamp resigned by
+   * the legitimate wallet.
    */
-  consume(challengeId: string, address: string, nowSec: number): ConsumeResult {
+  consume(challengeId: string, submitted: StreamChallenge, nowSec: number): ConsumeResult {
     const entry = this.store.get(challengeId);
     if (!entry) return { ok: false, reason: 'unknown' };
     if (entry.expiresAt <= nowSec) return { ok: false, reason: 'expired' };
-    if (entry.address !== address.toLowerCase()) {
+    if (entry.address !== submitted.address.toLowerCase()) {
       return { ok: false, reason: 'address_mismatch' };
+    }
+    if (entry.issuedAt !== submitted.issuedAt || entry.expiresAt !== submitted.expiresAt) {
+      return { ok: false, reason: 'tampered' };
     }
     if (entry.consumed) return { ok: false, reason: 'already_used' };
     entry.consumed = true;
@@ -213,12 +231,21 @@ export type VerifyTokenResult =
  * the signature comparison is timing-safe; expiry comes last so a valid-sig
  * stale token returns `expired` rather than being misclassified.
  */
-// Strict base64url alphabet (no padding). Without this, Node's `Buffer.from(s,
-// 'base64url')` silently strips non-alphabet bytes — so `validToken + "!!!!"`
-// decodes the same as `validToken`. Not an HMAC bypass (sig still matches),
-// but it lets two distinct token strings present the same secret material —
-// flagged by Hermes review-30 as a footgun for future raw-token denylisting.
-const BASE64URL_STRICT = /^[A-Za-z0-9_-]+$/;
+/**
+ * Canonical base64url round-trip. Subsumes a non-alphabet character check
+ * AND closes the equivalent-pad-bit variant Hermes verified in review-30
+ * round 2: a 32-byte HMAC encodes to 43 base64url chars with 2 unused bits
+ * in the last char, so four distinct chars decode to the same byte sequence.
+ * Forcing `Buffer.from(s, 'base64url').toString('base64url') === s` rejects
+ * any non-canonical encoding, ensuring 1:1 between bytes and wire token.
+ */
+function isCanonicalBase64url(s: string): boolean {
+  if (s.length === 0) return false;
+  // Buffer.from(...'base64url') strips non-alphabet chars AND padding, AND
+  // ignores the low bits of an over-long final char; re-encoding gives the
+  // canonical form. Any input that differs from its canonical form fails.
+  return Buffer.from(s, 'base64url').toString('base64url') === s;
+}
 
 export function verifyStreamAuthToken(
   token: string,
@@ -229,7 +256,7 @@ export function verifyStreamAuthToken(
   if (parts.length !== 2) return { ok: false, reason: 'malformed' };
   const payloadB64 = parts[0]!;
   const sigB64 = parts[1]!;
-  if (!BASE64URL_STRICT.test(payloadB64) || !BASE64URL_STRICT.test(sigB64)) {
+  if (!isCanonicalBase64url(payloadB64) || !isCanonicalBase64url(sigB64)) {
     return { ok: false, reason: 'malformed' };
   }
 

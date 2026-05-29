@@ -514,10 +514,12 @@ Set via `heroku config:set <var>=<value> --app ospex-core-api`. Mirrors `.env.ex
 - `POSITION_MODULE_ADDRESS` — optional defensive log-source filter for tx parsers
 - `MAX_STREAM_CONNECTIONS_TOTAL`, `MAX_STREAM_CONNECTIONS_PER_IP` — optional SSE concurrent-connection caps (defaults 200 / 10); set either to tune the stream stack without a code change
 - `REDACT_HIDDEN_PUBLIC` — optional bool, **default `true`** (redaction enforced). Short-lived rollout/rollback guard for the M2 hidden-row redaction. Setting `false` reverts every anonymous read path to the legacy "full body for all rows" behavior for a deploy window only; the flag is scheduled for removal post-M7 cutover
-- `STREAM_AUTH_HMAC_SECRET` — optional but required by `/v1/auth/stream-token` (the handler returns `503 NOT_READY` if unset). HMAC-SHA256 secret used to sign + verify stream-auth bearer tokens; must be ≥ 32 characters of entropy (boot-time fatal otherwise). Rotation = add a second key and accept both during transition (follow-up; current `kid` is `v1`)
-- `STREAM_AUTH_AUDIENCE` — optional but required for the stream-auth handlers (same `503 NOT_READY` rule). The canonical host string bound into both the challenge typed-data and the issued token (e.g. `https://api.ospex.org`); SDK clients derive the same string from their `baseUrl`, so a token minted for one deployment cannot be replayed against another
-- `STREAM_CHALLENGE_TTL_SECONDS` — optional, default `180` (3 min). Lifetime of a single-use challenge; spec §3.3 allows 2–5 min
-- `STREAM_TOKEN_TTL_SECONDS` — optional, default `900` (15 min). Lifetime of an issued bearer token
+- `STREAM_AUTH_HMAC_SECRET` — optional but required by **both** stream-auth POST endpoints AND the `verifyStreamToken` middleware (each returns `503 NOT_READY` if unset). HMAC-SHA256 secret used to sign + verify stream-auth bearer tokens; must be ≥ 32 characters of entropy (boot-time fatal otherwise). Rotation = add a second key and accept both during transition (follow-up; current `kid` is `v1`)
+- `STREAM_AUTH_AUDIENCE` — optional but required by both stream-auth POST endpoints (same `503 NOT_READY` rule). The canonical host string bound into both the challenge typed-data and the issued token (e.g. `https://api.ospex.org`); SDK clients derive the same string from their `baseUrl`, so a token minted for one deployment cannot be replayed against another
+- `STREAM_CHALLENGE_TTL_SECONDS` — optional, default `180` (3 min). Lifetime of a single-use challenge; **boot-fatal outside [120, 300]** per spec §3.3
+- `STREAM_TOKEN_TTL_SECONDS` — optional, default `900` (15 min). Lifetime of an issued bearer token; **boot-fatal outside [60, 1800]**
+
+The stream-auth challenge store is **in-memory, per-process**. A challenge minted on one dyno cannot be consumed on another — fine for the current single-dyno Heroku deployment, but horizontal scale-out requires moving challenges to Redis/Postgres or running with sticky routing first. The endpoint-level `503 NOT_READY` checks are deliberately separate from `/readyz` (next section) — `/readyz` keeps the meaning "the always-required dependencies are reachable", and stream-auth is opt-in at the operator level.
 
 `NODE_ENV=production` and `LOG_LEVEL=info` are recommended. **Do not set `PORT`** — Heroku injects it; setting it as a config var creates a binding mismatch.
 
@@ -531,7 +533,7 @@ curl -s "$URL/v1/protocol/info"    # mainnet contract addresses
 curl -s "$URL/v1/contests"         # paginated list (empty until indexer ingests data)
 ```
 
-`/readyz` is the canonical "everything wired" check — both Supabase reachability and EIP-712 relay env config are surfaced in the JSON.
+`/readyz` checks the always-required dependencies: Supabase reachability + EIP-712 relay env config for `POST /v1/commitments`. It does **not** include stream-auth (M3) readiness — those endpoints are opt-in at the operator level and surface their own `503 NOT_READY` per call when `STREAM_AUTH_HMAC_SECRET` / `STREAM_AUTH_AUDIENCE` / `MATCHING_MODULE_ADDRESS` are unset.
 
 ## Project conventions
 
