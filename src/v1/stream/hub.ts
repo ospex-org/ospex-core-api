@@ -112,6 +112,10 @@ export class StreamHub {
   // boundary.
   private resyncCursor: { completedAt: string; id: bigint } | null = null;
   private resyncPolling = false;
+  // Cumulative count of resync broadcasts (one per resyncResource call, not per
+  // subscriber emission). Surfaced via stats() for /v1/metrics — instance-scoped
+  // so a test using __setStreamHubForTest(new StreamHub(...)) gets a fresh 0.
+  private resyncBroadcastTotal = 0;
 
   constructor(deps: StreamHubDeps) {
     this.deps = {
@@ -281,6 +285,7 @@ export class StreamHub {
   }
 
   private resyncResource(state: PollerState, reason: string): void {
+    this.resyncBroadcastTotal += 1;
     for (const sub of state.subs) {
       try {
         sub.onResync(reason);
@@ -387,8 +392,12 @@ export class StreamHub {
     }
   }
 
-  stats(): { resources: number; subscribers: number } {
-    return { resources: this.pollers.size, subscribers: this.totalSubs };
+  stats(): { resources: number; subscribers: number; resyncBroadcastTotal: number } {
+    return {
+      resources: this.pollers.size,
+      subscribers: this.totalSubs,
+      resyncBroadcastTotal: this.resyncBroadcastTotal,
+    };
   }
 }
 

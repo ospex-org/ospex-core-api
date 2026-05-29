@@ -168,3 +168,68 @@ describe('graceful-shutdown stream registry', () => {
     expect(ok).toHaveBeenCalledTimes(1);
   });
 });
+
+// ── M0 cumulative counters (rejected + slow-client shed) ─────────────────────
+
+describe('M0 cumulative counters', () => {
+  afterEach(() => __resetConnections());
+
+  it('acquire failures bump rejectedTotal (per-IP scope)', () => {
+    configureConnectionCaps({ maxTotal: 100, maxPerIp: 1 });
+    expect(connectionStats().rejectedTotal).toBe(0);
+
+    acquire('1.1.1.1'); // ok
+    acquire('1.1.1.1'); // rejected — per-ip
+    acquire('1.1.1.1'); // rejected — per-ip
+
+    expect(connectionStats().rejectedTotal).toBe(2);
+    expect(connectionStats().rejectedByScope).toEqual({ ip: 2, total: 0 });
+  });
+
+  it('acquire failures bump rejectedTotal (total scope)', () => {
+    configureConnectionCaps({ maxTotal: 1, maxPerIp: 10 });
+    expect(connectionStats().rejectedTotal).toBe(0);
+
+    acquire('1.1.1.1'); // ok
+    acquire('2.2.2.2'); // rejected — total
+    acquire('3.3.3.3'); // rejected — total
+
+    expect(connectionStats().rejectedTotal).toBe(2);
+    expect(connectionStats().rejectedByScope).toEqual({ ip: 0, total: 2 });
+  });
+
+  it('makeShedIfSlow bumps slowClientShedTotal when the buffer exceeds MAX_PENDING_BYTES', async () => {
+    const { makeShedIfSlow, MAX_PENDING_BYTES } = await import('../src/v1/stream/common.js');
+    const res = { writableEnded: false, writableLength: MAX_PENDING_BYTES + 1, end: vi.fn() };
+    const onShed = vi.fn();
+    const shed = makeShedIfSlow(res as unknown as Response, onShed);
+
+    expect(connectionStats().slowClientShedTotal).toBe(0);
+    shed();
+    expect(connectionStats().slowClientShedTotal).toBe(1);
+    expect(onShed).toHaveBeenCalledWith(MAX_PENDING_BYTES + 1);
+    expect(res.end).toHaveBeenCalledTimes(1);
+  });
+
+  it('makeShedIfSlow is a no-op (no counter bump) when the buffer is under threshold', async () => {
+    const { makeShedIfSlow, MAX_PENDING_BYTES } = await import('../src/v1/stream/common.js');
+    const res = { writableEnded: false, writableLength: MAX_PENDING_BYTES - 1, end: vi.fn() };
+    const onShed = vi.fn();
+    const shed = makeShedIfSlow(res as unknown as Response, onShed);
+
+    shed();
+    expect(connectionStats().slowClientShedTotal).toBe(0);
+    expect(onShed).not.toHaveBeenCalled();
+    expect(res.end).not.toHaveBeenCalled();
+  });
+
+  it('makeShedIfSlow is a no-op (no counter bump) once the socket has ended', async () => {
+    const { makeShedIfSlow, MAX_PENDING_BYTES } = await import('../src/v1/stream/common.js');
+    const res = { writableEnded: true, writableLength: MAX_PENDING_BYTES + 1, end: vi.fn() };
+    const shed = makeShedIfSlow(res as unknown as Response, vi.fn());
+
+    shed();
+    expect(connectionStats().slowClientShedTotal).toBe(0);
+    expect(res.end).not.toHaveBeenCalled();
+  });
+});

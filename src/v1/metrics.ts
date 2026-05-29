@@ -12,10 +12,11 @@ import type { Request, Response } from 'express';
 import { getStreamHub } from './stream/hub.js';
 import { getOddsHub } from './stream/oddsHub.js';
 import { connectionStats } from './stream/connections.js';
+import { handlerStats } from './stream/handler.js';
 
 export function getMetricsHandler(_req: Request, res: Response): void {
   res.status(200).json({
-    stream: getStreamHub().stats(),
+    stream: { ...getStreamHub().stats(), ...handlerStats() },
     odds: getOddsHub().stats(),
     connections: connectionStats(),
     uptimeSeconds: Math.round(process.uptime()),

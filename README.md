@@ -436,15 +436,30 @@ Operational counters for the SSE subsystem, surfaced as JSON. Kept separate from
 
 ```jsonc
 {
-  "stream":      { "resources": 0, "subscribers": 0 },                                  // protocol-stream hub: active pollers + total subscribers
-  "odds":        { "subscribers": 0, "channelOpen": false, "subscribed": false, "degraded": false }, // odds hub: Realtime channel state
-  "connections": { "total": 0, "ips": 0, "maxTotal": 200, "maxPerIp": 10 },             // concurrent SSE slots in use + the configured caps
+  "stream": {
+    "resources": 0, "subscribers": 0,                  // protocol-stream hub: active pollers + total subscribers
+    "resyncBroadcastTotal": 0,                         // cumulative resync broadcasts (overlap-window overflow + recovery)
+    "catchupStartedTotal": 0,                          // cumulative SSE handler entries into the catchup phase
+    "catchupCompletedTotal": 0,                        // cumulative clean handoffs (`ready` emitted)
+    "catchupResyncedTotal": 0                          // cumulative catchup → resync exits (started - completed - resynced ≈ in-flight or disconnected mid-catchup)
+  },
+  "odds": {
+    "subscribers": 0, "channelOpen": false, "subscribed": false, "degraded": false,
+    "channelDegradedTotal": 0,                         // cumulative Realtime channel-down events (gated by !degraded; one bump per outage)
+    "hardResetTotal": 0                                // cumulative hard-reset backstops fired
+  },
+  "connections": {
+    "total": 0, "ips": 0, "maxTotal": 200, "maxPerIp": 10,
+    "rejectedTotal": 0,                                // cumulative 429s
+    "rejectedByScope": { "ip": 0, "total": 0 },        // 429s split by limiting scope
+    "slowClientShedTotal": 0                           // cumulative connections ended for backpressure (outbound buffer > MAX_PENDING_BYTES)
+  },
   "uptimeSeconds": 0,
   "timestamp": "..."
 }
 ```
 
-All counters are **process-local** — on a multi-dyno deploy, scrape each dyno rather than going through the load balancer. `connections.maxTotal` / `maxPerIp` echo the active caps (defaults, or the `MAX_STREAM_CONNECTIONS_*` overrides).
+All counters are **process-local and cumulative since process start** (reset on restart) — on a multi-dyno deploy, scrape each dyno rather than going through the load balancer. `connections.maxTotal` / `maxPerIp` echo the active caps (defaults, or the `MAX_STREAM_CONNECTIONS_*` overrides).
 
 ## Scripts
 

@@ -84,6 +84,10 @@ export class OddsHub {
   private degraded = false;
   private resetting = false;
   private resetTimer: ReturnType<typeof setTimeout> | undefined;
+  // Cumulative operational counters — instance-scoped so a test using
+  // __setOddsHubForTest(new OddsHub(...)) gets a fresh 0. Surfaced via stats().
+  private channelDegradedTotal = 0;
+  private hardResetTotal = 0;
 
   constructor(deps: OddsHubDeps) {
     this.deps = {
@@ -119,12 +123,21 @@ export class OddsHub {
     return this.degraded;
   }
 
-  stats(): { subscribers: number; channelOpen: boolean; subscribed: boolean; degraded: boolean } {
+  stats(): {
+    subscribers: number;
+    channelOpen: boolean;
+    subscribed: boolean;
+    degraded: boolean;
+    channelDegradedTotal: number;
+    hardResetTotal: number;
+  } {
     return {
       subscribers: this.subs.size,
       channelOpen: this.channel !== undefined,
       subscribed: this.subscribed,
       degraded: this.degraded,
+      channelDegradedTotal: this.channelDegradedTotal,
+      hardResetTotal: this.hardResetTotal,
     };
   }
 
@@ -187,6 +200,7 @@ export class OddsHub {
       this.subscribed = false;
       if (!this.degraded) {
         this.degraded = true;
+        this.channelDegradedTotal += 1;
         this.broadcastDegraded(reasonForStatus(status));
       }
       this.scheduleReset();
@@ -214,6 +228,7 @@ export class OddsHub {
   private async hardReset(): Promise<void> {
     if (this.resetting || this.subs.size === 0 || !this.degraded) return;
     this.resetting = true;
+    this.hardResetTotal += 1;
     let failed = false;
     try {
       await this.teardownChannel();

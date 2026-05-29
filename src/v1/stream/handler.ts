@@ -57,6 +57,28 @@ const CATCHUP_MAX_PAGES = 50;
 type CatchupStatus = 'complete' | 'resync';
 type Phase = 'catchup' | 'live';
 
+// Cumulative per-handler counters — process-local, surfaced via handlerStats()
+// for /v1/metrics. `started - completed - resynced` ≈ connections still in the
+// catchup phase OR disconnected before reaching live (operationally useful as a
+// hung-catchup signal). Reset on restart; __resetHandlerMetrics() for tests.
+let catchupStartedTotal = 0;
+let catchupCompletedTotal = 0;
+let catchupResyncedTotal = 0;
+
+export function handlerStats(): {
+  catchupStartedTotal: number;
+  catchupCompletedTotal: number;
+  catchupResyncedTotal: number;
+} {
+  return { catchupStartedTotal, catchupCompletedTotal, catchupResyncedTotal };
+}
+
+export function __resetHandlerMetrics(): void {
+  catchupStartedTotal = 0;
+  catchupCompletedTotal = 0;
+  catchupResyncedTotal = 0;
+}
+
 export function getStreamHandler(req: Request, res: Response): void {
   const name = String(req.params.resource ?? '');
   if (!isStreamResource(name)) {
@@ -142,6 +164,7 @@ export function getStreamHandler(req: Request, res: Response): void {
   res.on('error', cleanup);
 
   void (async () => {
+    catchupStartedTotal += 1;
     try {
       const status: CatchupStatus = cursor
         ? await runCatchUp(res, resource, filters, cursor, () => closed, shedIfSlow)
@@ -152,6 +175,7 @@ export function getStreamHandler(req: Request, res: Response): void {
         // runCatchUp already emitted a resync on its own failure/backlog; only
         // emit one here when the abort came from a raced live delta/resync.
         if (status !== 'resync') writeEvent(res, 'resync', { reason: 'handoff_raced' });
+        catchupResyncedTotal += 1;
         res.end(); // force the client through snapshot → reconnect
         return;
       }
@@ -160,9 +184,11 @@ export function getStreamHandler(req: Request, res: Response): void {
       // emitting `ready` is now honest — the client is at catch-up's DB state.
       phase = 'live';
       writeEvent(res, 'ready', { resource: name });
+      catchupCompletedTotal += 1;
     } catch (err) {
       logger.error({ err: err instanceof Error ? err.message : String(err), resource: name }, 'stream: catch-up/handoff failed');
       writeEvent(res, 'resync', { reason: 'internal_error' });
+      catchupResyncedTotal += 1;
       res.end();
     }
   })();
