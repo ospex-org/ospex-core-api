@@ -33,6 +33,13 @@ export interface Config {
   /** SSE concurrent-connection caps. Absent ⇒ the stream module's defaults apply. */
   maxStreamConnectionsTotal?: number | undefined;
   maxStreamConnectionsPerIp?: number | undefined;
+  /**
+   * Public hidden-row (`book_visible=false`) redaction switch — short-lived
+   * rollout/rollback guard. Default `true` (redaction enforced). Set `false`
+   * ONLY to revert behavior during a deploy window; remove the flag entirely
+   * after the M7 cutover soak per the spec (see implementation-plan.md §M7).
+   */
+  redactHiddenPublic: boolean;
 }
 
 function requireEnv(name: string): string {
@@ -96,6 +103,20 @@ function optionalPositiveIntEnv(name: string): number | undefined {
     process.exit(1);
   }
   return n;
+}
+
+/**
+ * Boolean env var with a fixed default. Accepts `true|false|1|0` (case-insensitive);
+ * any other value is a boot-time fatal so a typo can't silently flip a security gate.
+ */
+function parseBoolEnv(name: string, defaultValue: boolean): boolean {
+  const raw = optionalEnv(name);
+  if (raw === undefined) return defaultValue;
+  const s = raw.toLowerCase();
+  if (s === 'true' || s === '1') return true;
+  if (s === 'false' || s === '0') return false;
+  logger.fatal({ var: name, value: raw }, `${name} must be true|false|1|0`);
+  process.exit(1);
 }
 
 let cached: Config | undefined;
@@ -166,6 +187,11 @@ export function loadConfig(): Config {
   const maxStreamConnectionsTotal = optionalPositiveIntEnv('MAX_STREAM_CONNECTIONS_TOTAL');
   const maxStreamConnectionsPerIp = optionalPositiveIntEnv('MAX_STREAM_CONNECTIONS_PER_IP');
 
+  // Public hidden-row redaction. Default ON; flip to false only as a deploy-window
+  // rollback (see Config.redactHiddenPublic docstring).
+  const redactHiddenPublic = parseBoolEnv('REDACT_HIDDEN_PUBLIC', true);
+  logger.info({ redactHiddenPublic }, 'env: REDACT_HIDDEN_PUBLIC');
+
   cached = {
     port,
     nodeEnv,
@@ -173,6 +199,7 @@ export function loadConfig(): Config {
     chainId,
     supabaseUrl,
     supabaseServiceRoleKey,
+    redactHiddenPublic,
     ...(supabaseAnonKey !== undefined ? { supabaseAnonKey } : {}),
     ...(alchemyRpcUrl !== undefined ? { alchemyRpcUrl } : {}),
     ...(matchingModuleAddress !== undefined ? { matchingModuleAddress } : {}),

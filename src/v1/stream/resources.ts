@@ -19,7 +19,7 @@ import type { ApiError } from '../../middleware/errorHandler.js';
 import type { CursorableRow, CursorTable } from '../../lib/cursor.js';
 
 import {
-  rowToBody as commitmentRowToBody,
+  commitmentRowToPublicBody,
   COMMITMENT_RECOVERY_COLUMNS,
   type CommitmentRow,
 } from '../commitments.js';
@@ -114,7 +114,9 @@ export const STREAM_RESOURCES: Record<StreamResourceName, StreamResource> = {
     cursorTable: 'commitments',
     table: 'commitments',
     columns: COMMITMENT_RECOVERY_COLUMNS,
-    toBody: (row) => commitmentRowToBody(row as unknown as CommitmentRow, Date.now()),
+    // Anonymous SSE catchup + live deltas route through the public-body router
+    // so hidden rows emit the redacted allow-list projection.
+    toBody: (row) => commitmentRowToPublicBody(row as unknown as CommitmentRow, Date.now()),
     parseFilters: (req) =>
       collect([
         ['maker', 'maker', vAddress(req.query.maker)],
