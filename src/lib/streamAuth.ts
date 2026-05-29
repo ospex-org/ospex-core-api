@@ -213,6 +213,13 @@ export type VerifyTokenResult =
  * the signature comparison is timing-safe; expiry comes last so a valid-sig
  * stale token returns `expired` rather than being misclassified.
  */
+// Strict base64url alphabet (no padding). Without this, Node's `Buffer.from(s,
+// 'base64url')` silently strips non-alphabet bytes — so `validToken + "!!!!"`
+// decodes the same as `validToken`. Not an HMAC bypass (sig still matches),
+// but it lets two distinct token strings present the same secret material —
+// flagged by Hermes review-30 as a footgun for future raw-token denylisting.
+const BASE64URL_STRICT = /^[A-Za-z0-9_-]+$/;
+
 export function verifyStreamAuthToken(
   token: string,
   secret: string,
@@ -222,7 +229,7 @@ export function verifyStreamAuthToken(
   if (parts.length !== 2) return { ok: false, reason: 'malformed' };
   const payloadB64 = parts[0]!;
   const sigB64 = parts[1]!;
-  if (payloadB64.length === 0 || sigB64.length === 0) {
+  if (!BASE64URL_STRICT.test(payloadB64) || !BASE64URL_STRICT.test(sigB64)) {
     return { ok: false, reason: 'malformed' };
   }
 

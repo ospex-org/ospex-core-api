@@ -193,6 +193,40 @@ describe('mintStreamAuthToken / verifyStreamAuthToken', () => {
       reason: 'unknown_kid',
     });
   });
+
+  // Hermes review-30: `Buffer.from(s, 'base64url')` is LENIENT — it strips
+  // characters outside the base64url alphabet. Without a strict pre-decode
+  // check, `validToken + "!!!!"` decodes to the same bytes as `validToken`
+  // and verifies. Tightens token identity for any future raw-token denylist.
+  describe('strict base64url alphabet (review-30 footgun)', () => {
+    it('rejects a token whose sig segment carries trailing non-alphabet bytes', () => {
+      const valid = mintStreamAuthToken(claims(), SECRET);
+      const tampered = `${valid}!!!!`;
+      expect(verifyStreamAuthToken(tampered, SECRET, NOW_SEC)).toEqual({
+        ok: false,
+        reason: 'malformed',
+      });
+    });
+
+    it('rejects a token whose payload segment carries non-alphabet bytes', () => {
+      const valid = mintStreamAuthToken(claims(), SECRET);
+      const [p, s] = valid.split('.');
+      const tampered = `${p}@@@.${s}`;
+      expect(verifyStreamAuthToken(tampered, SECRET, NOW_SEC)).toEqual({
+        ok: false,
+        reason: 'malformed',
+      });
+    });
+
+    it('rejects a token using padding "=" (not used by our minter)', () => {
+      const valid = mintStreamAuthToken(claims(), SECRET);
+      const [p, s] = valid.split('.');
+      expect(verifyStreamAuthToken(`${p}=.${s}`, SECRET, NOW_SEC)).toEqual({
+        ok: false,
+        reason: 'malformed',
+      });
+    });
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -223,8 +223,25 @@ export function loadConfig(): Config {
     process.exit(1);
   }
   const streamAuthAudience = optionalEnv('STREAM_AUTH_AUDIENCE');
+  // TTL bounds per spec §3.3 (challenge 2–5 min) + a sane 60s–30min envelope
+  // for the token. Boot-fatal — silent clamping would hide an operator typo
+  // that weakens the security boundary (e.g. a "1d" token TTL).
   const streamChallengeTtlSec = optionalPositiveIntEnv('STREAM_CHALLENGE_TTL_SECONDS') ?? 180;
+  if (streamChallengeTtlSec < 120 || streamChallengeTtlSec > 300) {
+    logger.fatal(
+      { value: streamChallengeTtlSec },
+      'STREAM_CHALLENGE_TTL_SECONDS must be between 120 and 300 (spec §3.3: 2–5 min)',
+    );
+    process.exit(1);
+  }
   const streamTokenTtlSec = optionalPositiveIntEnv('STREAM_TOKEN_TTL_SECONDS') ?? 900;
+  if (streamTokenTtlSec < 60 || streamTokenTtlSec > 1800) {
+    logger.fatal(
+      { value: streamTokenTtlSec },
+      'STREAM_TOKEN_TTL_SECONDS must be between 60 and 1800 (1 min – 30 min)',
+    );
+    process.exit(1);
+  }
   logger.info(
     {
       streamAuthHmacSecret: streamAuthHmacSecret !== undefined ? 'set' : 'unset',

@@ -41,10 +41,19 @@ interface ChallengeResponseBody {
 
 export function postStreamChallengeHandler(req: Request, res: Response): void {
   const config = loadConfig();
-  if (!config.streamAuthAudience || !config.matchingModuleAddress) {
+  // Unified readiness contract: BOTH endpoints require all three env vars.
+  // A challenge that can be minted but never traded for a token is dead-end UX
+  // (the SDK can't recover); fail fast at the first call so the operator
+  // sees the misconfiguration immediately. Per Hermes review-30.
+  if (
+    !config.streamAuthHmacSecret ||
+    !config.streamAuthAudience ||
+    !config.matchingModuleAddress
+  ) {
     logger.warn('postStreamChallengeHandler: stream-auth env not configured');
     res.status(503).json({
-      error: 'Server not configured for stream auth: set STREAM_AUTH_AUDIENCE and MATCHING_MODULE_ADDRESS.',
+      error:
+        'Server not configured for stream auth: set STREAM_AUTH_HMAC_SECRET, STREAM_AUTH_AUDIENCE, MATCHING_MODULE_ADDRESS.',
       code: 'NOT_READY',
     } satisfies ApiError);
     return;
@@ -258,12 +267,19 @@ function parseChallenge(raw: unknown):
     return { ok: false, error: 'challenge.scope must be "read:own-state".' };
   }
   const network = o['network'];
-  if (
-    typeof network !== 'object' ||
-    network === null ||
-    typeof (network as Record<string, unknown>)['chainId'] !== 'number'
-  ) {
-    return { ok: false, error: 'challenge.network.chainId must be a number.' };
+  if (typeof network !== 'object' || network === null) {
+    return { ok: false, error: 'challenge.network must be an object.' };
+  }
+  const chainId = (network as Record<string, unknown>)['chainId'];
+  // Hermes review-30 blocker: typeof === 'number' alone lets fractional /
+  // Infinity / NaN through, and the BigInt() conversion downstream throws
+  // RangeError → Express 500. Safe-integer + non-negative everywhere a
+  // value flows into BigInt or into a JSON-roundtrip comparison.
+  if (!Number.isSafeInteger(chainId) || (chainId as number) <= 0) {
+    return {
+      ok: false,
+      error: 'challenge.network.chainId must be a positive safe-integer.',
+    };
   }
   const audience = o['audience'];
   if (typeof audience !== 'string' || audience.length === 0) {
@@ -275,8 +291,17 @@ function parseChallenge(raw: unknown):
   }
   const issuedAt = o['issuedAt'];
   const expiresAt = o['expiresAt'];
-  if (typeof issuedAt !== 'number' || typeof expiresAt !== 'number') {
-    return { ok: false, error: 'challenge.issuedAt and challenge.expiresAt must be numbers (unix seconds).' };
+  if (!Number.isSafeInteger(issuedAt) || (issuedAt as number) < 0) {
+    return {
+      ok: false,
+      error: 'challenge.issuedAt must be a non-negative safe-integer unix-seconds value.',
+    };
+  }
+  if (!Number.isSafeInteger(expiresAt) || (expiresAt as number) < 0) {
+    return {
+      ok: false,
+      error: 'challenge.expiresAt must be a non-negative safe-integer unix-seconds value.',
+    };
   }
   return {
     ok: true,
@@ -284,11 +309,11 @@ function parseChallenge(raw: unknown):
       address,
       resource: 'own-state',
       scope: 'read:own-state',
-      network: { chainId: (network as { chainId: number }).chainId },
+      network: { chainId: chainId as number },
       audience,
       challengeId,
-      issuedAt,
-      expiresAt,
+      issuedAt: issuedAt as number,
+      expiresAt: expiresAt as number,
     },
   };
 }

@@ -509,7 +509,7 @@ Set via `heroku config:set <var>=<value> --app ospex-core-api`. Mirrors `.env.ex
 - `NETWORK` — `polygon` for production, `amoy` for testnet
 - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
 - `ALCHEMY_RPC_URL` — Polygon mainnet RPC (PAYG-tier — required by `/v1/positions/by-tx` and `/v1/positions/claim-result`)
-- `MATCHING_MODULE_ADDRESS` — R4 matching module; verifying contract for the EIP-712 domain on `POST /v1/commitments` and `DELETE /v1/commitments/:hash`
+- `MATCHING_MODULE_ADDRESS` — R4 matching module; verifying contract for the EIP-712 domain on `POST /v1/commitments` and `DELETE /v1/commitments/:hash`, **and** reused as the verifying contract of the separate `OspexStreamAuth` domain (M3 — see `STREAM_AUTH_*` below). The stream-auth endpoints return `503 NOT_READY` if this is unset
 - `SCORER_MONEYLINE_ADDRESS`, `SCORER_SPREAD_ADDRESS`, `SCORER_TOTAL_ADDRESS` — required by `POST /v1/commitments` (all-or-nothing; partial config is rejected at boot)
 - `POSITION_MODULE_ADDRESS` — optional defensive log-source filter for tx parsers
 - `MAX_STREAM_CONNECTIONS_TOTAL`, `MAX_STREAM_CONNECTIONS_PER_IP` — optional SSE concurrent-connection caps (defaults 200 / 10); set either to tune the stream stack without a code change

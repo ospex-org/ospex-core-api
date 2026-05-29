@@ -151,6 +151,30 @@ describe('POST /v1/auth/stream-challenge', () => {
     expect(res.statusCode).toBe(503);
     expect(res.body).toMatchObject({ code: 'NOT_READY' });
   });
+
+  // Hermes review-30: stream-challenge previously only required AUDIENCE +
+  // MATCHING_MODULE_ADDRESS, but a challenge minted with HMAC_SECRET unset
+  // cannot be traded for a token — dead-end UX. Unified contract: BOTH
+  // endpoints require all three vars.
+  it('503 NOT_READY when HMAC secret is missing (unified contract — review-30)', () => {
+    envMock.loadConfig.mockReturnValue({
+      network: 'polygon',
+      chainId: 137,
+      matchingModuleAddress: MATCHING_MODULE,
+      redactHiddenPublic: true,
+      streamAuthHmacSecret: undefined as unknown as string,
+      streamAuthAudience: AUDIENCE,
+      streamChallengeTtlSec: 180,
+      streamTokenTtlSec: 900,
+    });
+    const res = makeRes();
+    postStreamChallengeHandler(
+      makeReq({ body: { address: '0x1111111111111111111111111111111111111111' } }),
+      res as unknown as Response,
+    );
+    expect(res.statusCode).toBe(503);
+    expect(res.body).toMatchObject({ code: 'NOT_READY' });
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -298,6 +322,65 @@ describe('POST /v1/auth/stream-token', () => {
     postStreamTokenHandler(makeReq({ body: {} }), res as unknown as Response);
     expect(res.statusCode).toBe(400);
     expect(res.body).toMatchObject({ code: 'INVALID_PARAM' });
+  });
+
+  // ── Hermes review-30 BLOCKER: malformed timestamps must 400, not 500 ──
+  // Each of these would previously reach `BigInt(c.issuedAt)` and throw
+  // a RangeError that Express turned into a 500. The parser must catch
+  // them at the boundary — they're publicly-submittable values.
+  describe('safe-integer guards on numeric challenge fields (review-30)', () => {
+    function bodyWithChallengeOverride(over: Record<string, unknown>): { challenge: Record<string, unknown>; signature: string } {
+      return {
+        challenge: {
+          address: '0x1111111111111111111111111111111111111111',
+          resource: 'own-state',
+          scope: 'read:own-state',
+          network: { chainId: 137 },
+          audience: AUDIENCE,
+          challengeId: 'fixture-challenge-id',
+          issuedAt: Math.floor(Date.now() / 1000),
+          expiresAt: Math.floor(Date.now() / 1000) + 180,
+          ...over,
+        },
+        signature: '0x00',
+      };
+    }
+
+    it.each([
+      ['fractional issuedAt', { issuedAt: 1.5 }],
+      ['Infinity issuedAt (1e309)', { issuedAt: 1e309 }],
+      ['NaN issuedAt', { issuedAt: Number.NaN }],
+      ['negative issuedAt', { issuedAt: -1 }],
+      ['unsafe-integer issuedAt', { issuedAt: Number.MAX_SAFE_INTEGER + 2 }],
+      ['fractional expiresAt', { expiresAt: 1.5 }],
+      ['Infinity expiresAt', { expiresAt: 1e309 }],
+      ['NaN expiresAt', { expiresAt: Number.NaN }],
+      ['negative expiresAt', { expiresAt: -100 }],
+      ['fractional chainId', { network: { chainId: 1.5 } }],
+      ['Infinity chainId', { network: { chainId: 1e309 } }],
+      ['NaN chainId', { network: { chainId: Number.NaN } }],
+      ['zero chainId', { network: { chainId: 0 } }],
+      ['negative chainId', { network: { chainId: -1 } }],
+      ['string issuedAt', { issuedAt: '12345' as unknown as number }],
+    ])('400 INVALID_PARAM for %s — never 500', (_label, override) => {
+      const res = makeRes();
+      postStreamTokenHandler(
+        makeReq({ body: bodyWithChallengeOverride(override as Record<string, unknown>) }),
+        res as unknown as Response,
+      );
+      expect(res.statusCode).toBe(400);
+      expect(res.body).toMatchObject({ code: 'INVALID_PARAM' });
+    });
+
+    it('challenge.network not an object → 400 INVALID_PARAM', () => {
+      const res = makeRes();
+      postStreamTokenHandler(
+        makeReq({ body: bodyWithChallengeOverride({ network: 'nope' as unknown as object }) }),
+        res as unknown as Response,
+      );
+      expect(res.statusCode).toBe(400);
+      expect(res.body).toMatchObject({ code: 'INVALID_PARAM' });
+    });
   });
 
   it('503 NOT_READY when HMAC secret is missing', async () => {
