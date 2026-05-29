@@ -812,6 +812,21 @@ async function getCommitmentsRecovery(req: Request, res: Response): Promise<void
 }
 
 export async function getCommitmentsHandler(req: Request, res: Response): Promise<void> {
+  // `?includeHidden` is removed (M2). Reject ANY presence — any value, every
+  // sub-route — BEFORE the `?since=` recovery branch dispatches, so the
+  // contract "param removed everywhere, 400 before any DB call" holds whether
+  // the caller is hitting the list path or recovery. Makers retrieve hidden
+  // bodies via the owner-auth own-state surface (M4).
+  if (req.query.includeHidden !== undefined) {
+    res.status(400).json({
+      error:
+        'includeHidden has been removed from public commitment endpoints. ' +
+        'Use the owner-auth own-state surface for maker-owned hidden commitments.',
+      code: 'INCLUDE_HIDDEN_REMOVED',
+    } satisfies ApiError);
+    return;
+  }
+
   // `?since=<cursor>` switches to cursor recovery mode (ordered by
   // row_updated_at, includes terminal lifecycle rows). Absent → the
   // open-book list below, unchanged.
@@ -892,20 +907,9 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
     } satisfies ApiError);
     return;
   }
-  // Off-chain-hidden rows (book_visible=false) are excluded from the public book,
-  // unconditionally. The legacy `?includeHidden=true` opt-in was an unauthenticated
-  // path to the signed-payload allow-list bypass and is removed in M2 (see
-  // own-state-sse-plan.md §8 M2 + phase0-redaction-audit.md §8). Makers retrieve
-  // their own hidden bodies via the owner-auth own-state stream (M4).
-  if (req.query.includeHidden !== undefined) {
-    res.status(400).json({
-      error:
-        'includeHidden has been removed from public commitment endpoints. ' +
-        'Use the owner-auth own-state surface for maker-owned hidden commitments.',
-      code: 'INCLUDE_HIDDEN_REMOVED',
-    } satisfies ApiError);
-    return;
-  }
+  // (`?includeHidden` is rejected at the top of `getCommitmentsHandler`
+  // above — Hermes review-29 caught that placing the check here let
+  // `?since=<cursor>&includeHidden=*` bypass the rejection.)
   // Opt-in advisory fillability (Layer D). When true, each row carries a
   // `fillability` object from the maker_funding snapshot. Default off — the
   // response is byte-identical without it (one extra query only when asked).

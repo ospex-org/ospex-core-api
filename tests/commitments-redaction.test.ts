@@ -282,6 +282,34 @@ describe('Leak path 3 — GET /v1/commitments?includeHidden=true (removed)', () 
     await getCommitmentsHandler(makeReq(), res as unknown as Response);
     expect(res.statusCode).toBe(200);
   });
+
+  // Hermes review-29: `?since=` is dispatched to recovery in `getCommitmentsHandler`
+  // BEFORE the inline `includeHidden` check ran, so combining the two slipped
+  // through the contract ("removed everywhere, 400 before any DB call"). Moving
+  // the check to the top of `getCommitmentsHandler` closes both branches with
+  // one site. These two regressions pin the contract whether the caller hits
+  // the list OR the recovery sub-route.
+  it('?since= + includeHidden=true is STILL rejected — recovery does NOT bypass the removal (review-29 blocker)', async () => {
+    supabaseMock.getSupabase.mockReturnValue(undefined); // no DB allowed
+    const res = makeRes();
+    await getCommitmentsHandler(
+      makeReq({ since: RECOVERY_CURSOR, includeHidden: 'true' }),
+      res as unknown as Response,
+    );
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toMatchObject({ code: 'INCLUDE_HIDDEN_REMOVED' });
+  });
+
+  it('?since= + includeHidden=false is STILL rejected — the value does not matter', async () => {
+    supabaseMock.getSupabase.mockReturnValue(undefined);
+    const res = makeRes();
+    await getCommitmentsHandler(
+      makeReq({ since: RECOVERY_CURSOR, includeHidden: 'false' }),
+      res as unknown as Response,
+    );
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toMatchObject({ code: 'INCLUDE_HIDDEN_REMOVED' });
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────
