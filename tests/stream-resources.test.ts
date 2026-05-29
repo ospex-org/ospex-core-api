@@ -1,6 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { Request } from 'express';
-import { STREAM_RESOURCES, isStreamResource, matchesRow, type StreamRow } from '../src/v1/stream/resources.js';
+
+// `STREAM_RESOURCES.commitments.toBody` routes through `commitmentRowToPublicBody`,
+// which reads `redactHiddenPublic` from `loadConfig` — mock env so the test does
+// not boot into `requireEnv` exits. Redaction default-on matches production.
+const envMock = vi.hoisted(() => ({
+  loadConfig: vi.fn(() => ({ network: 'polygon', chainId: 137, redactHiddenPublic: true })),
+}));
+vi.mock('../src/lib/env.js', () => envMock);
+
+const { STREAM_RESOURCES, isStreamResource, matchesRow } = await import('../src/v1/stream/resources.js');
+type StreamRow = import('../src/v1/stream/resources.js').StreamRow;
 
 function req(query: Record<string, string>): Request {
   return { query } as unknown as Request;

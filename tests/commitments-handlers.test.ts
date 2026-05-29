@@ -271,13 +271,24 @@ describe('GET /v1/commitments list', () => {
     expect(body.commitments[0]).toMatchObject({ status: 'cancelled', storedStatus: 'open', nonceInvalidated: true });
   });
 
-  it('includeHidden=true drops the book_visible filter', async () => {
+  it('any includeHidden value is rejected (400 INCLUDE_HIDDEN_REMOVED) — the param has been removed', async () => {
     const { client, calls } = makeSupabase({ data: [row()], error: null, count: 1 });
     supabaseMock.getSupabase.mockReturnValue(client);
     const res = makeRes();
     await getCommitmentsHandler(makeReq({ includeHidden: 'true' }), res as unknown as Response);
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toMatchObject({ code: 'INCLUDE_HIDDEN_REMOVED' });
+    // Hard fail-fast before the DB call: no select issued.
+    expect(calls.some((c) => c.method === 'select')).toBe(false);
+  });
+
+  it('the default list always filters book_visible=true (includeHidden removal means the filter is unconditional)', async () => {
+    const { client, calls } = makeSupabase({ data: [row()], error: null, count: 1 });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await getCommitmentsHandler(makeReq(), res as unknown as Response);
     expect(res.statusCode).toBe(200);
-    expect(calls.some((c) => c.method === 'eq' && c.args[0] === 'book_visible')).toBe(false);
+    expect(calls).toContainEqual({ method: 'eq', args: ['book_visible', true] });
   });
 });
 

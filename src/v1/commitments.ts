@@ -165,6 +165,128 @@ export function rowToBody(row: CommitmentRow, nowMs: number): CommitmentBody {
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Public hidden-row redaction (M2 of the own-state SSE migration stack)
+//
+// Hidden rows (`book_visible=false`) are off-book via off-chain DELETE but
+// their on-chain signature stays valid until expiry/nonce-floor/onchain-cancel.
+// Anonymous public surfaces MUST NOT serve the signed payload (anything in
+// `MatchingModule.matchCommitment`'s struct, plus the signature itself); makers
+// recover hidden bodies via the owner-auth own-state stream landing in M4.
+//
+// Mapping uses an exported ALLOW-LIST (additive surface changes upstream don't
+// silently extend the public hidden body). The two discriminants `redacted` +
+// `payloadAvailable` give SDK consumers a structural signal so the type system
+// can narrow on them instead of probing optional fields.
+//
+// Deviations from `implementation-plan.md` §M2's proposed constant — flagged
+// in the PR description:
+//   - `bookVisible` (camelCase) not `book_visible`: matches the wire shape used
+//     across `CommitmentBody`; the wire is camelCase even where the column is
+//     snake_case.
+//   - `speculationKey` / `speculationId` are BOTH excluded. The wire field is
+//     `speculationKey` (a keccak of contestId+scorer+lineTicks); leaking it
+//     plus the in-allow-list `contestId` brute-forces (scorer, lineTicks) over
+//     the tiny tuple space (~3 scorers × small line range), both of which are
+//     in the locked deny-list (audit §6.2). Adding `speculationId` instead
+//     would require a per-page join; if observers need linkage to hidden rows
+//     pre-fill, that goes in a follow-up.
+// ────────────────────────────────────────────────────────────────────────
+
+export interface CommitmentHiddenBody {
+  commitmentHash: string;
+  maker: string;
+  contestId: string | null;
+  positionType: 0 | 1 | null;
+  status: string;            // effective — for a hidden row, derives to terminal (cancelled/expired)
+  storedStatus: string;
+  filledRiskAmount: string;
+  expiry: string | null;
+  bookVisible: false;
+  nonceInvalidated: boolean;
+  redacted: true;
+  payloadAvailable: false;
+}
+
+/**
+ * Exact wire allow-list for public hidden-row bodies. The integration test
+ * asserts `Object.keys(hiddenBody).sort()` equals this — an allow-list
+ * (not deny-list) so an upstream field addition can't accidentally leak.
+ */
+export const PUBLIC_HIDDEN_ALLOWLIST: readonly (keyof CommitmentHiddenBody)[] = [
+  'commitmentHash',
+  'maker',
+  'contestId',
+  'positionType',
+  'status',
+  'storedStatus',
+  'filledRiskAmount',
+  'expiry',
+  'bookVisible',
+  'nonceInvalidated',
+  'redacted',
+  'payloadAvailable',
+] as const;
+
+/**
+ * Build the redacted public body for a hidden (`book_visible=false`) row.
+ * Throws if called on a visible row — callers route via
+ * `commitmentRowToPublicBody`, which makes the visibility choice; a misrouted
+ * visible row reaching this mapper is a programming bug, not a security gap.
+ */
+export function rowToHiddenAllowlistBody(row: CommitmentRow, nowMs: number): CommitmentHiddenBody {
+  if (row.book_visible !== false) {
+    throw new Error(
+      `rowToHiddenAllowlistBody invoked on a non-hidden row (commitment_hash=${row.commitment_hash})`,
+    );
+  }
+  const filled = row.filled_risk_amount != null ? BigInt(String(row.filled_risk_amount)) : 0n;
+  const storedStatus = row.status;
+  const status = deriveEffectiveStatus({
+    storedStatus,
+    expiry: row.expiry,
+    nonceInvalidated: Boolean(row.nonce_invalidated),
+    bookVisible: false,
+    nowMs,
+  });
+  return {
+    commitmentHash: row.commitment_hash,
+    maker: row.maker,
+    contestId: row.contest_id != null ? String(row.contest_id) : null,
+    positionType: row.position_type ? POSITION_TYPE_TO_INT[row.position_type] : null,
+    status,
+    storedStatus,
+    filledRiskAmount: filled.toString(),
+    expiry: row.expiry,
+    bookVisible: false,
+    nonceInvalidated: Boolean(row.nonce_invalidated),
+    redacted: true,
+    payloadAvailable: false,
+  };
+}
+
+/**
+ * Single public-body router for every anonymous read surface. Visible rows
+ * get the full `CommitmentBody`; hidden rows get the allow-list projection.
+ * `REDACT_HIDDEN_PUBLIC=false` reverts to the legacy "full body for all rows"
+ * behavior — a short-lived deploy-window rollback only (see Config docstring).
+ *
+ * Safe-by-default on `redactHiddenPublic`: only an EXPLICIT `false` disables
+ * redaction. Missing flag (undefined — e.g. a partial loadConfig mock) is
+ * treated as enabled, so a test fixture can't accidentally widen the public
+ * surface by omitting one config field.
+ */
+export function commitmentRowToPublicBody(
+  row: CommitmentRow,
+  nowMs: number,
+): CommitmentBody | CommitmentHiddenBody {
+  const { redactHiddenPublic } = loadConfig();
+  if (redactHiddenPublic !== false && row.book_visible === false) {
+    return rowToHiddenAllowlistBody(row, nowMs);
+  }
+  return rowToBody(row, nowMs);
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Advisory maker-funding fillability (Layer D)
 //
 // Opt-in via `?includeFillability=true`. Each row gets a `fillability` object
@@ -552,7 +674,11 @@ function parseBoolQuery(value: unknown): boolean | null {
 }
 
 interface ListResponse {
-  commitments: CommitmentBody[];
+  // The list applies `book_visible=true` upstream, so in practice every row
+  // is a `CommitmentBody`. The union accepts `CommitmentHiddenBody` for
+  // defense-in-depth: a hidden row that reaches the mapper (filter bypass)
+  // still gets redacted before reply.
+  commitments: Array<CommitmentBody | CommitmentHiddenBody>;
   pagination: {
     limit: number;
     offset: number;
@@ -671,8 +797,15 @@ async function getCommitmentsRecovery(req: Request, res: Response): Promise<void
 
   const rows = (data ?? []) as unknown as CommitmentRecoveryRow[];
   const last = rows.length > 0 ? rows[rows.length - 1] : undefined;
+  // Recovery surfaces lifecycle transitions for tracked rows, including the
+  // book_visible=true→false transition. Hidden rows are emitted with the
+  // public allow-list projection (no filter) so a reconnecting client still
+  // converges its state to "row is now off-book" rather than silently losing
+  // the row. (This deliberately deviates from `implementation-plan.md` §M2's
+  // "also add `book_visible=true` filter" recommendation — see PR description
+  // for the convergence-vs-defense trade-off the deviation resolves.)
   res.status(200).json({
-    commitments: rows.map((r) => rowToBody(r as unknown as CommitmentRow, nowMs)),
+    commitments: rows.map((r) => commitmentRowToPublicBody(r as unknown as CommitmentRow, nowMs)),
     nextCursor: nextCursor('commitments', last, recovery.sinceRaw),
     hasMore: rows.length === recovery.limit,
   });
@@ -759,14 +892,17 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
     } satisfies ApiError);
     return;
   }
-  // Off-chain-hidden rows (book_visible=false) are excluded from the public book
-  // by default, the same way nonce-invalidated / expired rows are. Opt back in to
-  // see hidden rows (e.g. a maker auditing their own retracted/recovered quotes).
-  const includeHidden = parseBoolQuery(req.query.includeHidden);
-  if (req.query.includeHidden !== undefined && includeHidden === null) {
+  // Off-chain-hidden rows (book_visible=false) are excluded from the public book,
+  // unconditionally. The legacy `?includeHidden=true` opt-in was an unauthenticated
+  // path to the signed-payload allow-list bypass and is removed in M2 (see
+  // own-state-sse-plan.md §8 M2 + phase0-redaction-audit.md §8). Makers retrieve
+  // their own hidden bodies via the owner-auth own-state stream (M4).
+  if (req.query.includeHidden !== undefined) {
     res.status(400).json({
-      error: 'includeHidden must be true|false|1|0.',
-      code: 'INVALID_PARAM',
+      error:
+        'includeHidden has been removed from public commitment endpoints. ' +
+        'Use the owner-auth own-state surface for maker-owned hidden commitments.',
+      code: 'INCLUDE_HIDDEN_REMOVED',
     } satisfies ApiError);
     return;
   }
@@ -900,7 +1036,11 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
   if (scorer !== undefined) q = q.eq('scorer', scorer);
   if (contestId !== undefined) q = q.eq('contest_id', contestId);
   if (speculationKey !== undefined) q = q.eq('speculation_key', speculationKey);
-  if (!includeHidden) q = q.eq('book_visible', true);
+  // Hidden rows are always excluded from the public list (see `includeHidden`
+  // removal above). The mapper below double-projects through
+  // `commitmentRowToPublicBody` as defense-in-depth so any bug that lets a
+  // hidden row past the filter still produces a redacted body.
+  q = q.eq('book_visible', true);
   if (!includeInvalidated) q = q.eq('nonce_invalidated', false);
   if (!includeExpired) {
     // Postgres `>` is false (not null) for NULL operands, so this also excludes
@@ -933,7 +1073,18 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
 
   const body: ListResponse = {
     commitments: rows.map((r) => {
-      const cb = rowToBody(r, nowMs);
+      const cb = commitmentRowToPublicBody(r, nowMs);
+      // The upstream filter guarantees `cb` is a full `CommitmentBody`. The
+      // narrow handles the impossible-but-defended hidden case: log + emit
+      // the redacted projection rather than skipping the row outright (the
+      // caller still gets a discriminant entry to reconcile against).
+      if ('redacted' in cb) {
+        logger.warn(
+          { commitmentHash: cb.commitmentHash },
+          'commitments: hidden row reached the public list — defensive redaction applied',
+        );
+        return cb;
+      }
       if (includeFillability) {
         cb.fillability = computeFillability({
           remainingRiskWei6: BigInt(cb.remainingRiskAmount),
@@ -1003,7 +1154,7 @@ export async function getCommitmentByHashHandler(req: Request, res: Response): P
     return;
   }
 
-  res.status(200).json(rowToBody(data as unknown as CommitmentRow, nowMs));
+  res.status(200).json(commitmentRowToPublicBody(data as unknown as CommitmentRow, nowMs));
 }
 
 // ────────────────────────────────────────────────────────────────────────
