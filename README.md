@@ -32,6 +32,7 @@ In progress. Working today:
 - **Odds stream (Phase 1.5):** `GET /v1/stream/odds?contestId=&market=` — snapshot then live `change`/`refresh` over Server-Sent Events (latest-state, no cursor). See "Odds stream" below.
 - `GET /v1/metrics` — operational stream / odds / connection counters (process-local). See "Metrics" below.
 - **Stream auth (M3):** `POST /v1/auth/stream-challenge` + `POST /v1/auth/stream-token` — EIP-712 challenge/response that mints a ~15 min HMAC bearer token, scoped to `{address, audience, chainId}`. Required for the owner-auth `/v1/own-state/*` surfaces landing in M4; the public/anonymous reads above are unchanged.
+- **Own-state snapshot (M4a):** `GET /v1/own-state/snapshot?cursor=<opt>` — owner-auth (`Authorization: Bearer <stream-token>`) paged snapshot of the maker's commitments + positions. Returns `{cursor, commitments[], positions[], truncated}` per spec §6.1. The composite cursor is the resume point for `/v1/stream/own-state` (M4b) or — when `truncated: true` — the continuation key for the next page.
 
 Not ported (no R4 analog — see "Position helpers" section below): `/withdraw-params`, `/withdraw-result/:txHash`. Not ported in any batch yet (deferred or out of scope): everything else under `/v1/analytics/*`, `/v1/current-odds*` (the legacy `/v1/current-odds*` paths from agent-server are superseded by the contest-centric `/v1/contests/:contestId/odds`).
 

@@ -58,6 +58,12 @@ export interface Config {
   streamChallengeTtlSec: number;
   /** Stream-token TTL (seconds). Default 900 (15 min); spec §3.1 says ~15 min. */
   streamTokenTtlSec: number;
+  /**
+   * Per-page commitments cap for `GET /v1/own-state/snapshot` (spec §6.2).
+   * Default 5000. Boot-fatal outside [100, 50000] — too small breaks paged
+   * cold start, too large defeats the cap's purpose (bounded response time).
+   */
+  ownStateSnapshotMaxCommitments: number;
 }
 
 function requireEnv(name: string): string {
@@ -242,6 +248,18 @@ export function loadConfig(): Config {
     );
     process.exit(1);
   }
+  const ownStateSnapshotMaxCommitments =
+    optionalPositiveIntEnv('OWN_STATE_SNAPSHOT_MAX_COMMITMENTS') ?? 5000;
+  if (
+    ownStateSnapshotMaxCommitments < 100 ||
+    ownStateSnapshotMaxCommitments > 50_000
+  ) {
+    logger.fatal(
+      { value: ownStateSnapshotMaxCommitments },
+      'OWN_STATE_SNAPSHOT_MAX_COMMITMENTS must be between 100 and 50000',
+    );
+    process.exit(1);
+  }
   logger.info(
     {
       streamAuthHmacSecret: streamAuthHmacSecret !== undefined ? 'set' : 'unset',
@@ -262,6 +280,7 @@ export function loadConfig(): Config {
     redactHiddenPublic,
     streamChallengeTtlSec,
     streamTokenTtlSec,
+    ownStateSnapshotMaxCommitments,
     ...(supabaseAnonKey !== undefined ? { supabaseAnonKey } : {}),
     ...(alchemyRpcUrl !== undefined ? { alchemyRpcUrl } : {}),
     ...(matchingModuleAddress !== undefined ? { matchingModuleAddress } : {}),
