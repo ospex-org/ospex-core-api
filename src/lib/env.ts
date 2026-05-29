@@ -40,6 +40,24 @@ export interface Config {
    * after the M7 cutover soak per the spec (see implementation-plan.md §M7).
    */
   redactHiddenPublic: boolean;
+  /**
+   * Stream-auth (M3) secrets + config — optional. Endpoints check at use site
+   * (mirrors `matchingModuleAddress`) and 503 NOT_READY if missing, so the API
+   * boots cleanly even before the stream-auth feature is wired.
+   *
+   * `streamAuthHmacSecret`: HMAC-SHA256 secret used to sign + verify bearer
+   * tokens minted by POST /v1/auth/stream-token. Must be ≥ 32 bytes of entropy.
+   *
+   * `streamAuthAudience`: the canonical host string the SDK derives from its
+   * baseUrl. Bound into both the challenge typed-data and the issued token, so
+   * a token minted for deployment A cannot be replayed against deployment B.
+   */
+  streamAuthHmacSecret?: string;
+  streamAuthAudience?: string;
+  /** Stream-challenge TTL (seconds). Default 180 (3 min); spec §3.3 allows 2–5 min. */
+  streamChallengeTtlSec: number;
+  /** Stream-token TTL (seconds). Default 900 (15 min); spec §3.1 says ~15 min. */
+  streamTokenTtlSec: number;
 }
 
 function requireEnv(name: string): string {
@@ -192,6 +210,31 @@ export function loadConfig(): Config {
   const redactHiddenPublic = parseBoolEnv('REDACT_HIDDEN_PUBLIC', true);
   logger.info({ redactHiddenPublic }, 'env: REDACT_HIDDEN_PUBLIC');
 
+  // Stream-auth (M3). Secret + audience are optional at boot (handlers 503 if
+  // unset) so the server boots cleanly in environments where stream-auth isn't
+  // yet wired. A set-but-too-short secret fails loud — a 16-char secret is a
+  // misconfiguration we want to surface, not a quiet weakening.
+  const streamAuthHmacSecret = optionalEnv('STREAM_AUTH_HMAC_SECRET');
+  if (streamAuthHmacSecret !== undefined && streamAuthHmacSecret.length < 32) {
+    logger.fatal(
+      { length: streamAuthHmacSecret.length },
+      'STREAM_AUTH_HMAC_SECRET must be at least 32 characters of entropy',
+    );
+    process.exit(1);
+  }
+  const streamAuthAudience = optionalEnv('STREAM_AUTH_AUDIENCE');
+  const streamChallengeTtlSec = optionalPositiveIntEnv('STREAM_CHALLENGE_TTL_SECONDS') ?? 180;
+  const streamTokenTtlSec = optionalPositiveIntEnv('STREAM_TOKEN_TTL_SECONDS') ?? 900;
+  logger.info(
+    {
+      streamAuthHmacSecret: streamAuthHmacSecret !== undefined ? 'set' : 'unset',
+      streamAuthAudience: streamAuthAudience ?? 'unset',
+      streamChallengeTtlSec,
+      streamTokenTtlSec,
+    },
+    'env: stream-auth (M3)',
+  );
+
   cached = {
     port,
     nodeEnv,
@@ -200,6 +243,8 @@ export function loadConfig(): Config {
     supabaseUrl,
     supabaseServiceRoleKey,
     redactHiddenPublic,
+    streamChallengeTtlSec,
+    streamTokenTtlSec,
     ...(supabaseAnonKey !== undefined ? { supabaseAnonKey } : {}),
     ...(alchemyRpcUrl !== undefined ? { alchemyRpcUrl } : {}),
     ...(matchingModuleAddress !== undefined ? { matchingModuleAddress } : {}),
@@ -207,6 +252,8 @@ export function loadConfig(): Config {
     ...(scorers !== undefined ? { scorers } : {}),
     ...(maxStreamConnectionsTotal !== undefined ? { maxStreamConnectionsTotal } : {}),
     ...(maxStreamConnectionsPerIp !== undefined ? { maxStreamConnectionsPerIp } : {}),
+    ...(streamAuthHmacSecret !== undefined ? { streamAuthHmacSecret } : {}),
+    ...(streamAuthAudience !== undefined ? { streamAuthAudience } : {}),
   };
   return cached;
 }

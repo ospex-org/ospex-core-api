@@ -269,7 +269,12 @@ export function eip712Auth(action: ActionType) {
 
     // Verify signature.
     const domain = buildDomain(config.chainId, config.matchingModuleAddress);
-    const result = verifyTypedData(domain, action, message, signature);
+    const result = verifyTypedData(
+      domain,
+      { [action]: getActionFields(action) },
+      message,
+      signature,
+    );
     if ('kind' in result) {
       if (result.kind === 'invalid_signature_format') {
         res.status(400).json(err('signature must be 0x-prefixed hex.', 'INVALID_PARAM'));

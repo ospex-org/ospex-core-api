@@ -31,6 +31,7 @@ In progress. Working today:
 - **SSE streams (Phase 1.5):** `GET /v1/stream/{commitments,positions,fills,speculations,contests}` — live deltas + cursor catch-up + resync over Server-Sent Events. See "SSE streams" below.
 - **Odds stream (Phase 1.5):** `GET /v1/stream/odds?contestId=&market=` — snapshot then live `change`/`refresh` over Server-Sent Events (latest-state, no cursor). See "Odds stream" below.
 - `GET /v1/metrics` — operational stream / odds / connection counters (process-local). See "Metrics" below.
+- **Stream auth (M3):** `POST /v1/auth/stream-challenge` + `POST /v1/auth/stream-token` — EIP-712 challenge/response that mints a ~15 min HMAC bearer token, scoped to `{address, audience, chainId}`. Required for the owner-auth `/v1/own-state/*` surfaces landing in M4; the public/anonymous reads above are unchanged.
 
 Not ported (no R4 analog — see "Position helpers" section below): `/withdraw-params`, `/withdraw-result/:txHash`. Not ported in any batch yet (deferred or out of scope): everything else under `/v1/analytics/*`, `/v1/current-odds*` (the legacy `/v1/current-odds*` paths from agent-server are superseded by the contest-centric `/v1/contests/:contestId/odds`).
 
@@ -513,6 +514,10 @@ Set via `heroku config:set <var>=<value> --app ospex-core-api`. Mirrors `.env.ex
 - `POSITION_MODULE_ADDRESS` — optional defensive log-source filter for tx parsers
 - `MAX_STREAM_CONNECTIONS_TOTAL`, `MAX_STREAM_CONNECTIONS_PER_IP` — optional SSE concurrent-connection caps (defaults 200 / 10); set either to tune the stream stack without a code change
 - `REDACT_HIDDEN_PUBLIC` — optional bool, **default `true`** (redaction enforced). Short-lived rollout/rollback guard for the M2 hidden-row redaction. Setting `false` reverts every anonymous read path to the legacy "full body for all rows" behavior for a deploy window only; the flag is scheduled for removal post-M7 cutover
+- `STREAM_AUTH_HMAC_SECRET` — optional but required by `/v1/auth/stream-token` (the handler returns `503 NOT_READY` if unset). HMAC-SHA256 secret used to sign + verify stream-auth bearer tokens; must be ≥ 32 characters of entropy (boot-time fatal otherwise). Rotation = add a second key and accept both during transition (follow-up; current `kid` is `v1`)
+- `STREAM_AUTH_AUDIENCE` — optional but required for the stream-auth handlers (same `503 NOT_READY` rule). The canonical host string bound into both the challenge typed-data and the issued token (e.g. `https://api.ospex.org`); SDK clients derive the same string from their `baseUrl`, so a token minted for one deployment cannot be replayed against another
+- `STREAM_CHALLENGE_TTL_SECONDS` — optional, default `180` (3 min). Lifetime of a single-use challenge; spec §3.3 allows 2–5 min
+- `STREAM_TOKEN_TTL_SECONDS` — optional, default `900` (15 min). Lifetime of an issued bearer token
 
 `NODE_ENV=production` and `LOG_LEVEL=info` are recommended. **Do not set `PORT`** — Heroku injects it; setting it as a config var creates a binding mismatch.
 
