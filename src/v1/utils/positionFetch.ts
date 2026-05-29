@@ -102,7 +102,7 @@ export interface PositionFetchResult {
    * claimable.length` is unsafe (it under-detects truncation when the
    * helper filters out lost rows below the cap). Callers that need to
    * know whether more positions exist beyond what was categorized MUST
-   * read this field. Hermes review-31 round 2 blocker #3.
+   * read this field.
    */
   hitCap: boolean;
 }

@@ -147,9 +147,9 @@ describe('decode — watermark rejections (each resource slot is validated)', ()
     expect(() => decodeOwnStateCursor(bad)).toThrow(OwnStateCursorError);
   });
 
-  // Hermes review-31 round 1 blocker #5: the shape regex alone let
-  // `2026-99-99T...` through (passes ISO regex; Date.parse → NaN). The new
-  // semantic gate catches these before they reach PostgREST.
+  // Regression: the shape regex alone let `2026-99-99T...` through
+  // (passes ISO regex; Date.parse → NaN). The semantic gate catches
+  // these before they reach PostgREST.
   it('rejects a semantically-invalid calendar timestamp (shape-valid but Date.parse=NaN)', () => {
     const bad = Buffer.from(
       JSON.stringify({ ...sample, c: { s: '2026-99-99T99:99:99.000Z', i: '0' } }),
@@ -158,10 +158,10 @@ describe('decode — watermark rejections (each resource slot is validated)', ()
     expect(() => decodeOwnStateCursor(bad)).toThrow(OwnStateCursorError);
   });
 
-  // Hermes review-31 round 2 blocker #5: `Date.parse` silently NORMALIZES
-  // impossible dates (Feb 30 → Mar 2, etc.). The component-comparison gate
-  // catches all of these by round-tripping the parsed Date back to its
-  // components and requiring an exact match against the input.
+  // Regression: `Date.parse` silently NORMALIZES impossible dates (Feb 30
+  // → Mar 2, etc.). The component-comparison gate catches all of these by
+  // round-tripping the parsed Date back to its components and requiring an
+  // exact match against the input.
   it('rejects Feb 30 (normalizes to Mar 2)', () => {
     const bad = Buffer.from(
       JSON.stringify({ ...sample, c: { s: '2026-02-30T00:00:00.000Z', i: '0' } }),
@@ -197,11 +197,10 @@ describe('decode — watermark rejections (each resource slot is validated)', ()
     expect(() => decodeOwnStateCursor(bad)).toThrow(OwnStateCursorError);
   });
 
-  // Hermes review-31 round 3 wire-contract blocker: Supabase / PostgREST
-  // emits timestamptz as `...+00:00` with microsecond fractional seconds.
-  // The round-2 Z-only regex made the snapshot mint cursors it rejected on
-  // the next call, breaking paging. Both wire shapes the server can emit
-  // MUST round-trip cleanly.
+  // Wire-contract regression: Supabase / PostgREST emits timestamptz as
+  // `...+00:00` with microsecond fractional seconds. A Z-only regex made
+  // the snapshot mint cursors it rejected on the next call, breaking
+  // paging. Both wire shapes the server can emit MUST round-trip cleanly.
   it('accepts the +00:00 wire form Supabase actually emits', () => {
     const ok = Buffer.from(
       JSON.stringify({

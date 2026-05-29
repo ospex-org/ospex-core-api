@@ -61,7 +61,6 @@ import {
 import {
   derivePositionStatus,
   type ContestInput,
-  type PositionInput,
   type PositionStatusEventBody,
   type SpeculationInput,
 } from './positionStatus.js';
@@ -120,12 +119,42 @@ interface ResourceTipState {
   emitted: Map<string, number>;
 }
 
+/**
+ * Per-position status cache — the semantic-event-key dedup contract for
+ * `positionStatus` events. Spec §2.1.2 keys positionStatus events on
+ * `(address, speculationId, positionType, status, sourceUpdatedAt)`. Raw
+ * `(positions.row_updated_at, positions.id)` dedup would lose
+ * speculation/contest-driven transitions (the underlying position row
+ * doesn't move when the parent speculation settles or the contest scores).
+ * We re-derive status from a join of (position, speculation, contest)
+ * EVERY tick and emit when the derived status differs from the cached one
+ * — that catches every source of change while still suppressing no-op
+ * re-emits.
+ *
+ * Per-key: `${speculationId}_${positionType}`. The address is implicit
+ * (it's the wallet poller's key).
+ */
+interface StatusCacheEntry {
+  status: import('./positionStatus.js').PositionStatus;
+  /** `max(positions.row_updated_at, speculations.row_updated_at, contests.row_updated_at)` at emit time. */
+  sourceUpdatedAt: string;
+}
+
 interface WalletPoller {
   subs: Set<OwnStateSubscriber>;
   timer: ReturnType<typeof setInterval>;
   commitments: ResourceTipState;
   fills: ResourceTipState;
-  positions: ResourceTipState;
+  /**
+   * Cache of last-emitted (status, sourceUpdatedAt) per `${speculationId}_${positionType}`.
+   * Populated on the first tick WITHOUT emitting — the SDK's prior
+   * snapshot/catchup already covered the bootstrap state and re-emitting
+   * the same statuses would spam reducers. Subsequent ticks emit only on
+   * derived-status change.
+   */
+  statusCache: Map<string, StatusCacheEntry>;
+  /** Toggled true after the first successful re-derivation pass. */
+  cachePopulated: boolean;
   polling: boolean;
 }
 
@@ -138,6 +167,37 @@ interface ScanResult {
 // reserved chars, so direct interpolation is safe. The hub never accepts
 // untrusted address input — `req.streamAuth.address` is set by the
 // verifyStreamToken middleware after EIP-712 recovery.
+
+/**
+ * Per-tick cap on the position re-derivation query. Mirrors
+ * `POSITION_QUERY_LIMIT` in `positionFetch.ts` so the stream and snapshot
+ * cover the same population. `ORDER BY row_updated_at DESC` keeps the most
+ * recent transitions in-window; long-quiet terminal positions naturally
+ * fall out of the window without losing future events (they don't
+ * transition again).
+ */
+const STATUS_DERIVATION_LIMIT = 200;
+
+/**
+ * Returns the largest ISO-8601 timestamp by parsed epoch ms. Used for
+ * `sourceUpdatedAt` derivation across (position, speculation, contest)
+ * row_updated_at values. Different rows may emit `Z` vs `+00:00` shapes
+ * (PostgREST quirk — see `cursor.ts` self-compat note), so we compare on
+ * the parsed numeric value, not lexicographically. The original string
+ * is preserved verbatim so cursor pagination keeps full precision.
+ */
+function maxIsoTimestamp(
+  ...values: Array<string | null | undefined>
+): string {
+  let best: { s: string; ms: number } | null = null;
+  for (const v of values) {
+    if (!v) continue;
+    const ms = Date.parse(v);
+    if (!Number.isFinite(ms)) continue;
+    if (best === null || ms > best.ms) best = { s: v, ms };
+  }
+  return best ? best.s : new Date(0).toISOString();
+}
 
 export class OwnStateHub {
   private readonly deps: Required<OwnStateHubDeps>;
@@ -172,7 +232,8 @@ export class OwnStateHub {
         subs: new Set(),
         commitments: { tip: { s: nowIso, i: '0' }, emitted: new Map() },
         fills: { tip: { s: nowIso, i: '0' }, emitted: new Map() },
-        positions: { tip: { s: nowIso, i: '0' }, emitted: new Map() },
+        statusCache: new Map(),
+        cachePopulated: false,
         polling: false,
         timer: setInterval(() => {
           void this.pollWallet(addr);
@@ -222,10 +283,15 @@ export class OwnStateHub {
       // a handful of ms on the median tick at the cost of read-burst spikes.
       await this.pollCommitments(address, state);
       await this.pollFills(address, state);
-      await this.pollPositions(address, state);
+      // positionStatus is a derived event over (positions, speculations,
+      // contests). Forward-scan on positions.row_updated_at alone would miss
+      // every speculation/contest-driven transition (parent settles,
+      // contest scores) since those don't bump the position row. Instead,
+      // re-derive the full join every tick and emit on derived-status
+      // change. See `reDerivePositionStatuses` for the dedup contract.
+      await this.reDerivePositionStatuses(address, state);
       this.evict(state.commitments);
       this.evict(state.fills);
-      this.evict(state.positions);
     } catch (err) {
       logger.error(
         { err: err instanceof Error ? err.message : String(err), address },
@@ -294,32 +360,211 @@ export class OwnStateHub {
     }
   }
 
-  private async pollPositions(address: string, state: WalletPoller): Promise<void> {
-    const resState = state.positions;
-    const forward = await this.scanPositions(
-      address,
-      resState,
-      resState.tip,
-      null,
-      this.deps.maxForwardPages,
-      state.subs,
-    );
-    resState.tip = forward.tip;
-    const tipMs = Date.parse(resState.tip.s);
-    if (!Number.isFinite(tipMs)) return;
-    const floorIso = new Date(Math.max(0, tipMs - this.deps.overlapMs)).toISOString();
-    const overlap = await this.scanPositions(
-      address,
-      resState,
-      { s: floorIso, i: '0' },
-      resState.tip.s,
-      this.deps.maxOverlapPages,
-      state.subs,
-    );
-    if (!overlap.exhausted) {
-      logger.warn({ address }, 'ownStateHub positions: overlap window exceeded budget — resync');
-      this.resyncWallet(state, 'overlap_window_too_large');
+  /**
+   * Re-derive `positionStatus` for every tracked wallet position and emit on
+   * change. Mirrors `loadOwnStateSnapshot`'s join (positions →
+   * speculations → contests) so the stream and snapshot agree on derived
+   * state.
+   *
+   * Per-tick cost: one positions query (capped at 200 by
+   * `STATUS_DERIVATION_LIMIT`) + one speculations IN-list query + one
+   * contests IN-list query. Bounded; safe to run at the standard poll
+   * cadence.
+   *
+   * First-tick semantics: the cache is populated WITHOUT emitting. The
+   * SDK has just received either the cold-start snapshot or the resume
+   * catch-up's full re-derivation; re-emitting bootstrap state would only
+   * trigger reducer-dedup work. Subsequent ticks emit on derived-status
+   * change.
+   *
+   * 200-row cap: the snapshot helper's `fetchCategorizedPositions` uses
+   * the same cap. A wallet with more rows ORDERS BY `row_updated_at DESC`
+   * so the most-recent transitions still surface; long-quiet claimed
+   * positions naturally fall out of the window (they're terminal and
+   * never transition again, so missing them post-cap can't lose
+   * a future event).
+   */
+  private async reDerivePositionStatuses(
+    address: string,
+    state: WalletPoller,
+  ): Promise<void> {
+    const sb = this.deps.getClient();
+    const net = this.deps.getNetwork();
+    const positionsRes = await sb
+      .from('positions')
+      .select(
+        'speculation_id, user_address, position_type, risk_amount, profit_amount, ' +
+          'claimed, row_updated_at, id',
+      )
+      .eq('network', net)
+      .eq('user_address', address)
+      .order('row_updated_at', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(STATUS_DERIVATION_LIMIT);
+    if (positionsRes.error) {
+      logger.error(
+        { err: positionsRes.error.message, address },
+        'ownStateHub positionStatus: positions query failed',
+      );
+      return;
     }
+    const positions = (positionsRes.data ?? []) as unknown as Array<{
+      speculation_id: string | number;
+      user_address: string;
+      position_type: 'upper' | 'lower';
+      risk_amount: string | number | null;
+      profit_amount: string | number | null;
+      claimed: boolean;
+      row_updated_at: string;
+      id: string | number;
+    }>;
+    if (positions.length === 0) {
+      state.cachePopulated = true;
+      return;
+    }
+    const specIds = [...new Set(positions.map((p) => Number(p.speculation_id)))];
+    const specsById = new Map<
+      number,
+      {
+        speculation_id: number;
+        contest_id: number | null;
+        market_type: MarketType | null;
+        line_ticks: number | null;
+        speculation_status: 'open' | 'closed';
+        win_side: SpeculationInput['winSide'];
+        row_updated_at: string;
+      }
+    >();
+    if (specIds.length > 0) {
+      const specRes = await sb
+        .from('speculations')
+        .select(
+          'speculation_id, contest_id, market_type, line_ticks, speculation_status, ' +
+            'win_side, row_updated_at',
+        )
+        .eq('network', net)
+        .in('speculation_id', specIds);
+      if (specRes.error) {
+        logger.error(
+          { err: specRes.error.message, address },
+          'ownStateHub positionStatus: speculations join failed',
+        );
+        return;
+      }
+      for (const s of (specRes.data ?? []) as unknown as Array<{
+        speculation_id: number;
+        contest_id: number | null;
+        market_type: MarketType | null;
+        line_ticks: number | null;
+        speculation_status: 'open' | 'closed';
+        win_side: SpeculationInput['winSide'];
+        row_updated_at: string;
+      }>) {
+        specsById.set(s.speculation_id, s);
+      }
+    }
+    const contestIds = [
+      ...new Set(
+        [...specsById.values()]
+          .map((s) => s.contest_id)
+          .filter((id): id is number => id != null),
+      ),
+    ];
+    const contestsById = new Map<
+      number,
+      {
+        contest_id: number;
+        contest_status: ContestInput['contestStatus'];
+        away_score: number | null;
+        home_score: number | null;
+        row_updated_at: string;
+      }
+    >();
+    if (contestIds.length > 0) {
+      const contestRes = await sb
+        .from('contests')
+        .select('contest_id, contest_status, away_score, home_score, row_updated_at')
+        .eq('network', net)
+        .in('contest_id', contestIds);
+      if (contestRes.error) {
+        logger.error(
+          { err: contestRes.error.message, address },
+          'ownStateHub positionStatus: contests join failed',
+        );
+        return;
+      }
+      for (const c of (contestRes.data ?? []) as unknown as Array<{
+        contest_id: number;
+        contest_status: ContestInput['contestStatus'];
+        away_score: number | null;
+        home_score: number | null;
+        row_updated_at: string;
+      }>) {
+        contestsById.set(c.contest_id, c);
+      }
+    }
+
+    for (const row of positions) {
+      const spec = specsById.get(Number(row.speculation_id));
+      if (!spec) continue; // orphan — defensive skip
+      const contest = spec.contest_id != null ? contestsById.get(spec.contest_id) ?? null : null;
+      const positionType: 0 | 1 = row.position_type === 'upper' ? 0 : 1;
+      const sourceUpdatedAt = maxIsoTimestamp(
+        row.row_updated_at,
+        spec.row_updated_at,
+        contest?.row_updated_at,
+      );
+      const body = derivePositionStatus(
+        {
+          speculationId: String(row.speculation_id),
+          address: row.user_address.toLowerCase(),
+          positionType,
+          riskAmount: row.risk_amount as string | null,
+          profitAmount: row.profit_amount as string | null,
+          claimed: row.claimed,
+        },
+        {
+          speculationStatus: spec.speculation_status,
+          winSide: spec.win_side,
+          marketType: spec.market_type ?? 'moneyline',
+          lineTicks: spec.line_ticks,
+        },
+        contest
+          ? {
+              contestStatus: contest.contest_status,
+              awayScore: contest.away_score,
+              homeScore: contest.home_score,
+            }
+          : null,
+        sourceUpdatedAt,
+      );
+      const key = `${String(row.speculation_id)}_${positionType}`;
+      const prior = state.statusCache.get(key);
+      state.statusCache.set(key, { status: body.status, sourceUpdatedAt });
+      // Bootstrap: populate cache without emitting on the first tick. The
+      // SDK has just received the bootstrap state from the snapshot or
+      // catch-up; re-emitting it would only spend reducer-dedup work.
+      if (!state.cachePopulated) continue;
+      // Steady state: emit when derived status differs from the cache
+      // (covers both raw position transitions AND spec/contest-driven
+      // transitions on unchanged position rows). Equal-status repeats are
+      // dropped here, matching the dedup contract — the SDK reducer
+      // already keys on `(addr, specId, positionType, status,
+      // sourceUpdatedAt)` for cross-replay dedup.
+      if (prior && prior.status === body.status) continue;
+      for (const sub of state.subs) {
+        try {
+          sub.onPositionStatus(body, sourceUpdatedAt, String(row.id));
+        } catch (err) {
+          logger.error(
+            { err: err instanceof Error ? err.message : String(err), address },
+            'ownStateHub positionStatus: onPositionStatus threw',
+          );
+        }
+      }
+    }
+
+    state.cachePopulated = true;
   }
 
   // ── per-resource scans ────────────────────────────────────────────────
@@ -436,201 +681,6 @@ export class OwnStateHub {
         cmp = { s: row.row_updated_at, i: String(row.id) };
       }
       if (rows.length < this.deps.pollLimit) return { tip: cmp, exhausted: true };
-    }
-    return { tip: cmp, exhausted: false };
-  }
-
-  private async scanPositions(
-    address: string,
-    res: ResourceTipState,
-    start: Tip,
-    upperTs: string | null,
-    maxPages: number,
-    subs: Set<OwnStateSubscriber>,
-  ): Promise<ScanResult> {
-    let cmp = start;
-    for (let page = 0; page < maxPages; page += 1) {
-      let q = this.deps
-        .getClient()
-        .from('positions')
-        .select(
-          'speculation_id, user_address, position_type, risk_amount, profit_amount, ' +
-            'claimed, row_updated_at, id',
-        )
-        .eq('network', this.deps.getNetwork())
-        .eq('user_address', address)
-        .or(`row_updated_at.gt.${cmp.s},and(row_updated_at.eq.${cmp.s},id.gt.${cmp.i})`);
-      if (upperTs !== null) q = q.lte('row_updated_at', upperTs);
-      const { data, error } = await q
-        .order('row_updated_at', { ascending: true })
-        .order('id', { ascending: true })
-        .limit(this.deps.pollLimit);
-      if (error) {
-        logger.error({ err: error.message, address }, 'ownStateHub positions: query failed');
-        return { tip: cmp, exhausted: true };
-      }
-      const rawRows = (data ?? []) as unknown as Array<{
-        speculation_id: string | number;
-        user_address: string;
-        position_type: 'upper' | 'lower';
-        risk_amount: string | number | null;
-        profit_amount: string | number | null;
-        claimed: boolean;
-        row_updated_at: string;
-        id: string | number;
-      }>;
-
-      // Filter out rows we've already emitted before we run the join — saves
-      // a speculations/contests batch fetch when overlap-rescan finds zero
-      // new rows.
-      const fresh: typeof rawRows = [];
-      for (const row of rawRows) {
-        const key = `${row.row_updated_at}|${String(row.id)}`;
-        if (res.emitted.has(key)) {
-          cmp = { s: row.row_updated_at, i: String(row.id) };
-          continue;
-        }
-        fresh.push(row);
-      }
-      if (fresh.length === 0) {
-        if (rawRows.length < this.deps.pollLimit) return { tip: cmp, exhausted: true };
-        continue;
-      }
-
-      // Batch-fetch speculations + contests for status derivation.
-      const specIds = [...new Set(fresh.map((p) => Number(p.speculation_id)))];
-      const specById = new Map<
-        number,
-        {
-          speculation_id: number;
-          contest_id: number | null;
-          market_type: MarketType | null;
-          line_ticks: number | null;
-          speculation_status: 'open' | 'closed';
-          win_side: SpeculationInput['winSide'];
-        }
-      >();
-      if (specIds.length > 0) {
-        const specRes = await this.deps
-          .getClient()
-          .from('speculations')
-          .select(
-            'speculation_id, contest_id, market_type, line_ticks, speculation_status, win_side',
-          )
-          .eq('network', this.deps.getNetwork())
-          .in('speculation_id', specIds);
-        if (specRes.error) {
-          logger.error(
-            { err: specRes.error.message, address },
-            'ownStateHub positions: speculations join failed',
-          );
-          return { tip: cmp, exhausted: true };
-        }
-        for (const s of (specRes.data ?? []) as Array<{
-          speculation_id: number;
-          contest_id: number | null;
-          market_type: MarketType | null;
-          line_ticks: number | null;
-          speculation_status: 'open' | 'closed';
-          win_side: SpeculationInput['winSide'];
-        }>) {
-          specById.set(s.speculation_id, s);
-        }
-      }
-      const contestIds = [
-        ...new Set(
-          [...specById.values()]
-            .map((s) => s.contest_id)
-            .filter((id): id is number => id != null),
-        ),
-      ];
-      const contestById = new Map<
-        number,
-        {
-          contest_id: number;
-          contest_status: ContestInput['contestStatus'];
-          away_score: number | null;
-          home_score: number | null;
-        }
-      >();
-      if (contestIds.length > 0) {
-        const contestRes = await this.deps
-          .getClient()
-          .from('contests')
-          .select('contest_id, contest_status, away_score, home_score')
-          .eq('network', this.deps.getNetwork())
-          .in('contest_id', contestIds);
-        if (contestRes.error) {
-          logger.error(
-            { err: contestRes.error.message, address },
-            'ownStateHub positions: contests join failed',
-          );
-          return { tip: cmp, exhausted: true };
-        }
-        for (const c of (contestRes.data ?? []) as Array<{
-          contest_id: number;
-          contest_status: ContestInput['contestStatus'];
-          away_score: number | null;
-          home_score: number | null;
-        }>) {
-          contestById.set(c.contest_id, c);
-        }
-      }
-
-      for (const row of fresh) {
-        const key = `${row.row_updated_at}|${String(row.id)}`;
-        const tsMs = Date.parse(row.row_updated_at);
-        res.emitted.set(key, Number.isFinite(tsMs) ? tsMs : Date.now());
-
-        const spec = specById.get(Number(row.speculation_id));
-        if (!spec) {
-          // Defensive: a position with no speculation row is unsurfaceable —
-          // skip rather than emit a wrong status.
-          cmp = { s: row.row_updated_at, i: String(row.id) };
-          continue;
-        }
-        const contest =
-          spec.contest_id != null ? contestById.get(spec.contest_id) ?? null : null;
-        const positionInput: PositionInput = {
-          speculationId: String(row.speculation_id),
-          address: row.user_address.toLowerCase(),
-          positionType: row.position_type === 'upper' ? 0 : 1,
-          riskAmount: row.risk_amount as string | null,
-          profitAmount: row.profit_amount as string | null,
-          claimed: row.claimed,
-        };
-        const speculationInput: SpeculationInput = {
-          speculationStatus: spec.speculation_status,
-          winSide: spec.win_side,
-          marketType: spec.market_type ?? 'moneyline',
-          lineTicks: spec.line_ticks,
-        };
-        const contestInput: ContestInput | null = contest
-          ? {
-              contestStatus: contest.contest_status,
-              awayScore: contest.away_score,
-              homeScore: contest.home_score,
-            }
-          : null;
-        const body = derivePositionStatus(
-          positionInput,
-          speculationInput,
-          contestInput,
-          row.row_updated_at,
-        );
-        for (const sub of subs) {
-          try {
-            sub.onPositionStatus(body, row.row_updated_at, String(row.id));
-          } catch (err) {
-            logger.error(
-              { err: err instanceof Error ? err.message : String(err), address },
-              'ownStateHub positions: onPositionStatus threw',
-            );
-          }
-        }
-        cmp = { s: row.row_updated_at, i: String(row.id) };
-      }
-      if (rawRows.length < this.deps.pollLimit) return { tip: cmp, exhausted: true };
     }
     return { tip: cmp, exhausted: false };
   }

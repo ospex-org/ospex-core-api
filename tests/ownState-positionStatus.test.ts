@@ -234,6 +234,42 @@ describe('derivePositionStatus / status enum', () => {
     );
     expect(body.status).toBe('active');
   });
+
+  // ── zero-risk convergence with the snapshot's `fetchCategorizedPositions` ──
+  it('open + unscored + zero-risk ⇒ settledLost (transferred-out via secondary market)', () => {
+    const body = derivePositionStatus(
+      position({ riskAmount: '0', profitAmount: '0' }),
+      speculation({ speculationStatus: 'open', winSide: 'tbd' }),
+      contest({ contestStatus: 'unverified' }),
+      SOURCE_UPDATED_AT,
+    );
+    expect(body.status).toBe('settledLost');
+    expect(body.result).toBe('lost');
+    expect(body.claimableAmount).toBeUndefined();
+  });
+
+  it('open + unscored + zero-risk + null contest ⇒ settledLost', () => {
+    const body = derivePositionStatus(
+      position({ riskAmount: '0', profitAmount: '0' }),
+      speculation({ speculationStatus: 'open', winSide: 'tbd' }),
+      null,
+      SOURCE_UPDATED_AT,
+    );
+    expect(body.status).toBe('settledLost');
+  });
+
+  it('open + scored + zero-risk (predicted winner) ⇒ settledLost (payout=0)', () => {
+    // The pendingSettle winner branch already catches `riskWei6===0 || payoutWei6===0`
+    // and returns settledLost — covered here for completeness alongside the new
+    // fall-through case above.
+    const body = derivePositionStatus(
+      position({ riskAmount: '0', profitAmount: '0' }),
+      speculation({ marketType: 'moneyline' }),
+      contest({ contestStatus: 'scored', awayScore: 10, homeScore: 5 }),
+      SOURCE_UPDATED_AT,
+    );
+    expect(body.status).toBe('settledLost');
+  });
 });
 
 describe('positionStatusRank', () => {

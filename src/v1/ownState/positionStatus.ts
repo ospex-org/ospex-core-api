@@ -294,5 +294,19 @@ export function derivePositionStatus(
     // predict returned null → fall through to active.
   }
 
+  // Zero-risk + open + unscored ⇒ terminal-lost rather than active.
+  // Closed/scored branches above already short-circuit zero-risk to
+  // `settledLost` via the payout==0 check (or to `void` when the
+  // speculation voided — both terminal, label preserved for accuracy).
+  // The fall-through here catches the open + secondary-market-transferred
+  // case where the position lost its stake before any speculation/contest
+  // signal — `fetchCategorizedPositions` (positionFetch.ts:206-225)
+  // omits these rows from the REST snapshot for the same reason. Surface
+  // as `settledLost` so the SDK reducer transitions a previously-active
+  // row to terminal instead of treating it as live own-position exposure.
+  if (riskWei6 === 0n) {
+    return { ...base, status: 'settledLost', result: 'lost' };
+  }
+
   return { ...base, status: 'active' };
 }

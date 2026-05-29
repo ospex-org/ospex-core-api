@@ -273,6 +273,36 @@ describe('GET /v1/stream/own-state — cold start (no cursor)', () => {
     expect((ev[0] as { data: { truncated: boolean } }).data.truncated).toBe(false);
   });
 
+  it('emits snapshot WITHOUT ready when positions truncated; ends the connection', async () => {
+    // Force positions truncation: position helper signals hitCap=true; commitments
+    // stay clean. SDK reconnects with the cursor (p preserved as SENTINEL) and the
+    // resume catch-up replays position transitions before `ready`.
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: [],
+      pendingSettle: [],
+      claimable: [],
+      hitCap: true,
+    });
+    supabaseMock.getSupabase.mockImplementation(() =>
+      sequencedClient([
+        { data: [], error: null }, // active commitments query
+        { data: null, error: null }, // maxFills
+        // No maxPositions query — when positionsTruncated, snapshot preserves
+        // cursor.p as SENTINEL_WATERMARK (cold start) instead of querying.
+      ]),
+    );
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+    await flushTicks(64);
+    const ev = events(res);
+    const snap = ev.find((e) => e.event === 'snapshot');
+    expect(snap).toBeDefined();
+    expect((snap as { data: { positionsTruncated: boolean } }).data.positionsTruncated).toBe(true);
+    expect((snap as { data: { truncated: boolean } }).data.truncated).toBe(false);
+    expect(ev.find((e) => e.event === 'ready')).toBeUndefined();
+    expect(res.writableEnded).toBe(true);
+  });
+
   it('emits snapshot WITHOUT ready when commitments truncated; ends the connection', async () => {
     // Force truncation: cap the snapshot at maxCommitments=1, return 1 active row.
     envMock.loadConfig.mockReturnValue({
@@ -339,6 +369,69 @@ describe('GET /v1/stream/own-state — resume catchup', () => {
     const ev = events(res);
     // No snapshot on resume; just ready when catchup is empty (default fixtures).
     expect(ev.find((e) => e.event === 'snapshot')).toBeUndefined();
+    expect(ev.find((e) => e.event === 'ready')).toBeDefined();
+  });
+
+  it('catchup emits positionStatus derived from joined spec/contest even when position row is unchanged', async () => {
+    // Spec/contest-driven convergence: a contest scoring (or speculation
+    // settling) after the cursor was minted but with no position-row bump
+    // still must surface via the resume catch-up — the
+    // `sourceUpdatedAt = max(pos, spec, contest)` derivation makes the
+    // transition observable through `cursor.p`.
+    const positionRow = {
+      speculation_id: 101,
+      user_address: ADDRESS,
+      position_type: 'upper',
+      risk_amount: '1000000',
+      profit_amount: '500000',
+      claimed: false,
+      // pre-cursor timestamp
+      row_updated_at: '2026-05-29T13:00:00.000Z',
+      id: 7,
+    };
+    const specRowSettled = {
+      speculation_id: 101,
+      contest_id: 42,
+      market_type: 'moneyline',
+      line_ticks: null,
+      speculation_status: 'closed',
+      win_side: 'away',
+      // POST-cursor timestamp — drives the derivation forward
+      row_updated_at: '2026-05-29T15:30:00.000Z',
+    };
+    const contestRowStatic = {
+      contest_id: 42,
+      contest_status: 'verified',
+      away_score: null,
+      home_score: null,
+      row_updated_at: '2026-05-29T13:00:00.000Z',
+    };
+    // Catchup sequence: commitments empty → fills empty → positions list →
+    // speculations IN-list → contests IN-list. The first two return empty data;
+    // the positions query returns the single row; the joins return the spec/contest.
+    supabaseMock.getSupabase.mockImplementation(() =>
+      sequencedClient([
+        { data: [], error: null }, // commitments catchup
+        { data: [], error: null }, // fills catchup
+        { data: [positionRow], error: null }, // positions catchup
+        { data: [specRowSettled], error: null }, // speculations join
+        { data: [contestRowStatic], error: null }, // contests join
+      ]),
+    );
+    const res = makeRes();
+    getOwnStateStreamHandler(
+      makeReq({ query: { cursor: liveCursor() } }),
+      res as unknown as Response,
+    );
+    await flushTicks(64);
+    const ev = events(res);
+    const ps = ev.find((e) => e.event === 'positionStatus');
+    expect(ps).toBeDefined();
+    expect((ps as { data: { status: string } }).data.status).toBe('claimable');
+    // sourceUpdatedAt should be the spec's row_updated_at (the max).
+    expect((ps as { data: { sourceUpdatedAt: string } }).data.sourceUpdatedAt).toBe(
+      '2026-05-29T15:30:00.000Z',
+    );
     expect(ev.find((e) => e.event === 'ready')).toBeDefined();
   });
 

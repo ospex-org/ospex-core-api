@@ -46,10 +46,10 @@ describe('ChallengeStore', () => {
   const ADDR = '0x1111111111111111111111111111111111111111';
   const NOW_SEC = Math.floor(Date.parse('2026-05-28T16:00:00.000Z') / 1000);
 
-  // Hermes review-30 round 2: the store now records EVERY server-set field
-  // (`address`, `issuedAt`, `expiresAt`) and consume() requires an exact match
-  // on the submitted typed-data. A small fixture keeps tests readable when
-  // they only care about one mutation.
+  // The store records EVERY server-set field (`address`, `issuedAt`,
+  // `expiresAt`) and consume() requires an exact match on the submitted
+  // typed-data. A small fixture keeps tests readable when they only care
+  // about one mutation.
   function fixtureChallenge(over: Partial<StreamChallenge> = {}): StreamChallenge {
     return {
       address: ADDR,
@@ -138,10 +138,10 @@ describe('ChallengeStore', () => {
     });
   });
 
-  // Hermes review-30 round 2 blocker: the server was trusting client-supplied
-  // timestamps, so a wallet re-signing a mutated expiresAt got a fresh token
-  // back. The store now binds the exact minted timestamps.
-  describe('issuedAt/expiresAt binding (review-30 round 2)', () => {
+  // Mint-binding regression: trusting client-supplied timestamps would let
+  // a wallet re-signing a mutated expiresAt get a fresh token back. The
+  // store binds the exact minted timestamps.
+  describe('issuedAt/expiresAt binding', () => {
     it('rejects a mutated expiresAt as tampered', () => {
       const store = new ChallengeStore();
       const id = generateChallengeId();
@@ -263,14 +263,14 @@ describe('mintStreamAuthToken / verifyStreamAuthToken', () => {
     });
   });
 
-  // Hermes review-30 (round 1): `Buffer.from(s, 'base64url')` is LENIENT —
-  // it strips non-alphabet bytes and padding. Round 2 additionally caught
-  // the unused-pad-bit case: a 32-byte HMAC encodes to 43 base64url chars
-  // with 2 unused bits in the last char, so four distinct chars decode to
-  // the same byte sequence. The canonical roundtrip check
+  // `Buffer.from(s, 'base64url')` is LENIENT — it strips non-alphabet
+  // bytes and padding, AND silently accepts unused-pad-bit variants:
+  // a 32-byte HMAC encodes to 43 base64url chars with 2 unused bits
+  // in the last char, so four distinct chars decode to the same byte
+  // sequence. The canonical roundtrip check
   // (`Buffer.from(s, 'base64url').toString('base64url') === s`) subsumes
   // all three (non-alphabet, padding, equivalent-pad-bit variants).
-  describe('canonical base64url roundtrip (review-30 rounds 1+2)', () => {
+  describe('canonical base64url roundtrip', () => {
     it('rejects a token whose sig segment carries trailing non-alphabet bytes', () => {
       const valid = mintStreamAuthToken(claims(), SECRET);
       const tampered = `${valid}!!!!`;
@@ -299,7 +299,7 @@ describe('mintStreamAuthToken / verifyStreamAuthToken', () => {
       });
     });
 
-    // Hermes round 2 repro: the 43-char sig has 2 unused pad bits in the
+    // Unused-pad-bit case: the 43-char sig has 2 unused pad bits in the
     // last char, so four chars decode to the same 32 bytes. Computed via
     // exhaustive search of the alphabet — works whatever the canonical
     // last char happens to be for this particular HMAC output.

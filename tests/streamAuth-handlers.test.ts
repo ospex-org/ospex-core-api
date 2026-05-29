@@ -152,11 +152,11 @@ describe('POST /v1/auth/stream-challenge', () => {
     expect(res.body).toMatchObject({ code: 'NOT_READY' });
   });
 
-  // Hermes review-30: stream-challenge previously only required AUDIENCE +
-  // MATCHING_MODULE_ADDRESS, but a challenge minted with HMAC_SECRET unset
-  // cannot be traded for a token — dead-end UX. Unified contract: BOTH
-  // endpoints require all three vars.
-  it('503 NOT_READY when HMAC secret is missing (unified contract — review-30)', () => {
+  // Unified readiness contract: BOTH endpoints require all three env vars
+  // (AUDIENCE + MATCHING_MODULE_ADDRESS + HMAC_SECRET). A challenge minted
+  // with HMAC_SECRET unset cannot be traded for a token, so it's dead-end
+  // UX — fail at the first call.
+  it('503 NOT_READY when HMAC secret is missing (unified contract)', () => {
     envMock.loadConfig.mockReturnValue({
       network: 'polygon',
       chainId: 137,
@@ -321,14 +321,14 @@ describe('POST /v1/auth/stream-token', () => {
     expect(res.body).toMatchObject({ code: 'AUTH_CHALLENGE_EXPIRED' });
   });
 
-  // ── Hermes review-30 round 2 BLOCKER ─────────────────────────────────
+  // ── Tampered-challenge protection ────────────────────────────────────
   // A valid wallet that re-signs a CLIENT-MUTATED challenge (e.g. flipped
-  // expiresAt) used to succeed because the server stored only address +
-  // expiresAt and trusted client-supplied timestamps. The exchange now binds
-  // every server-minted field, so the mutated typed-data hits
-  // AUTH_CHALLENGE_TAMPERED before the token is issued.
-  describe('signed-but-tampered challenge timestamps (review-30 round 2)', () => {
-    it('expiresAt mutated to the past → 401 AUTH_CHALLENGE_TAMPERED (Hermes repro)', async () => {
+  // expiresAt) would succeed if the server stored only address + expiresAt
+  // and trusted client-supplied timestamps. The exchange binds every
+  // server-minted field, so mutated typed-data hits AUTH_CHALLENGE_TAMPERED
+  // before the token is issued.
+  describe('signed-but-tampered challenge timestamps', () => {
+    it('expiresAt mutated to the past → 401 AUTH_CHALLENGE_TAMPERED', async () => {
       const wallet = ethers.Wallet.createRandom();
       const nowSec = Math.floor(Date.now() / 1000);
       const { challenge, signature } = await mintAndSign({
@@ -380,11 +380,11 @@ describe('POST /v1/auth/stream-token', () => {
     expect(res.body).toMatchObject({ code: 'INVALID_PARAM' });
   });
 
-  // ── Hermes review-30 BLOCKER: malformed timestamps must 400, not 500 ──
-  // Each of these would previously reach `BigInt(c.issuedAt)` and throw
-  // a RangeError that Express turned into a 500. The parser must catch
-  // them at the boundary — they're publicly-submittable values.
-  describe('safe-integer guards on numeric challenge fields (review-30)', () => {
+  // ── Malformed-timestamp boundary guard: 400, not 500 ─────────────────
+  // Each of these would reach `BigInt(c.issuedAt)` and throw a RangeError
+  // that Express turned into a 500. The parser catches them at the
+  // boundary — they're publicly-submittable values.
+  describe('safe-integer guards on numeric challenge fields', () => {
     function bodyWithChallengeOverride(over: Record<string, unknown>): { challenge: Record<string, unknown>; signature: string } {
       return {
         challenge: {

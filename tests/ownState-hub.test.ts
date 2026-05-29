@@ -233,7 +233,12 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
     ]);
   });
 
-  it('emits onPositionStatus, joining speculations + contests for derivation', async () => {
+  it('first tick populates statusCache WITHOUT emitting; second tick with no change still no-ops', async () => {
+    // Bootstrap contract: the SDK already has the snapshot's positions[]
+    // when the hub starts polling, so re-emitting the bootstrap state on
+    // first tick would only spend reducer-dedup work. The hub populates
+    // its cache on tick 1 silently and only emits on subsequent ticks
+    // when the derived status differs.
     const row = positionRow();
     const spec = speculationRow();
     const contest = contestRow();
@@ -251,9 +256,130 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
     const cb = makeCallbacks();
     hub.subscribe(ADDRESS, cb);
     await hub.pollWallet(ADDRESS);
-    // away 10 home 5 → upper (=away) wins predicted → pendingSettle
+    expect(cb.positionStatuses).toEqual([]);
+    await hub.pollWallet(ADDRESS);
+    expect(cb.positionStatuses).toEqual([]);
+  });
+
+  it('emits onPositionStatus when derived status changes (claim flip after bootstrap)', async () => {
+    const row = positionRow();
+    const spec = speculationRow();
+    const contest = contestRow();
+    let positionsData: Row[] = [row];
+
+    const hub = new OwnStateHub({
+      // Fresh client per call so each tick reads the current `positionsData`
+      // value via closure — supabase-js's promise resolves at .then() time,
+      // which captures the array contents as of the call to the mock.
+      getClient: () =>
+        makeClient({
+          positions: positionsData,
+          speculations: [spec],
+          contests: [contest],
+        }),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+    });
+    const cb = makeCallbacks();
+    hub.subscribe(ADDRESS, cb);
+    await hub.pollWallet(ADDRESS); // tick 1: bootstrap status='pendingSettle' (no emit)
+    expect(cb.positionStatuses).toEqual([]);
+    // Flip claimed=true with bumped row_updated_at on the position row.
+    const claimedRow = {
+      ...row,
+      claimed: true,
+      row_updated_at: '2026-05-29T15:40:00.000Z',
+    };
+    positionsData.length = 0;
+    positionsData.push(claimedRow);
+    await hub.pollWallet(ADDRESS); // tick 2: status transitioned pendingSettle → claimed
     expect(cb.positionStatuses).toEqual([
-      { ts: row.row_updated_at, id: String(row.id), status: 'pendingSettle' },
+      { ts: '2026-05-29T15:40:00.000Z', id: String(row.id), status: 'claimed' },
+    ]);
+  });
+
+  it('spec-only transition (speculation_status open→closed, position row unchanged) ⇒ emit', async () => {
+    const row = positionRow();
+    // Tick 1: spec open, no win_side, contest unscored
+    const specBefore = speculationRow({ speculation_status: 'open', win_side: 'tbd' });
+    const contestBefore = contestRow({ contest_status: 'unverified', away_score: null, home_score: null });
+    let specs: Row[] = [specBefore];
+    let contests: Row[] = [contestBefore];
+
+    const hub = new OwnStateHub({
+      getClient: () =>
+        makeClient({
+          positions: [row],
+          speculations: specs,
+          contests: contests,
+        }),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+    });
+    const cb = makeCallbacks();
+    hub.subscribe(ADDRESS, cb);
+    await hub.pollWallet(ADDRESS); // bootstrap: status='active'
+    expect(cb.positionStatuses).toEqual([]);
+    // Tick 2: speculation closed with win_side='away' (upper position wins).
+    // Position row.row_updated_at UNCHANGED — the raw-row dedup of the old
+    // code would have missed this. The semantic-event-key dedup catches it.
+    const specAfter = speculationRow({
+      speculation_status: 'closed',
+      win_side: 'away',
+      row_updated_at: '2026-05-29T15:30:00.000Z',
+    });
+    specs.length = 0;
+    specs.push(specAfter);
+    await hub.pollWallet(ADDRESS);
+    expect(cb.positionStatuses).toEqual([
+      {
+        // sourceUpdatedAt is the MAX of (position, spec, contest) row_updated_ats — here the spec.
+        ts: '2026-05-29T15:30:00.000Z',
+        id: String(row.id),
+        status: 'claimable',
+      },
+    ]);
+  });
+
+  it('contest-only transition (contest unverified→scored, position+spec unchanged) ⇒ emit', async () => {
+    const row = positionRow();
+    const specStaticOpen = speculationRow({ speculation_status: 'open', win_side: 'tbd' });
+    const contestBefore = contestRow({ contest_status: 'unverified', away_score: null, home_score: null });
+    let contests: Row[] = [contestBefore];
+
+    const hub = new OwnStateHub({
+      getClient: () =>
+        makeClient({
+          positions: [row],
+          speculations: [specStaticOpen],
+          contests: contests,
+        }),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+    });
+    const cb = makeCallbacks();
+    hub.subscribe(ADDRESS, cb);
+    await hub.pollWallet(ADDRESS); // bootstrap: active
+    expect(cb.positionStatuses).toEqual([]);
+    // Tick 2: contest scored (upper/away predicted winner).
+    const contestAfter = contestRow({
+      contest_status: 'scored',
+      away_score: 10,
+      home_score: 5,
+      row_updated_at: '2026-05-29T15:35:00.000Z',
+    });
+    contests.length = 0;
+    contests.push(contestAfter);
+    await hub.pollWallet(ADDRESS);
+    expect(cb.positionStatuses).toEqual([
+      {
+        ts: '2026-05-29T15:35:00.000Z',
+        id: String(row.id),
+        status: 'pendingSettle',
+      },
     ]);
   });
 

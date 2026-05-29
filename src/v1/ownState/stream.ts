@@ -11,9 +11,15 @@
  *   the maker's complete current state via the shared `loadOwnStateSnapshot`
  *   helper. If the snapshot was complete (`truncated: false` AND
  *   `positionsTruncated: false`), the server immediately emits `event: ready`
- *   and transitions to live. If the commitments page was truncated, NO `ready`
- *   is emitted — per spec §6.2 the SDK pages REST `/v1/own-state/snapshot?cursor=`
- *   until untruncated, then reconnects to this stream with the final cursor.
+ *   and transitions to live. If EITHER `truncated` or `positionsTruncated` is
+ *   true, NO `ready` is emitted and the connection ends:
+ *     - `truncated` (commitments): per spec §6.2 the SDK pages REST
+ *       `/v1/own-state/snapshot?cursor=` until untruncated, then reconnects
+ *       to this stream with the final cursor.
+ *     - `positionsTruncated`: the snapshot preserves `cursor.p` as sentinel
+ *       (cold start) or input value, so the SDK reconnects to this stream
+ *       with the emitted cursor and resume catch-up replays every position
+ *       transition from the preserved tail before `ready`.
  *
  *   RESUME (cursor present) — server runs per-resource catch-up replay from the
  *   cursor's watermarks (commitments, position_fills, positions). Each replayed
@@ -66,7 +72,6 @@ import {
 import {
   derivePositionStatus,
   type ContestInput,
-  type PositionInput,
   type PositionStatusEventBody,
   type SpeculationInput,
 } from './positionStatus.js';
@@ -289,11 +294,23 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
           res.end();
           return;
         }
-        if (result.body.truncated) {
-          // Snapshot incomplete — SDK pages REST then reconnects. No `ready`.
-          // We close the stream so the SDK doesn't hold an idle slot during
-          // the REST page-through.
-          preReadyCompletedTotal += 1; // we delivered the snapshot we could
+        if (result.body.truncated || result.body.positionsTruncated) {
+          // Snapshot incomplete on at least one resource — must NOT emit
+          // `ready`. The two truncation kinds end on different paths:
+          //
+          //   - `truncated` (commitments): SDK pages REST
+          //     `/v1/own-state/snapshot?cursor=` until untruncated, then
+          //     reconnects to this stream with the final cursor.
+          //
+          //   - `positionsTruncated`: the snapshot helper preserves
+          //     `cursor.p` as sentinel (cold start) or the input cursor's
+          //     value, so the SDK reconnects to this stream WITH the
+          //     emitted cursor, and resume catch-up replays every position
+          //     transition from the preserved tail before `ready`.
+          //
+          // Either way we end this connection so the SDK doesn't hold a
+          // slot while it transitions to the recovery path.
+          preReadyCompletedTotal += 1;
           res.end();
           return;
         }
@@ -555,6 +572,35 @@ async function catchUpFills(
   return 'resync';
 }
 
+/**
+ * Catch up `positionStatus` since `cursorWatermark` (cursor `p`).
+ *
+ * `positionStatus` is a DERIVED event over (positions, speculations,
+ * contests) — a transition can be caused by any of the three source rows
+ * (position claim/transfer, speculation settling, contest scoring).
+ * Keyset-paging on `positions.row_updated_at` alone would miss every
+ * speculation/contest-driven transition since the position row doesn't
+ * move. The catch-up mirrors `OwnStateHub.reDerivePositionStatuses`:
+ *
+ *   1. Query the wallet's positions (capped 200, ORDER BY row_updated_at DESC).
+ *   2. Batch-join speculations + contests.
+ *   3. Compute `sourceUpdatedAt = max(pos.row, spec.row, contest.row)` per row.
+ *   4. Emit current derived status for every row whose
+ *      `(sourceUpdatedAt, position.id) > (cursor.p, cursor.p.i)`, with an
+ *      overlap floor on the first call (`watermarkLiveKeysetOr` semantics).
+ *
+ * Cursor `p` then carries the highest-effective `sourceUpdatedAt` covered
+ * (advanced by `emit`). The SDK reducer dedupes the catch-up against its
+ * own snapshot state via the semantic event key
+ * `(addr, specId, positionType, status, sourceUpdatedAt)`; over-emission
+ * (e.g. unchanged statuses) is benign.
+ *
+ * Saturation: when the position query returns the full 200-row cap, the
+ * wallet may have more positions whose effective timestamps we couldn't
+ * inspect. Emit `resync` so the SDK re-snapshots — the snapshot helper
+ * will hit `positionsTruncated: true` and the SDK's recovery flow takes
+ * over (see snapshot.ts `positionsTruncated` contract).
+ */
 async function catchUpPositions(
   res: Response,
   sb: ReturnType<typeof getSupabase>,
@@ -565,163 +611,239 @@ async function catchUpPositions(
   shed: () => void,
   emit: (body: PositionStatusEventBody, ts: string, id: string) => void,
 ): Promise<CatchupStatus> {
-  let firstPage = true;
-  let cmp: ResourceWatermark = cursorWatermark;
-  for (let page = 0; page < CATCHUP_MAX_PAGES; page += 1) {
-    if (isClosed() || res.writableEnded) return 'closed';
-    const cmpEffective = firstPage ? floorBaseWatermark(cursorWatermark) : cmp;
-    const orExpr = `row_updated_at.gt.${cmpEffective.s},and(row_updated_at.eq.${cmpEffective.s},id.gt.${cmpEffective.i})`;
-    const { data, error } = await sb
-      .from('positions')
+  if (isClosed() || res.writableEnded) return 'closed';
+
+  // Step 1: positions (the full snapshot-equivalent population).
+  const positionsRes = await sb
+    .from('positions')
+    .select(
+      'speculation_id, user_address, position_type, risk_amount, profit_amount, ' +
+        'claimed, row_updated_at, id',
+    )
+    .eq('network', net)
+    .eq('user_address', address)
+    .order('row_updated_at', { ascending: false })
+    .order('id', { ascending: false })
+    .limit(CATCHUP_POSITIONS_LIMIT);
+  if (positionsRes.error) {
+    logger.error(
+      { err: positionsRes.error.message, address },
+      'ownState/stream catchup: positions query failed',
+    );
+    writeOwnStateEvent(res, 'resync', { reason: 'catchup_failed' });
+    return 'resync';
+  }
+  const positions = (positionsRes.data ?? []) as unknown as Array<{
+    speculation_id: string | number;
+    user_address: string;
+    position_type: 'upper' | 'lower';
+    risk_amount: string | number | null;
+    profit_amount: string | number | null;
+    claimed: boolean;
+    row_updated_at: string;
+    id: string | number;
+  }>;
+  if (positions.length === 0) return 'complete';
+
+  // Step 2a: batch speculation join (carries row_updated_at for the
+  // source-timestamp derivation).
+  const specIds = [...new Set(positions.map((p) => Number(p.speculation_id)))];
+  const specsById = new Map<
+    number,
+    {
+      speculation_id: number;
+      contest_id: number | null;
+      market_type: MarketType | null;
+      line_ticks: number | null;
+      speculation_status: 'open' | 'closed';
+      win_side: SpeculationInput['winSide'];
+      row_updated_at: string;
+    }
+  >();
+  if (specIds.length > 0) {
+    const specRes = await sb
+      .from('speculations')
       .select(
-        'speculation_id, user_address, position_type, risk_amount, profit_amount, ' +
-          'claimed, row_updated_at, id',
+        'speculation_id, contest_id, market_type, line_ticks, speculation_status, ' +
+          'win_side, row_updated_at',
       )
       .eq('network', net)
-      .eq('user_address', address)
-      .or(orExpr)
-      .order('row_updated_at', { ascending: true })
-      .order('id', { ascending: true })
-      .limit(CATCHUP_PAGE);
-    if (error) {
-      logger.error({ err: error.message, address }, 'ownState/stream catchup: positions query failed');
+      .in('speculation_id', specIds);
+    if (specRes.error) {
+      logger.error(
+        { err: specRes.error.message, address },
+        'ownState/stream catchup: speculations join failed',
+      );
       writeOwnStateEvent(res, 'resync', { reason: 'catchup_failed' });
       return 'resync';
     }
-    const rawRows = (data ?? []) as unknown as Array<{
-      speculation_id: string | number;
-      user_address: string;
-      position_type: 'upper' | 'lower';
-      risk_amount: string | number | null;
-      profit_amount: string | number | null;
-      claimed: boolean;
+    for (const s of (specRes.data ?? []) as unknown as Array<{
+      speculation_id: number;
+      contest_id: number | null;
+      market_type: MarketType | null;
+      line_ticks: number | null;
+      speculation_status: 'open' | 'closed';
+      win_side: SpeculationInput['winSide'];
       row_updated_at: string;
-      id: string | number;
-    }>;
-    if (rawRows.length === 0) return 'complete';
-
-    // Batch-fetch speculations + contests for this page.
-    const specIds = [...new Set(rawRows.map((p) => Number(p.speculation_id)))];
-    const specById = new Map<
-      number,
-      {
-        speculation_id: number;
-        contest_id: number | null;
-        market_type: MarketType | null;
-        line_ticks: number | null;
-        speculation_status: 'open' | 'closed';
-        win_side: SpeculationInput['winSide'];
-      }
-    >();
-    if (specIds.length > 0) {
-      const specRes = await sb
-        .from('speculations')
-        .select('speculation_id, contest_id, market_type, line_ticks, speculation_status, win_side')
-        .eq('network', net)
-        .in('speculation_id', specIds);
-      if (specRes.error) {
-        logger.error(
-          { err: specRes.error.message, address },
-          'ownState/stream catchup: speculations join failed',
-        );
-        writeOwnStateEvent(res, 'resync', { reason: 'catchup_failed' });
-        return 'resync';
-      }
-      for (const s of (specRes.data ?? []) as Array<{
-        speculation_id: number;
-        contest_id: number | null;
-        market_type: MarketType | null;
-        line_ticks: number | null;
-        speculation_status: 'open' | 'closed';
-        win_side: SpeculationInput['winSide'];
-      }>) {
-        specById.set(s.speculation_id, s);
-      }
+    }>) {
+      specsById.set(s.speculation_id, s);
     }
-    const contestIds = [
-      ...new Set(
-        [...specById.values()]
-          .map((s) => s.contest_id)
-          .filter((id): id is number => id != null),
-      ),
-    ];
-    const contestById = new Map<
-      number,
-      {
-        contest_id: number;
-        contest_status: ContestInput['contestStatus'];
-        away_score: number | null;
-        home_score: number | null;
-      }
-    >();
-    if (contestIds.length > 0) {
-      const contestRes = await sb
-        .from('contests')
-        .select('contest_id, contest_status, away_score, home_score')
-        .eq('network', net)
-        .in('contest_id', contestIds);
-      if (contestRes.error) {
-        logger.error(
-          { err: contestRes.error.message, address },
-          'ownState/stream catchup: contests join failed',
-        );
-        writeOwnStateEvent(res, 'resync', { reason: 'catchup_failed' });
-        return 'resync';
-      }
-      for (const c of (contestRes.data ?? []) as Array<{
-        contest_id: number;
-        contest_status: ContestInput['contestStatus'];
-        away_score: number | null;
-        home_score: number | null;
-      }>) {
-        contestById.set(c.contest_id, c);
-      }
-    }
+  }
 
-    for (const row of rawRows) {
-      const spec = specById.get(Number(row.speculation_id));
-      if (!spec) continue;
-      const contest =
-        spec.contest_id != null ? contestById.get(spec.contest_id) ?? null : null;
-      const positionInput: PositionInput = {
+  // Step 2b: batch contest join (carries row_updated_at).
+  const contestIds = [
+    ...new Set(
+      [...specsById.values()]
+        .map((s) => s.contest_id)
+        .filter((id): id is number => id != null),
+    ),
+  ];
+  const contestsById = new Map<
+    number,
+    {
+      contest_id: number;
+      contest_status: ContestInput['contestStatus'];
+      away_score: number | null;
+      home_score: number | null;
+      row_updated_at: string;
+    }
+  >();
+  if (contestIds.length > 0) {
+    const contestRes = await sb
+      .from('contests')
+      .select('contest_id, contest_status, away_score, home_score, row_updated_at')
+      .eq('network', net)
+      .in('contest_id', contestIds);
+    if (contestRes.error) {
+      logger.error(
+        { err: contestRes.error.message, address },
+        'ownState/stream catchup: contests join failed',
+      );
+      writeOwnStateEvent(res, 'resync', { reason: 'catchup_failed' });
+      return 'resync';
+    }
+    for (const c of (contestRes.data ?? []) as unknown as Array<{
+      contest_id: number;
+      contest_status: ContestInput['contestStatus'];
+      away_score: number | null;
+      home_score: number | null;
+      row_updated_at: string;
+    }>) {
+      contestsById.set(c.contest_id, c);
+    }
+  }
+
+  // Step 3: cursor floor for the "deliver if newer" filter. The input
+  // cursor is `k='live'` (validated upstream), so the first call applies
+  // the overlap floor — a late-committing tx whose effective timestamp
+  // predates the cursor still surfaces.
+  const flooredCursor = floorBaseWatermark(cursorWatermark);
+  const flooredMs = Date.parse(flooredCursor.s);
+  const flooredId = (() => {
+    try {
+      return BigInt(flooredCursor.i);
+    } catch {
+      return 0n;
+    }
+  })();
+
+  // Step 4: derive, filter, emit. Sort by (sourceUpdatedAt, id) ASC so
+  // the cursor advances monotonically for the SDK's reducer.
+  type DerivedRow = {
+    body: PositionStatusEventBody;
+    sourceUpdatedAt: string;
+    sourceMs: number;
+    id: string;
+  };
+  const derived: DerivedRow[] = [];
+  for (const row of positions) {
+    const spec = specsById.get(Number(row.speculation_id));
+    if (!spec) continue; // orphan — defensive skip
+    const contest = spec.contest_id != null ? contestsById.get(spec.contest_id) ?? null : null;
+    const sourceUpdatedAt = maxIsoTimestampStream(
+      row.row_updated_at,
+      spec.row_updated_at,
+      contest?.row_updated_at,
+    );
+    const body = derivePositionStatus(
+      {
         speculationId: String(row.speculation_id),
         address: row.user_address.toLowerCase(),
         positionType: row.position_type === 'upper' ? 0 : 1,
         riskAmount: row.risk_amount as string | null,
         profitAmount: row.profit_amount as string | null,
         claimed: row.claimed,
-      };
-      const speculationInput: SpeculationInput = {
+      },
+      {
         speculationStatus: spec.speculation_status,
         winSide: spec.win_side,
         marketType: spec.market_type ?? 'moneyline',
         lineTicks: spec.line_ticks,
-      };
-      const contestInput: ContestInput | null = contest
+      },
+      contest
         ? {
             contestStatus: contest.contest_status,
             awayScore: contest.away_score,
             homeScore: contest.home_score,
           }
-        : null;
-      const body = derivePositionStatus(
-        positionInput,
-        speculationInput,
-        contestInput,
-        row.row_updated_at,
-      );
-      emit(body, row.row_updated_at, String(row.id));
+        : null,
+      sourceUpdatedAt,
+    );
+    const sourceMs = Date.parse(sourceUpdatedAt);
+    if (!Number.isFinite(sourceMs)) continue;
+    // (sourceMs, id) > (flooredMs, flooredId) — strict greater-than for the
+    // semantic keyset advance. Equal-source AND equal-id can't happen for
+    // distinct positions but the comparison is still well-defined.
+    let idBig: bigint;
+    try {
+      idBig = BigInt(String(row.id));
+    } catch {
+      idBig = 0n;
     }
-    shed();
-    if (res.writableEnded) return 'closed';
-    if (rawRows.length < CATCHUP_PAGE) return 'complete';
-    const last = rawRows[rawRows.length - 1]!;
-    cmp = { s: last.row_updated_at, i: String(last.id) };
-    firstPage = false;
+    if (sourceMs < flooredMs) continue;
+    if (sourceMs === flooredMs && idBig <= flooredId) continue;
+    derived.push({ body, sourceUpdatedAt, sourceMs, id: String(row.id) });
   }
-  writeOwnStateEvent(res, 'resync', { reason: 'backlog_too_large' });
-  return 'resync';
+  derived.sort((a, b) => {
+    if (a.sourceMs !== b.sourceMs) return a.sourceMs - b.sourceMs;
+    return Number(BigInt(a.id) - BigInt(b.id));
+  });
+  for (const d of derived) {
+    if (isClosed() || res.writableEnded) return 'closed';
+    emit(d.body, d.sourceUpdatedAt, d.id);
+    shed();
+  }
+  if (res.writableEnded) return 'closed';
+
+  // Saturation: hit the cap; more positions may exist whose status we
+  // couldn't inspect → re-snapshot is the safe path.
+  if (positions.length >= CATCHUP_POSITIONS_LIMIT) {
+    writeOwnStateEvent(res, 'resync', { reason: 'positions_cap_exceeded' });
+    return 'resync';
+  }
+  return 'complete';
 }
+
+/**
+ * Local `max` for ISO-8601 timestamps. Same parse-and-compare approach as
+ * `hub.ts:maxIsoTimestamp` — the wire format admits `Z` and `+00:00`
+ * shapes (PostgREST quirk), so lexicographic comparison is unsafe.
+ */
+function maxIsoTimestampStream(
+  ...values: Array<string | null | undefined>
+): string {
+  let best: { s: string; ms: number } | null = null;
+  for (const v of values) {
+    if (!v) continue;
+    const ms = Date.parse(v);
+    if (!Number.isFinite(ms)) continue;
+    if (best === null || ms > best.ms) best = { s: v, ms };
+  }
+  return best ? best.s : new Date(0).toISOString();
+}
+
+/** Mirrors `STATUS_DERIVATION_LIMIT` in hub.ts + `POSITION_QUERY_LIMIT` in positionFetch.ts. */
+const CATCHUP_POSITIONS_LIMIT = 200;
 
 // Floor `(s, i)` by the recovery overlap window — used to catch a slow
 // writer tx whose row_updated_at predates the cursor's timestamp. Mirrors

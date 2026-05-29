@@ -28,7 +28,7 @@
  * Truncation is the maker's signal to keep paging via `?cursor=` until
  * `truncated: false`; the SDK MUST NOT emit `ready` until then (§6.2).
  *
- * ── Passive-expiry contract (Hermes review-31 round 4) ────────────────
+ * ── Passive-expiry contract ────────────────────────────────────────────
  *
  * "Recently-terminal-since-cursor" recovery emits rows whose terminal
  * transition the INDEXER WROTE TO THE DB (status → filled/cancelled,
@@ -169,11 +169,11 @@ export async function loadOwnStateSnapshot(
   const maxCommitments = config.ownStateSnapshotMaxCommitments;
   const nowISO = new Date(nowMs).toISOString();
 
-  // ── Cursor state machine (Hermes review-31 round 2 — explicit phases) ──
+  // ── Cursor state machine (explicit two-phase recovery) ───────────────
   //
-  // Round-1's merge approach interleaved active and terminal rows by
-  // (row_updated_at, id), which could starve a long-lived active row out
-  // of page 1's slice and then permanently exclude it on page 2's strict
+  // A merged stream interleaving active and terminal rows by
+  // (row_updated_at, id) would starve a long-lived active row out of
+  // page 1's slice and then permanently exclude it on page 2's strict
   // keyset. The two-phase model drains the entire active set BEFORE any
   // terminal row is delivered. Phase boundaries:
   //
@@ -316,11 +316,10 @@ export async function loadOwnStateSnapshot(
   const truncatedCommitments = phase1Saturated || phase2Saturated;
 
   // ── Positions (delivered on every page; never paginated within snapshot) ──
-  // M4a fail-closed contract for positions: re-use the categorized fetcher.
-  // The raw query inside the helper caps at 200; `hitCap` surfaces the
-  // raw-cap signal (Hermes review-31 round 2 blocker #3 — counting
-  // post-filtered categorized rows under-detected truncation when the
-  // helper filtered "lost" positions below the cap).
+  // Re-use the categorized fetcher. The raw query inside the helper caps
+  // at 200; `hitCap` surfaces the raw-cap signal because counting
+  // post-filtered categorized rows under-detects truncation when the
+  // helper filters lost positions below the cap.
   let active: PositionBase[];
   let pendingSettle: PendingSettlePosition[];
   let claimable: ClaimablePosition[];
@@ -384,7 +383,7 @@ export async function loadOwnStateSnapshot(
     ...claimedRows.map((r) => mapClaimedRow(r, address)),
   ];
 
-  // ── Response cursor (Hermes review-31 round 2 — two-phase state machine) ──
+  // ── Response cursor (two-phase state machine) ────────────────────────
   //
   //   - c: phase 1 saturated → last activeRow's (row, id); phase 2 saturated
   //        (only) → last terminalRow's (row, id); neither → MAX in DB.
@@ -394,15 +393,15 @@ export async function loadOwnStateSnapshot(
   //        fill the SDK hasn't seen. Cold start: MAX in DB; input cursor:
   //        preserved verbatim.
   //   - p: positions truncated → preserve input.p (or sentinel on cold start)
-  //        so the M4b stream replays every position transition since.
+  //        so the live stream replays every position transition since.
   //   - k: phase 1 saturated → `page-recovery-active` (recovering) or
   //        `page-active` (cold start); phase 2 saturated → `page-recovery-
   //        terminal`; else → `live`.
   //
   // The `truncated` body field is COMMITMENTS-ONLY (decoupled from
-  // `positionsTruncated`, per Hermes review-31 round 2 blocker #4). The SDK's
-  // "page until truncated: false" contract no longer loops on positions-only
-  // truncation; positions truncation is informational and is converged by
+  // `positionsTruncated`). The SDK's "page until truncated: false" contract
+  // does not loop on positions-only truncation; positions truncation is
+  // informational and is converged by
   // the M4b stream + a /v1/positions fallback per README.
   let cWatermark: ResourceWatermark;
   let outputK: OwnStateCursorKind;
