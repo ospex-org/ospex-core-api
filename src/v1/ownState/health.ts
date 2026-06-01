@@ -10,16 +10,20 @@
  * minted bearer per poll would be pure overhead for a value that carries no
  * per-wallet information.
  *
- * Lag source — `sync_state.last_processed_at`, NOT `max(now -
- * row_updated_at)` over the own-state data tables (commitments / positions /
- * fills). The indexer advances `sync_state.last_processed_at` on EVERY
- * processed block (via `advance_sync_state`), including empty ones, so this
- * measures TRUE indexer liveness. A row-age approach over the data tables
- * would report false-high lag during any quiet, no-activity window — common
- * for a sparse P2P book — and spuriously trip the consumer's health gate
- * even when the indexer is perfectly current. This is a deliberate deviation
- * from the plan's literal `max(now - last_row_updated_at)` (§3.3); see the
- * PR description. `lagSource` reports `'sync_state'` accordingly.
+ * Lag source — `indexer_cursor.updated_at`, NOT `max(now - row_updated_at)`
+ * over the own-state data tables (commitments / positions / fills). The
+ * indexer advances `indexer_cursor` on EVERY confirmed block it processes —
+ * Polygon mints a block every ~2s, so `updated_at` advances continuously
+ * regardless of whether any Ospex event landed. That makes `now - updated_at`
+ * a TRUE liveness/lag measure: a row-age approach over the data tables would
+ * report false-high lag during any quiet, no-activity window — common for a
+ * sparse P2P book — and spuriously trip the consumer's health gate even when
+ * the indexer is perfectly current.
+ *
+ * (`indexer_cursor` is the table the live indexer actually maintains; the
+ * `sync_state` table + `advance_sync_state` function exist in the schema but
+ * are unpopulated in production — confirmed empty at deploy time. Sourcing
+ * from `sync_state` returned `INDEXER_CURSOR_UNAVAILABLE` for every request.)
  */
 
 import type { Request, Response } from 'express';
@@ -29,12 +33,12 @@ import { getSupabase } from '../../lib/supabase.js';
 import type { ApiError } from '../../middleware/errorHandler.js';
 
 export interface OwnStateHealthBody {
-  /** Whole seconds since the indexer last advanced its processed-block watermark. */
+  /** Whole seconds since the indexer last advanced its confirmed-block cursor. */
   indexerLagSeconds: number;
-  /** ISO-8601 of that watermark (`sync_state.last_processed_at`). */
+  /** ISO-8601 of that cursor watermark (`indexer_cursor.updated_at`). */
   lastIndexedAt: string;
   /** The signal backing the lag measurement. */
-  lagSource: 'sync_state';
+  lagSource: 'indexer_cursor';
 }
 
 export async function ownStateHealthHandler(_req: Request, res: Response): Promise<void> {
@@ -42,15 +46,15 @@ export async function ownStateHealthHandler(_req: Request, res: Response): Promi
   const sb = getSupabase();
 
   const result = await sb
-    .from('sync_state')
-    .select('last_processed_at')
+    .from('indexer_cursor')
+    .select('updated_at')
     .eq('network', config.network)
     .maybeSingle();
 
   if (result.error) {
     logger.error(
       { err: result.error.message },
-      'ownState/health: sync_state query failed',
+      'ownState/health: indexer_cursor query failed',
     );
     res.status(500).json({
       error: 'Failed to load indexer health.',
@@ -59,21 +63,21 @@ export async function ownStateHealthHandler(_req: Request, res: Response): Promi
     return;
   }
   if (!result.data) {
-    // No sync_state row for this network — the indexer has never recorded a
-    // processed block. We can't assert lag, so report not-ready rather than a
-    // fabricated zero; consumers treat any non-200 as unhealthy.
+    // No indexer_cursor row for this network — the indexer has never recorded
+    // a confirmed block. We can't assert lag, so report not-ready rather than
+    // a fabricated zero; consumers treat any non-200 as unhealthy.
     res.status(503).json({
-      error: 'Indexer sync state unavailable for this network.',
-      code: 'INDEXER_SYNC_UNAVAILABLE',
+      error: 'Indexer cursor unavailable for this network.',
+      code: 'INDEXER_CURSOR_UNAVAILABLE',
     } satisfies ApiError);
     return;
   }
 
-  const lastProcessedAtMs = Date.parse(String(result.data.last_processed_at));
-  if (!Number.isFinite(lastProcessedAtMs)) {
+  const updatedAtMs = Date.parse(String(result.data.updated_at));
+  if (!Number.isFinite(updatedAtMs)) {
     logger.error(
-      { lastProcessedAt: result.data.last_processed_at },
-      'ownState/health: unparseable sync_state.last_processed_at',
+      { updatedAt: result.data.updated_at },
+      'ownState/health: unparseable indexer_cursor.updated_at',
     );
     res.status(500).json({
       error: 'Failed to load indexer health.',
@@ -83,17 +87,17 @@ export async function ownStateHealthHandler(_req: Request, res: Response): Promi
   }
 
   // Clamp to 0: clock skew between the API dyno and the DB can put
-  // `last_processed_at` marginally in the future; a negative lag is
-  // nonsensical and would read as "extremely fresh" while actually
-  // signalling skew. 0 is the honest floor.
+  // `updated_at` marginally in the future; a negative lag is nonsensical and
+  // would read as "extremely fresh" while actually signalling skew. 0 is the
+  // honest floor.
   const indexerLagSeconds = Math.max(
     0,
-    Math.round((Date.now() - lastProcessedAtMs) / 1000),
+    Math.round((Date.now() - updatedAtMs) / 1000),
   );
   const body: OwnStateHealthBody = {
     indexerLagSeconds,
-    lastIndexedAt: new Date(lastProcessedAtMs).toISOString(),
-    lagSource: 'sync_state',
+    lastIndexedAt: new Date(updatedAtMs).toISOString(),
+    lagSource: 'indexer_cursor',
   };
   res.status(200).json(body);
 }

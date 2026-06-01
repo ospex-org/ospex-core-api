@@ -2,14 +2,14 @@
  * `ownStateHealthHandler` tests (Phase 3 PR0b, amendment A4).
  *
  * The handler is a PUBLIC indexer-lag probe (`GET /v1/health/own-state`).
- * It reads `sync_state.last_processed_at` for the configured network and
- * reports `indexerLagSeconds = now - last_processed_at` (clamped at 0),
- * `lastIndexedAt`, and `lagSource: 'sync_state'`.
+ * It reads `indexer_cursor.updated_at` for the configured network and
+ * reports `indexerLagSeconds = now - updated_at` (clamped at 0),
+ * `lastIndexedAt`, and `lagSource: 'indexer_cursor'`.
  *
  * Covers:
  *   - healthy lag computation + network-scoped query;
  *   - clock-skew clamp (future watermark → 0, never negative);
- *   - missing sync_state row → 503 INDEXER_SYNC_UNAVAILABLE;
+ *   - missing indexer_cursor row → 503 INDEXER_CURSOR_UNAVAILABLE;
  *   - query error → 500 INTERNAL_ERROR.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -99,10 +99,10 @@ afterEach(() => {
 });
 
 describe('ownStateHealthHandler', () => {
-  it('reports lag from sync_state.last_processed_at, scoped to the configured network', async () => {
-    const lastProcessedAt = new Date(NOW - 5_000).toISOString(); // 5s ago
+  it('reports lag from indexer_cursor.updated_at, scoped to the configured network', async () => {
+    const updatedAt = new Date(NOW - 5_000).toISOString(); // 5s ago
     const { client, calls } = makeSupabase({
-      data: { last_processed_at: lastProcessedAt },
+      data: { updated_at: updatedAt },
       error: null,
     });
     supabaseMock.getSupabase.mockReturnValue(client);
@@ -113,11 +113,11 @@ describe('ownStateHealthHandler', () => {
     expect(res.statusCode).toBe(200);
     expect(res.body).toEqual({
       indexerLagSeconds: 5,
-      lastIndexedAt: lastProcessedAt,
-      lagSource: 'sync_state',
+      lastIndexedAt: updatedAt,
+      lagSource: 'indexer_cursor',
     });
-    // Queried sync_state, scoped to the network from config.
-    expect(calls.some((c) => c.table === 'sync_state')).toBe(true);
+    // Queried indexer_cursor, scoped to the network from config.
+    expect(calls.some((c) => c.table === 'indexer_cursor')).toBe(true);
     expect(
       calls.some((c) => c.method === 'eq' && c.args[0] === 'network' && c.args[1] === 'polygon'),
     ).toBe(true);
@@ -126,7 +126,7 @@ describe('ownStateHealthHandler', () => {
   it('clamps a future watermark (clock skew) to 0 rather than reporting negative lag', async () => {
     const future = new Date(NOW + 4_000).toISOString();
     const { client } = makeSupabase({
-      data: { last_processed_at: future },
+      data: { updated_at: future },
       error: null,
     });
     supabaseMock.getSupabase.mockReturnValue(client);
@@ -138,7 +138,7 @@ describe('ownStateHealthHandler', () => {
     expect((res.body as { indexerLagSeconds: number }).indexerLagSeconds).toBe(0);
   });
 
-  it('returns 503 INDEXER_SYNC_UNAVAILABLE when no sync_state row exists for the network', async () => {
+  it('returns 503 INDEXER_CURSOR_UNAVAILABLE when no indexer_cursor row exists for the network', async () => {
     const { client } = makeSupabase({ data: null, error: null });
     supabaseMock.getSupabase.mockReturnValue(client);
 
@@ -146,10 +146,10 @@ describe('ownStateHealthHandler', () => {
     await ownStateHealthHandler(req, res as unknown as Response);
 
     expect(res.statusCode).toBe(503);
-    expect((res.body as { code: string }).code).toBe('INDEXER_SYNC_UNAVAILABLE');
+    expect((res.body as { code: string }).code).toBe('INDEXER_CURSOR_UNAVAILABLE');
   });
 
-  it('returns 500 INTERNAL_ERROR when the sync_state query errors', async () => {
+  it('returns 500 INTERNAL_ERROR when the indexer_cursor query errors', async () => {
     const { client } = makeSupabase({ data: null, error: { message: 'db down' } });
     supabaseMock.getSupabase.mockReturnValue(client);
 
