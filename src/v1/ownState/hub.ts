@@ -46,12 +46,14 @@ import { loadConfig } from '../../lib/env.js';
 import { logger } from '../../lib/logger.js';
 import { getSupabase } from '../../lib/supabase.js';
 import {
-  rowToBody as commitmentRowToBody,
   COMMITMENT_RECOVERY_COLUMNS,
-  type CommitmentBody,
   type CommitmentRecoveryRow,
-  type CommitmentRow,
 } from '../commitments.js';
+import {
+  fetchCommitmentEnrichment,
+  toOwnerCommitmentBody,
+  type OwnerCommitmentBody,
+} from './enrich.js';
 import {
   rowToBody as fillRowToBody,
   FILL_COLUMNS,
@@ -74,7 +76,7 @@ import type { MarketType } from '../../lib/speculation.js';
 
 export interface OwnStateCallbacks {
   /** A maker-scoped commitment row update (insert or mutation). */
-  onCommitment: (body: CommitmentBody, ts: string, id: string) => void;
+  onCommitment: (body: OwnerCommitmentBody, ts: string, id: string) => void;
   /** A maker or taker side fill row. */
   onFill: (body: FillBody, ts: string, id: string) => void;
   /**
@@ -781,6 +783,20 @@ export class OwnStateHub {
         return { tip: cmp, exhausted: true };
       }
       const rows = (data ?? []) as unknown as CommitmentRecoveryRow[];
+      let enrichment;
+      try {
+        enrichment = await fetchCommitmentEnrichment(
+          this.deps.getClient(),
+          this.deps.getNetwork(),
+          rows,
+        );
+      } catch (err) {
+        logger.error(
+          { err: err instanceof Error ? err.message : String(err), address },
+          'ownStateHub commitments: enrichment failed',
+        );
+        return { tip: cmp, exhausted: true };
+      }
       for (const row of rows) {
         const key = `${row.row_updated_at}|${String(row.id)}`;
         if (res.emitted.has(key)) {
@@ -789,7 +805,7 @@ export class OwnStateHub {
         }
         const tsMs = Date.parse(row.row_updated_at);
         res.emitted.set(key, Number.isFinite(tsMs) ? tsMs : Date.now());
-        const body = commitmentRowToBody(row as unknown as CommitmentRow, nowMs);
+        const body = toOwnerCommitmentBody(row, nowMs, enrichment);
         for (const sub of subs) {
           try {
             sub.onCommitment(body, row.row_updated_at, String(row.id));
