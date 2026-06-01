@@ -70,6 +70,14 @@ export interface PositionBase {
   oddsDecimal: number | null;     // implied: 1 + (profit_amount / risk_amount)
   riskAmountUSDC: number;
   profitAmountUSDC: number;
+  // ── Phase 3 PR0b enrichment (§3.2) ────────────────────────────────────
+  contestId: string;             // parent contest (numeric id as string)
+  sport: string;                 // contests.sport_slug ?? '' — matches the API's sport mapping
+  awayTeam: string;              // ABSOLUTE away team (distinct from the maker-relative `team`)
+  homeTeam: string;              // ABSOLUTE home team
+  riskAmountWei6: string;        // authoritative wei6 (your stake); `riskAmountUSDC` stays for back-compat
+  counterpartyRiskWei6: string;  // authoritative wei6 (counterparty stake = your profit in zero-vig)
+  updatedAtUnixSec: number;      // max(position, speculation, contest) row_updated_at, as unix seconds
 }
 
 export interface ClaimablePosition extends PositionBase {
@@ -180,6 +188,7 @@ interface ContestRow {
   contest_id: number;
   away_team: string | null;
   home_team: string | null;
+  sport_slug: string | null;
   contest_status: 'unverified' | 'verified' | 'scored' | 'voided';
   away_score: number | null;
   home_score: number | null;
@@ -322,7 +331,7 @@ export async function fetchCategorizedPositions(
   if (contestIds.length > 0) {
     const contestRes = await sb
       .from('contests')
-      .select('contest_id, away_team, home_team, contest_status, away_score, home_score, row_updated_at')
+      .select('contest_id, away_team, home_team, sport_slug, contest_status, away_score, home_score, row_updated_at')
       .eq('network', config.network)
       .in('contest_id', contestIds);
     if (contestRes.error) throw new Error(`fetchCategorizedPositions contests: ${contestRes.error.message}`);
@@ -407,6 +416,7 @@ export async function fetchCategorizedPositions(
     const riskWei6 = BigInt(String(p.risk_amount));
     const profitWei6 = p.profit_amount != null ? BigInt(String(p.profit_amount)) : 0n;
 
+    const updatedAtMs = Date.parse(sourceUpdatedAt);
     const base: PositionBase = {
       positionId: `${p.speculation_id}_${lowerAddress}_${positionType}`,
       speculationId: String(p.speculation_id),
@@ -417,6 +427,13 @@ export async function fetchCategorizedPositions(
       oddsDecimal: impliedOddsDecimal(riskWei6, profitWei6),
       riskAmountUSDC: wei6ToUSDC(p.risk_amount),
       profitAmountUSDC: wei6ToUSDC(p.profit_amount),
+      contestId: spec.contest_id != null ? String(spec.contest_id) : '',
+      sport: contest?.sport_slug ?? '',
+      awayTeam: contest?.away_team ?? '',
+      homeTeam: contest?.home_team ?? '',
+      riskAmountWei6: riskWei6.toString(),
+      counterpartyRiskWei6: profitWei6.toString(),
+      updatedAtUnixSec: Number.isFinite(updatedAtMs) ? Math.floor(updatedAtMs / 1000) : 0,
     };
 
     if (spec.speculation_status === 'closed') {

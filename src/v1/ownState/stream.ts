@@ -54,12 +54,14 @@ import { getSupabase } from '../../lib/supabase.js';
 import type { ApiError } from '../../middleware/errorHandler.js';
 import type { StreamAuthRequest } from '../../middleware/verifyStreamToken.js';
 import {
-  rowToBody as commitmentRowToBody,
   COMMITMENT_RECOVERY_COLUMNS,
-  type CommitmentBody,
   type CommitmentRecoveryRow,
-  type CommitmentRow,
 } from '../commitments.js';
+import {
+  fetchCommitmentEnrichment,
+  toOwnerCommitmentBody,
+  type OwnerCommitmentBody,
+} from './enrich.js';
 import {
   rowToBody as fillRowToBody,
   FILL_COLUMNS,
@@ -557,7 +559,7 @@ async function catchUpCommitments(
   nowMs: number,
   isClosed: () => boolean,
   shed: () => void,
-  emit: (body: CommitmentBody, ts: string, id: string) => void,
+  emit: (body: OwnerCommitmentBody, ts: string, id: string) => void,
 ): Promise<CatchupStatus> {
   // First page: overlap floor (input cursor is `live`).
   let orExpr = watermarkLiveKeysetOr(cursorWatermark);
@@ -578,8 +580,19 @@ async function catchUpCommitments(
       return 'resync';
     }
     const rows = (data ?? []) as unknown as CommitmentRecoveryRow[];
+    let enrichment;
+    try {
+      enrichment = await fetchCommitmentEnrichment(sb, net, rows);
+    } catch (err) {
+      logger.error(
+        { err: err instanceof Error ? err.message : String(err), address },
+        'ownState/stream catchup: commitment enrichment failed',
+      );
+      writeOwnStateEvent(res, 'resync', { reason: 'catchup_failed' });
+      return 'resync';
+    }
     for (const row of rows) {
-      const body = commitmentRowToBody(row as unknown as CommitmentRow, nowMs);
+      const body = toOwnerCommitmentBody(row, nowMs, enrichment);
       emit(body, row.row_updated_at, String(row.id));
     }
     shed();

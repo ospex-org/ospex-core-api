@@ -92,34 +92,57 @@ interface RecordedCall {
  * `from(table)` re-uses the same builder so the `calls` log captures which
  * table was selected for which sequence step.
  */
-function makeSupabase(responses: MockResponse[]): { client: unknown; calls: RecordedCall[] } {
+function makeSupabase(
+  responses: MockResponse[],
+  enrich?: { contests?: unknown[]; speculations?: unknown[] },
+): { client: unknown; calls: RecordedCall[] } {
   const calls: RecordedCall[] = [];
   let idx = 0;
-  let currentTable: string | undefined;
   const next = (): MockResponse => responses[Math.min(idx++, responses.length - 1)]!;
-  const builder: Record<string, unknown> = {};
-  const chain =
-    (method: string) =>
-    (...args: unknown[]): unknown => {
-      calls.push({ table: currentTable, method, args });
-      return builder;
+  // A FRESH builder per `from()` call, each bound to its own table. This
+  // matters for the PR0b enrichment, which awaits `contests` + `speculations`
+  // queries together via Promise.all: a single shared builder would resolve
+  // both `.then`s against whichever table was set last. Per-table builders let
+  // each route correctly.
+  const makeBuilder = (table: string): Record<string, unknown> => {
+    const builder: Record<string, unknown> = {};
+    const chain =
+      (method: string) =>
+      (...args: unknown[]): unknown => {
+        calls.push({ table, method, args });
+        return builder;
+      };
+    for (const m of [
+      'select', 'eq', 'in', 'gt', 'gte', 'lte', 'or', 'order', 'range', 'limit',
+    ]) {
+      builder[m] = chain(m);
+    }
+    builder['maybeSingle'] = (): Promise<MockResponse> => {
+      calls.push({ table, method: 'maybeSingle', args: [] });
+      return Promise.resolve(next());
     };
-  for (const m of [
-    'select', 'eq', 'in', 'gt', 'gte', 'lte', 'or', 'order', 'range', 'limit',
-  ]) {
-    builder[m] = chain(m);
-  }
-  builder['maybeSingle'] = (): Promise<MockResponse> => {
-    calls.push({ table: currentTable, method: 'maybeSingle', args: [] });
-    return Promise.resolve(next());
+    builder['then'] = (resolve: (v: unknown) => void): void => {
+      // PR0b: the owner-commitment enrichment issues `contests` + `speculations`
+      // batch queries that aren't part of these tests' hand-ordered response
+      // sequences (the position fetcher is separately mocked, so these are the
+      // ONLY hits on those two tables). Route them to the optional `enrich`
+      // data (default empty) WITHOUT consuming the sequence — the carefully
+      // ordered commitment + watermark responses stay aligned.
+      if (table === 'contests') {
+        resolve({ data: enrich?.contests ?? [], error: null });
+        return;
+      }
+      if (table === 'speculations') {
+        resolve({ data: enrich?.speculations ?? [], error: null });
+        return;
+      }
+      resolve(next());
+    };
+    return builder;
   };
-  builder['then'] = (resolve: (v: unknown) => void): void => resolve(next());
   return {
     client: {
-      from: (t: string): unknown => {
-        currentTable = t;
-        return builder;
-      },
+      from: (t: string): unknown => makeBuilder(t),
     },
     calls,
   };
@@ -216,6 +239,46 @@ describe('GET /v1/own-state/snapshot — cold start (no cursor)', () => {
     // it mints from `max(sourceUpdatedAt)` across derived statuses, which
     // is empty here.
     expect(decoded.p).toEqual({ s: '1970-01-01T00:00:00.000Z', i: '0' });
+  });
+
+  it('enriches each commitment with sport / absolute teams / speculationId / signedPayload (PR0b)', async () => {
+    const { client } = makeSupabase(
+      [
+        { data: [commitmentRow()], error: null }, // active commitments
+        { data: sentinelWatermarkRow, error: null }, // max watermark commitments
+        { data: fillsWatermarkRow, error: null }, // max watermark fills
+      ],
+      {
+        contests: [
+          { contest_id: 42, away_team: 'Lions', home_team: 'Bears', sport_slug: 'americanfootball_nfl' },
+        ],
+        speculations: [
+          {
+            speculation_id: 7,
+            contest_id: 42,
+            speculation_scorer: '0x2222222222222222222222222222222222222222',
+            line_ticks: 0,
+          },
+        ],
+      },
+    );
+    supabaseMock.getSupabase.mockReturnValue(client);
+
+    const res = makeRes();
+    await ownStateSnapshotHandler(makeReq(), res as unknown as Response);
+
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { commitments: Array<Record<string, unknown>> };
+    const c = body.commitments[0]!;
+    expect(c.sport).toBe('americanfootball_nfl');
+    expect(c.awayTeam).toBe('Lions');
+    expect(c.homeTeam).toBe('Bears');
+    expect(c.speculationId).toBe('7');
+    expect(typeof c.updatedAtUnixSec).toBe('number');
+    // signedPayload reconstructed from the signed row (signature present).
+    const sp = c.signedPayload as { commitmentHash: string; commitment: { contestId: string } } | null;
+    expect(sp?.commitmentHash).toBe(commitmentRow().commitment_hash);
+    expect(sp?.commitment.contestId).toBe('42');
   });
 
   it('queries commitments scoped to the authenticated address (the only address)', async () => {

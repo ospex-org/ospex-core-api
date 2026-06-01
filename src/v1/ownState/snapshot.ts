@@ -75,12 +75,14 @@ import { loadConfig } from '../../lib/env.js';
 import { logger, formatError } from '../../lib/logger.js';
 import { getSupabase } from '../../lib/supabase.js';
 import {
-  rowToBody as commitmentRowToBody,
   COMMITMENT_RECOVERY_COLUMNS,
-  type CommitmentBody,
   type CommitmentRecoveryRow,
-  type CommitmentRow,
 } from '../commitments.js';
+import {
+  fetchCommitmentEnrichment,
+  toOwnerCommitmentBody,
+  type OwnerCommitmentBody,
+} from './enrich.js';
 import {
   fetchCategorizedPositions,
   type ClaimablePosition,
@@ -121,7 +123,7 @@ export type OwnerPosition =
 
 interface OwnStateSnapshotBody {
   cursor: string;
-  commitments: CommitmentBody[];
+  commitments: OwnerCommitmentBody[];
   positions: OwnerPosition[];
   /**
    * COMMITMENTS-ONLY truncation discriminant. True when the active or
@@ -345,10 +347,28 @@ export async function loadOwnStateSnapshot(
   // (also (row, id) ASC). No merge — the two phases are temporally separated
   // and never interleave. SDK applies events idempotently per natural key,
   // so terminals arriving "after" active in wire order is correct.
-  const commitments: CommitmentBody[] = [
-    ...activeRows.map((r) => commitmentRowToBody(r as unknown as CommitmentRow, nowMs)),
-    ...terminalRows.map((r) => commitmentRowToBody(r as unknown as CommitmentRow, nowMs)),
-  ];
+  const allCommitmentRows = [...activeRows, ...terminalRows];
+  let commitmentEnrichment;
+  try {
+    commitmentEnrichment = await fetchCommitmentEnrichment(
+      sb,
+      config.network,
+      allCommitmentRows,
+    );
+  } catch (err) {
+    logger.error(
+      { err: formatError(err) },
+      'ownState/snapshot: commitment enrichment failed',
+    );
+    return {
+      ok: false,
+      status: 500,
+      error: { error: 'Failed to load own-state.', code: 'INTERNAL_ERROR' },
+    };
+  }
+  const commitments: OwnerCommitmentBody[] = allCommitmentRows.map((r) =>
+    toOwnerCommitmentBody(r, nowMs, commitmentEnrichment),
+  );
   const truncatedCommitments = phase1Saturated || phase2Saturated;
 
   // ── Positions (delivered on every page; never paginated within snapshot) ──
@@ -593,6 +613,20 @@ function mapClaimedRow(row: ClaimedPositionRow, address: string): OwnerClaimedPo
     oddsDecimal: odds,
     riskAmountUSDC: wei6ToUSDC(row.risk_amount),
     profitAmountUSDC: wei6ToUSDC(row.profit_amount),
+    // PR0b enrichment — `claimed` rows are terminal + recovery-only (zero
+    // remaining exposure). Contest context is intentionally minimal, mirroring
+    // the existing `team`/`opponent: 'Unknown'` choice above: no second batch
+    // join for a settled row. wei6 + freshness are cheap and populated.
+    contestId: '',
+    sport: '',
+    awayTeam: '',
+    homeTeam: '',
+    riskAmountWei6: riskWei6.toString(),
+    counterpartyRiskWei6: profitWei6.toString(),
+    updatedAtUnixSec: (() => {
+      const ms = Date.parse(row.row_updated_at);
+      return Number.isFinite(ms) ? Math.floor(ms / 1000) : 0;
+    })(),
     claimedAt: row.claimed_at,
   };
 }
