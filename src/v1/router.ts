@@ -24,6 +24,7 @@ import { getTeamAliasesHandler } from './teams.js';
 import { getAuthDomainHandler } from './auth.js';
 import { postStreamChallengeHandler, postStreamTokenHandler } from './streamAuth.js';
 import { ownStateSnapshotHandler } from './ownState/snapshot.js';
+import { ownStateHealthHandler } from './ownState/health.js';
 import { getOwnStateStreamHandler } from './ownState/stream.js';
 import { verifyStreamToken } from '../middleware/verifyStreamToken.js';
 import { getPublicConfigHandler } from './config.js';
@@ -115,6 +116,11 @@ v1Router.get(
   verifyStreamToken,
   asyncHandler(ownStateSnapshotHandler),
 );
+
+// Public indexer-lag probe for the own-state stream-health gate (spec §2.6).
+// No stream-auth — lag is a global, wallet-independent signal the market-maker
+// polls at ~10s cadence; minting a bearer per poll would be pure overhead.
+v1Router.get('/health/own-state', readRateLimit, asyncHandler(ownStateHealthHandler));
 
 v1Router.get('/config/public', readRateLimit, (req, res) => getPublicConfigHandler(req, res));
 
