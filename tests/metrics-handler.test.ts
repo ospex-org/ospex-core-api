@@ -8,10 +8,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Request, Response } from 'express';
 import type { StreamHub } from '../src/v1/stream/hub.js';
 import type { OddsHub } from '../src/v1/stream/oddsHub.js';
+import type { OwnStateHub } from '../src/v1/ownState/hub.js';
 
 import { getMetricsHandler } from '../src/v1/metrics.js';
 import { __setStreamHubForTest } from '../src/v1/stream/hub.js';
 import { __setOddsHubForTest } from '../src/v1/stream/oddsHub.js';
+import { __setOwnStateHubForTest } from '../src/v1/ownState/hub.js';
 import { __resetConnections, acquire, configureConnectionCaps } from '../src/v1/stream/connections.js';
 import { __resetHandlerMetrics } from '../src/v1/stream/handler.js';
 
@@ -55,6 +57,14 @@ function fakeOddsHub(stats: {
   const full = { channelDegradedTotal: 0, hardResetTotal: 0, ...stats };
   return { stats: () => full } as unknown as OddsHub;
 }
+function fakeOwnStateHub(stats: {
+  wallets: number;
+  subscribers: number;
+  resyncBroadcastTotal?: number;
+}): OwnStateHub {
+  const full = { resyncBroadcastTotal: 0, ...stats };
+  return { stats: () => full } as unknown as OwnStateHub;
+}
 
 beforeEach(() => {
   __resetConnections();
@@ -63,14 +73,16 @@ beforeEach(() => {
 afterEach(() => {
   __setStreamHubForTest(undefined);
   __setOddsHubForTest(undefined);
+  __setOwnStateHubForTest(undefined);
   __resetConnections();
   __resetHandlerMetrics();
 });
 
 describe('GET /v1/metrics', () => {
-  it('returns the three stat blocks (plus uptime/timestamp) with default caps', () => {
+  it('returns the four stat blocks (plus uptime/timestamp) with default caps', () => {
     __setStreamHubForTest(fakeStreamHub({ resources: 0, subscribers: 0 }));
     __setOddsHubForTest(fakeOddsHub({ subscribers: 0, channelOpen: false, subscribed: false, degraded: false }));
+    __setOwnStateHubForTest(fakeOwnStateHub({ wallets: 0, subscribers: 0 }));
 
     const res = makeRes();
     getMetricsHandler(req, res as unknown as Response);
@@ -79,6 +91,7 @@ describe('GET /v1/metrics', () => {
     expect(res.body).toMatchObject({
       stream: { resources: 0, subscribers: 0 },
       odds: { subscribers: 0, channelOpen: false, subscribed: false, degraded: false },
+      ownState: { wallets: 0, subscribers: 0, resyncBroadcastTotal: 0 },
       connections: { total: 0, ips: 0, maxTotal: 200, maxPerIp: 10 },
     });
     const body = res.body as { uptimeSeconds: unknown; timestamp: unknown };
