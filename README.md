@@ -30,7 +30,7 @@ In progress. Working today:
 - **Cursor recovery (Phase 1.5):** `?since=<cursor>` recovery mode on `GET /v1/commitments`, `/v1/speculations`, `/v1/contests`; bare `GET /v1/positions` (recovery) alongside the address-scoped snapshot; `GET /v1/fills` (append-only fill events). See "Cursor recovery reads" below.
 - **SSE streams (Phase 1.5):** `GET /v1/stream/{commitments,positions,fills,speculations,contests}` — live deltas + cursor catch-up + resync over Server-Sent Events. See "SSE streams" below.
 - **Odds stream (Phase 1.5):** `GET /v1/stream/odds?contestId=&market=` — snapshot then live `change`/`refresh` over Server-Sent Events (latest-state, no cursor). See "Odds stream" below.
-- `GET /v1/metrics` — operational stream / odds / connection counters (process-local). See "Metrics" below.
+- `GET /v1/metrics` — operational stream / odds / own-state / connection counters (process-local). See "Metrics" below.
 - **Stream auth (M3):** `POST /v1/auth/stream-challenge` + `POST /v1/auth/stream-token` — EIP-712 challenge/response that mints a ~15 min HMAC bearer token, scoped to `{address, audience, chainId}`. Required for the owner-auth `/v1/own-state/*` surfaces landing in M4; the public/anonymous reads above are unchanged.
 - **Own-state snapshot (M4a):** `GET /v1/own-state/snapshot?cursor=<opt>` — owner-auth (`Authorization: Bearer <stream-token>`) paged snapshot of the maker's commitments + positions. Returns `{cursor, commitments[], positions[], truncated, positionsTruncated}` per spec §6.1. The composite cursor is the resume point for `/v1/stream/own-state` (M4b) or — when `truncated: true` (commitments-only) — the continuation key for the next page. `positionsTruncated` is the DEGRADED discriminant, decoupled from `truncated`: when `true`, position visibility is PARTIAL. The stream cold-start emits `event: degraded` before `ready` and consumers (SDK / MM) must quote-hold per spec §2.6 and treat owner-state as partial. There is no paging/convergence mechanism that drains positions beyond the actionable cap; the `/v1/positions/:address` REST endpoint provides full history out-of-band for operator tooling. **Passive expiry** (a commitment whose only terminal transition is `expiry <= now`) is NOT emitted by recovery — the indexer doesn't advance `row_updated_at` for time alone, so such rows fall outside both halves of the recovery response. The SDK reducer is responsible for computing effective status locally (same `deriveEffectiveStatus` pattern used by `/v1/commitments`) and pruning any locally-held active commitment whose stored expiry has lapsed; the active set the snapshot returns is authoritative of currently-matchable rows.
 
@@ -453,6 +453,11 @@ Operational counters for the SSE subsystem, surfaced as JSON. Kept separate from
     "channelDegradedTotal": 0,                         // cumulative Realtime channel-down events (gated by !degraded; one bump per outage)
     "hardResetTotal": 0                                // cumulative hard-reset backstops fired
   },
+  "ownState": {
+    "wallets": 0,                                      // own-state hub: active per-wallet pollers
+    "subscribers": 0,                                  // total owner-auth own-state subscribers
+    "resyncBroadcastTotal": 0                          // cumulative own-state resync broadcasts (overlap-window overflow + recovery)
+  },
   "connections": {
     "total": 0, "ips": 0, "maxTotal": 200, "maxPerIp": 10,
     "rejectedTotal": 0,                                // cumulative 429s
@@ -575,7 +580,7 @@ src/
     contests.ts        # GET /v1/contests, /:contestId, /scripts/approved
     speculations.ts    # GET /v1/speculations, /:speculationId
     protocol.ts        # GET /v1/protocol/info
-    metrics.ts         # GET /v1/metrics — stream/odds/connection counters
+    metrics.ts         # GET /v1/metrics — stream/odds/own-state/connection counters
     positions.ts       # GET /v1/positions (recovery) + /:address + /status,
                        #   /claim-params, /by-tx/:txHash, /claim-result/:txHash
     fills.ts           # GET /v1/fills — append-only fill event recovery
