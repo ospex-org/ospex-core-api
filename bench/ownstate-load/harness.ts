@@ -139,17 +139,43 @@ function makeCommitmentRow(maker: string, hashByte: string, updatedAtMs: number)
   };
 }
 
-/** commitmentHashes a client saw — via the cold snapshot body AND/OR live deltas. */
-function seenCommitmentHashes(c: OwnStateClient): Set<string> {
+/**
+ * commitmentHashes a client received as LIVE / CATCH-UP `commitment` DELTA events
+ * — NOT the cold-start `snapshot` body. The resume assertions key off this on
+ * purpose: a server that ignored `Last-Event-ID` and cold-started would deliver
+ * the active rows inside a `snapshot` (and emit no `commitment` deltas), so a
+ * snapshot-inclusive count would FALSE-PASS the resume contract. (A review caught
+ * exactly that hole — counting snapshot rows made the resume gate non-load-bearing
+ * against a cursor-ignored regression.)
+ */
+function commitmentDeltaHashes(c: OwnStateClient): Set<string> {
   const out = new Set<string>();
   for (const f of c.frames) {
-    if (f.event === 'snapshot') {
-      const body = f.data as { commitments?: Array<{ commitmentHash?: string }> };
-      for (const cm of body.commitments ?? []) if (cm.commitmentHash) out.add(cm.commitmentHash.toLowerCase());
-    } else if (f.event === 'commitment') {
-      const body = f.data as { commitmentHash?: string };
-      if (body.commitmentHash) out.add(body.commitmentHash.toLowerCase());
-    }
+    if (f.event !== 'commitment') continue;
+    const h = (f.data as { commitmentHash?: string }).commitmentHash?.toLowerCase();
+    if (h) out.add(h);
+  }
+  return out;
+}
+
+/**
+ * commitmentHashes delivered as CATCH-UP deltas — `commitment` events received
+ * BEFORE the connection's `ready` frame. A correct `Last-Event-ID` resume emits
+ * the recovered rows as catch-up deltas BEFORE `ready`; a cursor-ignored cold
+ * start emits a `snapshot` then `ready` with NO commitment deltas before it (the
+ * live re-emit comes after `ready`). Keying the resume assertions off this makes
+ * gapless / overlap / cross-outage ALL fail the cold-start regression — not just
+ * the no-snapshot check.
+ */
+function catchUpDeltaHashes(c: OwnStateClient): Set<string> {
+  const readyIdx = c.frames.findIndex((f) => f.event === 'ready');
+  const cutoff = readyIdx === -1 ? c.frames.length : readyIdx;
+  const out = new Set<string>();
+  for (let i = 0; i < cutoff; i++) {
+    const f = c.frames[i]!;
+    if (f.event !== 'commitment') continue;
+    const h = (f.data as { commitmentHash?: string }).commitmentHash?.toLowerCase();
+    if (h) out.add(h);
   }
   return out;
 }
@@ -236,7 +262,7 @@ async function profile2(ctx: Ctx): Promise<void> {
   report.check('live commitment deltas delivered before shutdown', deltaCount >= 2, `${deltaCount} commitment events`);
   const resumeCursor = a.lastEventId;
   report.info(`resume cursor (Last-Event-ID) = ${resumeCursor ? resumeCursor.slice(0, 24) + '...' : '(none)'}`);
-  const seenBefore = seenCommitmentHashes(a);
+  const seenBefore = commitmentDeltaHashes(a); // A's r1/r2 arrived as live deltas (its cold snapshot was empty)
 
   // ── graceful-shutdown assertions (POSIX only) ──
   if (SIGTERM_IS_GRACEFUL) {
@@ -277,18 +303,35 @@ async function profile2(ctx: Ctx): Promise<void> {
   await b.open();
   const bReady = await withTimeout(b.ready, 15_000, 'B').then(() => true).catch(() => false);
   report.check('resumed subscription (Last-Event-ID) reached ready', bReady && b.httpStatus === 200, `status=${b.httpStatus}`);
-  // Let any overlap/forward catch-up deltas flow.
-  await waitFor(() => seenCommitmentHashes(b).has(`0x${'33'.repeat(32)}`), 12_000);
 
-  const seenAfter = seenCommitmentHashes(b);
+  // LOAD-BEARING: a Last-Event-ID connection must run CATCH-UP, not a cold restart.
+  // A cold-started connection delivers the active rows in a `snapshot` body and emits
+  // NO `commitment` deltas — so the absence of a snapshot frame (and delivery via
+  // deltas, below) is what proves the cursor was actually honored. Without this, a
+  // server that ignored the cursor would still pass the resume gate (the hole a
+  // review surfaced and the mutation `stream.ts` → ignore cursor reproduces).
+  const bSnapshots = b.framesOfType('snapshot').length;
+  const resumeMode = report.check("resume ran CATCH-UP, not a cold start — NO snapshot frame on the Last-Event-ID connection",
+    bSnapshots === 0, `${bSnapshots} snapshot frame(s)`);
+  if (!resumeMode) report.finding({ severity: 'high', title: 'Last-Event-ID ignored — resume cold-started',
+    detail: `A Last-Event-ID connection received a cold-start snapshot (${bSnapshots} snapshot frame[s]) instead of catch-up; the server did not honor the resume cursor, so no real catch-up/dedup occurred.` });
+
+  // Delivery is measured from CATCH-UP deltas only (commitment events before
+  // `ready`, never the snapshot), so the cross-outage row + overlap re-delivery
+  // must come via real cursor catch-up — a cold-started server delivers none.
+  await waitFor(() => catchUpDeltaHashes(b).has(`0x${'33'.repeat(32)}`) || b.framesOfType('ready').length > 0, 12_000);
+
+  const seenAfter = catchUpDeltaHashes(b);
   const all = new Set<string>([...seenBefore, ...seenAfter]);
   const expected = new Set(['11', '22', '33'].map((bb) => `0x${bb.repeat(32)}`));
 
   const missing = [...expected].filter((h) => !all.has(h));
   const phantom = [...all].filter((h) => !expected.has(h));
 
-  // GAPLESS — every seeded commitment is delivered somewhere across the boundary.
-  const gapless = report.check('resumed sequence is GAPLESS — every seeded commitment is delivered across the restart',
+  // GAPLESS — every seeded commitment is delivered as a DELTA across the boundary
+  // (A's r1/r2 live deltas + B's catch-up deltas). A cursor-ignored cold start
+  // delivers nothing as a delta on B, so r3 goes missing → this fails.
+  const gapless = report.check('resumed sequence is GAPLESS — every seeded commitment delivered as a delta across the restart',
     missing.length === 0, missing.length ? `missing ${missing.join(',')}` : 'all 3 present');
 
   // The resume must actually re-deliver a pre-restart row (the fresh server has no
@@ -298,7 +341,7 @@ async function profile2(ctx: Ctx): Promise<void> {
   const reDelivered = [...seenAfter].filter((h) => seenBefore.has(h));
   report.check('overlap re-delivered a pre-restart row on resume (exercises the client content-dedup / boot-seed)',
     reDelivered.length > 0, reDelivered.length ? `${reDelivered.length} re-delivered` : 'no overlap observed');
-  report.check('the cross-outage row (r3) was delivered to the resumed client (forward catch-up)',
+  report.check('the cross-outage row (r3) was delivered to the resumed client as a catch-up DELTA (not a snapshot)',
     seenAfter.has(`0x${'33'.repeat(32)}`));
 
   // DUPLICATE-FREE (canonical, content-keyed): after the client collapses the at-least-once

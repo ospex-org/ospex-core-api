@@ -40,11 +40,16 @@ Supabase* below).
 - *(POSIX only — see Platform)* on `SIGTERM` the in-flight stream gets **exactly
   one** `resync{reason:'server_shutdown'}` then a **clean close** (no truncated
   frame), and the server **stops accepting** new connections.
-- After restart, the client resumes via **`Last-Event-ID`**; the resumed sequence
-  is **gapless** (a row that arrived during the outage is caught up) and
-  **duplicate-free** (the at-least-once overlap re-delivery collapses to the
-  seeded set under client content-dedup — the same property the F5 restart-dedup
-  boot-seed only unit-tests).
+- After restart, the client resumes via **`Last-Event-ID`** and the harness
+  asserts the cursor was actually **honored** — resume ran **catch-up, not a cold
+  start** (no `snapshot` frame on the resume connection; the recovered rows arrive
+  as `commitment` deltas *before* `ready`, never via the snapshot body). The
+  resumed sequence is then **gapless** (a row that arrived during the outage is
+  caught up) and **duplicate-free** (the at-least-once overlap re-delivery
+  collapses to the seeded set under client content-dedup — the property the F5
+  restart-dedup boot-seed only unit-tests). Measuring delivery from catch-up
+  deltas (not the snapshot) is what makes this gate load-bearing: a server that
+  ignored the cursor and cold-started fails all four resume checks.
 
 ## Platform — graceful SIGTERM is POSIX-only
 
