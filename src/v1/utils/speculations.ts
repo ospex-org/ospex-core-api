@@ -12,7 +12,7 @@
  */
 
 import { lineTicksToLine, scorerToType, type MarketType, type ScorerAddresses } from '../../lib/speculation.js';
-import type { CommitmentBody } from '../commitments.js';
+import type { CommitmentBody, CommitmentHiddenBody } from '../commitments.js';
 
 export interface Speculation {
   speculationId: string;
@@ -27,7 +27,13 @@ export interface Speculation {
 }
 
 export interface SpeculationDetail extends Speculation {
-  orderbook: CommitmentBody[];
+  // Hidden rows are filtered upstream (book_visible=true); the union accepts
+  // `CommitmentHiddenBody` for defense-in-depth — a hidden row that ever reaches
+  // the mapper SURFACES REDACTED here (flat list, matching the list / recovery /
+  // SSE paths) rather than leaking its signed payload. (The contest-detail
+  // orderbook instead DROPS such a row — it groups by `speculationKey`, which a
+  // redacted body lacks; see getContestByIdHandler.)
+  orderbook: Array<CommitmentBody | CommitmentHiddenBody>;
   /**
    * Parent contest context — kept small (5 fields) so consumers don't
    * have to fetch `/v1/contests/:contestId` for the common "what game

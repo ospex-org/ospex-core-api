@@ -72,6 +72,12 @@ interface ContestListItem extends ContestBody {
 // Team UUIDs are resolved via lib/teamIds.ts so contests + speculations
 // share the same join logic. See that file's jsdoc for null semantics.
 
+// LOCAL to this file — distinct from the exported `SpeculationDetail` in
+// utils/speculations.ts (whose `orderbook` is the `CommitmentBody |
+// CommitmentHiddenBody` union). The contest-detail orderbook stays
+// `CommitmentBody[]` because this handler DROPS redacted rows — they have no
+// `speculationKey` to group on (the speculation-detail endpoint surfaces them
+// instead). See getContestByIdHandler.
 interface SpeculationDetail extends Speculation {
   orderbook: CommitmentBody[];
 }
@@ -455,6 +461,18 @@ export async function getContestByIdHandler(req: Request, res: Response): Promis
   // speculation and are dropped from the orderbook.
   const orderbookByKey = new Map<string, CommitmentBody[]>();
   for (const cm of ob.commitments) {
+    // Defense-in-depth: `fetchOpenCommitmentsByContestId` filters
+    // book_visible=true AND routes every row through the redaction router. A
+    // hidden row that ever slips past the filter arrives REDACTED
+    // (`redacted: true`, no `speculationKey`) — it has no key to group on and an
+    // off-book row has no place in the public orderbook, so log + drop it.
+    if ('redacted' in cm) {
+      logger.warn(
+        { commitmentHash: cm.commitmentHash },
+        'contests: hidden row reached the contest orderbook embed — redacted + dropped',
+      );
+      continue;
+    }
     if (!cm.speculationKey) continue;
     const list = orderbookByKey.get(cm.speculationKey) ?? [];
     list.push(cm);

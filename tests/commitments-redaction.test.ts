@@ -25,6 +25,15 @@ const NOW = Date.parse('2026-05-28T16:00:00.000Z');
 const NOW_ISO = new Date(NOW).toISOString();
 const FUTURE = '2026-05-28T17:00:00.000Z';
 
+// Scorer addresses for the contest/speculation orderbook-embed leak paths
+// (getContestByIdHandler requires config.scorers). Kept in sync with the
+// inlined copy in the hoisted env mock below.
+const SCORERS = {
+  moneyline: '0x1111111111111111111111111111111111111111',
+  spread: '0x2222222222222222222222222222222222222222',
+  total: '0x3333333333333333333333333333333333333333',
+};
+
 // A real recovery cursor — `parseRecovery` rejects anything else as 400.
 const RECOVERY_CURSOR = encodeCursor({ t: 'commitments', s: NOW_ISO, i: '1', k: 'page' });
 
@@ -34,16 +43,33 @@ const envMock = vi.hoisted(() => ({
     network: 'polygon',
     chainId: 137,
     redactHiddenPublic: true,
+    scorers: {
+      moneyline: '0x1111111111111111111111111111111111111111',
+      spread: '0x2222222222222222222222222222222222222222',
+      total: '0x3333333333333333333333333333333333333333',
+    },
   })),
+}));
+
+const loggerMock = vi.hoisted(() => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn() },
 }));
 
 vi.mock('../src/lib/supabase.js', () => supabaseMock);
 vi.mock('../src/lib/env.js', () => envMock);
+vi.mock('../src/lib/logger.js', () => loggerMock);
 
-const { getCommitmentByHashHandler, getCommitmentsHandler, PUBLIC_HIDDEN_ALLOWLIST } = await import(
-  '../src/v1/commitments.js'
-);
+const {
+  getCommitmentByHashHandler,
+  getCommitmentsHandler,
+  fetchOpenCommitmentsByContestId,
+  rowToHiddenAllowlistBody,
+  PUBLIC_HIDDEN_ALLOWLIST,
+} = await import('../src/v1/commitments.js');
 const { STREAM_RESOURCES } = await import('../src/v1/stream/resources.js');
+const { getContestByIdHandler } = await import('../src/v1/contests.js');
+const { getSpeculationByIdHandler } = await import('../src/v1/speculations.js');
+const { deriveSpeculationKey } = await import('../src/lib/eip712.js');
 
 // ── test doubles ────────────────────────────────────────────────────────
 
@@ -160,10 +186,145 @@ function assertHiddenBody(body: unknown): void {
   }
 }
 
+// ── multi-query handler mock (keyed by table) ─────────────────────────────
+// The flat `makeSupabase` above queues responses across ALL `.from()` calls;
+// the contest/speculation detail handlers issue several queries against
+// different tables, so they need per-table responses. Mirrors the harness in
+// speculations-handlers.test.ts. Filters (`eq`/`in`/`gt`/…) are no-ops, so a
+// hidden row passed here reaches the mapper AS IF the `book_visible=true`
+// filter had failed — exactly the defense-in-depth case under test.
+function makeSupabaseByTable(tables: Record<string, MockResponse | MockResponse[]>): {
+  from: (table: string) => unknown;
+} {
+  const callCounts = new Map<string, number>();
+  return {
+    from(table: string): unknown {
+      const responses = tables[table];
+      const arr = Array.isArray(responses) ? responses : responses ? [responses] : [];
+      const count = callCounts.get(table) ?? 0;
+      callCounts.set(table, count + 1);
+      const response: MockResponse = arr[Math.min(count, arr.length - 1)] ?? { data: null, error: null };
+      const builder: Record<string, unknown> = {
+        select: () => builder,
+        eq: () => builder,
+        in: () => builder,
+        gt: () => builder,
+        gte: () => builder,
+        lte: () => builder,
+        or: () => builder,
+        order: () => builder,
+        range: () => builder,
+        limit: () => builder,
+        maybeSingle: () => Promise.resolve(response),
+        single: () => Promise.resolve(response),
+        then: (resolve: (v: unknown) => void) => resolve(response),
+      };
+      return builder;
+    },
+  };
+}
+
+// Full `ContestDetailRow` shape for getContestByIdHandler. `jsonodds_id: null`
+// short-circuits the team-id resolve (no `games` query).
+function contestDetailRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    contest_id: 42,
+    jsonodds_id: null,
+    rundown_id: null,
+    sportspage_id: null,
+    contest_creator: '0x4444444444444444444444444444444444444444',
+    league_id: '1',
+    verify_source_hash: null,
+    market_update_source_hash: null,
+    score_contest_source_hash: null,
+    away_team: 'Away',
+    home_team: 'Home',
+    sport_slug: 'nba',
+    jsonodds_sport_id: 2,
+    start_time: FUTURE,
+    contest_status: 'verified',
+    away_score: null,
+    home_score: null,
+    contest_created_at: null,
+    verified_at: null,
+    scored_at: null,
+    voided_at: null,
+    ...overrides,
+  };
+}
+// Parent-contest context row for getSpeculationByIdHandler (jsonodds_id null →
+// no games query).
+function contestContextRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    contest_id: 42,
+    jsonodds_id: null,
+    away_team: 'Away',
+    home_team: 'Home',
+    sport_slug: 'nba',
+    start_time: FUTURE,
+    contest_status: 'verified',
+    ...overrides,
+  };
+}
+// A moneyline speculation row on contest 42 (line_ticks 0). Drives the
+// speculationKey the orderbook groups on.
+function specRowMoneyline(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    speculation_id: 100,
+    contest_id: 42,
+    speculation_scorer: SCORERS.moneyline,
+    market_type: 'moneyline',
+    line_ticks: 0,
+    speculation_status: 'open',
+    ...overrides,
+  };
+}
+
+// Recursively collect every object key in a response tree.
+function collectKeys(value: unknown, acc: Set<string>): void {
+  if (Array.isArray(value)) {
+    for (const v of value) collectKeys(v, acc);
+  } else if (value !== null && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      acc.add(k);
+      collectKeys(v, acc);
+    }
+  }
+}
+
+// The hard security invariant: the full signed payload must not appear ANYWHERE
+// in a response — neither the signature value nor any commitment-only matchable
+// key. `lineTicks` is deliberately excluded: the Speculation wire type
+// legitimately carries it (a hidden COMMITMENT body never does).
+const COMMITMENT_SIGNED_KEYS = [
+  'signature',
+  'oddsTick',
+  'riskAmount',
+  'remainingRiskAmount',
+  'speculationKey',
+  'nonce',
+  'marketType',
+  'scorer',
+] as const;
+function assertNoSignedPayloadAnywhere(responseBody: unknown): void {
+  // The fixture signature value (0x + 130 hex) must never appear in the wire.
+  expect(JSON.stringify(responseBody)).not.toContain('9'.repeat(130));
+  const keys = new Set<string>();
+  collectKeys(responseBody, keys);
+  for (const k of COMMITMENT_SIGNED_KEYS) {
+    expect(keys.has(k), `response leaked a "${k}" field`).toBe(false);
+  }
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(NOW);
-  envMock.loadConfig.mockReturnValue({ network: 'polygon', chainId: 137, redactHiddenPublic: true });
+  envMock.loadConfig.mockReturnValue({
+    network: 'polygon',
+    chainId: 137,
+    redactHiddenPublic: true,
+    scorers: SCORERS,
+  });
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -353,7 +514,9 @@ describe('Leak path 5 — chain via fills → /v1/commitments/:hash', () => {
 // ─────────────────────────────────────────────────────────────────────────
 describe('REDACT_HIDDEN_PUBLIC=false rollback', () => {
   beforeEach(() => {
-    envMock.loadConfig.mockReturnValue({ network: 'polygon', chainId: 137, redactHiddenPublic: false });
+    // `scorers` included so the contest embed (which 500s without them) can be
+    // exercised under the rollback flag too.
+    envMock.loadConfig.mockReturnValue({ network: 'polygon', chainId: 137, redactHiddenPublic: false, scorers: SCORERS });
   });
 
   it('/:hash hidden row → full body (legacy behavior)', async () => {
@@ -389,6 +552,221 @@ describe('REDACT_HIDDEN_PUBLIC=false rollback', () => {
     await getCommitmentsHandler(makeReq({ includeHidden: 'true' }), res as unknown as Response);
     expect(res.statusCode).toBe(400);
     expect(res.body).toMatchObject({ code: 'INCLUDE_HIDDEN_REMOVED' });
+  });
+
+  it('speculation-detail orderbook hidden row → full body (legacy behavior; the new embed honors the flag)', async () => {
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabaseByTable({
+        speculations: { data: specRowMoneyline(), error: null },
+        contests: { data: contestContextRow(), error: null },
+        commitments: { data: [hiddenRow()], error: null },
+      }),
+    );
+    const res = makeRes();
+    await getSpeculationByIdHandler(makeReq({}, { speculationId: '100' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { orderbook: Array<Record<string, unknown>> };
+    expect(body.orderbook).toHaveLength(1);
+    expect(body.orderbook[0]).toMatchObject({ signature: expect.any(String), bookVisible: false });
+    expect(body.orderbook[0]).not.toHaveProperty('redacted');
+  });
+
+  it('contest-detail orderbook hidden row → full body grouped (legacy behavior; flag reverts the new embed too)', async () => {
+    // Under rollback the hidden row is NOT redacted → it keeps its speculationKey
+    // → it groups into the orderbook as a full body (the legacy "full body for all
+    // rows" behavior the flag restores).
+    const specKey = deriveSpeculationKey(42n, SCORERS.moneyline.toLowerCase(), 0);
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabaseByTable({
+        contests: { data: contestDetailRow(), error: null },
+        speculations: { data: [specRowMoneyline()], error: null },
+        commitments: { data: [hiddenRow({ speculation_key: specKey })], error: null },
+      }),
+    );
+    const res = makeRes();
+    await getContestByIdHandler(makeReq({}, { contestId: '42' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { speculations: Array<{ orderbook: Array<Record<string, unknown>> }> };
+    expect(body.speculations[0]!.orderbook).toHaveLength(1);
+    expect(body.speculations[0]!.orderbook[0]).toMatchObject({ signature: expect.any(String), bookVisible: false });
+    expect(body.speculations[0]!.orderbook[0]).not.toHaveProperty('redacted');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// F4 — the allow-list is the LOAD-BEARING runtime projection
+// ─────────────────────────────────────────────────────────────────────────
+describe('F4 — runtime allow-list projection (not just a CI assertion)', () => {
+  it('projects a fully-signed hidden row down to EXACTLY the allow-list at runtime (drops signature + the whole matchable struct)', () => {
+    // `hiddenRow()`'s FULL body would carry every signed/matchable field
+    // (signature, nonce, oddsTick, riskAmount, lineTicks, scorer,
+    // speculationKey, marketType). `rowToHiddenAllowlistBody` projects through
+    // PUBLIC_HIDDEN_ALLOWLIST, so none of them can survive — the projection,
+    // not a type wall, is the guarantee.
+    const body = rowToHiddenAllowlistBody(hiddenRow() as never, NOW);
+    // Asserted on the EMITTED body shape (keys === allow-list, deny-list gone),
+    // not on the existence of the constant.
+    assertHiddenBody(body);
+  });
+
+  it('the projection (pick), not the type, drops every off-allow-list field that IS present on the full candidate body', () => {
+    // These are real `CommitmentBody` fields that `rowToBody` populates, so they
+    // genuinely reach the candidate that `pick` projects — i.e. `pick` (not
+    // `rowToBody` ignoring an unknown column) is what drops them. A hidden row
+    // whose full body carries the entire signed/matchable struct must emerge
+    // carrying none of it.
+    const body = rowToHiddenAllowlistBody(
+      hiddenRow({
+        signature: `0x${'9'.repeat(130)}`,
+        nonce: '42',
+        odds_tick: 175,
+        risk_amount: '7000000',
+        line_ticks: 25,
+        scorer: SCORERS.spread,
+        speculation_key: `0x${'e'.repeat(64)}`,
+        market_type: 'spread',
+      }) as never,
+      NOW,
+    ) as Record<string, unknown>;
+    // Emitted key set is EXACTLY the allow-list — every present off-list field dropped.
+    expect(Object.keys(body).sort()).toEqual([...PUBLIC_HIDDEN_ALLOWLIST].sort());
+    // Spell out the high-value signed/matchable fields the candidate carried.
+    for (const k of [
+      'signature',
+      'nonce',
+      'oddsTick',
+      'riskAmount',
+      'remainingRiskAmount',
+      'lineTicks',
+      'scorer',
+      'speculationKey',
+      'marketType',
+    ]) {
+      expect(body, `pick failed to drop off-list field "${k}"`).not.toHaveProperty(k);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Leak path 6 — GET /v1/contests/:contestId orderbook embed
+//           7 — GET /v1/speculations/:speculationId orderbook embed
+//
+// The two anonymous orderbook embeds used to map through the FULL-body
+// `rowToBody`, bypassing the redaction router (single `book_visible=true`
+// filter as the only guard). They now route through `commitmentRowToPublicBody`
+// — defense-in-depth on top of the filter. These tests drive a hidden row past
+// the (mocked-away) filter and assert no signed payload escapes.
+// ─────────────────────────────────────────────────────────────────────────
+describe('Leak path 6 — GET /v1/contests/:contestId orderbook embed', () => {
+  it('fetchOpenCommitmentsByContestId redacts a hidden row that slips past book_visible=true', async () => {
+    const { client } = makeSupabase({ data: [hiddenRow()], error: null });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const out = await fetchOpenCommitmentsByContestId('42', NOW);
+    expect(out.error).toBeNull();
+    expect(out.commitments).toHaveLength(1);
+    assertHiddenBody(out.commitments![0]);
+  });
+
+  it('getContestByIdHandler: a hidden row reaching the orderbook is redacted + dropped — no signed payload in the response', async () => {
+    // speculation_key matches the moneyline speculation, so a REGRESSION (full
+    // body) would be grouped into that speculation's orderbook and leak. The
+    // fixed path redacts (no speculationKey) → the row is dropped.
+    const specKey = deriveSpeculationKey(42n, SCORERS.moneyline.toLowerCase(), 0);
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabaseByTable({
+        contests: { data: contestDetailRow(), error: null },
+        speculations: { data: [specRowMoneyline()], error: null },
+        commitments: { data: [hiddenRow({ speculation_key: specKey })], error: null },
+      }),
+    );
+    const res = makeRes();
+    await getContestByIdHandler(makeReq({}, { contestId: '42' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { speculations: Array<{ orderbook: unknown[] }> };
+    expect(body.speculations.length).toBeGreaterThan(0);
+    for (const s of body.speculations) expect(s.orderbook).toEqual([]);
+    assertNoSignedPayloadAnywhere(res.body);
+  });
+
+  it('getContestByIdHandler: a MIX of visible + hidden rows — visible rows group (createdAt-sorted), the hidden one is dropped + warn-logged, never leaked', async () => {
+    // The realistic defense-in-depth case: a mostly-visible orderbook with one
+    // hidden row that slipped the filter. This pins the PER-ROW drop (a regression
+    // to `break` would lose visible rows after the hidden one) AND the operational
+    // warn signal. `created_at` ordering: visible2 (08:00) sorts before visible1 (09:00).
+    const specKey = deriveSpeculationKey(42n, SCORERS.moneyline.toLowerCase(), 0);
+    // The hidden row gets a DISTINCT signature sentinel so we can assert its
+    // payload (and its hash) never appear — the two visible rows legitimately
+    // carry the default `0x9…9` signature, so a blanket no-signature scan
+    // wouldn't fit the mixed case.
+    const HIDDEN_SIG = `0x${'7'.repeat(130)}`;
+    const HIDDEN_HASH = `0x${'3'.repeat(64)}`;
+    const visible1 = visibleRow({ commitment_hash: `0x${'1'.repeat(64)}`, speculation_key: specKey, created_at: '2026-05-28T09:00:00.000Z' });
+    const visible2 = visibleRow({ commitment_hash: `0x${'2'.repeat(64)}`, speculation_key: specKey, created_at: '2026-05-28T08:00:00.000Z' });
+    const hidden = hiddenRow({ commitment_hash: HIDDEN_HASH, speculation_key: specKey, signature: HIDDEN_SIG });
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabaseByTable({
+        contests: { data: contestDetailRow(), error: null },
+        speculations: { data: [specRowMoneyline()], error: null },
+        commitments: { data: [visible1, hidden, visible2], error: null },
+      }),
+    );
+    const res = makeRes();
+    await getContestByIdHandler(makeReq({}, { contestId: '42' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { speculations: Array<{ orderbook: Array<Record<string, unknown>> }> };
+    const ob = body.speculations[0]!.orderbook;
+    // Both visible rows survive the drop and group; hidden row is gone.
+    expect(ob).toHaveLength(2);
+    expect(ob[0]).toMatchObject({ commitmentHash: `0x${'2'.repeat(64)}`, signature: expect.any(String) }); // earlier created_at first
+    expect(ob[1]).toMatchObject({ commitmentHash: `0x${'1'.repeat(64)}` });
+    for (const e of ob) expect(e).not.toHaveProperty('redacted');
+    // The hidden row's payload + hash never surface, and the drop emitted its warn.
+    const json = JSON.stringify(res.body);
+    expect(json).not.toContain(HIDDEN_SIG);
+    expect(json).not.toContain(HIDDEN_HASH);
+    expect(loggerMock.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ commitmentHash: HIDDEN_HASH }),
+      expect.stringContaining('redacted + dropped'),
+    );
+  });
+});
+
+describe('Leak path 7 — GET /v1/speculations/:speculationId orderbook embed', () => {
+  it('getSpeculationByIdHandler: a hidden row reaching the orderbook surfaces REDACTED, never the full signed payload', async () => {
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabaseByTable({
+        speculations: { data: specRowMoneyline(), error: null },
+        contests: { data: contestContextRow(), error: null },
+        commitments: { data: [hiddenRow()], error: null },
+      }),
+    );
+    const res = makeRes();
+    await getSpeculationByIdHandler(makeReq({}, { speculationId: '100' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { orderbook: unknown[] };
+    expect(body.orderbook).toHaveLength(1);
+    assertHiddenBody(body.orderbook[0]);
+    assertNoSignedPayloadAnywhere(res.body);
+  });
+
+  it('getSpeculationByIdHandler: a VISIBLE row still renders the full body (no regression)', async () => {
+    // speculation_key matches the derived key so the fixture is a true end-to-end
+    // happy path (the mock's .eq() is a no-op, but keep it internally consistent).
+    const specKey = deriveSpeculationKey(42n, SCORERS.moneyline.toLowerCase(), 0);
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabaseByTable({
+        speculations: { data: specRowMoneyline(), error: null },
+        contests: { data: contestContextRow(), error: null },
+        commitments: { data: [visibleRow({ speculation_key: specKey })], error: null },
+      }),
+    );
+    const res = makeRes();
+    await getSpeculationByIdHandler(makeReq({}, { speculationId: '100' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { orderbook: Array<Record<string, unknown>> };
+    expect(body.orderbook).toHaveLength(1);
+    expect(body.orderbook[0]).toMatchObject({ signature: expect.any(String), nonce: '1', bookVisible: true });
+    expect(body.orderbook[0]).not.toHaveProperty('redacted');
   });
 });
 
