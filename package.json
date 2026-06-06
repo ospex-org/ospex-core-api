@@ -13,7 +13,9 @@
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "bench:ownstate": "node --import tsx bench/ownstate-load/harness.ts",
+    "bench:check": "tsc -p bench/tsconfig.json"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.4",
