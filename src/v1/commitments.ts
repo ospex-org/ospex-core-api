@@ -173,10 +173,20 @@ export function rowToBody(row: CommitmentRow, nowMs: number): CommitmentBody {
 // `MatchingModule.matchCommitment`'s struct, plus the signature itself); makers
 // recover hidden bodies via the owner-auth own-state stream landing in M4.
 //
-// Mapping uses an exported ALLOW-LIST (additive surface changes upstream don't
-// silently extend the public hidden body). The two discriminants `redacted` +
-// `payloadAvailable` give SDK consumers a structural signal so the type system
-// can narrow on them instead of probing optional fields.
+// The redaction is enforced by RUNTIME PROJECTION through an exported
+// ALLOW-LIST, not a hand-written literal. `rowToHiddenAllowlistBody` builds the
+// FULL body (which carries the signature + the entire matchable struct) and then
+// PROJECTS it through `PUBLIC_HIDDEN_ALLOWLIST`, dropping every field not on the
+// list. The allow-list is the single source of truth: the wire type is DERIVED
+// from it (`CommitmentHiddenBody = Pick<…, allow-list>`), so a field cannot reach
+// the wire unless it is on the list — regardless of any upstream body change. An
+// additive column upstream is dropped at runtime by the projection, not merely
+// flagged by a type wall (which a deliberate type+literal edit could defeat).
+// See `tests/commitments-redaction.test.ts`.
+//
+// The two discriminants `redacted` + `payloadAvailable` give SDK consumers a
+// structural signal so the type system can narrow on them instead of probing
+// optional fields.
 //
 // Deviations from `implementation-plan.md` §M2's proposed constant — flagged
 // in the PR description:
@@ -192,27 +202,49 @@ export function rowToBody(row: CommitmentRow, nowMs: number): CommitmentBody {
 //     pre-fill, that goes in a follow-up.
 // ────────────────────────────────────────────────────────────────────────
 
-export interface CommitmentHiddenBody {
-  commitmentHash: string;
-  maker: string;
-  contestId: string | null;
-  positionType: 0 | 1 | null;
-  status: string;            // effective — for a hidden row, derives to terminal (cancelled/expired)
-  storedStatus: string;
-  filledRiskAmount: string;
-  expiry: string | null;
-  bookVisible: false;
-  nonceInvalidated: boolean;
-  redacted: true;
-  payloadAvailable: false;
+/**
+ * Pick a fixed set of keys off an object at runtime. Used to project a full
+ * commitment body down to the public hidden-row allow-list — the projection,
+ * not a type wall, is what guarantees an off-list field can't reach the wire.
+ */
+function pick<T extends object, K extends keyof T>(obj: T, keys: readonly K[]): Pick<T, K> {
+  const out = {} as Pick<T, K>;
+  // `k in obj` guard: copy only keys actually present, so an allow-list entry for
+  // an OPTIONAL field that happens to be absent on a given object is omitted
+  // rather than materialized as `key: undefined`. Every current allow-list key is
+  // always-present on the candidate, so this is purely defensive — it keeps the
+  // projected key set the present∩allow-list subset if the allow-list ever grows
+  // an optional field.
+  for (const k of keys) {
+    if (k in obj) out[k] = obj[k];
+  }
+  return out;
 }
 
 /**
- * Exact wire allow-list for public hidden-row bodies. The integration test
- * asserts `Object.keys(hiddenBody).sort()` equals this — an allow-list
- * (not deny-list) so an upstream field addition can't accidentally leak.
+ * The full candidate body a hidden row is projected FROM: every public
+ * `CommitmentBody` field (including the signature + matchable struct) plus the
+ * three redaction markers. `PUBLIC_HIDDEN_ALLOWLIST` selects the subset that is
+ * safe to publish; everything else here is dropped by the projection. Adding a
+ * field to `CommitmentBody` widens this candidate but NOT the public hidden body
+ * unless the field is also added to the allow-list.
  */
-export const PUBLIC_HIDDEN_ALLOWLIST: readonly (keyof CommitmentHiddenBody)[] = [
+type CommitmentHiddenCandidate = CommitmentBody & {
+  bookVisible: false;
+  redacted: true;
+  payloadAvailable: false;
+};
+
+/**
+ * Exact wire allow-list for public hidden-row bodies — the SINGLE source of
+ * truth. `CommitmentHiddenBody` is derived from it and `rowToHiddenAllowlistBody`
+ * projects through it at runtime, so the type, the runtime body, and this list
+ * can never diverge. `satisfies keyof CommitmentHiddenCandidate` makes a
+ * typo'd/removed key a compile error. An allow-list (not deny-list) so an
+ * upstream field addition can't accidentally leak — it's dropped by the
+ * projection unless explicitly added here.
+ */
+export const PUBLIC_HIDDEN_ALLOWLIST = [
   'commitmentHash',
   'maker',
   'contestId',
@@ -225,10 +257,25 @@ export const PUBLIC_HIDDEN_ALLOWLIST: readonly (keyof CommitmentHiddenBody)[] = 
   'nonceInvalidated',
   'redacted',
   'payloadAvailable',
-] as const;
+] as const satisfies readonly (keyof CommitmentHiddenCandidate)[];
 
 /**
- * Build the redacted public body for a hidden (`book_visible=false`) row.
+ * Public hidden-row wire body — DERIVED from `PUBLIC_HIDDEN_ALLOWLIST` so the
+ * type and the runtime projection can never diverge. Changing the allow-list
+ * changes this type in lockstep.
+ */
+export type CommitmentHiddenBody = Pick<
+  CommitmentHiddenCandidate,
+  (typeof PUBLIC_HIDDEN_ALLOWLIST)[number]
+>;
+
+/**
+ * Build the redacted public body for a hidden (`book_visible=false`) row by
+ * PROJECTING the full body through `PUBLIC_HIDDEN_ALLOWLIST`. Starting from the
+ * full body (signature + matchable struct included) and dropping everything not
+ * on the allow-list makes the allow-list load-bearing at runtime: a field cannot
+ * reach the wire unless it is on the list, no matter what `rowToBody` later adds.
+ *
  * Throws if called on a visible row — callers route via
  * `commitmentRowToPublicBody`, which makes the visibility choice; a misrouted
  * visible row reaching this mapper is a programming bug, not a security gap.
@@ -239,29 +286,19 @@ export function rowToHiddenAllowlistBody(row: CommitmentRow, nowMs: number): Com
       `rowToHiddenAllowlistBody invoked on a non-hidden row (commitment_hash=${row.commitment_hash})`,
     );
   }
-  const filled = row.filled_risk_amount != null ? BigInt(String(row.filled_risk_amount)) : 0n;
-  const storedStatus = row.status;
-  const status = deriveEffectiveStatus({
-    storedStatus,
-    expiry: row.expiry,
-    nonceInvalidated: Boolean(row.nonce_invalidated),
+  // `rowToBody` already derives `status` with bookVisible=false (the row is
+  // hidden) and normalizes filled/risk, so the projected subset is identical to
+  // the prior hand-written literal — but now guaranteed by the allow-list rather
+  // than by hand. The redaction markers are added, then everything not on the
+  // allow-list (signature, nonce, oddsTick, riskAmount, lineTicks, scorer,
+  // speculationKey, marketType, …) is dropped by `pick`.
+  const candidate: CommitmentHiddenCandidate = {
+    ...rowToBody(row, nowMs),
     bookVisible: false,
-    nowMs,
-  });
-  return {
-    commitmentHash: row.commitment_hash,
-    maker: row.maker,
-    contestId: row.contest_id != null ? String(row.contest_id) : null,
-    positionType: row.position_type ? POSITION_TYPE_TO_INT[row.position_type] : null,
-    status,
-    storedStatus,
-    filledRiskAmount: filled.toString(),
-    expiry: row.expiry,
-    bookVisible: false,
-    nonceInvalidated: Boolean(row.nonce_invalidated),
     redacted: true,
     payloadAvailable: false,
   };
+  return pick(candidate, PUBLIC_HIDDEN_ALLOWLIST);
 }
 
 /**
@@ -466,12 +503,12 @@ export const OPEN_BOOK_MAX_ROWS = 1000;
 export async function fetchOpenCommitmentsByContestId(
   contestId: string,
   nowMs: number = Date.now(),
-): Promise<{ commitments: CommitmentBody[] | null; error: string | null }> {
+): Promise<{ commitments: Array<CommitmentBody | CommitmentHiddenBody> | null; error: string | null }> {
   const config = loadConfig();
   const sb = getSupabase();
   // Open-book filter == "effective status ∈ {open, partially_filled}": live
   // status, not nonce-invalidated, not past expiry. Same boundary `nowMs` is
-  // reused for rowToBody so the filter and the labels agree.
+  // reused for the body mapper so the filter and the labels agree.
   const { data, error } = await sb
     .from('commitments')
     .select(COMMITMENT_COLUMNS)
@@ -483,8 +520,13 @@ export async function fetchOpenCommitmentsByContestId(
     .gt('expiry', new Date(nowMs).toISOString())
     .limit(OPEN_BOOK_MAX_ROWS);
   if (error) return { commitments: null, error: error.message };
+  // Route every row through the redaction router (defense-in-depth on top of the
+  // `book_visible=true` filter above): a hidden row that ever slips past the
+  // filter emerges REDACTED, never as the full signed payload. The single filter
+  // clause is no longer the sole guard. (Consumers handle the union — a redacted
+  // row has no `speculationKey` to group on; see the contest detail handler.)
   return {
-    commitments: (data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow, nowMs)),
+    commitments: (data ?? []).map((r) => commitmentRowToPublicBody(r as unknown as CommitmentRow, nowMs)),
     error: null,
   };
 }

@@ -30,8 +30,9 @@ import { resolveTeamIdsForContest } from '../lib/teamIds.js';
 import {
   COMMITMENT_COLUMNS,
   OPEN_BOOK_MAX_ROWS,
-  rowToBody,
+  commitmentRowToPublicBody,
   type CommitmentBody,
+  type CommitmentHiddenBody,
   type CommitmentRow,
 } from './commitments.js';
 import {
@@ -347,14 +348,14 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
   // Orderbook — single targeted query keyed on speculation_key. Same
   // default open-book filter as `/v1/commitments` (open or
   // partially_filled, not invalidated, not expired).
-  let orderbook: CommitmentBody[] = [];
+  let orderbook: Array<CommitmentBody | CommitmentHiddenBody> = [];
   if (specRow.speculation_scorer && specRow.line_ticks != null) {
     const speculationKey = deriveSpeculationKey(
       BigInt(speculation.contestId),
       String(specRow.speculation_scorer).toLowerCase(),
       specRow.line_ticks,
     );
-    // One captured `now` for both the expiry boundary and rowToBody labeling.
+    // One captured `now` for both the expiry boundary and body labeling.
     const nowMs = Date.now();
     const obRes = await sb
       .from('commitments')
@@ -373,7 +374,11 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
       res.status(500).json({ error: 'Failed to fetch orderbook.', code: 'INTERNAL_ERROR' } satisfies ApiError);
       return;
     }
-    orderbook = (obRes.data ?? []).map((r) => rowToBody(r as unknown as CommitmentRow, nowMs));
+    // Route every row through the redaction router (defense-in-depth on top of
+    // the `book_visible=true` filter): a hidden row that ever slips past the
+    // filter surfaces REDACTED in the flat orderbook (matching the list /
+    // recovery paths), never as the full signed payload.
+    orderbook = (obRes.data ?? []).map((r) => commitmentRowToPublicBody(r as unknown as CommitmentRow, nowMs));
   }
 
   const body: SpeculationDetail = { ...speculation, orderbook, contest };
