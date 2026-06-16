@@ -198,7 +198,9 @@ describe('GET /v1/stream/:resource guards', () => {
 
   it('429s when the per-IP connection cap is full', () => {
     const ip = '5.5.5.5';
-    for (let i = 0; i < 10; i += 1) expect(acquire(ip).ok).toBe(true);
+    // This is an anonymous protocol stream; the anon per-IP budget is
+    // maxPerIp - reservedPerIpOwner = 16 - 3 = 13 (defaults).
+    for (let i = 0; i < 13; i += 1) expect(acquire(ip).ok).toBe(true);
     const res = makeRes();
     getStreamHandler(makeReq({ resource: 'fills', ip }), res as unknown as Response);
     expect(res.statusCode).toBe(429);

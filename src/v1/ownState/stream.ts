@@ -181,7 +181,10 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
     }
   }
 
-  const ip = acquireStreamSlot(req, res);
+  // 'owner': this owner-authenticated own-state stream may draw from the per-IP
+  // reserve, so anonymous public-stream saturation from the same IP cannot 429
+  // a market-maker's safety-critical own-state reconnect.
+  const ip = acquireStreamSlot(req, res, 'owner');
   if (ip === null) return;
 
   // From here a slot is held — every early return must release it.
@@ -257,7 +260,7 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
     closed = true;
     clearInterval(heartbeat);
     getOwnStateHub().unsubscribe(sub);
-    release(ip);
+    release(ip, 'owner');
     deregisterStream();
   };
   const heartbeat = setInterval(() => writeComment(res, 'hb'), HEARTBEAT_MS);

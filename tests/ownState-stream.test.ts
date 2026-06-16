@@ -39,7 +39,7 @@ const { getOwnStateStreamHandler, __resetOwnStateStreamMetrics } = await import(
   '../src/v1/ownState/stream.js'
 );
 const { OwnStateHub, __setOwnStateHubForTest } = await import('../src/v1/ownState/hub.js');
-const { __resetConnections } = await import('../src/v1/stream/connections.js');
+const { __resetConnections, acquire, configureConnectionCaps } = await import('../src/v1/stream/connections.js');
 const {
   encodeOwnStateCursor,
   decodeOwnStateCursor,
@@ -260,6 +260,36 @@ describe('GET /v1/stream/own-state — cursor guards', () => {
       res as unknown as Response,
     );
     expect(res.statusCode).toBe(400);
+  });
+});
+
+describe('GET /v1/stream/own-state — per-IP owner-auth reserve (D1-6)', () => {
+  // makeReq()'s ip is '9.9.9.9'; saturate the ANON budget for that IP, then
+  // confirm the owner-auth own-state stream is (not) starved depending on the
+  // reserve. Anonymous public-stream saturation must not be able to 429 the
+  // market-maker's safety-critical own-state reconnect.
+  it('opens despite anon saturation when a reserve exists (owner takes the reserved slot)', async () => {
+    configureConnectionCaps({ maxPerIp: 2, reservedPerIpOwner: 1 }); // anon cap 1, 1 owner-reserved
+    expect(acquire('9.9.9.9', 'anon').ok).toBe(true); // fill the anon budget
+    expect(acquire('9.9.9.9', 'anon').ok).toBe(false); // anon is now starved…
+
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+    await flushTicks(32);
+
+    expect(res.statusCode).not.toBe(429); // …but the own-state stream is not 429'd
+    expect(events(res)[0]).toMatchObject({ event: 'snapshot' }); // it opened
+  });
+
+  it('is starved by anon saturation when reservedPerIpOwner = 0 (the D1-6 bug)', () => {
+    configureConnectionCaps({ maxPerIp: 1, reservedPerIpOwner: 0 }); // single shared pool, no reserve
+    expect(acquire('9.9.9.9', 'anon').ok).toBe(true); // anon takes the only slot
+
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+
+    expect(res.statusCode).toBe(429); // own-state is rejected — the starvation the reserve fixes
+    expect((res.body as { code?: string }).code).toBe('RATE_LIMIT_EXCEEDED');
   });
 });
 

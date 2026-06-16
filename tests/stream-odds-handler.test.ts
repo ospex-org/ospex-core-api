@@ -231,7 +231,8 @@ describe('GET /v1/stream/odds guards', () => {
 
   it('429s when the per-IP cap is full', async () => {
     const ip = '5.5.5.5';
-    for (let i = 0; i < 10; i += 1) expect(acquire(ip).ok).toBe(true);
+    // Anonymous odds stream → anon per-IP budget = maxPerIp - reservedPerIpOwner = 16 - 3 = 13 (defaults).
+    for (let i = 0; i < 13; i += 1) expect(acquire(ip).ok).toBe(true);
     const res = makeRes();
     await getOddsStreamHandler(makeReq({ contestId: '1', market: 'spread', ip }), res as unknown as Response);
     expect(res.statusCode).toBe(429);

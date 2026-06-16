@@ -78,15 +78,66 @@ describe('sse wire format', () => {
 describe('connection caps', () => {
   afterEach(() => __resetConnections());
 
-  it('enforces the per-IP cap and frees a slot on release', () => {
+  it('enforces the per-IP anon cap (maxPerIp - reservedPerIpOwner) and frees a slot on release', () => {
     const ip = '1.2.3.4';
-    for (let i = 0; i < 10; i += 1) expect(acquire(ip).ok).toBe(true);
-    const over = acquire(ip);
+    // Default caps: 16 per IP with 3 reserved for owner-auth → 13 anon slots.
+    for (let i = 0; i < 13; i += 1) expect(acquire(ip).ok).toBe(true);
+    const over = acquire(ip); // 14th anon — would dip into the owner reserve
     expect(over.ok).toBe(false);
     expect(over.scope).toBe('ip');
 
     release(ip);
     expect(acquire(ip).ok).toBe(true); // a slot freed up
+  });
+
+  it('co-located makers (the docs example): at the default 16/3, N=2 makers × 7 odds = 14 anon streams 429s the 14th, while both own-state streams still fit', () => {
+    // The .env.example / README co-location example: PER_IP=16, reserve=3, N=2, odds=7.
+    // The OVERALL check N*(odds+1)=2*8=16 ≤ 16 looks like it fits, but the BINDING
+    // anon-odds check N*odds=14 > PER_IP-reserve=13 rejects the 14th odds stream — so
+    // docs must size PER_IP for the anon constraint, not the overall one.
+    const ip = '198.51.100.7'; // one shared egress host for both makers
+    for (let i = 0; i < 13; i += 1) expect(acquire(ip, 'anon').ok).toBe(true); // 13 odds streams fit
+    expect(acquire(ip, 'anon')).toMatchObject({ ok: false, scope: 'ip' }); // the 14th odds stream is 429'd
+    // …but the reserve still admits each maker's safety-critical own-state stream.
+    expect(acquire(ip, 'owner').ok).toBe(true); // maker A own-state
+    expect(acquire(ip, 'owner').ok).toBe(true); // maker B own-state
+    // 13 anon + 2 owner = 15 held; one reserved slot to spare under the 16 cap.
+    expect(connectionStats()).toMatchObject({ maxPerIp: 16, reservedPerIpOwner: 3, total: 15 });
+  });
+
+  it('owner-auth streams may use the reserved slots anon cannot, up to the full per-IP cap', () => {
+    const ip = '1.2.3.4';
+    for (let i = 0; i < 13; i += 1) expect(acquire(ip, 'anon').ok).toBe(true); // fill the anon cap
+    expect(acquire(ip, 'anon').ok).toBe(false); // anon is now capped out (the reserve is owner-only)…
+    // …but owner can still take the 3 reserved slots — anon saturation can't starve own-state.
+    expect(acquire(ip, 'owner').ok).toBe(true);
+    expect(acquire(ip, 'owner').ok).toBe(true);
+    expect(acquire(ip, 'owner').ok).toBe(true);
+    const overOwner = acquire(ip, 'owner'); // 17th total from this IP — over the full per-IP cap (16)
+    expect(overOwner.ok).toBe(false);
+    expect(overOwner.scope).toBe('ip');
+  });
+
+  it('releasing an owner slot (kind must match) restores the reserve', () => {
+    const ip = '9.9.9.9';
+    configureConnectionCaps({ maxPerIp: 3, reservedPerIpOwner: 1 }); // anon cap 2, 1 owner-reserved
+    expect(acquire(ip, 'anon').ok).toBe(true);
+    expect(acquire(ip, 'anon').ok).toBe(true);
+    expect(acquire(ip, 'anon').ok).toBe(false); // anon capped at 2
+    expect(acquire(ip, 'owner').ok).toBe(true); // takes the reserved slot (total 3)
+    expect(acquire(ip, 'owner').ok).toBe(false); // per-IP cap (3) hit
+    release(ip, 'owner');
+    expect(acquire(ip, 'owner').ok).toBe(true); // reserve available again
+    expect(acquire(ip, 'anon').ok).toBe(false); // still anon-capped (2 anon held)
+  });
+
+  it('reservedPerIpOwner = 0 is the original single shared per-IP pool', () => {
+    const ip = '7.7.7.7';
+    configureConnectionCaps({ maxPerIp: 2, reservedPerIpOwner: 0 });
+    expect(acquire(ip, 'anon').ok).toBe(true);
+    expect(acquire(ip, 'anon').ok).toBe(true); // anon may use the whole per-IP cap
+    expect(acquire(ip, 'anon').ok).toBe(false);
+    expect(acquire(ip, 'owner').ok).toBe(false); // no reserve — owner gets no privileged slot
   });
 
   it('tracks distinct IPs independently', () => {
@@ -104,13 +155,13 @@ describe('connection caps', () => {
     expect(connectionStats().total).toBe(1);
   });
 
-  it('reports the default caps (200 total / 10 per IP) until configured', () => {
-    expect(connectionStats()).toMatchObject({ maxTotal: 200, maxPerIp: 10 });
+  it('reports the default caps (200 total / 16 per IP / 3 owner-reserved) until configured', () => {
+    expect(connectionStats()).toMatchObject({ maxTotal: 200, maxPerIp: 16, reservedPerIpOwner: 3 });
   });
 
   it('configureConnectionCaps overrides both caps and enforces the new limits', () => {
-    configureConnectionCaps({ maxTotal: 3, maxPerIp: 2 });
-    expect(connectionStats()).toMatchObject({ maxTotal: 3, maxPerIp: 2 });
+    configureConnectionCaps({ maxTotal: 3, maxPerIp: 2, reservedPerIpOwner: 0 });
+    expect(connectionStats()).toMatchObject({ maxTotal: 3, maxPerIp: 2, reservedPerIpOwner: 0 });
 
     const ip = '1.1.1.1';
     expect(acquire(ip).ok).toBe(true);
@@ -175,7 +226,7 @@ describe('M0 cumulative counters', () => {
   afterEach(() => __resetConnections());
 
   it('acquire failures bump rejectedTotal (per-IP scope)', () => {
-    configureConnectionCaps({ maxTotal: 100, maxPerIp: 1 });
+    configureConnectionCaps({ maxTotal: 100, maxPerIp: 1, reservedPerIpOwner: 0 });
     expect(connectionStats().rejectedTotal).toBe(0);
 
     acquire('1.1.1.1'); // ok

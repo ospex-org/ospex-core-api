@@ -33,6 +33,8 @@ export interface Config {
   /** SSE concurrent-connection caps. Absent ⇒ the stream module's defaults apply. */
   maxStreamConnectionsTotal?: number | undefined;
   maxStreamConnectionsPerIp?: number | undefined;
+  /** Per-IP slots reserved for owner-auth (own-state) streams. Absent ⇒ the stream module's default. */
+  reservedStreamConnectionsPerIpOwner?: number | undefined;
   /**
    * Public hidden-row (`book_visible=false`) redaction switch — short-lived
    * rollout/rollback guard. Default `true` (redaction enforced). Set `false`
@@ -130,6 +132,25 @@ function optionalPositiveIntEnv(name: string): number | undefined {
 }
 
 /**
+ * Optional non-negative-integer env var (accepts 0; rejects negatives /
+ * non-integers). Used for RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER, where `0` is
+ * the documented "disable the reserve / original single shared pool" setting that
+ * the acquire logic clamps for (see `src/v1/stream/connections.ts`); the per-IP
+ * and total caps stay {@link optionalPositiveIntEnv} (a 0 there would block every
+ * connection). Returns undefined when unset (caller falls back to a default).
+ */
+function optionalNonNegativeIntEnv(name: string): number | undefined {
+  const raw = optionalEnv(name);
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    logger.fatal({ var: name, value: raw }, `${name} must be a non-negative integer`);
+    process.exit(1);
+  }
+  return n;
+}
+
+/**
  * Boolean env var with a fixed default. Accepts `true|false|1|0` (case-insensitive);
  * any other value is a boot-time fatal so a typo can't silently flip a security gate.
  */
@@ -210,6 +231,14 @@ export function loadConfig(): Config {
   // unset var leaves the cap at its default rather than overriding it.
   const maxStreamConnectionsTotal = optionalPositiveIntEnv('MAX_STREAM_CONNECTIONS_TOTAL');
   const maxStreamConnectionsPerIp = optionalPositiveIntEnv('MAX_STREAM_CONNECTIONS_PER_IP');
+  // Per-IP owner-auth reserve. `0` is a valid, documented setting — the original
+  // single shared pool (anonymous + own-state share the full per-IP cap; the
+  // acquire clamp in `src/v1/stream/connections.ts` treats 0 as no reserve), so it
+  // parses through the NON-negative helper (negatives / non-integers still fatal).
+  // Unset leaves it at the stream module's DEFAULT_RESERVED_PER_IP_OWNER.
+  const reservedStreamConnectionsPerIpOwner = optionalNonNegativeIntEnv(
+    'RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER',
+  );
 
   // Public hidden-row redaction. Default ON; flip to false only as a deploy-window
   // rollback (see Config.redactHiddenPublic docstring).
@@ -288,8 +317,14 @@ export function loadConfig(): Config {
     ...(scorers !== undefined ? { scorers } : {}),
     ...(maxStreamConnectionsTotal !== undefined ? { maxStreamConnectionsTotal } : {}),
     ...(maxStreamConnectionsPerIp !== undefined ? { maxStreamConnectionsPerIp } : {}),
+    ...(reservedStreamConnectionsPerIpOwner !== undefined ? { reservedStreamConnectionsPerIpOwner } : {}),
     ...(streamAuthHmacSecret !== undefined ? { streamAuthHmacSecret } : {}),
     ...(streamAuthAudience !== undefined ? { streamAuthAudience } : {}),
   };
   return cached;
+}
+
+/** Test-only: clear the memoized config so a test can re-run `loadConfig()` under a different env. */
+export function __resetConfigCache(): void {
+  cached = undefined;
 }
