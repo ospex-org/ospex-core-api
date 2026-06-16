@@ -90,6 +90,21 @@ describe('connection caps', () => {
     expect(acquire(ip).ok).toBe(true); // a slot freed up
   });
 
+  it('co-located makers (the docs example): at the default 16/3, N=2 makers × 7 odds = 14 anon streams 429s the 14th, while both own-state streams still fit', () => {
+    // The .env.example / README co-location example: PER_IP=16, reserve=3, N=2, odds=7.
+    // The OVERALL check N*(odds+1)=2*8=16 ≤ 16 looks like it fits, but the BINDING
+    // anon-odds check N*odds=14 > PER_IP-reserve=13 rejects the 14th odds stream — so
+    // docs must size PER_IP for the anon constraint, not the overall one.
+    const ip = '198.51.100.7'; // one shared egress host for both makers
+    for (let i = 0; i < 13; i += 1) expect(acquire(ip, 'anon').ok).toBe(true); // 13 odds streams fit
+    expect(acquire(ip, 'anon')).toMatchObject({ ok: false, scope: 'ip' }); // the 14th odds stream is 429'd
+    // …but the reserve still admits each maker's safety-critical own-state stream.
+    expect(acquire(ip, 'owner').ok).toBe(true); // maker A own-state
+    expect(acquire(ip, 'owner').ok).toBe(true); // maker B own-state
+    // 13 anon + 2 owner = 15 held; one reserved slot to spare under the 16 cap.
+    expect(connectionStats()).toMatchObject({ maxPerIp: 16, reservedPerIpOwner: 3, total: 15 });
+  });
+
   it('owner-auth streams may use the reserved slots anon cannot, up to the full per-IP cap', () => {
     const ip = '1.2.3.4';
     for (let i = 0; i < 13; i += 1) expect(acquire(ip, 'anon').ok).toBe(true); // fill the anon cap
