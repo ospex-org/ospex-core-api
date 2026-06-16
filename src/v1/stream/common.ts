@@ -8,7 +8,7 @@
 
 import type { Request, Response } from 'express';
 import type { ApiError } from '../../middleware/errorHandler.js';
-import { acquire, recordSlowClientShed } from './connections.js';
+import { acquire, recordSlowClientShed, type StreamKind } from './connections.js';
 
 /** Heartbeat comment interval — keeps the connection under the platform idle timeout. */
 export const HEARTBEAT_MS = 20_000;
@@ -18,12 +18,15 @@ export const MAX_PENDING_BYTES = 1_000_000;
 
 /**
  * Acquire a concurrent-stream slot for the request. On success returns the
- * client IP (the key the caller passes to `release`); when the cap is full,
- * sends a `429 RATE_LIMIT_EXCEEDED` and returns null — the caller returns early.
+ * client IP (the key the caller passes to `release`, with the SAME `kind`);
+ * when the cap is full, sends a `429 RATE_LIMIT_EXCEEDED` and returns null —
+ * the caller returns early. `kind` selects the budget: `owner` (own-state) may
+ * use the per-IP reserve, `anon` (public odds/protocol) may not. Defaults to
+ * `anon`.
  */
-export function acquireStreamSlot(req: Request, res: Response): string | null {
+export function acquireStreamSlot(req: Request, res: Response, kind: StreamKind = 'anon'): string | null {
   const ip = req.ip ?? 'unknown';
-  const slot = acquire(ip);
+  const slot = acquire(ip, kind);
   if (!slot.ok) {
     res.status(429).json({
       error:

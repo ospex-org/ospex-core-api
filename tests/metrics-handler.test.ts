@@ -92,7 +92,7 @@ describe('GET /v1/metrics', () => {
       stream: { resources: 0, subscribers: 0 },
       odds: { subscribers: 0, channelOpen: false, subscribed: false, degraded: false },
       ownState: { wallets: 0, subscribers: 0, resyncBroadcastTotal: 0 },
-      connections: { total: 0, ips: 0, maxTotal: 200, maxPerIp: 10 },
+      connections: { total: 0, ips: 0, maxTotal: 200, maxPerIp: 16, reservedPerIpOwner: 3 },
     });
     const body = res.body as { uptimeSeconds: unknown; timestamp: unknown };
     expect(typeof body.uptimeSeconds).toBe('number');
@@ -102,7 +102,7 @@ describe('GET /v1/metrics', () => {
   it('reflects live hub stats, held connections, and configured caps', () => {
     __setStreamHubForTest(fakeStreamHub({ resources: 2, subscribers: 5 }));
     __setOddsHubForTest(fakeOddsHub({ subscribers: 3, channelOpen: true, subscribed: true, degraded: false }));
-    configureConnectionCaps({ maxTotal: 50, maxPerIp: 4 });
+    configureConnectionCaps({ maxTotal: 50, maxPerIp: 4, reservedPerIpOwner: 0 });
     acquire('1.2.3.4');
     acquire('1.2.3.4');
     acquire('5.6.7.8');
@@ -148,7 +148,7 @@ describe('GET /v1/metrics', () => {
   it('surfaces per-IP rejection counts (acquire failures bump rejectedTotal + rejectedByScope.ip)', () => {
     __setStreamHubForTest(fakeStreamHub({ resources: 0, subscribers: 0 }));
     __setOddsHubForTest(fakeOddsHub({ subscribers: 0, channelOpen: false, subscribed: false, degraded: false }));
-    configureConnectionCaps({ maxTotal: 10, maxPerIp: 2 });
+    configureConnectionCaps({ maxTotal: 10, maxPerIp: 2, reservedPerIpOwner: 0 });
     acquire('1.2.3.4'); // ok
     acquire('1.2.3.4'); // ok (at cap)
     acquire('1.2.3.4'); // rejected — per-ip

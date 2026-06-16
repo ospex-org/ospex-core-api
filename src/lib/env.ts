@@ -33,6 +33,8 @@ export interface Config {
   /** SSE concurrent-connection caps. Absent ⇒ the stream module's defaults apply. */
   maxStreamConnectionsTotal?: number | undefined;
   maxStreamConnectionsPerIp?: number | undefined;
+  /** Per-IP slots reserved for owner-auth (own-state) streams. Absent ⇒ the stream module's default. */
+  reservedStreamConnectionsPerIpOwner?: number | undefined;
   /**
    * Public hidden-row (`book_visible=false`) redaction switch — short-lived
    * rollout/rollback guard. Default `true` (redaction enforced). Set `false`
@@ -210,6 +212,12 @@ export function loadConfig(): Config {
   // unset var leaves the cap at its default rather than overriding it.
   const maxStreamConnectionsTotal = optionalPositiveIntEnv('MAX_STREAM_CONNECTIONS_TOTAL');
   const maxStreamConnectionsPerIp = optionalPositiveIntEnv('MAX_STREAM_CONNECTIONS_PER_IP');
+  // Per-IP owner-auth reserve (optionalPositiveIntEnv rejects negatives; 0 is not
+  // "positive" so a 0 reserve is set explicitly in code via the default, not env —
+  // operators only ever RAISE the reserve, which is the safe direction).
+  const reservedStreamConnectionsPerIpOwner = optionalPositiveIntEnv(
+    'RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER',
+  );
 
   // Public hidden-row redaction. Default ON; flip to false only as a deploy-window
   // rollback (see Config.redactHiddenPublic docstring).
@@ -288,6 +296,7 @@ export function loadConfig(): Config {
     ...(scorers !== undefined ? { scorers } : {}),
     ...(maxStreamConnectionsTotal !== undefined ? { maxStreamConnectionsTotal } : {}),
     ...(maxStreamConnectionsPerIp !== undefined ? { maxStreamConnectionsPerIp } : {}),
+    ...(reservedStreamConnectionsPerIpOwner !== undefined ? { reservedStreamConnectionsPerIpOwner } : {}),
     ...(streamAuthHmacSecret !== undefined ? { streamAuthHmacSecret } : {}),
     ...(streamAuthAudience !== undefined ? { streamAuthAudience } : {}),
   };

@@ -140,6 +140,7 @@ function main(): void {
   configureConnectionCaps({
     maxTotal: config.maxStreamConnectionsTotal,
     maxPerIp: config.maxStreamConnectionsPerIp,
+    reservedPerIpOwner: config.reservedStreamConnectionsPerIpOwner,
   });
   const app = buildApp(config);
 
