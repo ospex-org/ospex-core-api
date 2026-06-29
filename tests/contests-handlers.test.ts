@@ -27,9 +27,7 @@ const envMock = vi.hoisted(() => ({
 vi.mock('../src/lib/supabase.js', () => supabaseMock);
 vi.mock('../src/lib/env.js', () => envMock);
 
-const { getApprovedScriptsHandler, getContestsHandler, getContestByIdHandler } = await import(
-  '../src/v1/contests.js'
-);
+const { getContestsHandler, getContestByIdHandler } = await import('../src/v1/contests.js');
 
 interface FakeRes {
   statusCode?: number;
@@ -100,48 +98,6 @@ function makeSupabase(tables: Record<string, MockResponse | MockResponse[]>): {
     },
   };
 }
-
-describe('GET /v1/contests/scripts/approved', () => {
-  it('returns the polygon approvals bundle on a polygon deployment', () => {
-    envMock.loadConfig.mockReturnValueOnce({
-      network: 'polygon',
-      chainId: 137,
-      scorers: SCORERS,
-    });
-    const res = makeRes();
-    getApprovedScriptsHandler(makeReq(), res as unknown as Response);
-    expect(res.statusCode).toBe(200);
-    expect(res.body).toMatchObject({
-      network: 'polygon',
-      approvedSigner: '0xfd6C7Fc1F182de53AA636584f1c6B80d9D885886',
-      verify: { purpose: 0, leagueId: 0, version: 1 },
-      marketUpdate: { purpose: 1, validUntil: 0 },
-      score: { purpose: 2, validUntil: 0 },
-    });
-  });
-
-  it('exposes the verify approval expiry and a non-empty signature', () => {
-    envMock.loadConfig.mockReturnValueOnce({
-      network: 'polygon',
-      chainId: 137,
-      scorers: SCORERS,
-    });
-    const res = makeRes();
-    getApprovedScriptsHandler(makeReq(), res as unknown as Response);
-    const body = res.body as { verify: { validUntil: number; signature: string } };
-    expect(body.verify.validUntil).toBeGreaterThan(0);
-    expect(body.verify.signature).toMatch(/^0x[0-9a-f]+$/i);
-    expect(body.verify.signature.length).toBe(2 + 130);
-  });
-
-  it('returns 503 SCRIPT_APPROVALS_NOT_CONFIGURED on amoy (no committed approvals)', () => {
-    envMock.loadConfig.mockReturnValueOnce({ network: 'amoy', chainId: 80002, scorers: SCORERS });
-    const res = makeRes();
-    getApprovedScriptsHandler(makeReq(), res as unknown as Response);
-    expect(res.statusCode).toBe(503);
-    expect(res.body).toMatchObject({ code: 'SCRIPT_APPROVALS_NOT_CONFIGURED' });
-  });
-});
 
 describe('GET /v1/contests', () => {
   it('returns 400 for an unknown sport', async () => {

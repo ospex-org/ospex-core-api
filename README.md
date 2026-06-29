@@ -12,7 +12,6 @@ In progress. Working today:
 - `POST /v1/commitments` — EIP-712 commitment relay
 - `GET /v1/commitments` — list with filters / pagination
 - `GET /v1/contests`, `GET /v1/contests/:contestId` — contest list / detail (renamed from `/v1/markets/*`)
-- `GET /v1/contests/scripts/approved` — EIP-712 script approvals (M4)
 - `GET /v1/speculations`, `GET /v1/speculations/:speculationId` — speculation list (filters: `contestId`, `sport`, `status`) / detail (with orderbook + parent contest context)
 - `GET /v1/protocol/info` — static protocol metadata
 - `GET /v1/positions/:address` — wallet position history
@@ -148,7 +147,7 @@ Response: `{ contests: ContestListItem[], pagination }`. Each contest has `conte
 
 Single contest detail. Returns the same shape as a list item, plus an `orderbook` array on each speculation populated with currently fillable commitments. Same default filter as `GET /v1/commitments` (status `open` or `partially_filled`, not invalidated, not expired); each entry has the same wire shape as a commitment from `GET /v1/commitments`. Sorted by `createdAt` ascending; price-aware sorting is a follow-up. The list endpoint `GET /v1/contests` does not populate orderbooks.
 
-Detail-only fields surfaced here (omitted on list rows): `jsonoddsId`, `rundownId`, `sportspageId`, `contestCreator`, `leagueId`, `verifySourceHash`, `marketUpdateSourceHash`, `scoreContestSourceHash`, `awayScore`, `homeScore`, `contestCreatedAt`, `verifiedAt`, `scoredAt`, `voidedAt`, plus `awayTeamId` / `homeTeamId` (UUIDs from the `teams` table, resolved via `contests.network + jsonodds_id → games.{home_team_id, away_team_id}`; null when no game linkage exists). The team UUIDs are consumed by `@ospex/sdk`'s resolver layer to scope alias matching to a contest's two teams.
+Detail-only fields surfaced here (omitted on list rows): `jsonoddsId`, `rundownId`, `sportspageId`, `contestCreator`, `leagueId`, `awayScore`, `homeScore`, `contestCreatedAt`, `verifiedAt`, `scoredAt`, `voidedAt`, plus `awayTeamId` / `homeTeamId` (UUIDs from the `teams` table, resolved via `contests.network + jsonodds_id → games.{home_team_id, away_team_id}`; null when no game linkage exists). The team UUIDs are consumed by `@ospex/sdk`'s resolver layer to scope alias matching to a contest's two teams.
 
 ### `GET /v1/contests/:contestId/odds`
 
@@ -580,7 +579,7 @@ src/
   v1/
     router.ts          # versioned router
     commitments.ts     # POST + GET /v1/commitments
-    contests.ts        # GET /v1/contests, /:contestId, /scripts/approved
+    contests.ts        # GET /v1/contests, /:contestId
     speculations.ts    # GET /v1/speculations, /:speculationId
     protocol.ts        # GET /v1/protocol/info
     metrics.ts         # GET /v1/metrics — stream/odds/own-state/connection counters

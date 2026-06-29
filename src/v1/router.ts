@@ -9,7 +9,6 @@ import {
   postCommitmentHandler,
 } from './commitments.js';
 import {
-  getApprovedScriptsHandler,
   getContestByIdHandler,
   getContestsHandler,
 } from './contests.js';
@@ -49,9 +48,9 @@ import { getScheduleHandler } from './schedule.js';
  * ospex-agent-server. Each handler registers its own rate-limit /
  * auth middleware where appropriate; the router itself stays thin.
  *
- * Static / specific paths are registered before parameterized ones
- * (e.g. `/contests/scripts/approved` before `/contests/:contestId`)
- * so Express's matcher doesn't claim a static segment as a parameter.
+ * Static / specific paths are registered before parameterized ones so
+ * Express's matcher doesn't claim a static segment as a parameter (see
+ * positions.ts for the same static-prefix-first discipline).
  */
 export const v1Router: Router = Router();
 
@@ -79,11 +78,6 @@ v1Router.delete(
 v1Router.get('/commitments/:hash', readRateLimit, asyncHandler(getCommitmentByHashHandler));
 v1Router.get('/commitments', readRateLimit, asyncHandler(getCommitmentsHandler));
 
-// Static /contests/scripts/approved MUST come before /contests/:contestId
-// or Express would match `scripts` as the contestId.
-v1Router.get('/contests/scripts/approved', readRateLimit, (req, res) =>
-  getApprovedScriptsHandler(req, res),
-);
 v1Router.get('/contests', readRateLimit, asyncHandler(getContestsHandler));
 v1Router.get('/contests/:contestId/odds', readRateLimit, asyncHandler(getCurrentOddsHandler));
 v1Router.get('/contests/:contestId', readRateLimit, asyncHandler(getContestByIdHandler));
