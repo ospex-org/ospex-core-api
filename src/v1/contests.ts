@@ -3,7 +3,6 @@
  *
  *   GET /v1/contests                        — list upcoming contests with their speculations
  *   GET /v1/contests/:contestId             — single contest detail with populated orderbooks
- *   GET /v1/contests/scripts/approved       — EIP-712 script approvals for the deployment's network
  *
  * The list endpoint stays lean (no orderbook population — heavy and not
  * currently needed). The detail endpoint groups commitments by
@@ -26,10 +25,6 @@ import { deriveSpeculationKey } from '../lib/eip712.js';
 import { SPORTS as VALID_SPORTS, isSport } from '../lib/sports.js';
 import { resolveTeamIdsForContest } from '../lib/teamIds.js';
 import type { ApiError } from '../middleware/errorHandler.js';
-import {
-  SCRIPT_APPROVALS_BY_NETWORK,
-  type ScriptApprovalsBundle,
-} from '../data/scriptApprovals.js';
 import { fetchOpenCommitmentsByContestId, type CommitmentBody } from './commitments.js';
 import {
   SPECULATION_COLUMNS,
@@ -99,20 +94,11 @@ interface ContestDetail extends ContestBody {
    * endpoint only — list responses stay minimal.
    */
   jsonoddsId: string | null;
-  /**
-   * Contest fields surfaced on the detail endpoint only. Source hashes
-   * are the keccak256 of the Chainlink Functions JS sources baked into
-   * the on-chain contest at creation; the indexer persists them so SDK
-   * consumers can verify the contest was created against the
-   * protocol-approved scripts.
-   */
+  /** Contest fields surfaced on the detail endpoint only. */
   rundownId: string | null;
   sportspageId: string | null;
   contestCreator: string;
   leagueId: string;
-  verifySourceHash: string | null;
-  marketUpdateSourceHash: string | null;
-  scoreContestSourceHash: string | null;
   awayScore: number | null;
   homeScore: number | null;
   contestCreatedAt: string | null;
@@ -515,9 +501,6 @@ export async function getContestByIdHandler(req: Request, res: Response): Promis
     sportspageId: c.sportspage_id ?? null,
     contestCreator: c.contest_creator ?? '',
     leagueId: c.league_id ?? 'unknown',
-    verifySourceHash: c.verify_source_hash ?? null,
-    marketUpdateSourceHash: c.market_update_source_hash ?? null,
-    scoreContestSourceHash: c.score_contest_source_hash ?? null,
     awayTeam: c.away_team ?? '',
     homeTeam: c.home_team ?? '',
     sport: c.sport_slug ?? '',
@@ -533,27 +516,4 @@ export async function getContestByIdHandler(req: Request, res: Response): Promis
     speculations,
   };
   res.status(200).json(body);
-}
-
-// ── GET /v1/contests/scripts/approved ──────────────────────────────────
-
-/**
- * EIP-712 script approvals required by `@ospex/sdk` M4 `contests.create()`.
- * The SDK fetches these at runtime so a re-signed approval can ship via
- * a core-api redeploy without an SDK release. Static, no DB, no auth.
- *
- * If the deployment's network has no approvals committed (e.g. amoy
- * before the first amoy signing), responds 503 SCRIPT_APPROVALS_NOT_CONFIGURED.
- */
-export function getApprovedScriptsHandler(_req: Request, res: Response): void {
-  const config = loadConfig();
-  const bundle: ScriptApprovalsBundle | null = SCRIPT_APPROVALS_BY_NETWORK[config.network];
-  if (bundle === null) {
-    res.status(503).json({
-      error: `Script approvals not configured for network "${config.network}".`,
-      code: 'SCRIPT_APPROVALS_NOT_CONFIGURED',
-    } satisfies ApiError);
-    return;
-  }
-  res.status(200).json(bundle);
 }

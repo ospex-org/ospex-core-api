@@ -5,8 +5,8 @@
  * Reads `games` (writer-managed) instead of `current_schedules` because
  * `games` is the table the writer pipeline actually populates with the
  * three external IDs (jsonodds_id, sportspage_id, rundown_id) needed
- * by `OracleModule.createContestFromOracle`. Team UUIDs are joined to
- * `teams` for readable home/away names.
+ * by `CreOracleReceiver.createContestAndRequestVerify`. Team UUIDs are
+ * joined to `teams` for readable home/away names.
  *
  * **gameId stability.** The canonical `gameId` in the response is the
  * row's `jsonodds_id` — part of the writer's `(network, jsonodds_id)`
