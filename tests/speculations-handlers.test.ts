@@ -251,6 +251,51 @@ describe('GET /v1/speculations/:speculationId', () => {
     });
   });
 
+  it('surfaces the settled outcome (winSide/settledAt/voided) on a closed speculation', async () => {
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabase({
+        speculations: {
+          data: {
+            speculation_id: 2,
+            contest_id: 2,
+            speculation_scorer: SCORERS.moneyline,
+            market_type: 'moneyline',
+            line_ticks: 0,
+            speculation_status: 'closed',
+            win_side: 'away',
+            settled_at: '2026-07-01T04:00:14+00:00',
+            voided: false,
+          },
+          error: null,
+        },
+        contests: {
+          data: {
+            contest_id: 2,
+            jsonodds_id: null,
+            away_team: 'Chicago White Sox',
+            home_team: 'Baltimore Orioles',
+            sport_slug: 'mlb',
+            start_time: '2026-06-30T22:35:00Z',
+            contest_status: 'scored',
+          },
+          error: null,
+        },
+        commitments: { data: [], error: null },
+      }),
+    );
+
+    const res = makeRes();
+    await getSpeculationByIdHandler(makeReq({}, { speculationId: '2' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      speculationId: '2',
+      speculationStatus: 1,
+      winSide: 'away',
+      settledAt: '2026-07-01T04:00:14+00:00',
+      voided: false,
+    });
+  });
+
   it('populates team_ids on the parent contest context when the games row is present', async () => {
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabase({

@@ -49,7 +49,7 @@
  * scorer-logic drift.
  */
 
-import type { MarketType } from '../../lib/speculation.js';
+import type { MarketType, WinSide } from '../../lib/speculation.js';
 
 /** Spec §2.1.3 canonical enum. */
 export type PositionStatus =
@@ -104,7 +104,7 @@ export interface PositionInput {
 /** Input projection from the `speculations` table. */
 export interface SpeculationInput {
   speculationStatus: 'open' | 'closed';
-  winSide: 'tbd' | 'away' | 'home' | 'over' | 'under' | 'push' | 'void';
+  winSide: WinSide;
   marketType: MarketType;
   /** int32 in 10× domain (spread / total only); null for moneyline. */
   lineTicks: number | null;
