@@ -11,6 +11,20 @@
 
 export type MarketType = 'moneyline' | 'spread' | 'total';
 
+/**
+ * On-chain `WinSide` enum values as projected onto the `speculations.win_side`
+ * column (Postgres enum, NOT NULL, default `'tbd'`). `'tbd'` is the
+ * pre-settlement sentinel; the settle handler flips it to a concrete value
+ * atomically with `speculation_status='closed'` and `settled_at`.
+ */
+export type WinSide = 'tbd' | 'away' | 'home' | 'over' | 'under' | 'push' | 'void';
+
+/**
+ * A settled `WinSide` — every value except the `'tbd'` sentinel. This is what
+ * the wire exposes as `Speculation.winSide` once `'tbd'` is mapped to `null`.
+ */
+export type SettledWinSide = Exclude<WinSide, 'tbd'>;
+
 export interface ScorerAddresses {
   moneyline: string;
   spread: string;

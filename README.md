@@ -141,7 +141,7 @@ List upcoming contests within a configurable time window (default 72h, max 168h)
 
 Query params: `sport` (one of `nba`, `nhl`, `ncaab`, `nfl`, `mlb`), `status`, `window` (hours), `limit` (max 200), `offset`.
 
-Response: `{ contests: ContestListItem[], pagination }`. Each contest has `contestId`, team names, sport, `matchTime`, status, and a list of speculations. Each speculation has `speculationId`, `contestId`, `type` (`moneyline`/`spread`/`total`), `lineTicks` (raw int32, 10x format per the contracts), `line` (`lineTicks / 10`), and for spread also `awayLine` / `homeLine`.
+Response: `{ contests: ContestListItem[], pagination }`. Each contest has `contestId`, team names, sport, `matchTime`, status, and a list of speculations. Each embedded speculation carries the same shape as the `GET /v1/speculations` response (below): `speculationId`, `contestId`, `type` (`moneyline`/`spread`/`total`), `lineTicks` (raw int32, 10x format per the contracts), `line` (`lineTicks / 10`), `speculationStatus`, the settlement outcome `winSide` / `settledAt` / `voided` (see that section for the value set and the `speculationStatus === 1` ⟺ `winSide !== null` invariant), and for spread also `awayLine` / `homeLine`.
 
 ### `GET /v1/contests/:contestId`
 
@@ -205,7 +205,16 @@ Query params:
 | `limit` | optional, default 100, max 500. |
 | `offset` | optional, default 0. |
 
-Response: `{ speculations: Speculation[], pagination }`. Each `Speculation` carries `speculationId`, `contestId`, `type`, `lineTicks`, `line`, `speculationStatus`, and (for spread) `awayLine`/`homeLine`. List rows do NOT include `orderbook` — fetch the detail endpoint for that.
+Response: `{ speculations: Speculation[], pagination }`. Each `Speculation` carries `speculationId`, `contestId`, `type`, `lineTicks`, `line`, `speculationStatus`, the settlement outcome `winSide` / `settledAt` / `voided`, and (for spread) `awayLine`/`homeLine`. List rows do NOT include `orderbook` — fetch the detail endpoint for that.
+
+Settlement fields:
+
+- `speculationStatus` — `0` = open (taking commitments), `1` = closed (settled on-chain via `settleSpeculation`). Maps directly from `speculations.speculation_status`, which flips to `closed` only at settle time — never at contest-score time.
+- `winSide` — the settled outcome, or `null` while open. One of `away`/`home` (moneyline, spread), `over`/`under` (total), `push`, or `void`. This is the authoritative on-chain `WinSide`; for spread/total/push/void it cannot be recomputed client-side from scores alone. **Invariant: `speculationStatus === 1` ⟺ `winSide !== null`** — both are projected from the same atomic row (the indexer writes `speculation_status` + `win_side` + `settled_at` in one UPDATE), so a closed speculation always carries its winner.
+- `settledAt` — ISO timestamp of the on-chain settlement, or `null` while open.
+- `voided` — `true` iff the speculation settled to `void` (equivalently `winSide === 'void'`); surfaced explicitly so consumers needn't special-case the enum value.
+
+(`scoredAt` is a contest-level field — read it from `GET /v1/contests/:contestId` (`scoredAt`), not the speculation.)
 
 Reads `speculations.market_type` directly; does not depend on the `SCORER_*_ADDRESS` env vars.
 

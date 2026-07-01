@@ -47,7 +47,7 @@
 
 import { getSupabase } from '../../lib/supabase.js';
 import { wei6ToUSDC } from '../../lib/sanitize.js';
-import type { MarketType } from '../../lib/speculation.js';
+import type { MarketType, WinSide } from '../../lib/speculation.js';
 import { loadConfig } from '../../lib/env.js';
 import {
   derivePositionStatus,
@@ -180,7 +180,7 @@ interface SpeculationRow {
   market_type: MarketType | null;
   line_ticks: number | null;
   speculation_status: 'open' | 'closed';
-  win_side: 'tbd' | 'away' | 'home' | 'over' | 'under' | 'push' | 'void';
+  win_side: WinSide;
   row_updated_at: string;
 }
 

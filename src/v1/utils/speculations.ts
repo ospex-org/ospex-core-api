@@ -11,7 +11,14 @@
  * where `contestId` is field 1).
  */
 
-import { lineTicksToLine, scorerToType, type MarketType, type ScorerAddresses } from '../../lib/speculation.js';
+import {
+  lineTicksToLine,
+  scorerToType,
+  type MarketType,
+  type ScorerAddresses,
+  type WinSide,
+  type SettledWinSide,
+} from '../../lib/speculation.js';
 import type { CommitmentBody, CommitmentHiddenBody } from '../commitments.js';
 
 export interface Speculation {
@@ -22,8 +29,31 @@ export interface Speculation {
   line: number | null;
   awayLine?: number;
   homeLine?: number;
-  /** 0 = open (taking commitments), 1 = closed (settled or scored). */
+  /**
+   * 0 = open (taking commitments), 1 = closed (settled on-chain via
+   * `settleSpeculation`). Maps directly from the `speculation_status` column,
+   * which flips to `'closed'` ONLY at settle time — never at contest-score time.
+   */
   speculationStatus: 0 | 1;
+  /**
+   * The settled outcome, or `null` while the speculation is still open
+   * (`win_side='tbd'`). `'push'`/`'void'` are settled outcomes (non-null).
+   *
+   * INVARIANT: on this surface `speculationStatus === 1` ⟺ `winSide !== null`.
+   * Both fields are projected from the SAME Supabase row, and the indexer writes
+   * `speculation_status`, `win_side`, and `settled_at` in one atomic UPDATE — so
+   * a closed speculation always carries its winner (no "closed with no winner"
+   * window is representable here).
+   */
+  winSide: SettledWinSide | null;
+  /** ISO timestamp of the on-chain settlement, or `null` while open. */
+  settledAt: string | null;
+  /**
+   * True iff the speculation settled to `void` (equivalently `winSide === 'void'`,
+   * per the DB `chk_void_consistency` constraint). Surfaced explicitly so
+   * consumers don't have to special-case the `'void'` enum value.
+   */
+  voided: boolean;
 }
 
 export interface SpeculationDetail extends Speculation {
@@ -69,6 +99,24 @@ export interface SpeculationRow {
   market_type: MarketType | null;
   line_ticks: number | null;
   speculation_status: string | null;
+  win_side: WinSide | null;
+  settled_at: string | null;
+  voided: boolean | null;
+}
+
+/**
+ * Project the settlement outcome onto the wire shape. Shared by both
+ * converters so they can't drift. `win_side='tbd'` → `winSide: null`
+ * (agents test `winSide != null`, not a magic sentinel); timestamps pass
+ * through verbatim (ISO | null) — never round-tripped through `Date`, per
+ * the timestamptz-precision rule.
+ */
+function winnerFields(row: SpeculationRow): Pick<Speculation, 'winSide' | 'settledAt' | 'voided'> {
+  return {
+    winSide: row.win_side && row.win_side !== 'tbd' ? row.win_side : null,
+    settledAt: row.settled_at ?? null,
+    voided: row.voided ?? false,
+  };
 }
 
 /**
@@ -89,6 +137,7 @@ export function specRowToSpeculation(row: SpeculationRow): Speculation | null {
     lineTicks,
     line,
     speculationStatus: status,
+    ...winnerFields(row),
   };
   if (row.market_type === 'spread' && line != null) {
     out.awayLine = line;
@@ -119,6 +168,7 @@ export function specRowToSpeculationViaScorer(
     lineTicks,
     line,
     speculationStatus: status,
+    ...winnerFields(row),
   };
   if (type === 'spread' && line != null) {
     out.awayLine = line;
@@ -128,4 +178,4 @@ export function specRowToSpeculationViaScorer(
 }
 
 export const SPECULATION_COLUMNS =
-  'speculation_id, contest_id, speculation_scorer, market_type, line_ticks, speculation_status';
+  'speculation_id, contest_id, speculation_scorer, market_type, line_ticks, speculation_status, win_side, settled_at, voided';
