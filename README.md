@@ -141,7 +141,7 @@ List upcoming contests within a configurable time window (default 72h, max 168h)
 
 Query params: `sport` (one of `nba`, `nhl`, `ncaab`, `nfl`, `mlb`), `status`, `window` (hours), `limit` (max 200), `offset`.
 
-Response: `{ contests: ContestListItem[], pagination }`. Each contest has `contestId`, team names, sport, `matchTime`, status, and a list of speculations. Each speculation has `speculationId`, `contestId`, `type` (`moneyline`/`spread`/`total`), `lineTicks` (raw int32, 10x format per the contracts), `line` (`lineTicks / 10`), and for spread also `awayLine` / `homeLine`.
+Response: `{ contests: ContestListItem[], pagination }`. Each contest has `contestId`, team names, sport, `matchTime`, status, and a list of speculations. Each embedded speculation carries the same shape as the `GET /v1/speculations` response (below): `speculationId`, `contestId`, `type` (`moneyline`/`spread`/`total`), `lineTicks` (raw int32, 10x format per the contracts), `line` (`lineTicks / 10`), `speculationStatus`, the settlement outcome `winSide` / `settledAt` / `voided` (see that section for the value set and the `speculationStatus === 1` ⟺ `winSide !== null` invariant), and for spread also `awayLine` / `homeLine`.
 
 ### `GET /v1/contests/:contestId`
 
