@@ -43,6 +43,7 @@ import {
   type SpeculationParentContext,
   type SpeculationRow,
 } from './utils/speculations.js';
+import { attachClosingLines } from './utils/closingLines.js';
 import type { CursorableRow } from '../lib/cursor.js';
 import { nextCursor, parseRecovery, recoveryKeysetExpr } from '../lib/recovery.js';
 import type { ApiError } from '../middleware/errorHandler.js';
@@ -244,6 +245,11 @@ export async function getSpeculationsHandler(req: Request, res: Response): Promi
     const s = specRowToSpeculation(row as SpeculationRow);
     if (s) speculations.push(s);
   }
+
+  // Attach the no-vig fair closing line (fresh closing_lines rows only) so
+  // consumers can derive CLV against each taker's price. Best-effort — a
+  // closing-line fetch failure never fails the speculations read.
+  await attachClosingLines(sb, config.network, speculations);
 
   const total = count ?? 0;
   const body: SpeculationsListBody = {

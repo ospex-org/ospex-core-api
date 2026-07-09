@@ -141,7 +141,7 @@ List upcoming contests within a configurable time window (default 72h, max 168h)
 
 Query params: `sport` (one of `nba`, `nhl`, `ncaab`, `nfl`, `mlb`), `status`, `window` (hours), `limit` (max 200), `offset`.
 
-Response: `{ contests: ContestListItem[], pagination }`. Each contest has `contestId`, team names, sport, `matchTime`, status, and a list of speculations. Each embedded speculation carries the same shape as the `GET /v1/speculations` response (below): `speculationId`, `contestId`, `type` (`moneyline`/`spread`/`total`), `lineTicks` (raw int32, 10x format per the contracts), `line` (`lineTicks / 10`), `speculationStatus`, the settlement outcome `winSide` / `settledAt` / `voided` (see that section for the value set and the `speculationStatus === 1` ⟺ `winSide !== null` invariant), and for spread also `awayLine` / `homeLine`.
+Response: `{ contests: ContestListItem[], pagination }`. Each contest has `contestId`, team names, sport, `matchTime`, status, and a list of speculations. Each embedded speculation carries the same base shape as the `GET /v1/speculations` response (below): `speculationId`, `contestId`, `type` (`moneyline`/`spread`/`total`), `lineTicks` (raw int32, 10x format per the contracts), `line` (`lineTicks / 10`), `speculationStatus`, the settlement outcome `winSide` / `settledAt` / `voided` (see that section for the value set and the `speculationStatus === 1` ⟺ `winSide !== null` invariant), and for spread also `awayLine` / `homeLine`. The optional `closing` object that the `GET /v1/speculations` **list** endpoint attaches (below) is **not** present on embedded contest speculations.
 
 ### `GET /v1/contests/:contestId`
 
@@ -205,7 +205,7 @@ Query params:
 | `limit` | optional, default 100, max 500. |
 | `offset` | optional, default 0. |
 
-Response: `{ speculations: Speculation[], pagination }`. Each `Speculation` carries `speculationId`, `contestId`, `type`, `lineTicks`, `line`, `speculationStatus`, the settlement outcome `winSide` / `settledAt` / `voided`, and (for spread) `awayLine`/`homeLine`. List rows do NOT include `orderbook` — fetch the detail endpoint for that.
+Response: `{ speculations: Speculation[], pagination }`. Each `Speculation` carries `speculationId`, `contestId`, `type`, `lineTicks`, `line`, `speculationStatus`, the settlement outcome `winSide` / `settledAt` / `voided`, (for spread) `awayLine`/`homeLine`, and — **on this list endpoint only** — an optional `closing` object (the no-vig fair closing line for CLV; see **Closing line** below). List rows do NOT include `orderbook` — fetch the detail endpoint for that.
 
 Settlement fields:
 
@@ -215,6 +215,24 @@ Settlement fields:
 - `voided` — `true` iff the speculation settled to `void` (equivalently `winSide === 'void'`); surfaced explicitly so consumers needn't special-case the enum value.
 
 (`scoredAt` is a contest-level field — read it from `GET /v1/contests/:contestId` (`scoredAt`), not the speculation.)
+
+**Closing line (`closing`)** — optional, **list endpoint only**. When a `fresh` closing line has been captured for the speculation's market (the materialized `closing_lines` table, written by `ospex-writer`), the row carries:
+
+```jsonc
+"closing": {
+  "awayDecimal": 1.96078,  // no-vig fair closing decimal, away/over side (upper, positionType 0) = 1 / away_p_novig
+  "homeDecimal": 2.04082,  // no-vig fair closing decimal, home/under side (lower, positionType 1)
+  "line": null,            // the line the market closed at (null for moneyline)
+  "estimated": false       // true if a side was push-probability-derived; currently ALWAYS false
+}
+```
+
+Both sides are the de-vig'd fair close (their implied probabilities sum to 1). Consumers derive CLV by comparing a taker's actual transacted price to the fair closing decimal for their side.
+
+- **Absent** when no `fresh` closing line exists for the market — never captured, or captured `stale` / `missing` (the writer's poll-liveness gate) — and when the enrichment fetch fails (best-effort: the speculations read still succeeds either way).
+- For a **spread/total whose line moved** off the speculation's line, `closing` is present but `awayDecimal` / `homeDecimal` are `null` (the price isn't resolvable at the speculation's line; a push-probability estimate is deferred). `line` still reports what the market closed at.
+- Moneyline has no line, so it always resolves when a `fresh` row exists.
+- **Only** this list endpoint attaches `closing`. It is NOT present on `GET /v1/speculations/:speculationId`, the `?since=` recovery mode, the SSE stream, or embedded contest speculations.
 
 Reads `speculations.market_type` directly; does not depend on the `SCORER_*_ADDRESS` env vars.
 

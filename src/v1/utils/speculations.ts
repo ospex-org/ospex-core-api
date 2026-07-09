@@ -54,6 +54,32 @@ export interface Speculation {
    * consumers don't have to special-case the `'void'` enum value.
    */
   voided: boolean;
+  /**
+   * No-vig fair closing line for this market, from the materialized
+   * `closing_lines` table (poll-liveness `fresh` rows only). Present only when
+   * a fresh closing line was captured for the parent contest's market; absent
+   * otherwise (renders as CLV-not-measurable). Attached on the list endpoint
+   * (`GET /v1/speculations`); the detail / recovery paths do not populate it.
+   */
+  closing?: ClosingLine;
+}
+
+export interface ClosingLine {
+  /**
+   * No-vig fair closing decimal for the away/over side (0 = upper). `1 / p_novig`.
+   * null when the price is not resolvable — a spread/total whose line moved off
+   * the speculation's line (push-probability estimate deferred).
+   */
+  awayDecimal: number | null;
+  /** No-vig fair closing decimal for the home/under side (1 = lower). */
+  homeDecimal: number | null;
+  /** The line the market closed at (transparency; null for moneyline). */
+  line: number | null;
+  /**
+   * True when a side decimal was derived via a push-probability estimate rather
+   * than a direct same-line comparison. Always false today (estimate deferred).
+   */
+  estimated: boolean;
 }
 
 export interface SpeculationDetail extends Speculation {
