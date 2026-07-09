@@ -1,11 +1,11 @@
 /**
  * GET /v1/protocol/info — the `build` provenance block.
  *
- * `build` echoes Heroku's runtime-dyno-metadata (HEROKU_SLUG_COMMIT etc.) so a
- * reader of the public repo can point at the exact commit the running service
- * was built from. These tests pin: populated when the metadata is present,
- * `null` when it is absent (local dev / feature not enabled), and the commit
- * URL is derived from the SHA.
+ * `build` echoes Heroku's dyno-metadata so a reader of the public repo can
+ * point at the exact commit the running service was built from. These tests
+ * pin: `commit` prefers the current HEROKU_BUILD_COMMIT, falls back to the
+ * deprecated HEROKU_SLUG_COMMIT with `commitSource` labeling which was used,
+ * `null` when both are absent, and the commit URL is derived from the SHA.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
@@ -36,6 +36,7 @@ const req = {} as unknown as Request;
 interface BuildInfo {
   commit: string;
   commitUrl: string;
+  commitSource: 'build' | 'slug';
   releaseVersion: string | null;
   releasedAt: string | null;
 }
@@ -67,8 +68,8 @@ describe('GET /v1/protocol/info — build provenance', () => {
     vi.restoreAllMocks();
   });
 
-  it('populates `build` from Heroku runtime-dyno-metadata when present', () => {
-    process.env.HEROKU_SLUG_COMMIT = 'a60c919bc0deadbeefcafef00d1234567890abcd';
+  it('populates `build` from HEROKU_BUILD_COMMIT (preferred, current) when present', () => {
+    process.env.HEROKU_BUILD_COMMIT = 'a60c919bc0deadbeefcafef00d1234567890abcd';
     process.env.HEROKU_RELEASE_VERSION = 'v248';
     process.env.HEROKU_RELEASE_CREATED_AT = '2026-07-09T19:10:00Z';
 
@@ -81,13 +82,37 @@ describe('GET /v1/protocol/info — build provenance', () => {
       commit: 'a60c919bc0deadbeefcafef00d1234567890abcd',
       commitUrl:
         'https://github.com/ospex-org/ospex-core-api/commit/a60c919bc0deadbeefcafef00d1234567890abcd',
+      commitSource: 'build',
       releaseVersion: 'v248',
       releasedAt: '2026-07-09T19:10:00Z',
     });
   });
 
+  it('prefers HEROKU_BUILD_COMMIT over the deprecated HEROKU_SLUG_COMMIT when both are set', () => {
+    process.env.HEROKU_BUILD_COMMIT = 'buildsha';
+    process.env.HEROKU_SLUG_COMMIT = 'slugsha';
+
+    const res = makeRes();
+    getProtocolInfoHandler(req, res as unknown as Response);
+    const build = (res.body as ProtocolBody).build;
+
+    expect(build?.commit).toBe('buildsha');
+    expect(build?.commitSource).toBe('build');
+  });
+
+  it('falls back to the deprecated HEROKU_SLUG_COMMIT (labeled) when only it is set', () => {
+    process.env.HEROKU_SLUG_COMMIT = 'slugsha';
+
+    const res = makeRes();
+    getProtocolInfoHandler(req, res as unknown as Response);
+    const build = (res.body as ProtocolBody).build;
+
+    expect(build?.commit).toBe('slugsha');
+    expect(build?.commitSource).toBe('slug');
+  });
+
   it('nulls the optional release fields when only the commit is present', () => {
-    process.env.HEROKU_SLUG_COMMIT = 'abc123';
+    process.env.HEROKU_BUILD_COMMIT = 'abc123';
 
     const res = makeRes();
     getProtocolInfoHandler(req, res as unknown as Response);

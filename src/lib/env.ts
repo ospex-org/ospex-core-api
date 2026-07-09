@@ -67,17 +67,22 @@ export interface Config {
    */
   ownStateSnapshotMaxCommitments: number;
   /**
-   * Deploy provenance — injected by Heroku's `runtime-dyno-metadata` labs
-   * feature (`heroku labs:enable runtime-dyno-metadata`). All optional: absent
-   * in local dev and until the feature is enabled. Surfaced (read-only) by
-   * `GET /v1/protocol/info` so a client can point at the exact public commit
-   * the running service was built from. These are build identifiers, not
-   * secrets.
+   * Deploy provenance — injected by Heroku's dyno-metadata labs features. All
+   * optional: absent in local dev and until the features are enabled. Surfaced
+   * (read-only) by `GET /v1/protocol/info` so a client can point at the exact
+   * public commit the running service was built from. These are build
+   * identifiers, not secrets.
    *
-   * `herokuSlugCommit`: git SHA of the deployed slug — a commit on the public
-   * repo (this service deploys via GitHub integration, so the SHA always
-   * resolves to a real commit there).
+   * `herokuBuildCommit` (`HEROKU_BUILD_COMMIT`, from the `runtime-dyno-build-
+   * metadata` feature) is the current, correct git SHA of the built slug.
+   * `herokuSlugCommit` (`HEROKU_SLUG_COMMIT`, from the older `runtime-dyno-
+   * metadata` feature) is DEPRECATED by Heroku and can reflect the previously
+   * running slug — kept only as a labeled fallback. Prefer the build commit.
+   * This service deploys via GitHub integration, so either SHA resolves to a
+   * real commit on the public repo. `herokuReleaseVersion` /
+   * `herokuReleaseCreatedAt` come from `runtime-dyno-metadata` (not deprecated).
    */
+  herokuBuildCommit?: string;
   herokuSlugCommit?: string;
   herokuReleaseVersion?: string;
   herokuReleaseCreatedAt?: string;
@@ -208,7 +213,8 @@ export function loadConfig(): Config {
   const matchingModuleAddress = optionalAddressEnv('MATCHING_MODULE_ADDRESS');
   const positionModuleAddress = optionalAddressEnv('POSITION_MODULE_ADDRESS');
 
-  // Deploy provenance from Heroku runtime-dyno-metadata (optional; see Config).
+  // Deploy provenance from Heroku dyno-metadata features (optional; see Config).
+  const herokuBuildCommit = optionalEnv('HEROKU_BUILD_COMMIT');
   const herokuSlugCommit = optionalEnv('HEROKU_SLUG_COMMIT');
   const herokuReleaseVersion = optionalEnv('HEROKU_RELEASE_VERSION');
   const herokuReleaseCreatedAt = optionalEnv('HEROKU_RELEASE_CREATED_AT');
@@ -340,6 +346,7 @@ export function loadConfig(): Config {
     ...(reservedStreamConnectionsPerIpOwner !== undefined ? { reservedStreamConnectionsPerIpOwner } : {}),
     ...(streamAuthHmacSecret !== undefined ? { streamAuthHmacSecret } : {}),
     ...(streamAuthAudience !== undefined ? { streamAuthAudience } : {}),
+    ...(herokuBuildCommit !== undefined ? { herokuBuildCommit } : {}),
     ...(herokuSlugCommit !== undefined ? { herokuSlugCommit } : {}),
     ...(herokuReleaseVersion !== undefined ? { herokuReleaseVersion } : {}),
     ...(herokuReleaseCreatedAt !== undefined ? { herokuReleaseCreatedAt } : {}),

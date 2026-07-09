@@ -9,10 +9,15 @@
  *
  * The `build` block reports the git commit the running service was built
  * from, so a reader of the public repo can confirm which source is live
- * (`repo` + `commit` → the exact reviewed code) and spot deploy drift
- * against `main`. It is a self-reported build identifier — a checkable
- * pointer, not a cryptographic proof that the dyno runs unmodified code.
- * `null` in local dev and until Heroku `runtime-dyno-metadata` is enabled.
+ * (`commitUrl` → the exact reviewed code) and spot deploy drift against
+ * `main`. It is a self-reported build identifier — a checkable pointer, not
+ * a cryptographic proof that the dyno runs unmodified code. `null` in local
+ * dev and until the Heroku dyno-metadata features are enabled.
+ *
+ * `commit` prefers `HEROKU_BUILD_COMMIT` (from `runtime-dyno-build-metadata`),
+ * the current, correct build SHA. It falls back to the DEPRECATED
+ * `HEROKU_SLUG_COMMIT`, which can reflect the previously-running slug —
+ * `commitSource` names which one was used so a reader knows the reliability.
  */
 
 import type { Request, Response } from 'express';
@@ -24,6 +29,8 @@ const REPO_URL = 'https://github.com/ospex-org/ospex-core-api';
 interface BuildInfo {
   commit: string;
   commitUrl: string;
+  /** `build` = the current `HEROKU_BUILD_COMMIT`; `slug` = the deprecated `HEROKU_SLUG_COMMIT` fallback. */
+  commitSource: 'build' | 'slug';
   releaseVersion: string | null;
   releasedAt: string | null;
 }
@@ -45,10 +52,12 @@ const SUPPORTED_SPORTS = ['NBA', 'NHL', 'NCAAB', 'NFL', 'MLB'];
 
 export function getProtocolInfoHandler(_req: Request, res: Response): void {
   const config = loadConfig();
-  const build: BuildInfo | null = config.herokuSlugCommit
+  const commit = config.herokuBuildCommit ?? config.herokuSlugCommit;
+  const build: BuildInfo | null = commit
     ? {
-        commit: config.herokuSlugCommit,
-        commitUrl: `${REPO_URL}/commit/${config.herokuSlugCommit}`,
+        commit,
+        commitUrl: `${REPO_URL}/commit/${commit}`,
+        commitSource: config.herokuBuildCommit ? 'build' : 'slug',
         releaseVersion: config.herokuReleaseVersion ?? null,
         releasedAt: config.herokuReleaseCreatedAt ?? null,
       }
