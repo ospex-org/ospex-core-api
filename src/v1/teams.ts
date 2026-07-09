@@ -2,10 +2,10 @@
  * GET /v1/teams/aliases — flat list of every team alias rows joined to
  * canonical team metadata.
  *
- * Closes the `resolveTeam` gap called out in this repo's README §"Schedule"
- * (the legacy resolver lived in the deprecated agent server). The
- * SDK's resolver layer needs alias data to map free-form user input
- * ("Lakers", "LAL", "Los Angeles Lakers") to a canonical team id when
+ * Closes the `resolveTeam` gap called out in this repo's README under
+ * `GET /v1/schedule` (the legacy resolver lived in the deprecated agent
+ * server). The SDK's resolver layer needs alias data to map free-form
+ * user input ("Lakers", "LAL", "Los Angeles Lakers") to a canonical team id when
  * the user is staking a commitment. Centralizing the read here lets the
  * writer be the single source of truth for aliases — operators add
  * aliases as `team_resolution_failures` get triaged and the change

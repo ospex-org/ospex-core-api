@@ -8,8 +8,8 @@ export const logger = pino({
     },
   },
   timestamp: pino.stdTimeFunctions.isoTime,
-  // Stream-auth (M3) secret hygiene: the M3 PR adds challenge/token endpoints
-  // whose request/response objects can carry a bearer token. Redacting these
+  // Stream-auth secret hygiene: the challenge/token endpoints have
+  // request/response objects that can carry a bearer token. Redacting these
   // paths blanket-replaces matching keys with `[Redacted]` in every log entry
   // — defends against an accidental `logger.info({req})` or `{token}` from
   // ever surfacing the raw value.

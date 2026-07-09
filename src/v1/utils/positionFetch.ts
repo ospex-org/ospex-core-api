@@ -70,7 +70,7 @@ export interface PositionBase {
   oddsDecimal: number | null;     // implied: 1 + (profit_amount / risk_amount)
   riskAmountUSDC: number;
   profitAmountUSDC: number;
-  // ── Phase 3 PR0b enrichment (§3.2) ────────────────────────────────────
+  // ── Owner-state enrichment ────────────────────────────────────────────
   contestId: string;             // parent contest (numeric id as string)
   sport: string;                 // contests.sport_slug ?? '' — matches the API's sport mapping
   awayTeam: string;              // ABSOLUTE away team (distinct from the maker-relative `team`)
@@ -121,7 +121,7 @@ export interface DerivedPositionStatus {
   status: PositionStatus;
   sourceUpdatedAt: string;
   /**
-   * Advisory categorical result (won/lost/push/void). The M4b stream's
+   * Advisory categorical result (won/lost/push/void). The own-state stream's
    * dedup contract treats this as a payload field — a same-status event
    * with a different `result` still emits, so a contest score correction
    * that flips `pendingSettle` from `won` to `push` surfaces even though
@@ -154,7 +154,7 @@ export interface PositionFetchResult {
   /**
    * Derived positionStatus + sourceUpdatedAt for EVERY position the
    * helper saw (including predicted-losers and zero-payout rows the
-   * buckets drop). Consumers seeding the M4b hub cache use this to
+   * buckets drop). Consumers seeding the own-state hub cache use this to
    * eliminate the cold-start race between the snapshot's wire body and
    * a separately-derived seed pass. `loadOwnStateSnapshot` also takes
    * `max(sourceUpdatedAt)` over this list as the response cursor's `p`
@@ -344,7 +344,7 @@ export async function fetchCategorizedPositions(
   // contract's `PositionModule__NoPayout` payout guard.
   // Derivation (derivedStatuses) also runs `derivePositionStatus` from
   // the same join — this guarantees the snapshot's wire body and any
-  // M4b hub-cache seed built from the same call can never disagree
+  // own-state hub-cache seed built from the same call can never disagree
   // about derived state, eliminating the cold-start race where a fresh
   // post-snapshot derivation might see a transition the snapshot did
   // not.

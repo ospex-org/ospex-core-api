@@ -1,5 +1,5 @@
 /**
- * Stream-auth core (M3) — the challenge / token primitives behind
+ * Stream-auth core — the challenge / token primitives behind
  * `/v1/auth/stream-{challenge,token}` + the `verifyStreamToken` middleware.
  *
  * Two halves:
@@ -24,7 +24,7 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 // ────────────────────────────────────────────────────────────────────
 
 /**
- * The EIP-712 typed-data the SDK signs (spec §3.2). Nested `network` struct
+ * The EIP-712 typed-data the SDK signs. Nested `network` struct
  * leaves room for future network metadata without a schema break. `address`
  * is stored / compared lowercased server-side; clients may send checksummed
  * but the resulting typed-data hash must use a consistent casing.

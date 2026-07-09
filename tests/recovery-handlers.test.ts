@@ -1,5 +1,5 @@
 /**
- * Handler tests for the Phase 1.5 cursor-recovery surfaces:
+ * Handler tests for the cursor-recovery surfaces:
  *   - GET /v1/commitments?since=  (recovery branch of getCommitmentsHandler)
  *   - GET /v1/fills
  *   - GET /v1/positions           (bare recovery endpoint)

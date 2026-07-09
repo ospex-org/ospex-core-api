@@ -1,5 +1,5 @@
 /**
- * `GET /v1/stream/own-state` — owner-auth composite SSE stream (M4b, spec §2.1).
+ * `GET /v1/stream/own-state` — owner-auth composite SSE stream.
  *
  *   Authorization: Bearer <stream-token>   (verifyStreamToken middleware)
  *   Last-Event-ID: <opaque-cursor>         (on reconnect; optional first connect)
@@ -10,7 +10,7 @@
  *   COLD START (no cursor) — server emits an inline `event: snapshot` carrying
  *   the maker's complete current state via the shared `loadOwnStateSnapshot`
  *   helper. If commitments are truncated (`truncated: true`), NO `ready` is
- *   emitted and the connection ends — per spec §6.2 the SDK pages REST
+ *   emitted and the connection ends — the SDK pages REST
  *   `/v1/own-state/snapshot?cursor=` until untruncated, then reconnects to
  *   this stream with the final cursor. Otherwise:
  *   - Server seeds the hub's positionStatus cache from `result.seedRows`
@@ -20,7 +20,7 @@
  *     transition cannot land between the two reads and silently
  *     populate the cache with a status the SDK never received.
  *   - If `positionsTruncated:true`, emit `event: degraded` first so
- *     SDK/MM enters quote-hold (spec §2.6).
+ *     SDK / market maker enters quote-hold.
  *   - Start the per-wallet poll timer (`hub.beginLive(sub)`).
  *   - Emit `event: ready` and transition to live.
  *
@@ -97,7 +97,7 @@ import type { MarketType } from '../../lib/speculation.js';
 const CATCHUP_PAGE = 500;
 const CATCHUP_MAX_PAGES = 50;
 
-// SSE event names. The spec grammar (§2.1) treats these as a closed set.
+// SSE event names. The wire grammar treats these as a closed set.
 type OwnStateSseEvent =
   | 'snapshot'
   | 'ready'
@@ -333,7 +333,7 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
         if (result.body.positionsTruncated) {
           // Snapshot exposed `positionsTruncated:true` — actionable
           // population exceeded the snapshot helper's cap. Emit
-          // `degraded` so the SDK / MM enters quote-hold per spec §2.6,
+          // `degraded` so the SDK / market maker enters quote-hold,
           // then proceed to `ready` — connection has delivered every
           // row we could observe. This breaks the earlier
           // `positionsTruncated → reconnect → resync → reconnect` loop
@@ -481,7 +481,7 @@ export function advancePositions(
  * `'resync'` on backlog overflow or query error, `'complete'` otherwise.
  *
  * Order: commitments → fills → positions. The SDK reducer's dedup keys are
- * per-resource (spec §2.1.2), so ordering across resources is immaterial.
+ * per-resource, so ordering across resources is immaterial.
  */
 async function runCatchUpWithCursor(
   res: Response,
@@ -689,7 +689,7 @@ export interface DerivedPositionStateResult {
    * `true` when the actionable-set query saturated the 200-row cap. The
    * stream still has VALID data for the rows it has; we just can't
    * guarantee complete coverage. Surfaced to the SDK via an `event:
-   * degraded` so the MM holds quoting per spec §2.6 instead of looping
+   * degraded` so the market maker holds quoting instead of looping
    * the SDK through endless reconnects.
    */
   saturated: boolean;
@@ -726,7 +726,7 @@ type DerivePositionStateResultWithFlags = DerivedPositionStateResult;
  * Saturation: `saturated=true` when the actionable query returned a full
  * 200-row page. The stream emits `event: degraded` and proceeds with
  * `ready`; the SDK / MM treats the wallet as quote-held per the stream-
- * health gate (spec §2.6). This breaks the infinite-resync loop the
+ * health gate. This breaks the infinite-resync loop the
  * earlier `positions_cap_exceeded` path produced for wallets at the cap.
  */
 export interface DerivePositionsOptions {
@@ -1043,7 +1043,7 @@ export async function derivePositionsForWallet(
  * Returns a `degraded` outcome (status='complete') when the actionable
  * query saturated — the handler emits `event: degraded` then `ready` so
  * the SDK has a defined terminal state instead of an endless resync
- * loop. The MM's quote-hold rules (spec §2.6) handle the operational
+ * loop. The market maker's quote-hold rules handle the operational
  * consequence.
  */
 async function catchUpPositions(

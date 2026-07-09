@@ -1,5 +1,5 @@
 /**
- * `ownStateHealthHandler` tests (Phase 3 PR0b, amendment A4).
+ * `ownStateHealthHandler` tests.
  *
  * The handler is a PUBLIC indexer-lag probe (`GET /v1/health/own-state`).
  * It reads `indexer_cursor.updated_at` for the configured network and

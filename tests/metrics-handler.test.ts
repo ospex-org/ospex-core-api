@@ -117,9 +117,9 @@ describe('GET /v1/metrics', () => {
     });
   });
 
-  // ── M0 cumulative counters ───────────────────────────────────────────────
+  // ── Cumulative counters ──────────────────────────────────────────────────
 
-  it('exposes the M0 counters (cumulative; zero on a fresh process)', () => {
+  it('exposes the cumulative counters (zero on a fresh process)', () => {
     __setStreamHubForTest(fakeStreamHub({ resources: 0, subscribers: 0 }));
     __setOddsHubForTest(fakeOddsHub({ subscribers: 0, channelOpen: false, subscribed: false, degraded: false }));
 

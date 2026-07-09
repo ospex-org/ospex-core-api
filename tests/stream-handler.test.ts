@@ -334,7 +334,7 @@ describe('GET /v1/stream/:resource lifecycle', () => {
   });
 });
 
-// ── M0 catchup counters ──────────────────────────────────────────────────────
+// ── Catchup counters ─────────────────────────────────────────────────────────
 
 describe('catchup counters', () => {
   it('a no-cursor handler → 1 started, 1 completed, 0 resynced', async () => {

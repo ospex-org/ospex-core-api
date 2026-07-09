@@ -165,13 +165,13 @@ export function rowToBody(row: CommitmentRow, nowMs: number): CommitmentBody {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// Public hidden-row redaction (M2 of the own-state SSE migration stack)
+// Public hidden-row redaction
 //
 // Hidden rows (`book_visible=false`) are off-book via off-chain DELETE but
 // their on-chain signature stays valid until expiry/nonce-floor/onchain-cancel.
 // Anonymous public surfaces MUST NOT serve the signed payload (anything in
 // `MatchingModule.matchCommitment`'s struct, plus the signature itself); makers
-// recover hidden bodies via the owner-auth own-state stream landing in M4.
+// recover hidden bodies via the owner-auth own-state stream.
 //
 // The redaction is enforced by RUNTIME PROJECTION through an exported
 // ALLOW-LIST, not a hand-written literal. `rowToHiddenAllowlistBody` builds the
@@ -857,11 +857,11 @@ async function getCommitmentsRecovery(req: Request, res: Response): Promise<void
 }
 
 export async function getCommitmentsHandler(req: Request, res: Response): Promise<void> {
-  // `?includeHidden` is removed (M2). Reject ANY presence — any value, every
+  // `?includeHidden` is removed. Reject ANY presence — any value, every
   // sub-route — BEFORE the `?since=` recovery branch dispatches, so the
   // contract "param removed everywhere, 400 before any DB call" holds whether
   // the caller is hitting the list path or recovery. Makers retrieve hidden
-  // bodies via the owner-auth own-state surface (M4).
+  // bodies via the owner-auth own-state surface.
   if (req.query.includeHidden !== undefined) {
     res.status(400).json({
       error:

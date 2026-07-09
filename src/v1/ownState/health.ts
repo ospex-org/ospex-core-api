@@ -1,11 +1,11 @@
 /**
- * Owner-auth own-state health probe — Phase 3 PR0b (amendment A4).
+ * Own-state health probe.
  *
  *   GET /v1/health/own-state
  *   → 200 { indexerLagSeconds, lastIndexedAt, lagSource }
  *
  * PUBLIC (no stream-auth). Indexer lag is a GLOBAL, wallet-independent
- * signal; the market-maker polls this at ~10s cadence to feed the spec §2.6
+ * signal; the market-maker polls this at ~10s cadence to feed its
  * stream-health gate (`indexerLagSeconds < INDEXER_LAG_MAX`). Requiring a
  * minted bearer per poll would be pure overhead for a value that carries no
  * per-wallet information.

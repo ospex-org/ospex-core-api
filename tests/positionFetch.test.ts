@@ -555,7 +555,7 @@ describe('fetchCategorizedPositions — mixed and edge cases', () => {
   // implicitly because the `riskWei6 === 0n` would fail the payout-check
   // in the pendingSettle branch and fall through. The regression: open +
   // unscored + zero-risk MUST NOT land in `active`, otherwise the snapshot
-  // and the M4b stream diverge on the row (snapshot says active, stream
+  // and the own-state stream diverge on the row (snapshot says active, stream
   // says settledLost). The DB filter is the authoritative line of
   // defense — this test pins the helper's behavior even if a row leaked
   // through.
@@ -602,7 +602,7 @@ describe('fetchCategorizedPositions — mixed and edge cases', () => {
     // check on the active path). Note this can only be reached if a
     // zero-risk row evades the DB-level `gt('risk_amount', 0)` filter —
     // the snapshot relies on that filter being honored. Pin the behavior:
-    // the helper's `active` bucket WOULD include such a row, so the M4b
+    // the helper's `active` bucket WOULD include such a row, so the own-state
     // stream's `derivePositionStatus` zero-risk → settledLost rule is
     // what guarantees convergence at the wire (stream emits settledLost,
     // snapshot's DB filter omits the row entirely).

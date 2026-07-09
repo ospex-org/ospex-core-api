@@ -1,5 +1,5 @@
 /**
- * Own-state composite cursor (M4 / spec §2.1, §6.1).
+ * Own-state composite cursor.
  *
  * The single-resource cursor in `src/lib/cursor.ts` encodes a watermark for
  * ONE resource table. The own-state composite cursor encodes per-resource
@@ -19,7 +19,7 @@
  * The `k` discriminator tells the SDK what to do next:
  *   `page` — snapshot was truncated; call `/v1/own-state/snapshot?cursor=…`
  *            again until `k === 'live'`. MUST NOT emit `ready` for trading
- *            purposes (spec §6.2).
+ *            purposes.
  *   `live` — snapshot complete; pass cursor to `/v1/stream/own-state` as
  *            `Last-Event-ID`.
  *
@@ -99,7 +99,7 @@ export interface OwnStateCursor {
   v: typeof OWN_STATE_CURSOR_VERSION;
   /**
    * Commitments progress watermark — advances through delivered rows only.
-   * Per spec §6.1: NEVER advances past an undelivered row of either phase.
+   * Invariant: NEVER advances past an undelivered row of either phase.
    * Phase 1 advances `c` through active rows in `(row, id)` order; phase 2
    * advances `c` through terminal rows in `(row, id)` order. The two phases
    * never compete for the watermark.

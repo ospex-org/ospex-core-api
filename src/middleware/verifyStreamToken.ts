@@ -1,5 +1,5 @@
 /**
- * `verifyStreamToken` — bearer-token gate for the M4 own-state surfaces.
+ * `verifyStreamToken` — bearer-token gate for the own-state surfaces.
  *
  * Reads `Authorization: Bearer <token>`, verifies the HMAC, audience, and
  * chain bindings, and attaches `{address, expiresAt}` to the request for

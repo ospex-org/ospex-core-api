@@ -1,5 +1,5 @@
 /**
- * Owner-state enrichment unit tests (Phase 3 PR0b §3.1 / A6).
+ * Owner-state enrichment unit tests.
  *
  * Covers the pure helpers in `enrich.ts`:
  *   - `buildSignedPayload` — struct reconstruction + bigint→string wire shape;

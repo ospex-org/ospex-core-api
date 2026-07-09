@@ -1,6 +1,6 @@
 /**
  * Tiny in-process fake of the Supabase PostgREST surface the own-state SSE path
- * reads. The M1 load harness points a spawned LOCAL core-api at this fake
+ * reads. The load harness points a spawned LOCAL core-api at this fake
  * (`SUPABASE_URL=http://127.0.0.1:<port>`) so the whole run is self-contained:
  * no prod core-api, no prod database, no credentials. The harness is the data
  * source — it serves empty results by default (profile 1 = transport/capacity)

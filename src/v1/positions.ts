@@ -361,7 +361,7 @@ export async function getPositionStatusHandler(req: Request, res: Response): Pro
  * contract addresses here so address rotations don't ripple through
  * every consumer.
  *
- * For M3, two `(target, method)` pairs are emitted:
+ * Two `(target, method)` pairs are emitted:
  *   - SpeculationModule.settleSpeculation(speculationId)
  *   - PositionModule.claimPosition(speculationId, positionType)
  */

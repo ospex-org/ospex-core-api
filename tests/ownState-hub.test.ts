@@ -234,7 +234,7 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
   });
 
   it('without a seeded cache, first tick emits every observed position (preReady-abort signal)', async () => {
-    // Contract change vs M4b PR1: there is no bootstrap-silent mode. If
+    // There is no bootstrap-silent mode. If
     // the handler forgot to seed the cache before `beginLive`, every
     // tick emits the current derivation — those emits arrive in the
     // subscriber's preReady phase and trip the handler's `aborted=true`,

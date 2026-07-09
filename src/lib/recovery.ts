@@ -1,7 +1,7 @@
 /**
  * Shared helpers for cursor-based recovery reads (`?since=<cursor>`).
  *
- * Recovery mode is the catch-up side of the Phase 1.5 push contract: a
+ * Recovery mode is the catch-up side of the push contract: a
  * client streams live deltas, and after a disconnect asks for everything
  * after its last cursor. It is intentionally distinct from the existing
  * open-book list endpoints — recovery orders by `(row_updated_at, id)` and
