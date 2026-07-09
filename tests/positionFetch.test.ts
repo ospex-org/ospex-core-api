@@ -610,7 +610,7 @@ describe('fetchCategorizedPositions — mixed and edge cases', () => {
   });
 
   it('derivedStatuses picks the contest sourceUpdatedAt when it is later by microseconds than the position', async () => {
-    // Hermes review-32 round 5 blocker 2: maxIsoTimestamptz must compare
+    // Regression: maxIsoTimestamptz must compare
     // microsecond-precise. With `Date.parse`-based max, two same-ms
     // timestamps (one position, one contest) differing only in
     // micros would be tied — and whichever was iterated first would

@@ -16,8 +16,8 @@
  *   5. Signature recovers to a valid address?
  *   6. Recovered == claimed maker?
  *
- * The legacy ospex-agent-server middleware also kept an in-memory
- * nonce LRU for replay protection. R4 OspexCommitment nonces are
+ * The legacy agent-server middleware also kept an in-memory nonce LRU
+ * for replay protection. OspexCommitment nonces are
  * invalidation thresholds, not single-use tokens — the contract
  * (`s_minNonces[maker][speculationKey]`) is the canonical authority,
  * so off-chain uniqueness checking would actively cause false

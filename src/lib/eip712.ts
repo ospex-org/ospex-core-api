@@ -1,16 +1,14 @@
 /**
  * EIP-712 typed-data registry for off-chain signed actions.
  *
- * R4 OspexCommitment schema — 9 fields, NOT 10. The R3 schema (in
- * ospex-agent-server) had a 10th field `contributionAmount`; R4
- * dropped it. Any signer producing a 10-field hash will fail
- * verification on-chain. Source of truth: the typehash in
- * ospex-foundry-matched-pairs/src/modules/MatchingModule.sol.
+ * OspexCommitment schema — 9 fields, NOT 10. An older schema carried a
+ * 10th field `contributionAmount`; it is gone. Any signer producing a
+ * 10-field hash will fail verification on-chain. Source of truth: the
+ * `COMMITMENT_TYPEHASH` constant in the MatchingModule contract.
  *
  * The `verifyingContract` for the domain is the MatchingModule, not
- * OspexCore. The legacy ospex-agent-server middleware used OspexCore,
- * which is the single most common bug for new integrators per the
- * eip712-commitments skill. This module hard-wires MatchingModule.
+ * OspexCore. Signing against OspexCore is the single most common bug
+ * for new integrators. This module hard-wires MatchingModule.
  */
 
 import { ethers, type TypedDataDomain, type TypedDataField } from 'ethers';
@@ -23,7 +21,7 @@ import type { ChainId } from './env.js';
 export type ActionType = 'OspexCommitment' | 'CancelCommitment';
 
 /**
- * R4 OspexCommitment fields — 9, in the exact order the contract's
+ * OspexCommitment fields — 9, in the exact order the contract's
  * typehash declares them.
  */
 const OSPEX_COMMITMENT_FIELDS: TypedDataField[] = [
@@ -79,8 +77,8 @@ export function getAllActionFields(): Readonly<Record<ActionType, TypedDataField
 /**
  * Build the EIP-712 domain for a given chain + verifying contract.
  *
- * R4 commitments are signed against MatchingModule. Future signed
- * actions (cancel-by-hash, etc.) live in the same domain.
+ * Commitments are signed against MatchingModule. Other signed actions
+ * (cancel-by-hash, etc.) live in the same domain.
  */
 export function buildDomain(chainId: ChainId, verifyingContract: string): TypedDataDomain {
   return {

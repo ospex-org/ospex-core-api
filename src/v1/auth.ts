@@ -8,10 +8,11 @@
  *                         relevant action's fields straight into
  *                         `wallet.signTypedData(domain, types, message)`.
  *
- * Verify-style sign-test endpoint deliberately not ported here. When
- * the CLI design crystallizes and we know what session auth would
- * actually gate, the plan is to evaluate SIWE rather than the legacy
- * agent-server `Verify` action. See PR #N description for context.
+ * A verify-style sign-test endpoint is deliberately not ported here.
+ * Signature-only "prove you hold this key" has no resource to gate on
+ * this service, and the owner-auth surfaces already have a purpose-built
+ * challenge/token handshake (`/v1/auth/stream-{challenge,token}`). If a
+ * session-auth need ever materializes, SIWE is the thing to evaluate.
  */
 
 import type { Request, Response } from 'express';

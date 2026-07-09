@@ -1,13 +1,13 @@
 /**
  * Numeric helpers for building on-chain transaction parameters.
  *
- * The R3 builders from ospex-agent-server (`createUnmatchedPair`,
- * `createUnmatchedPairWithSpeculation`) are intentionally NOT ported —
- * R4 superseded those methods with `matchCommitment`, which takes the
- * signed commitment + signature directly. R4 builders will land when a
- * future endpoint needs to return frontend-ready txParams for matching.
+ * The legacy `createUnmatchedPair` / `createUnmatchedPairWithSpeculation`
+ * builders are intentionally NOT ported — the protocol superseded those
+ * methods with `matchCommitment`, which takes the signed commitment +
+ * signature directly. Match builders will land when a future endpoint
+ * needs to return frontend-ready txParams for matching.
  *
- * The numeric primitives below are R4-compatible and reusable.
+ * The numeric primitives below are reusable as-is.
  */
 
 import type { ScorerAddresses } from './speculation.js';
@@ -18,12 +18,11 @@ export function usdcToOnChain(usdc: number): string {
 }
 
 /**
- * R4 odds tick scale. `MatchingModule` constant `ODDS_SCALE = 100`
- * (`ospex-foundry-matched-pairs/src/modules/MatchingModule.sol:59`).
- * Decimal odds 1.91 → tick 191. The on-chain `oddsTick` field is uint16
- * with valid range 101..10100. The legacy R3 codebase used 10_000_000
- * for a different (now-defunct) odds-pair scaling — do NOT carry that
- * constant forward.
+ * Odds tick scale — mirrors the `MatchingModule` contract constant
+ * `ODDS_SCALE = 100`. Decimal odds 1.91 → tick 191. The on-chain
+ * `oddsTick` field is uint16 with valid range 101..10100. An older
+ * codebase used 10_000_000 for a different (now-defunct) odds-pair
+ * scaling — do NOT carry that constant forward.
  */
 const ODDS_SCALE = 100;
 

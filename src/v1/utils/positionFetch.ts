@@ -1,19 +1,19 @@
 /**
  * Categorized position fetcher for /v1/positions/:address/{status,claim-params}.
  *
- * Pure Supabase. The agent-server's R3 version of this helper queried
- * Firestore through a clean-looking interface — that pattern is
- * intentionally not portable here (no Firebase deps in the package).
+ * Pure Supabase. The legacy version of this helper queried Firestore
+ * through a clean-looking interface — that pattern is intentionally not
+ * portable here (no Firebase deps in the package).
  *
- * R4 deviations vs the agent-server's helper:
- *   - No `withdrawable` bucket. R4 positions are always fully matched
+ * Deviations vs that legacy helper:
+ *   - No `withdrawable` bucket. Positions are always fully matched
  *     at fill time; there is no `unmatched_amount` column on the
  *     `positions` table and no `adjustUnmatchedPair` contract method.
- *     The R4 analog of "withdraw your unfilled stake" is "cancel your
+ *     The analog of "withdraw your unfilled stake" is "cancel your
  *     open commitment" via `MatchingModule.cancelCommitment(...)`,
  *     which is commitment-domain and constructed client-side from
  *     `GET /v1/commitments?maker=…`.
- *   - `oddsPairId` is gone — R4 positions are uniquely keyed by
+ *   - `oddsPairId` is gone — positions are uniquely keyed by
  *     `(speculationId, user, positionType)`.
  *   - Implied odds are derived from `risk_amount` + `profit_amount`
  *     (the position carries `profit_amount` directly; no need to
@@ -61,7 +61,7 @@ const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower
 const POSITION_TYPE_FROM_INT: Record<0 | 1, 'upper' | 'lower'> = { 0: 'upper', 1: 'lower' };
 
 export interface PositionBase {
-  positionId: string;            // `${speculationId}_${user}_${positionType}` — R4 identity
+  positionId: string;            // `${speculationId}_${user}_${positionType}` — position identity
   speculationId: string;
   positionType: 0 | 1;            // 0 = upper (away/over), 1 = lower (home/under)
   team: string;                   // your side: away if upper, home if lower
@@ -105,7 +105,7 @@ export interface PendingSettlePosition extends PositionBase {
 }
 
 /**
- * One row's worth of derived state for the M4b own-state stream's
+ * One row's worth of derived state for the own-state stream's
  * positionStatus seeding. Computed from the SAME join the categorization
  * uses, so the snapshot's wire body and the hub-cache seed cannot disagree
  * about position state — that disagreement was the cold-start race
@@ -276,7 +276,7 @@ export async function fetchCategorizedPositions(
   // the 200-row cap when a maker uses the secondary market heavily.
   // (Closed-speculation zero-risk rows are already filtered later,
   // by the `riskWei6 === 0n || payoutWei6 === 0n` check that mirrors
-  // PositionModule.sol:367-370.)
+  // the contract's `PositionModule__NoPayout` guard.)
   const posRes = await sb
     .from('positions')
     .select('speculation_id, user_address, position_type, risk_amount, profit_amount, claimed, position_created_at, row_updated_at')
@@ -299,8 +299,8 @@ export async function fetchCategorizedPositions(
 
   // Step 2: batch-fetch related speculations.
   // `market_type` is read straight from the column (populated by the
-  // indexer per migration 027) — no scorer-address lookup needed, so
-  // this read path doesn't depend on SCORER_*_ADDRESS env config.
+  // indexer) — no scorer-address lookup needed, so this read path
+  // doesn't depend on SCORER_*_ADDRESS env config.
   const specIds = [...new Set(positions.map((p) => p.speculation_id))];
   const specById = new Map<number, SpeculationRow>();
   if (specIds.length > 0) {
@@ -341,7 +341,7 @@ export async function fetchCategorizedPositions(
 
   // Step 4: categorize + derive in one pass.
   // Categorization (active/pendingSettle/claimable) mirrors the
-  // PositionModule.sol:367-370 payout contract.
+  // contract's `PositionModule__NoPayout` payout guard.
   // Derivation (derivedStatuses) also runs `derivePositionStatus` from
   // the same join — this guarantees the snapshot's wire body and any
   // M4b hub-cache seed built from the same call can never disagree

@@ -12,8 +12,8 @@
  *                                   `created_at DESC, commitment_hash ASC` —
  *                                   newest first; tie-break on hash so
  *                                   offset-based pagination is deterministic
- *                                   across ties (rows backfilled by indexer
- *                                   migration 039 share a timestamp).
+ *                                   across ties (backfilled rows can share a
+ *                                   timestamp).
  *
  *   GET    /v1/commitments/:hash  — single commitment lookup by EIP-712 hash.
  *                                   Returns the same canonical body shape as
@@ -188,8 +188,7 @@ export function rowToBody(row: CommitmentRow, nowMs: number): CommitmentBody {
 // structural signal so the type system can narrow on them instead of probing
 // optional fields.
 //
-// Deviations from `implementation-plan.md` §M2's proposed constant — flagged
-// in the PR description:
+// Two deliberate choices about what this allow-list contains:
 //   - `bookVisible` (camelCase) not `book_visible`: matches the wire shape used
 //     across `CommitmentBody`; the wire is camelCase even where the column is
 //     snake_case.
@@ -197,9 +196,9 @@ export function rowToBody(row: CommitmentRow, nowMs: number): CommitmentBody {
 //     `speculationKey` (a keccak of contestId+scorer+lineTicks); leaking it
 //     plus the in-allow-list `contestId` brute-forces (scorer, lineTicks) over
 //     the tiny tuple space (~3 scorers × small line range), both of which are
-//     in the locked deny-list (audit §6.2). Adding `speculationId` instead
-//     would require a per-page join; if observers need linkage to hidden rows
-//     pre-fill, that goes in a follow-up.
+//     deny-listed. Adding `speculationId` instead would require a per-page
+//     join; if observers need linkage to hidden rows pre-fill, that goes in a
+//     follow-up.
 // ────────────────────────────────────────────────────────────────────────
 
 /**
@@ -328,8 +327,8 @@ export function commitmentRowToPublicBody(
 //
 // Opt-in via `?includeFillability=true`. Each row gets a `fillability` object
 // derived from the indexer's ~30s `maker_funding` snapshot (USDC balance +
-// PositionModule allowance + the maker's visible committed book risk, per
-// migration 051). Advisory + point-in-time — NEVER folded into `status`.
+// PositionModule allowance + the maker's visible committed book risk).
+// Advisory + point-in-time — NEVER folded into `status`.
 // ────────────────────────────────────────────────────────────────────────
 
 export type MakerFundingStatus = 'fully_backed' | 'overcommitted' | 'unknown' | 'stale';
@@ -577,8 +576,11 @@ export async function postCommitmentHandler(req: AuthenticatedRequest, res: Resp
   const sb = getSupabase();
   const signature = (req.body as { signature: string }).signature;
 
-  // Idempotency / enrichment lookup. Gate enrichment on `!signature` only
-  // (provenance preserved — see review feedback comments in PR #2).
+  // Idempotency / enrichment lookup. Enrichment is gated on `!signature`
+  // alone: a row the indexer discovered on-chain has no signature, so the
+  // maker's POST fills it in. A row that already carries a signature is
+  // never overwritten, which preserves the original submission's provenance
+  // (and makes a duplicate POST an idempotent 200 rather than a mutation).
   const existing = await sb
     .from('commitments')
     .select(COMMITMENT_COLUMNS)
@@ -843,9 +845,10 @@ async function getCommitmentsRecovery(req: Request, res: Response): Promise<void
   // book_visible=true→false transition. Hidden rows are emitted with the
   // public allow-list projection (no filter) so a reconnecting client still
   // converges its state to "row is now off-book" rather than silently losing
-  // the row. (This deliberately deviates from `implementation-plan.md` §M2's
-  // "also add `book_visible=true` filter" recommendation — see PR description
-  // for the convergence-vs-defense trade-off the deviation resolves.)
+  // the row. (A `book_visible=true` filter here would be strictly safer, but
+  // it would silently strand the row in a reconnecting client's local state —
+  // convergence wins, and the allow-list projection already withholds the
+  // payload.)
   res.status(200).json({
     commitments: rows.map((r) => commitmentRowToPublicBody(r as unknown as CommitmentRow, nowMs)),
     nextCursor: nextCursor('commitments', last, recovery.sinceRaw),
@@ -1213,7 +1216,7 @@ export async function getCommitmentByHashHandler(req: Request, res: Response): P
  * on-chain `status` untouched. The commitment stays matchable on-chain until it
  * expires, is nonce-invalidated, or is cancelled on-chain (COMMITMENT_CANCELLED);
  * a later on-chain match is applied normally by the indexer's fill_commitment.
- * See migration 049 / docs/CANCEL_FLOW.md.
+ * See docs/CANCEL_FLOW.md.
  *
  * The response surfaces effective `status='cancelled'` for a hidden live row
  * (backward compatible), with `storedStatus='open'` and `bookVisible=false`.
@@ -1296,7 +1299,7 @@ export async function deleteCommitmentHandler(req: AuthenticatedRequest, res: Re
   // Off-chain cancel = "hide from the public book" (book_visible=false). It must
   // NOT touch the canonical on-chain `status`: a hidden row stays `open`, so a
   // later on-chain match is applied normally by the indexer's fill_commitment.
-  // See migration 049 / docs/CANCEL_FLOW.md.
+  // See docs/CANCEL_FLOW.md.
   //
   // Already hidden from the book (off-chain DELETE applied), or authoritatively
   // cancelled on-chain (COMMITMENT_CANCELLED) → idempotent 200, regardless of

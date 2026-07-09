@@ -1,12 +1,12 @@
 # ospex-core-api
 
-Public read API for the Ospex protocol. Reads on-chain state via Supabase (populated by `ospex-indexer`) and exposes it as a versioned REST API at `/v1/*`.
+Public REST read API, signed-write relay, and SSE push layer for the Ospex protocol — a zero-vig peer-to-peer sports prediction protocol on Polygon. Reads on-chain state mirrored into Supabase by the protocol indexer and exposes it as a versioned API at `/v1/*`.
 
-This repo replaces the API surface that used to live inside `ospex-agent-server`. The agent (Michelle/Dan) code has been deprecated; the read endpoints are migrating here so they can evolve independently of any agent code.
+**Where the trust sits.** Settlement, custody, matching validity, cancellation, and nonce floors are all enforced on-chain by the protocol's verified contracts. This service holds no signing key, submits no transactions, and holds no user funds — it cannot forge or alter an on-chain fill. What it *can* do is decide what the public orderbook shows and which signed commitments it relays onward, and it serves reads from a database mirror of chain state rather than from the chain directly. So this repo is the code you read to check that it doesn't play games with any of that. See "Hidden-row redaction" and [`docs/CANCEL_FLOW.md`](./docs/CANCEL_FLOW.md) for where it matters most.
 
 ## Status
 
-In progress. Working today:
+Live on Polygon mainnet. The API surface today:
 
 - `/healthz` (liveness), `/readyz` (readiness)
 - `POST /v1/commitments` — EIP-712 commitment relay
@@ -14,6 +14,8 @@ In progress. Working today:
 - `GET /v1/contests`, `GET /v1/contests/:contestId` — contest list / detail (renamed from `/v1/markets/*`)
 - `GET /v1/speculations`, `GET /v1/speculations/:speculationId` — speculation list (filters: `contestId`, `sport`, `status`) / detail (with orderbook + parent contest context)
 - `GET /v1/protocol/info` — static protocol metadata
+- `GET /v1/auth/domain` — EIP-712 self-discovery: the signing `domain`, every registered action's typed-field schema, and a per-endpoint map of which `action.type` each signed endpoint accepts. Copy `domain` + the action's fields straight into `wallet.signTypedData(...)`. Returns `503 NOT_READY` if `MATCHING_MODULE_ADDRESS` is unset
+- `GET /v1/config/public` — bootstrap config for public clients: `{supabaseUrl, supabaseAnonKey, network, chainId}`. The Supabase key served here is the **publishable** key and is public by design — it is gated by row-level security, and grants only the anonymous read access the protocol already exposes. Returns `503 NOT_READY` if `SUPABASE_ANON_KEY` is unset
 - `GET /v1/positions/:address` — wallet position history
 - `GET /v1/positions/:address/status` — categorized active / pendingSettle / claimable
 - `GET /v1/positions/:address/claim-params` — ordered `txParams[]` action plan
@@ -23,17 +25,21 @@ In progress. Working today:
 - `GET /v1/positions/claim-result/:txHash` — parse `PositionClaimed` from a tx
 - `GET /v1/leaderboard` — current active leaderboard
 - `GET /v1/schedule?sport=` — upcoming games
+- `GET /v1/games`, `GET /v1/games/:gameId` — upcoming games available for contest creation, including the `externalIds` (`jsonodds`, `sportspage`, `rundown`) contest creation needs. `gameId` is the immutable `jsonodds_id`; the human-readable `slug` is exposed separately and is **mutable** (the writer renames it on a reschedule or doubleheader), so anything persisting a game id between calls must store the `jsonodds_id` form
 - `GET /v1/teams/aliases?sport=` — flat list of team aliases (full name / nickname / abbrev / city) joined to canonical team metadata. Consumed by `@ospex/sdk`'s resolver layer to map free-form `--side` input ("Lakers", "LAL") to a canonical team id when staking a commitment.
-- `GET /v1/contests/:contestId/odds` — current upstream reference odds for the contest's underlying game (moneyline / spread / total snapshot from `current_odds`). Per-market response shapes are explicit (no shared "line + away/home" envelope) so consumers can't misread the semantics — see "Odds snapshot" below for the exact shape.
+- `GET /v1/contests/:contestId/odds` — current upstream reference odds for the contest's underlying game (moneyline / spread / total snapshot from `current_odds`). Per-market response shapes are explicit (no shared "line + away/home" envelope) so consumers can't misread the semantics — see "`GET /v1/contests/:contestId/odds`" below for the exact shape.
 - `GET /v1/analytics/odds-history/:contestId` — opening + current odds for analytics callers (deprecated SDK-internal use; new code should prefer `/contests/:contestId/odds` for current-state reads).
-- **Cursor recovery (Phase 1.5):** `?since=<cursor>` recovery mode on `GET /v1/commitments`, `/v1/speculations`, `/v1/contests`; bare `GET /v1/positions` (recovery) alongside the address-scoped snapshot; `GET /v1/fills` (append-only fill events). See "Cursor recovery reads" below.
-- **SSE streams (Phase 1.5):** `GET /v1/stream/{commitments,positions,fills,speculations,contests}` — live deltas + cursor catch-up + resync over Server-Sent Events. See "SSE streams" below.
-- **Odds stream (Phase 1.5):** `GET /v1/stream/odds?contestId=&market=` — snapshot then live `change`/`refresh` over Server-Sent Events (latest-state, no cursor). See "Odds stream" below.
+- `DELETE /v1/commitments/:hash` — EIP-712 signed off-chain cancel; hides the maker's commitment from the public book. **Authoritative cancel is still on-chain** — see [`docs/CANCEL_FLOW.md`](./docs/CANCEL_FLOW.md).
+- **Cursor recovery:** `?since=<cursor>` recovery mode on `GET /v1/commitments`, `/v1/speculations`, `/v1/contests`; bare `GET /v1/positions` (recovery) alongside the address-scoped snapshot; `GET /v1/fills` (append-only fill events). See "Cursor recovery reads" below.
+- **SSE streams:** `GET /v1/stream/{commitments,positions,fills,speculations,contests}` — live deltas + cursor catch-up + resync over Server-Sent Events. See "SSE streams" below.
+- **Odds stream:** `GET /v1/stream/odds?contestId=&market=` — snapshot then live `change`/`refresh` over Server-Sent Events (latest-state, no cursor). See "Odds stream" below.
 - `GET /v1/metrics` — operational stream / odds / own-state / connection counters (process-local). See "Metrics" below.
-- **Stream auth (M3):** `POST /v1/auth/stream-challenge` + `POST /v1/auth/stream-token` — EIP-712 challenge/response that mints a ~15 min HMAC bearer token, scoped to `{address, audience, chainId}`. Required for the owner-auth `/v1/own-state/*` surfaces landing in M4; the public/anonymous reads above are unchanged.
-- **Own-state snapshot (M4a):** `GET /v1/own-state/snapshot?cursor=<opt>` — owner-auth (`Authorization: Bearer <stream-token>`) paged snapshot of the maker's commitments + positions. Returns `{cursor, commitments[], positions[], truncated, positionsTruncated}` per spec §6.1. The composite cursor is the resume point for `/v1/stream/own-state` (M4b) or — when `truncated: true` (commitments-only) — the continuation key for the next page. `positionsTruncated` is the DEGRADED discriminant, decoupled from `truncated`: when `true`, position visibility is PARTIAL. The stream cold-start emits `event: degraded` before `ready` and consumers (SDK / MM) must quote-hold per spec §2.6 and treat owner-state as partial. There is no paging/convergence mechanism that drains positions beyond the actionable cap; the `/v1/positions/:address` REST endpoint provides full history out-of-band for operator tooling. **Passive expiry** (a commitment whose only terminal transition is `expiry <= now`) is NOT emitted by recovery — the indexer doesn't advance `row_updated_at` for time alone, so such rows fall outside both halves of the recovery response. The SDK reducer is responsible for computing effective status locally (same `deriveEffectiveStatus` pattern used by `/v1/commitments`) and pruning any locally-held active commitment whose stored expiry has lapsed; the active set the snapshot returns is authoritative of currently-matchable rows.
+- **Stream auth:** `POST /v1/auth/stream-challenge` + `POST /v1/auth/stream-token` — EIP-712 challenge/response that mints a ~15 min HMAC bearer token, scoped to `{address, audience, chainId}`. Required for the owner-auth `/v1/own-state/*` surfaces; the public/anonymous reads above are unchanged.
+- **Own-state snapshot:** `GET /v1/own-state/snapshot?cursor=<opt>` — owner-auth (`Authorization: Bearer <stream-token>`) paged snapshot of the maker's commitments + positions. Returns `{cursor, commitments[], positions[], truncated, positionsTruncated}`. The composite cursor is the resume point for `/v1/stream/own-state` or — when `truncated: true` (commitments-only) — the continuation key for the next page. `positionsTruncated` is the DEGRADED discriminant, decoupled from `truncated`: when `true`, position visibility is PARTIAL. The stream cold-start emits `event: degraded` before `ready` and consumers (SDK / market maker) must quote-hold and treat owner-state as partial. There is no paging/convergence mechanism that drains positions beyond the actionable cap; the `/v1/positions/:address` REST endpoint provides full history out-of-band for operator tooling. **Passive expiry** (a commitment whose only terminal transition is `expiry <= now`) is NOT emitted by recovery — the indexer doesn't advance `row_updated_at` for time alone, so such rows fall outside both halves of the recovery response. The SDK reducer is responsible for computing effective status locally (same `deriveEffectiveStatus` pattern used by `/v1/commitments`) and pruning any locally-held active commitment whose stored expiry has lapsed; the active set the snapshot returns is authoritative of currently-matchable rows.
+- **Own-state stream:** `GET /v1/stream/own-state` — owner-auth composite SSE stream of the caller's own commitments + position-status transitions. Cold start (no cursor) emits an inline `snapshot` event; reconnects resume from the composite cursor via `Last-Event-ID` or `?cursor=`. Emits `degraded` before `ready` when owner-state visibility is partial.
+- `GET /v1/health/own-state` — **public** (no stream-auth) indexer-lag probe returning `{indexerLagSeconds, lastIndexedAt, lagSource}`. Indexer lag is a global, wallet-independent signal; a market maker polls it to decide whether its owner-state view is fresh enough to quote against.
 
-Not ported (no R4 analog — see "Position helpers" section below): `/withdraw-params`, `/withdraw-result/:txHash`. Not ported in any batch yet (deferred or out of scope): everything else under `/v1/analytics/*`, `/v1/current-odds*` (the legacy `/v1/current-odds*` paths from agent-server are superseded by the contest-centric `/v1/contests/:contestId/odds`).
+Not ported (no analog in the current protocol — see "Position helpers" section below): `/withdraw-params`, `/withdraw-result/:txHash`. Not ported in any batch yet (deferred or out of scope): everything else under `/v1/analytics/*`, `/v1/current-odds*` (the legacy `/v1/current-odds*` paths are superseded by the contest-centric `/v1/contests/:contestId/odds`).
 
 ## Stack
 
@@ -93,7 +99,7 @@ Body shape:
 ```
 
 Notes:
-- 9 fields, no `contributionAmount` (R3 cruft).
+- 9 fields, in the exact order the contract's `COMMITMENT_TYPEHASH` declares them. A signer producing a different field set will fail verification on-chain.
 - `verifyingContract` of the EIP-712 domain is the **MatchingModule**, not OspexCore.
 - `riskAmount` must be a multiple of 100 (lot-size aligned).
 - `oddsTick` ∈ [101, 10100].
@@ -106,9 +112,9 @@ Responses: `201 Created` on new, `200 OK` on duplicate, `400` for validation, `4
 
 ### `GET /v1/commitments`
 
-List commitments, sorted by `created_at DESC, commitment_hash ASC` (newest first; tie-break on hash so offset-based pagination is deterministic — note that rows backfilled by indexer migration 039 share a timestamp).
+List commitments, sorted by `created_at DESC, commitment_hash ASC` (newest first; tie-break on hash so offset-based pagination is deterministic — backfilled rows can share a timestamp, so the hash tie-break is load-bearing).
 
-The default response is **the matchable open book**: still-fillable commitments that a taker could `matchCommitment` against right now. Power users can opt back into invalidated / expired / non-default-status rows via the flags below. Off-book (hidden) rows are excluded unconditionally — the legacy `?includeHidden=true` opt-in was removed (M2). Makers retrieve their own hidden rows via the owner-auth own-state surface (M4, landing alongside M2 in the integrated migration cutover).
+The default response is **the matchable open book**: still-fillable commitments that a taker could `matchCommitment` against right now. Power users can opt back into invalidated / expired / non-default-status rows via the flags below. Off-book (hidden) rows are excluded unconditionally — the legacy `?includeHidden=true` opt-in was removed. Makers retrieve their own hidden rows via the owner-auth own-state surface.
 
 Every returned commitment carries two status fields: **`status` is the _effective_ lifecycle status** and **`storedStatus`** is the raw on-chain lifecycle value the indexer/relay recorded. Effective status folds in what the contract enforces at match time but the indexer never writes as an event, plus off-chain book visibility: a stored `open`/`partially_filled` row past its `expiry` reports `status: 'expired'`; a nonce-invalidated row, or one the maker hid from the book via an off-chain `DELETE` (`bookVisible: false`), reports `status: 'cancelled'` (the row may still be matchable on-chain — read `storedStatus`/`bookVisible` for chain truth). `filled` and `cancelled` stay terminal. The `status`, `includeExpired`, and `includeInvalidated` query params filter on the **stored** value + the expiry / nonce columns (which keeps pagination and `total` exact); the effective lifecycle is read off the response `status` (notably on get-by-hash and on `include*` results). Off-book (hidden) rows are filtered out of the list unconditionally — there is no longer an `includeHidden` opt-in (see "Hidden-row redaction" below).
 
@@ -127,7 +133,7 @@ Query params:
 
 Response: `{ commitments: CommitmentBody[], pagination: { limit, offset, total, hasMore } }`. Each `CommitmentBody` has the full canonical shape including `status` (effective lifecycle), `storedStatus` (raw indexed value), `bookVisible` (off-chain book visibility), `signature`, `speculationKey`, `nonceInvalidated`, `createdAt`, etc.
 
-#### Hidden-row redaction across anonymous reads (M2)
+#### Hidden-row redaction across anonymous reads
 
 Anonymous reads of off-book rows (`book_visible=false`) return an **allow-list projection**, not the full body. The projection is enforced at **runtime**: the allow-list is the single source of truth, the wire type is derived from it, and the body is built by projecting the full body through it — so a field can't leak unless it's on the list, regardless of any upstream change. Hidden bodies expose only lifecycle and identity fields and **omit** `signature`, `nonce`, `oddsTick`, `riskAmount`, `remainingRiskAmount`, `lineTicks`, `scorer`, `speculationKey`, and every EIP-712 typed-data field — enough that no anonymous taker can reconstruct a `matchCommitment` transaction against a soft-cancelled order. The two structural discriminants `redacted: true` and `payloadAvailable: false` let consumers branch on the response shape without probing for missing fields.
 
@@ -277,15 +283,15 @@ Top-level `totals` mirrors all three buckets:
 | `estimatedPayoutUSDC` / `estimatedPayoutWei6` | claimable-only payouts (ready to sweep right now) |
 | `pendingSettlePayoutUSDC` / `pendingSettlePayoutWei6` | pendingSettle-only predicted payouts (require an extra `settleSpeculation` call before they materialize) |
 
-Wei6 totals are aggregated in bigint to avoid float-rounding loss across many rows; the USDC float is the bigint sum divided by 1e6. Capped at 200 unclaimed positions per address (matches agent-server behavior).
+Wei6 totals are aggregated in bigint to avoid float-rounding loss across many rows; the USDC float is the bigint sum divided by 1e6. Capped at 200 unclaimed positions per address.
 
-Filtering matches the contract exactly: `claimPosition` reverts only when `riskAmount == 0 || payout == 0` (`PositionModule.sol:367-370`). The filter is done in wei6 (bigint), so sub-cent payouts that ARE claimable on-chain still appear in the response. Lost positions are excluded (the contract would revert with `NoPayout`); positions on still-open speculations whose parent contest is not yet scored go in `active`. There is no `withdrawable` bucket — see note below.
+Filtering matches the contract exactly: `claimPosition` reverts with `PositionModule__NoPayout` when `riskAmount == 0 || payout == 0`. The filter is done in wei6 (bigint), so sub-cent payouts that ARE claimable on-chain still appear in the response. Lost positions are excluded (the contract would revert with `NoPayout`); positions on still-open speculations whose parent contest is not yet scored go in `active`. There is no `withdrawable` bucket — see note below.
 
 This endpoint reads `speculations.market_type` and `contests.{contest_status, away_score, home_score}` directly (all populated by the indexer) and does not depend on the `SCORER_*_ADDRESS` env vars — those are only required for `POST /v1/commitments`.
 
 #### `GET /v1/positions/:address/claim-params`
 
-Returns ready-to-sign tx params for every claimable AND pendingSettle position. R4 `claimPosition` takes `(speculationId, positionType)` — no `oddsPairId` (the R3 field is gone in R4 since positions are uniquely identified by `(speculationId, user, positionType)`).
+Returns ready-to-sign tx params for every claimable AND pendingSettle position. `claimPosition` takes `(speculationId, positionType)` — positions are uniquely identified by `(speculationId, user, positionType)`.
 
 Same filter / market_type / scorer-replay semantics as `/status` above.
 
@@ -333,7 +339,7 @@ The `description` field shows `"<$0.01"` for sub-cent expected payouts so it doe
 
 #### `GET /v1/positions/by-tx/:txHash`
 
-Parses the R4 `PositionFilled(speculationId, maker, taker, makerPositionType, takerPositionType, makerRisk, takerRisk)` event from a tx receipt. Each fill creates **two** position rows (maker + taker) so the response returns both as a single array. If `POSITION_MODULE_ADDRESS` is set, only logs from that contract are decoded; otherwise any log matching the event topic is decoded.
+Parses the `PositionFilled(speculationId, maker, taker, makerPositionType, takerPositionType, makerRisk, takerRisk)` event from a tx receipt. Each fill creates **two** position rows (maker + taker) so the response returns both as a single array. If `POSITION_MODULE_ADDRESS` is set, only logs from that contract are decoded; otherwise any log matching the event topic is decoded.
 
 Requires `ALCHEMY_RPC_URL`.
 
@@ -345,9 +351,9 @@ Requires `ALCHEMY_RPC_URL`.
 
 #### Not ported — `/withdraw-params`, `/withdraw-result/:txHash`
 
-R4 has no `adjustUnmatchedPair` method or `PositionAdjusted` event. The R3 helper let a user pull back an unmatched stake on a position; in R4 positions are always fully matched at fill time and "unmatched" lives on the `commitments` table instead.
+The protocol has no `adjustUnmatchedPair` method or `PositionAdjusted` event. Positions are always fully matched at fill time, so "unmatched" lives on the `commitments` table instead of on a position.
 
-The R4 analog of "withdraw your unfilled stake" is "cancel your open commitment" via `MatchingModule.cancelCommitment(commitment)`. Consumers can build that call directly from the existing `GET /v1/commitments?maker=…` response — every commitment row carries the 9 fields needed. So no helper endpoint is required. A future `GET /v1/commitments/cancel-result/:txHash` (parsing `CommitmentCancelled`) could be added if needed.
+The analog of "withdraw your unfilled stake" is therefore "cancel your open commitment" via `MatchingModule.cancelCommitment(commitment)`. Consumers can build that call directly from the existing `GET /v1/commitments?maker=…` response — every commitment row carries the 9 fields needed. So no helper endpoint is required. A future `GET /v1/commitments/cancel-result/:txHash` (parsing `CommitmentCancelled`) could be added if needed.
 
 ### `GET /v1/leaderboard`
 
@@ -365,7 +371,7 @@ Out of scope for this batch: best-effort merge with on-chain `contests` (so each
 
 Flat list of every row in the `team_aliases` table joined to canonical team metadata from the `teams` table. Network-agnostic — `team_aliases` and `teams` are sports-reference data shared across networks.
 
-Closes the `resolveTeam` gap historically called out in this file. The legacy resolver lived in deprecated `ospex-agent-server` and never migrated; consumers (notably the SDK's commitment resolver layer) now read aliases from this endpoint instead of re-implementing.
+Closes the `resolveTeam` gap historically called out in this file. The legacy resolver was never migrated from the deprecated agent server; consumers (notably the SDK's commitment resolver layer) now read aliases from this endpoint instead of re-implementing it.
 
 Query params:
 
@@ -399,7 +405,7 @@ Response:
 
 Pagination caveat: PostgREST returns at most 1000 rows per request, so `limit` is capped at 1000 — the table is ~1300+ rows, and a larger advertised limit would silently truncate while still echoing the requested limit in `pagination.limit`, causing naive `offset += pagination.limit` clients to skip rows. SDK consumers should paginate until `hasMore: false`.
 
-### Cursor recovery reads (Phase 1.5)
+### Cursor recovery reads
 
 The catch-up side of the push contract. A client streams live deltas (SSE — see "SSE streams") and, after a disconnect, asks for everything after its last cursor. These reads are intentionally distinct from the open-book list/snapshot endpoints above.
 
@@ -422,7 +428,7 @@ Common response envelope: `{ <resource>: [...], nextCursor: string | null, hasMo
 
 On the mutable-row endpoints, `?since=` *switches* the endpoint into recovery mode; without it they behave exactly as documented above (open-book list / window). `GET /v1/positions` (bare) and `GET /v1/fills` are recovery-native (cursor optional — absent means "from the beginning", paged).
 
-### SSE streams (Phase 1.5)
+### SSE streams
 
 `GET /v1/stream/:resource` (`resource` ∈ `commitments | positions | fills | speculations | contests`) opens a [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) stream — the live, push side of the contract. One internal poller per resource fans deltas out to every connected client: many agents subscribe, but each resource is polled once per tick (the N→1 collapse that keeps a busy fleet off the DB).
 
@@ -441,9 +447,9 @@ Operational notes:
 - SSE is **exempt from gzip** (compression buffers streams would defeat it) and from the request-rate limiter; a **concurrent-connection cap** (per-IP + total) bounds resource use instead — `429` when full. Of the per-IP budget, `RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER` slots are reserved for the owner-auth own-state stream so anonymous (odds/protocol) saturation from one IP can't 429 a market-maker's safety-critical own-state reconnect. The caps are env-tunable (`MAX_STREAM_CONNECTIONS_TOTAL` / `MAX_STREAM_CONNECTIONS_PER_IP` / `RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER`); the live values show on `GET /v1/metrics`.
 - **Graceful shutdown.** On `SIGTERM`/`SIGINT` the server proactively ends open streams — protocol streams get a final `resync` (`reason: "server_shutdown"`) then close — so it drains fast instead of waiting out the shutdown timeout. Reconnect as usual.
 - `position_fills` is append-only (every event delivered); the other four are state-delta convergence (latest state per row).
-- Backed by the same `(network, row_updated_at, id)` indexes as recovery (indexer migration 048) — apply those before production stream traffic.
+- Backed by the same `(network, row_updated_at, id)` indexes as the cursor-recovery reads — those indexes must exist before production stream traffic.
 
-### Odds stream (Phase 1.5)
+### Odds stream
 
 `GET /v1/stream/odds?contestId=<numeric>&market=<moneyline|spread|total>` opens a Server-Sent Events stream of upstream reference odds for a contest's underlying game. Both query params are **required**. This is a separate route from the protocol `/v1/stream/:resource` streams because odds is **latest-state, not a durable log** — there's no cursor, no catch-up replay, and no `Last-Event-ID` resume. The server maintains one internal `current_odds` subscription for the whole process and fans out to every connected client (the N→1 collapse); that internal source stays server-side and the provider game id is **never** on the wire (it's resolved from `contestId` internally).
 
@@ -544,16 +550,16 @@ Set via `heroku config:set <var>=<value> --app ospex-core-api`. Mirrors `.env.ex
 - `NETWORK` — `polygon` for production, `amoy` for testnet
 - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
 - `ALCHEMY_RPC_URL` — Polygon mainnet RPC (PAYG-tier — required by `/v1/positions/by-tx` and `/v1/positions/claim-result`)
-- `MATCHING_MODULE_ADDRESS` — R4 matching module; verifying contract for the EIP-712 domain on `POST /v1/commitments` and `DELETE /v1/commitments/:hash`, **and** reused as the verifying contract of the separate `OspexStreamAuth` domain (M3 — see `STREAM_AUTH_*` below). The stream-auth endpoints return `503 NOT_READY` if this is unset
+- `MATCHING_MODULE_ADDRESS` — the deployed `MatchingModule`; verifying contract for the EIP-712 domain on `POST /v1/commitments` and `DELETE /v1/commitments/:hash`, **and** reused as the verifying contract of the separate `OspexStreamAuth` domain (see `STREAM_AUTH_*` below). The stream-auth endpoints return `503 NOT_READY` if this is unset
 - `SCORER_MONEYLINE_ADDRESS`, `SCORER_SPREAD_ADDRESS`, `SCORER_TOTAL_ADDRESS` — required by `POST /v1/commitments` (all-or-nothing; partial config is rejected at boot)
 - `POSITION_MODULE_ADDRESS` — optional defensive log-source filter for tx parsers
 - `MAX_STREAM_CONNECTIONS_TOTAL`, `MAX_STREAM_CONNECTIONS_PER_IP`, `RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER` — optional SSE concurrent-connection caps (defaults 200 / 16 / 3); per-IP is per egress host. Co-locating N market makers must satisfy BOTH per-IP constraints: `N·(odds channels + 1) ≤ PER_IP` (overall) **and** `N·(odds channels) ≤ PER_IP − RESERVED` (anonymous odds — usually the binding one, since the reserve shrinks the anon budget below the total cap). E.g. PER_IP=16, reserve=3, N=2, odds=7 passes the overall check (16 ≤ 16) but fails anon (14 > 13), so core-api 429s the 14th odds stream — raise `PER_IP`. The owner-auth reserve keeps anonymous saturation from 429-ing a maker's own-state reconnect (`RESERVED=0` disables it = single shared pool). Set any to tune the stream stack without a code change
-- `REDACT_HIDDEN_PUBLIC` — optional bool, **default `true`** (redaction enforced). Short-lived rollout/rollback guard for the M2 hidden-row redaction. Setting `false` reverts every anonymous read path to the legacy "full body for all rows" behavior for a deploy window only; the flag is scheduled for removal post-M7 cutover
+- `REDACT_HIDDEN_PUBLIC` — optional bool, **default `true`** (redaction enforced). Short-lived rollout/rollback guard for hidden-row redaction. Setting `false` reverts every anonymous read path to the legacy "full body for all rows" behavior, for a deploy window only; the flag is scheduled for removal once the redaction rollout has soaked
 - `STREAM_AUTH_HMAC_SECRET` — optional but required by **both** stream-auth POST endpoints AND the `verifyStreamToken` middleware (each returns `503 NOT_READY` if unset). HMAC-SHA256 secret used to sign + verify stream-auth bearer tokens; must be ≥ 32 characters of entropy (boot-time fatal otherwise). Rotation = add a second key and accept both during transition (follow-up; current `kid` is `v1`)
 - `STREAM_AUTH_AUDIENCE` — optional but required by both stream-auth POST endpoints (same `503 NOT_READY` rule). The canonical host string bound into both the challenge typed-data and the issued token (e.g. `https://api.ospex.org`); SDK clients derive the same string from their `baseUrl`, so a token minted for one deployment cannot be replayed against another
-- `STREAM_CHALLENGE_TTL_SECONDS` — optional, default `180` (3 min). Lifetime of a single-use challenge; **boot-fatal outside [120, 300]** per spec §3.3
+- `STREAM_CHALLENGE_TTL_SECONDS` — optional, default `180` (3 min). Lifetime of a single-use challenge; **boot-fatal outside [120, 300]** (2–5 min)
 - `STREAM_TOKEN_TTL_SECONDS` — optional, default `900` (15 min). Lifetime of an issued bearer token; **boot-fatal outside [60, 1800]**
-- `OWN_STATE_SNAPSHOT_MAX_COMMITMENTS` — optional, default `5000` per spec §6.2. Per-page commitments cap for `GET /v1/own-state/snapshot`; **boot-fatal outside [100, 50000]**. SDK pages with `?cursor=` until the response carries `truncated: false`
+- `OWN_STATE_SNAPSHOT_MAX_COMMITMENTS` — optional, default `5000`. Per-page commitments cap for `GET /v1/own-state/snapshot`; **boot-fatal outside [100, 50000]**. SDK pages with `?cursor=` until the response carries `truncated: false`
 
 The stream-auth challenge store is **in-memory, per-process**. A challenge minted on one dyno cannot be consumed on another — fine for the current single-dyno Heroku deployment, but horizontal scale-out requires moving challenges to Redis/Postgres or running with sticky routing first. The endpoint-level `503 NOT_READY` checks are deliberately separate from `/readyz` (next section) — `/readyz` keeps the meaning "the always-required dependencies are reachable", and stream-auth is opt-in at the operator level.
 
@@ -569,13 +575,13 @@ curl -s "$URL/v1/protocol/info"    # mainnet contract addresses
 curl -s "$URL/v1/contests"         # paginated list (empty until indexer ingests data)
 ```
 
-`/readyz` checks the always-required dependencies: Supabase reachability + EIP-712 relay env config for `POST /v1/commitments`. It does **not** include stream-auth (M3) readiness — those endpoints are opt-in at the operator level and surface their own `503 NOT_READY` per call when `STREAM_AUTH_HMAC_SECRET` / `STREAM_AUTH_AUDIENCE` / `MATCHING_MODULE_ADDRESS` are unset.
+`/readyz` checks the always-required dependencies: Supabase reachability + EIP-712 relay env config for `POST /v1/commitments`. It does **not** include stream-auth readiness — those endpoints are opt-in at the operator level and surface their own `503 NOT_READY` per call when `STREAM_AUTH_HMAC_SECRET` / `STREAM_AUTH_AUDIENCE` / `MATCHING_MODULE_ADDRESS` are unset.
 
 ## Project conventions
 
 - **Supabase only** — no Firebase, no Firestore, no `firebase-admin`. The `package.json` has zero firebase deps and any PR adding one should be rejected at review.
-- **No data-source smuggling** — handlers and their helpers must read from the same data layer. Don't repeat the `positionFetch.ts` pattern from `ospex-agent-server` where a Supabase-looking handler quietly called a Firestore helper.
-- **Network-scoped queries** — every Supabase query that hits a network-partitioned table must filter `eq('network', NETWORK)`. The indexer skill in `.claude/skills/indexer/` has the canonical list.
+- **No data-source smuggling** — handlers and their helpers must read from the same data layer. Don't repeat the legacy `positionFetch.ts` pattern where a Supabase-looking handler quietly called a Firestore helper.
+- **Network-scoped queries** — every Supabase query that hits a network-partitioned table must filter `eq('network', NETWORK)`. Any table carrying a `network` column is network-partitioned.
 - **Service-role key bypasses RLS** — the server uses `SUPABASE_SERVICE_ROLE_KEY`, which sees every column on every row. Handlers must explicitly select the public columns they intend to expose (`.select('id, name, ...')` not `.select('*')`) and never echo a row directly to the response. Treat raw row shape as private by default.
 - **Strict TypeScript** — `any` is an error, unused vars are errors, console is an error (use the pino `logger`). Run `yarn typecheck` before merging.
 
@@ -588,7 +594,7 @@ src/
     env.ts             # boot-time env validation, typed Config
     supabase.ts        # lazy-init Supabase client
     logger.ts          # pino
-    eip712.ts          # R4 OspexCommitment schema, domain, verify, hash
+    eip712.ts          # OspexCommitment schema, domain, verify, hash
     rpc.ts             # lazy ethers JsonRpcProvider
     sanitize.ts        # wei6ToUSDC, toISOString
     parseOdds.ts       # American / line parsers
@@ -609,6 +615,8 @@ src/
     contests.ts        # GET /v1/contests, /:contestId
     speculations.ts    # GET /v1/speculations, /:speculationId
     protocol.ts        # GET /v1/protocol/info
+    auth.ts            # GET /v1/auth/domain — EIP-712 self-discovery
+    config.ts          # GET /v1/config/public — publishable client bootstrap
     metrics.ts         # GET /v1/metrics — stream/odds/own-state/connection counters
     positions.ts       # GET /v1/positions (recovery) + /:address + /status,
                        #   /claim-params, /by-tx/:txHash, /claim-result/:txHash
@@ -624,6 +632,7 @@ src/
       connections.ts   #   concurrent-connection caps + graceful-shutdown stream registry
     leaderboard.ts     # GET /v1/leaderboard
     schedule.ts        # GET /v1/schedule
+    games.ts           # GET /v1/games, /:gameId
     teams.ts           # GET /v1/teams/aliases
     utils/
       positionFetch.ts # categorize active/pendingSettle/claimable (Supabase-only)

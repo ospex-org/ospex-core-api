@@ -8,8 +8,8 @@
  * `VALID_SPORTS` sets so adding a new sport requires editing exactly
  * one file.
  *
- * The list mirrors the seeds in `ospex-indexer/scripts/seeds/seed-{mlb,
- * nfl,ncaaf}-teams.ts` plus the pre-existing nba / ncaab / nhl seeds.
+ * The list mirrors the indexer's team seeds (mlb / nfl / ncaaf) plus
+ * the pre-existing nba / ncaab / nhl seeds.
  */
 
 export type Sport = 'mlb' | 'nba' | 'ncaab' | 'ncaaf' | 'nfl' | 'nhl';

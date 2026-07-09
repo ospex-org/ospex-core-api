@@ -10,7 +10,7 @@
  *
  * This helper derives the **effective** status a client should treat as true
  * right now. It mirrors the on-chain temporal guard in
- * `MatchingModule._validateCommitment` (ospex-foundry-matched-pairs), which
+ * `MatchingModule._validateCommitment`, which
  * reverts with `MatchingModule__CommitmentExpired` when
  * `block.timestamp >= commitment.expiry` — i.e. `expiry <= now` is genuinely
  * unmatchable, and `expiry == 0`/absent is *always* unmatchable. Nonce-invalidated

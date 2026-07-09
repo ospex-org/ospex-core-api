@@ -2,9 +2,10 @@
  * GET /v1/protocol/info — static protocol metadata.
  *
  * Contract addresses, chain id, network, and supported sports. The
- * agent-server also exposed a `/v1/protocol/agents` endpoint that
- * read from a Firebase `agentMeta` collection — that is NOT ported,
- * see audit-agent-server-api.md.
+ * legacy agent server also exposed a `/v1/protocol/agents` endpoint
+ * backed by a Firebase collection. It is deliberately NOT ported:
+ * this service has no Firebase dependency and the protocol exposes no
+ * agent registry.
  */
 
 import type { Request, Response } from 'express';

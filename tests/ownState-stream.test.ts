@@ -305,7 +305,7 @@ describe('GET /v1/stream/own-state — cold start (no cursor)', () => {
   });
 
   it('seedRows come from the SAME read as snapshot body (race-by-construction impossible)', async () => {
-    // Hermes review-32 round 3 blocker 1: the cold-start race where a
+    // Regression: the cold-start race where a
     // fresh post-snapshot derivation observes a transition the snapshot
     // missed. Fix: snapshot.seedRows is produced FROM the same
     // categorization join that built body.positions. There is no second
@@ -539,7 +539,7 @@ describe('GET /v1/stream/own-state — resume catchup', () => {
   });
 
   it('resume catchup emits positionStatus:claimed for an OFFLINE claim transition (no live cache)', async () => {
-    // Hermes review-32 round 3 blocker 2: a position that became
+    // Regression: a position that became
     // `claimed=true` while the client was offline must surface via
     // `positionStatus:claimed` on resume — the actionable filter
     // excludes it (`claimed=false`) and the live hub has no cached key
@@ -595,7 +595,7 @@ describe('GET /v1/stream/own-state — resume catchup', () => {
   });
 
   it('resume terminal-since query uses keyset + 30s overlap floor (not naive .gt)', async () => {
-    // Hermes review-32 round 4 blocker 2: the prior `.gt('row_updated_at',
+    // Regression: the prior `.gt('row_updated_at',
     // since.s)` filter missed (a) same-timestamp rows with higher id and
     // (b) rows whose row_updated_at landed inside the 30s overlap window
     // due to writer-tx-commit-vs-now() lag. The fix folds
@@ -702,7 +702,7 @@ describe('GET /v1/stream/own-state — resume catchup', () => {
     // onPositionStatus with status B (because the seeded cache differs
     // from the current derivation). The handler must NOT silently cache
     // and emit ready — that's the convergence hole called out in
-    // review-32 round 2. The onPositionStatus callback during preReady
+    // review. The onPositionStatus callback during preReady
     // sets `aborted=true`, the handler emits resync, ends the connection,
     // and the SDK reconnects with fresh state.
     class RacingPositionHub extends OwnStateHub {
@@ -791,7 +791,7 @@ describe('GET /v1/stream/own-state — resume catchup', () => {
 
 describe('advancePositions — monotonic guard', () => {
   it('does not move cur.p backwards when a later cursor is followed by an earlier one', async () => {
-    // Hermes review-32 round 5 blocker 1 (defensive guard): the hub
+    // Regression (defensive guard): the hub
     // sorts emissions so this case should not arise in practice. This
     // test pins the belt-and-braces behavior — if a future code path
     // accidentally emits out of order, the cursor stays at the higher
