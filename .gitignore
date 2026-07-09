@@ -1,7 +1,11 @@
 node_modules/
 dist/
-.env
 *.log
+
+# Secrets — ignore every .env variant, but keep the placeholder template.
+.env
+.env.*
+!.env.example
 
 # Editor
 .vscode/
