@@ -24,7 +24,7 @@
  * boundary here. `fill` deltas carry the public fill body. `positionStatus`
  * deltas are SYNTHETIC: the hub joins each new/changed `positions` row with
  * its `speculations` + `contests` row at tick time and derives the canonical
- * spec §2.1.3 enum via `derivePositionStatus`.
+ * canonical enum via `derivePositionStatus`.
  *
  * Cursor `p` advances on the DERIVED `sourceUpdatedAt = max(positions,
  * speculations, contests)` row_updated_at — not raw
@@ -133,7 +133,7 @@ interface ResourceTipState {
 
 /**
  * Per-position status cache — the semantic-event-key dedup contract for
- * `positionStatus` events. Spec §2.1.2 keys positionStatus events on
+ * `positionStatus` events. The wire contract keys positionStatus events on
  * `(address, speculationId, positionType, status, sourceUpdatedAt)`. Raw
  * `(positions.row_updated_at, positions.id)` dedup would lose
  * speculation/contest-driven transitions (the underlying position row
@@ -154,7 +154,7 @@ interface StatusCacheEntry {
    * Advisory categorical result (won/lost/push/void) — part of the
    * payload-level dedup. A same-status event with a different `result`
    * still emits (e.g. score correction flipping pendingSettle's
-   * prediction). Per spec §2.1.2 the SDK reducer's dedup key is
+   * prediction). The SDK reducer's dedup key is
    * (addr, specId, ptype, status, sourceUpdatedAt); we include `result`
    * + `claimableAmount` here as belt-and-braces against any derivation
    * that could change the payload while keeping the same (status,
@@ -693,7 +693,7 @@ export class OwnStateHub {
         claimableAmount: body.claimableAmount,
       };
       // Dedup contract: we emit when ANY semantic field differs from the
-      // seeded/cached entry. The SDK reducer's dedup key (spec §2.1.2) is
+      // seeded/cached entry. The SDK reducer's dedup key is
       // (addr, specId, positionType, status, sourceUpdatedAt); we
       // additionally compare `result` and `claimableAmount` so a same-
       // status payload-only change (e.g. a contest score correction

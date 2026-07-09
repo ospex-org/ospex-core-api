@@ -89,8 +89,8 @@ v1Router.get('/protocol/info', readRateLimit, (req, res) => getProtocolInfoHandl
 
 v1Router.get('/auth/domain', readRateLimit, (req, res) => getAuthDomainHandler(req, res));
 
-// ── Stream-auth (M3): EIP-712 challenge → bearer token ──────────────
-// Owner-auth handshake for the M4 `/v1/own-state/*` surfaces. Both endpoints
+// ── Stream-auth: EIP-712 challenge → bearer token ───────────────────
+// Owner-auth handshake for the `/v1/own-state/*` surfaces. Both endpoints
 // share the same rate budget as signed-write commitments — moderate cost,
 // stops a bad actor from burning challenges or HMAC-grinding at request-rate.
 v1Router.post('/auth/stream-challenge', commitmentsRateLimit, (req, res) =>
@@ -100,7 +100,7 @@ v1Router.post('/auth/stream-token', commitmentsRateLimit, (req, res) =>
   postStreamTokenHandler(req, res),
 );
 
-// ── Own-state (M4): owner-auth snapshot + (M4b) SSE composite stream ──
+// ── Own-state: owner-auth snapshot + SSE composite stream ───────────
 // Snapshot is paged owner-auth REST — `verifyStreamToken` middleware fronts
 // the route, attaching `req.streamAuth.address`. `readRateLimit` is shared
 // with the other GETs; an SDK does one-or-two snapshot calls per session.
@@ -111,7 +111,7 @@ v1Router.get(
   asyncHandler(ownStateSnapshotHandler),
 );
 
-// Public indexer-lag probe for the own-state stream-health gate (spec §2.6).
+// Public indexer-lag probe for the own-state stream-health gate.
 // No stream-auth — lag is a global, wallet-independent signal the market-maker
 // polls at ~10s cadence; minting a bearer per poll would be pure overhead.
 v1Router.get('/health/own-state', readRateLimit, asyncHandler(ownStateHealthHandler));
@@ -146,7 +146,7 @@ v1Router.get('/fills', readRateLimit, asyncHandler(getFillsHandler));
 v1Router.get('/stream/odds', (req, res) => {
   void getOddsStreamHandler(req, res);
 });
-// Owner-auth composite SSE (M4b). Same registration-order rule as `/stream/odds`:
+// Owner-auth composite SSE. Same registration-order rule as `/stream/odds`:
 // the `verifyStreamToken` middleware fronts the route, and the static `own-state`
 // segment must beat `:resource`. No `readRateLimit` — long-lived SSE; the handler
 // uses the concurrent-connection cap via `acquireStreamSlot`.

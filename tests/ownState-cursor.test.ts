@@ -1,5 +1,5 @@
 /**
- * Pure tests for the own-state composite cursor codec (M4a). Roundtrip +
+ * Pure tests for the own-state composite cursor codec. Roundtrip +
  * exhaustive structural validation. The cursor's invariants gate every
  * own-state owner-auth request, so each rejection branch is pinned.
  */

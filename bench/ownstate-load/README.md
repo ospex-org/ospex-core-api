@@ -1,4 +1,4 @@
-# Own-state SSE load harness (M1 slice)
+# Own-state SSE load harness
 
 Tracked-but-**not-deployed** test tooling. It lives outside `src/`, so the `tsc`
 build (`yarn build`) never bundles it — it is a bench/test like the unit suite,
@@ -75,7 +75,7 @@ does against real Postgres. Anything it cannot serve faithfully is **logged**
 The harness is the data source: empty by default (profile 1), and `seed()` /
 `append()` controlled rows (profile 2 event injection).
 
-## Out of scope (deferred — the rest of the spec §11 stream-readiness gate)
+## Out of scope (deferred — the rest of the stream-readiness gate)
 
 Marked as skipped in the run output and tracked here so the gate isn't forgotten;
 pick these up at the agent-onboarding trigger:

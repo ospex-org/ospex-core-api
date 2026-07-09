@@ -1,5 +1,5 @@
 /**
- * `positionStatus` event derivation (spec §2.1.3, deferred from M4a).
+ * `positionStatus` event derivation.
  *
  * Maps a (positions, speculations, contests) join into a canonical
  * `PositionStatusEventBody`. Pure — callers pass already-fetched rows; this
@@ -28,7 +28,7 @@
  *                       terminal: no further state transition.
  *
  * Inputs are the joined raw values from each table — the caller picks
- * them out of whatever it has in hand. The dedup contract (spec §2.1.2)
+ * them out of whatever it has in hand. The dedup contract
  * keys positionStatus events on
  *   `(address, speculationId, positionType, status, sourceUpdatedAt)`
  * so `sourceUpdatedAt` MUST be the MAX of every source row that
@@ -51,7 +51,7 @@
 
 import type { MarketType, WinSide } from '../../lib/speculation.js';
 
-/** Spec §2.1.3 canonical enum. */
+/** Canonical `positionStatus` enum. */
 export type PositionStatus =
   | 'active'
   | 'pendingSettle'
@@ -60,7 +60,7 @@ export type PositionStatus =
   | 'settledLost'
   | 'void';
 
-/** Forward-rank for the SDK reducer's backwards-transition guard (spec §2.5.1). */
+/** Forward-rank for the SDK reducer's backwards-transition guard. */
 export function positionStatusRank(s: PositionStatus): number {
   switch (s) {
     case 'active':

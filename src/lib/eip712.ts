@@ -91,7 +91,7 @@ export function buildDomain(chainId: ChainId, verifyingContract: string): TypedD
 
 /**
  * Build the stream-auth EIP-712 domain. SEPARATE `domainSeparator` from the
- * on-chain commitment domain (spec §3.2: namespace under `OspexStreamAuth`) —
+ * on-chain commitment domain (namespaced under `OspexStreamAuth`) —
  * the `name` field differs, so an `OspexCommitment` signature can never be
  * replayed as an `OspexStreamAuth` and vice-versa. The `verifyingContract`
  * field reuses the matching-module address only to keep the domain shape
@@ -107,7 +107,7 @@ export function buildStreamAuthDomain(chainId: ChainId, verifyingContract: strin
 }
 
 // ────────────────────────────────────────────────────────────────────
-// OspexStreamAuth — stream-auth challenge (spec §3.2)
+// OspexStreamAuth — stream-auth challenge
 //
 // Owner-auth own-state subscribers sign a server-minted challenge; the server
 // trades the signature for a short-lived bearer token. The challenge is a

@@ -1,12 +1,12 @@
 /**
- * `derivePositionStatus` tests (M4b spec §2.1.3 helper).
+ * `derivePositionStatus` tests.
  *
  * Pure helper — no mocks. Each test pins a single transition in the enum
  * (active / pendingSettle / claimable / claimed / settledLost / void) and
  * the payload fields (`result`, `claimableAmount`, `sourceUpdatedAt`).
  *
  * The scorer logic mirrors `positionFetch.ts:predictWinSide` — covered
- * elsewhere — so these tests focus on the enum boundaries the M4b stream
+ * elsewhere — so these tests focus on the enum boundaries the own-state stream
  * cares about, not the scorer arithmetic.
  */
 import { describe, expect, it } from 'vitest';

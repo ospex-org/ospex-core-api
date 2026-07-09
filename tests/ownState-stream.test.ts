@@ -1,5 +1,5 @@
 /**
- * `getOwnStateStreamHandler` integration tests (M4b spec §2.1).
+ * `getOwnStateStreamHandler` integration tests.
  *
  * Covers the connect-time guards (cursor validation), the cold-start
  * snapshot-then-ready vs snapshot-only-on-truncation paths, the
@@ -357,10 +357,10 @@ describe('GET /v1/stream/own-state — cold start (no cursor)', () => {
   });
 
   it('emits snapshot + degraded + ready when positions truncated (defined terminal, no resync loop)', async () => {
-    // positionsTruncated reconnect contract (PR2 round 2): a wallet at the
+    // positionsTruncated reconnect contract: a wallet at the
     // 200-actionable-position cap reaches a DEFINED terminal state instead
     // of resync-looping. The stream emits `event: degraded` so the
-    // SDK / MM enters quote-hold per spec §2.6, then proceeds to `ready`.
+    // SDK / market maker enters quote-hold, then proceeds to `ready`.
     positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
       active: [],
       pendingSettle: [],

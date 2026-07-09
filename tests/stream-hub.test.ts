@@ -274,7 +274,7 @@ describe('StreamHub dedup + overlap', () => {
   });
 });
 
-describe('StreamHub overlap window (blocker 1)', () => {
+describe('StreamHub overlap window', () => {
   it('drains a multi-page overlap window to reach a late row (no overlap starvation)', async () => {
     const data = [fillRow(1, 1), fillRow(2, 2), fillRow(3, 3), fillRow(4, 4)];
     const hub = new StreamHub({
@@ -343,7 +343,7 @@ describe('StreamHub overlap window (blocker 1)', () => {
   });
 });
 
-describe('StreamHub per-subscriber recovery check (blocker 3)', () => {
+describe('StreamHub per-subscriber recovery check', () => {
   it('re-syncs a subscriber that connects soon after a recovery completed', async () => {
     const recovery: RRow[] = [
       { id: 1, kind: 'reorg', status: 'complete', completed_at: new Date(NOW - 5_000).toISOString() },

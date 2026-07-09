@@ -220,9 +220,9 @@ describe('graceful-shutdown stream registry', () => {
   });
 });
 
-// ── M0 cumulative counters (rejected + slow-client shed) ─────────────────────
+// ── Cumulative counters (rejected + slow-client shed) ────────────────────────
 
-describe('M0 cumulative counters', () => {
+describe('cumulative counters', () => {
   afterEach(() => __resetConnections());
 
   it('acquire failures bump rejectedTotal (per-IP scope)', () => {

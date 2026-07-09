@@ -43,7 +43,7 @@ export interface Config {
    */
   redactHiddenPublic: boolean;
   /**
-   * Stream-auth (M3) secrets + config — optional. Endpoints check at use site
+   * Stream-auth secrets + config — optional. Endpoints check at use site
    * (mirrors `matchingModuleAddress`) and 503 NOT_READY if missing, so the API
    * boots cleanly even before the stream-auth feature is wired.
    *
@@ -56,12 +56,12 @@ export interface Config {
    */
   streamAuthHmacSecret?: string;
   streamAuthAudience?: string;
-  /** Stream-challenge TTL (seconds). Default 180 (3 min); spec §3.3 allows 2–5 min. */
+  /** Stream-challenge TTL (seconds). Default 180 (3 min); bounded to 2–5 min. */
   streamChallengeTtlSec: number;
-  /** Stream-token TTL (seconds). Default 900 (15 min); spec §3.1 says ~15 min. */
+  /** Stream-token TTL (seconds). Default 900 (15 min); bounded to 1–30 min. */
   streamTokenTtlSec: number;
   /**
-   * Per-page commitments cap for `GET /v1/own-state/snapshot` (spec §6.2).
+   * Per-page commitments cap for `GET /v1/own-state/snapshot`.
    * Default 5000. Boot-fatal outside [100, 50000] — too small breaks paged
    * cold start, too large defeats the cap's purpose (bounded response time).
    */
@@ -245,7 +245,7 @@ export function loadConfig(): Config {
   const redactHiddenPublic = parseBoolEnv('REDACT_HIDDEN_PUBLIC', true);
   logger.info({ redactHiddenPublic }, 'env: REDACT_HIDDEN_PUBLIC');
 
-  // Stream-auth (M3). Secret + audience are optional at boot (handlers 503 if
+  // Stream-auth. Secret + audience are optional at boot (handlers 503 if
   // unset) so the server boots cleanly in environments where stream-auth isn't
   // yet wired. A set-but-too-short secret fails loud — a 16-char secret is a
   // misconfiguration we want to surface, not a quiet weakening.

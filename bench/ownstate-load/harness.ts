@@ -1,5 +1,5 @@
 /**
- * M1 own-state SSE load harness — cap=10 correctness + graceful-SIGTERM slice.
+ * Own-state SSE load harness — cap=10 correctness + graceful-SIGTERM slice.
  *
  * This is TRACKED-BUT-NOT-DEPLOYED test tooling (it lives outside `src/`, so the
  * `tsc` build never bundles it). It starts a LOCAL core-api process pointed at an
@@ -18,7 +18,7 @@
  * full graceful-shutdown coverage. Profile 1 and the restart+resume half run
  * everywhere.
  *
- * OUT OF SCOPE for this slice (the rest of the spec §11 stream-readiness gate) —
+ * OUT OF SCOPE for this slice (the rest of the stream-readiness gate) —
  * tracked in DEFERRED below so it isn't forgotten:
  *   - the full N=100 scale profile,
  *   - reconnect storms,
@@ -374,7 +374,7 @@ async function profile2(ctx: Ctx): Promise<void> {
 }
 
 function describeDeferred(report: Report): void {
-  report.section('DEFERRED — remaining spec §11 stream-readiness gate (NOT in this slice)');
+  report.section('DEFERRED — remaining stream-readiness gate (NOT in this slice)');
   for (const item of [
     'N=100 full scale profile (steady-state + ramp)',
     'reconnect storms (mass simultaneous reconnect)',

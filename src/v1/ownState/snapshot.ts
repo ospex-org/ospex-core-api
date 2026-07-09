@@ -1,5 +1,5 @@
 /**
- * Owner-auth own-state snapshot — M4a (spec §6.1).
+ * Owner-auth own-state snapshot.
  *
  *   GET /v1/own-state/snapshot?cursor=<opt>
  *   Authorization: Bearer <stream-token>
@@ -15,7 +15,7 @@
  * — the only address it serves is the bearer-token-bound one, so a wallet
  * cannot impersonate another wallet by tweaking the URL.
  *
- * Wire body per spec §6.1:
+ * Wire body:
  *
  *   {
  *     cursor: <base64url composite>,
@@ -31,7 +31,7 @@
  *     The SDK pages `/v1/own-state/snapshot?cursor=` until `truncated:
  *     false`, THEN connects the stream with the final `k='live'`
  *     cursor. The SDK MUST NOT emit `ready` for trading until paging
- *     completes (spec §6.2).
+ *     completes.
  *
  *   - `positionsTruncated`: position visibility is incomplete because
  *     `fetchCategorizedPositions` hit its 200-row cap. The SDK does
@@ -40,7 +40,7 @@
  *     mechanism to drain unseen positions. Consumers enter degraded /
  *     quote-hold mode; the stream cold-start emits `event: degraded`
  *     before `ready` so the SDK / MM treats the wallet's position view
- *     as partial-visibility (spec §2.6). The `/v1/positions/:address`
+ *     as partial-visibility. The `/v1/positions/:address`
  *     fallback covers full history for operator tooling.
  *
  * ── Passive-expiry contract ────────────────────────────────────────────
@@ -141,7 +141,7 @@ interface OwnStateSnapshotBody {
    * `?cursor=` paging on the actionable-positions filter. Instead the
    * stream cold-start treats `positionsTruncated: true` as a degraded
    * state: emits `event: degraded` then `ready`, and the SDK / MM
-   * enters quote-hold per spec §2.6. The `cursor.p` watermark is
+   * enters quote-hold. The `cursor.p` watermark is
    * preserved (or sentinel on cold start) so resume catch-up still
    * uses it for the terminal-since-cursor filter; the
    * `/v1/positions/:address` REST endpoint covers operator-side full
@@ -175,7 +175,7 @@ const CLAIMED_PAGE_CAP = 200;
 // ─────────────────────────────────────────────────────────────────────────
 // Helper — pure(ish) load, no express coupling
 //
-// Factored out from `ownStateSnapshotHandler` so the M4b SSE handler can
+// Factored out from `ownStateSnapshotHandler` so the SSE stream handler can
 // reuse the same query + cursor logic for its inline `event: snapshot` frame.
 // Returns a tagged result instead of writing to the response.
 // ─────────────────────────────────────────────────────────────────────────
@@ -187,7 +187,7 @@ export type LoadOwnStateSnapshotResult =
       /**
        * Derived (key, status, sourceUpdatedAt) for every actionable
        * position the snapshot saw — computed from the SAME categorization
-       * join that built `body.positions`. The M4b stream handler hands
+       * join that built `body.positions`. The stream handler hands
        * this to `OwnStateHub.seedStatusCache` BEFORE starting the live
        * timer so the seed and the wire body are guaranteed consistent
        * (eliminating the cold-start race a separate post-snapshot
@@ -240,7 +240,7 @@ export async function loadOwnStateSnapshot(
   // ── Phase 1: Active commitments ─────────────────────────────────────
   // Active set = stored status open/partially_filled AND nonce not invalidated
   // AND not past expiry. `book_visible` is informational, NOT a filter — a
-  // hidden-but-still-matchable row is in the active set per spec §6.1.
+  // hidden-but-still-matchable row is in the active set.
   //
   // Skipped entirely when input is phase-2 (page-recovery-terminal) — by then
   // the active set has fully drained on prior pages.
@@ -461,7 +461,7 @@ export async function loadOwnStateSnapshot(
   // contract does not loop on positions-only truncation:
   // `positionsTruncated:true` means position visibility is PARTIAL —
   // the stream cold-start emits `event: degraded` before `ready` and
-  // the SDK / MM must quote-hold per spec §2.6 and treat owner-state
+  // the SDK / market maker must quote-hold and treat owner-state
   // as partial. There is no paging/convergence mechanism that drains
   // positions beyond the actionable cap; full history is available
   // out-of-band via `/v1/positions/:address` for operator tooling.
@@ -490,7 +490,7 @@ export async function loadOwnStateSnapshot(
 
   // cursor.p reflects the maximum DERIVED `sourceUpdatedAt` across the
   // snapshot's actionable positions — NOT raw `positions.row_updated_at`.
-  // The M4b stream advances `p` with `sourceUpdatedAt = max(position,
+  // The own-state stream advances `p` with `sourceUpdatedAt = max(position,
   // speculation, contest)` and the resume catch-up filters via
   // `compareIsoTimestamptz` (microsecond-precise). Minting `p` here from
   // the same derived domain via `maxIsoTimestamptz` keeps snapshot and
@@ -511,8 +511,8 @@ export async function loadOwnStateSnapshot(
     // i='0' is a permissive tie-breaker: the stream's catch-up filter
     // `(sourceUpdatedAt, id) > (p.s, p.i)` re-admits any position whose
     // source matches `p.s` and has id > 0 (i.e. every real DB row).
-    // The SDK reducer dedupes the over-emission via the spec §2.1.2
-    // semantic event key.
+    // The SDK reducer dedupes the over-emission via the semantic
+    // event key.
     pWatermark = { s: bestS, i: '0' };
   } else {
     // No actionable positions and no truncation — preserve input cursor's
@@ -613,7 +613,7 @@ function mapClaimedRow(row: ClaimedPositionRow, address: string): OwnerClaimedPo
     oddsDecimal: odds,
     riskAmountUSDC: wei6ToUSDC(row.risk_amount),
     profitAmountUSDC: wei6ToUSDC(row.profit_amount),
-    // PR0b enrichment — `claimed` rows are terminal + recovery-only (zero
+    // Enrichment — `claimed` rows are terminal + recovery-only (zero
     // remaining exposure). Contest context is intentionally minimal, mirroring
     // the existing `team`/`opponent: 'Unknown'` choice above: no second batch
     // join for a settled row. wei6 + freshness are cheap and populated.

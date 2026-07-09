@@ -1,5 +1,5 @@
 /**
- * Snapshot handler tests (M4a). Drives `ownStateSnapshotHandler` with mocked
+ * Snapshot handler tests. Drives `ownStateSnapshotHandler` with mocked
  * supabase + env + categorized-position-fetcher so the test exercises:
  *   - active-set filtering (status / nonce / expiry; `book_visible`
  *     intentionally NOT filtered — hidden-but-still-matchable rows belong);
@@ -100,7 +100,7 @@ function makeSupabase(
   let idx = 0;
   const next = (): MockResponse => responses[Math.min(idx++, responses.length - 1)]!;
   // A FRESH builder per `from()` call, each bound to its own table. This
-  // matters for the PR0b enrichment, which awaits `contests` + `speculations`
+  // matters for the enrichment, which awaits `contests` + `speculations`
   // queries together via Promise.all: a single shared builder would resolve
   // both `.then`s against whichever table was set last. Per-table builders let
   // each route correctly.
@@ -122,7 +122,7 @@ function makeSupabase(
       return Promise.resolve(next());
     };
     builder['then'] = (resolve: (v: unknown) => void): void => {
-      // PR0b: the owner-commitment enrichment issues `contests` + `speculations`
+      // The owner-commitment enrichment issues `contests` + `speculations`
       // batch queries that aren't part of these tests' hand-ordered response
       // sequences (the position fetcher is separately mocked, so these are the
       // ONLY hits on those two tables). Route them to the optional `enrich`
@@ -241,7 +241,7 @@ describe('GET /v1/own-state/snapshot — cold start (no cursor)', () => {
     expect(decoded.p).toEqual({ s: '1970-01-01T00:00:00.000Z', i: '0' });
   });
 
-  it('enriches each commitment with sport / absolute teams / speculationId / signedPayload (PR0b)', async () => {
+  it('enriches each commitment with sport / absolute teams / speculationId / signedPayload', async () => {
     const { client } = makeSupabase(
       [
         { data: [commitmentRow()], error: null }, // active commitments
@@ -800,11 +800,11 @@ describe('GET /v1/own-state/snapshot — overlap floor + paging regressions', ()
     expect(keysetArgs.some((a) => a.includes('2026-05-29T09:59:30.000Z'))).toBe(true);
   });
 
-  // Blocker 3: f watermark NEVER advances past undelivered fills. Snapshot
+  // Invariant: the f watermark NEVER advances past undelivered fills. Snapshot
   // doesn't carry fills[], so the watermark either preserves (input cursor)
   // or starts at MAX-in-DB (cold start), but it cannot move past the SDK's
   // last-seen point on a recovery call.
-  it('input cursor.f is PRESERVED on the response cursor (blocker #3)', async () => {
+  it('input cursor.f is PRESERVED on the response cursor', async () => {
     const inputF = { s: '2026-05-29T10:00:00.000Z', i: '99' };
     const cursor = encodeOwnStateCursor({
       t: 'own-state',
@@ -835,9 +835,9 @@ describe('GET /v1/own-state/snapshot — overlap floor + paging regressions', ()
     expect(calls.some((c) => c.table === 'position_fills')).toBe(false);
   });
 
-  // Blocker 4: positions truncation surfaces via `positionsTruncated` flag,
+  // Invariant: positions truncation surfaces via `positionsTruncated` flag,
   // and the p watermark is preserved (or sentinel on cold start) so the
-  // M4b stream catches every position transition the snapshot couldn't.
+  // The own-state stream catches every position transition the snapshot couldn't.
   it('positions categorized count at the 200 cap → positionsTruncated=true + p preserved', async () => {
     // Build a 200-position categorized set (cap proxy).
     const buildActive = (n: number) =>
@@ -987,8 +987,8 @@ describe('GET /v1/own-state/snapshot — overlap floor + paging regressions', ()
     // marking any locally-held commitment with stored `expiry <= now` as
     // terminal. The server emitting it would require a third recovery
     // phase keyed by `expiry` rather than `row_updated_at` — out of scope
-    // for M4a and not required by the spec (which says "recently terminal
-    // since prior cursor", scoping to rows the indexer WROTE).
+    // and not required by the wire contract, which says "recently terminal
+    // since prior cursor", scoping to rows the indexer WROTE.
   });
 
   // Higher-level black-box pagination test: feed rows + DB-format

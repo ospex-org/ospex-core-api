@@ -1,8 +1,8 @@
 /**
- * Stream-auth handlers (M3) — `POST /v1/auth/stream-challenge` and
+ * Stream-auth handlers — `POST /v1/auth/stream-challenge` and
  * `POST /v1/auth/stream-token`.
  *
- * Flow (spec §3.1):
+ * Flow:
  *   1. Client POSTs {address} → server mints + stores a fresh EIP-712
  *      challenge, returns it with an `expiresAt`.
  *   2. SDK signs the challenge typed-data with the wallet for `address`.

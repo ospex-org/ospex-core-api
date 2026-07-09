@@ -1,5 +1,5 @@
 /**
- * Owner-state body enrichment — Phase 3 PR0b (§3.1, amendment A6).
+ * Owner-state body enrichment.
  *
  * The owner-auth own-state surface carries a SUPERSET of the public
  * {@link CommitmentBody}: a maker needs the contest context (sport + the

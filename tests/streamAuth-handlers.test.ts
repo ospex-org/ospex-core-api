@@ -1,5 +1,5 @@
 /**
- * HTTP-layer tests for the stream-auth surface (M3):
+ * HTTP-layer tests for the stream-auth surface:
  *   - POST /v1/auth/stream-challenge → mints + stores
  *   - POST /v1/auth/stream-token     → verifies sig + consumes + mints token
  *   - verifyStreamToken middleware   → 401s on every failure mode, attaches

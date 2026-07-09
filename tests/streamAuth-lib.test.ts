@@ -333,7 +333,7 @@ describe('mintStreamAuthToken / verifyStreamAuthToken', () => {
 // Pino redaction — production config pins token + Authorization paths
 // ─────────────────────────────────────────────────────────────────────────
 
-describe('logger redaction (M3 token hygiene)', () => {
+describe('logger redaction (token hygiene)', () => {
   function makeCapturingLogger(): { log: pino.Logger; captured: () => string } {
     let buf = '';
     const stream = new Writable({
