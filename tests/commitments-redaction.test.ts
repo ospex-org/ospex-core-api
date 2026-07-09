@@ -1,11 +1,11 @@
 /**
- * M2 redaction — public hidden-row allow-list across every anonymous read.
+ * Hidden-row redaction — public allow-list across every anonymous read.
  *
- * Five public anonymous paths can expose a commitment body (from
- * `phase0-redaction-audit.md` §3): `/v1/commitments/:hash`,
- * `/v1/commitments?since=<cursor>` (recovery), `/v1/commitments` default list
- * (with `?includeHidden=true` now removed → 400), and the SSE
- * `/v1/stream/commitments` toBody (used by both catch-up and live deltas).
+ * These are the public anonymous paths that can expose a commitment body:
+ * `/v1/commitments/:hash`, `/v1/commitments?since=<cursor>` (recovery),
+ * `/v1/commitments` default list (with `?includeHidden=true` now removed →
+ * 400), and the SSE `/v1/stream/commitments` toBody (used by both catch-up
+ * and live deltas).
  *
  * Allow-list (not deny-list) projection is the central guarantee. An upstream
  * column addition that isn't explicitly opted in MUST surface as a failed
@@ -14,8 +14,8 @@
  * Two operating modes are covered:
  *   - `REDACT_HIDDEN_PUBLIC=true` (default): the redaction enforcement.
  *   - `REDACT_HIDDEN_PUBLIC=false`: the short-lived rollback path. Same paths
- *     return full bodies. Used only as a deploy-window safety valve; the
- *     post-cutover follow-up removes the flag entirely (impl-plan §M7).
+ *     return full bodies. Used only as a deploy-window safety valve; a
+ *     follow-up removes the flag entirely once the rollout has soaked.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
@@ -152,10 +152,10 @@ function hiddenRow(overrides: Record<string, unknown> = {}): Record<string, unkn
 }
 
 /**
- * The deny-list assertion. These fields MUST NOT appear on a hidden public body
- * (audit §6.2). The allow-list exact-match assertion implicitly catches all
- * of these, but the explicit deny-list call-out documents the threat-model
- * fields and makes a regression unambiguous if a future addition slips in.
+ * The deny-list assertion. These fields MUST NOT appear on a hidden public
+ * body. The allow-list exact-match assertion implicitly catches all of these,
+ * but the explicit deny-list call-out documents the threat-model fields and
+ * makes a regression unambiguous if a future addition slips in.
  */
 const PUBLIC_HIDDEN_DENYLIST = [
   'signature',
@@ -450,7 +450,7 @@ describe('Leak path 3 — GET /v1/commitments?includeHidden=true (removed)', () 
   // check now sits at the top of `getCommitmentsHandler` and closes both
   // branches at one site. These two regressions pin the contract whether the
   // caller hits the list OR the recovery sub-route.
-  it('?since= + includeHidden=true is STILL rejected — recovery does NOT bypass the removal (review-29 blocker)', async () => {
+  it('?since= + includeHidden=true is STILL rejected — recovery does NOT bypass the removal (review regression)', async () => {
     supabaseMock.getSupabase.mockReturnValue(undefined); // no DB allowed
     const res = makeRes();
     await getCommitmentsHandler(
@@ -510,7 +510,7 @@ describe('Leak path 5 — chain via fills → /v1/commitments/:hash', () => {
 
 // ─────────────────────────────────────────────────────────────────────────
 // REDACT_HIDDEN_PUBLIC=false — rollback parity check
-// (Short-lived; removed post-cutover per impl-plan §M7.)
+// (Short-lived; removed once the redaction rollout has soaked.)
 // ─────────────────────────────────────────────────────────────────────────
 describe('REDACT_HIDDEN_PUBLIC=false rollback', () => {
   beforeEach(() => {

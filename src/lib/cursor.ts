@@ -10,8 +10,8 @@
  *
  * Ordering is keyset `(row_updated_at, id)` ascending — not offset — so
  * paging is stable under concurrent writes. `row_updated_at` is
- * trigger-maintained on every UPDATE (see indexer migration 048's backing
- * index), so it advances on both insert and mutation.
+ * trigger-maintained on every UPDATE (and backed by a `(network,
+ * row_updated_at, id)` index), so it advances on both insert and mutation.
  *
  * The cursor is OPAQUE to clients: minted and parsed only here, never on
  * the client side. The five recovery resources share this codec.

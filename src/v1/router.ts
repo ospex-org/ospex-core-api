@@ -45,7 +45,7 @@ import { getScheduleHandler } from './schedule.js';
 
 /**
  * Versioned public API. Endpoints migrate here in batches from
- * ospex-agent-server. Each handler registers its own rate-limit /
+ * the legacy agent server. Each handler registers its own rate-limit /
  * auth middleware where appropriate; the router itself stays thin.
  *
  * Static / specific paths are registered before parameterized ones so

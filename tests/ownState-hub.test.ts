@@ -439,7 +439,7 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
   });
 
   it('population unification: spec transition on actionable position emits even when many newer claimed rows exist', async () => {
-    // Scenario from review-32 round 2 blocker 3: a wallet has many recent
+    // Scenario: a wallet has many recent
     // claimed positions whose row_updated_at dominates the table, plus a
     // few older actionable positions. The previous top-200-by-row_updated_at
     // window could miss the older actives; the new `claimed=false AND
@@ -517,7 +517,7 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
   });
 
   it('re-emits on a same-status payload change (score correction flips pendingSettle from won to push)', async () => {
-    // Hermes review-32 round 4 blocker 3: the prior dedup compared
+    // Regression: the prior dedup compared
     // only `status`. A contest score correction that keeps the
     // position at `pendingSettle` but flips its predicted result/payout
     // would have been suppressed, leaving the SDK with a stale payload.
@@ -582,7 +582,7 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
   });
 
   it('emits sorted by (sourceUpdatedAt, id) ASC even when positions query returns them in row_updated_at DESC order', async () => {
-    // Hermes review-32 round 5 blocker 1: positions are queried in
+    // Regression: positions are queried in
     // `row_updated_at DESC` order, but `sourceUpdatedAt = max(pos, spec,
     // contest)` can reorder them. Emitting in query order risks a
     // mid-tick disconnect leaving the subscriber's cursor past an

@@ -2,22 +2,22 @@
  * Position read endpoints.
  *
  *   GET /v1/positions/by-tx/:txHash       — parse PositionFilled events
- *                                            from a tx receipt (R4 emits
- *                                            two positions per fill —
+ *                                            from a tx receipt (each fill
+ *                                            creates two positions —
  *                                            maker + taker).
  *   GET /v1/positions/claim-result/:txHash — parse PositionClaimed event.
  *   GET /v1/positions/:address/claim-params — txParams for claimable rows
  *   GET /v1/positions/:address/status      — categorized active|claimable
  *   GET /v1/positions/:address             — paginated history (existing).
  *
- * Out of scope (no R4 analog):
- *   - /v1/positions/:address/withdraw-params — R4 has no
+ * Out of scope (no analog in the current protocol):
+ *   - /v1/positions/:address/withdraw-params — the protocol has no
  *     `adjustUnmatchedPair`. The "pull back unfilled stake" flow is
  *     `MatchingModule.cancelCommitment(commitment)`, which is
  *     commitment-domain. Consumers can build that call directly from
  *     the existing `GET /v1/commitments?maker=…` response — every
  *     commitment row carries the 9 fields needed.
- *   - /v1/positions/withdraw-result/:txHash — R4 has no
+ *   - /v1/positions/withdraw-result/:txHash — the protocol has no
  *     `PositionAdjusted` event.
  */
 
@@ -46,7 +46,7 @@ const MAX_LIMIT = 200;
 const TX_HASH_REGEX = /^0x[0-9a-fA-F]{64}$/;
 const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower: 1 };
 
-// ─── R4 PositionModule event ABIs (human-readable form) ─────────────────
+// ─── PositionModule event ABIs (human-readable form) ────────────────────
 //
 // Solidity declares `PositionType` as an enum; in the encoded event ABI
 // it appears as `uint8`. ethers parses these fine when the param type is

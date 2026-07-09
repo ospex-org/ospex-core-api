@@ -55,7 +55,7 @@ export function typeToScorer(marketType: MarketType, scorers: ScorerAddresses): 
 }
 
 /**
- * Convert R4 `line_ticks` (10x-scaled int32, 0 for moneyline) to a
+ * Convert `line_ticks` (10x-scaled int32, 0 for moneyline) to a
  * human-readable line.
  *
  *   spread:    -35  →  -3.5
@@ -65,8 +65,8 @@ export function typeToScorer(marketType: MarketType, scorers: ScorerAddresses): 
  * The 10x scale is documented in the contract interfaces
  * (`IPositionModule.sol`, `IScorerModule.sol`, `ISpeculationModule.sol`):
  * "The line number (10x format, 0 for moneyline)". A previous version of
- * this helper used R3's half-integer convention (`+ 0.5` / `- 0.5`)
- * which produced wrong values for R4 data — fixed.
+ * this helper used an older half-integer convention (`+ 0.5` / `- 0.5`)
+ * which produced wrong values against the 10x scale — fixed.
  */
 export function lineTicksToLine(type: MarketType, lineTicks: number | null): number | null {
   if (lineTicks === null) return null;

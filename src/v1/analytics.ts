@@ -7,13 +7,12 @@
  *     plus a line-movement summary for spread/total.
  *
  * This is the only `/v1/analytics/*` endpoint ported from
- * ospex-agent-server. The other 11 (elo/*, schedule, injuries,
+ * the legacy agent server. The other 11 (elo/*, schedule, injuries,
  * standings, team-stats, rankings, rosters, expert-picks, matchup)
  * read from sports-reference tables that have no active writer in
- * the new architecture (writers lived in the retired
- * ospex-agent-server/db/supabase/queries.ts). They will return
- * stale rows until the data-feed question is decided independently.
- * See `audit-agent-server-api.md` for the full inventory.
+ * the current architecture — their writers lived in the retired
+ * agent server. They will return stale rows until the data-feed
+ * question is decided independently.
  */
 
 import type { Request, Response } from 'express';
@@ -64,8 +63,7 @@ interface SidedSnapshot {
    * Spread is exposed from BOTH perspectives explicitly — `homeLine`
    * and `awayLine` (always negations of each other). The underlying
    * `odds_history.line` column is stored from the home perspective
-   * (the fdb writer pulls `PointSpreadHome` / `sportspage.spread.open.home`
-   * — see `ospex-fdb/src/oddsHistory.ts:134,218`). Returning a single
+   * (the upstream odds writer records the home-side spread). Returning a single
    * un-labelled `line` would let a caller misalign with `/v1/contests`,
    * which exposes both `homeLine`/`awayLine` from the speculation row.
    * Convention: negative homeLine = home favored.
@@ -79,9 +77,9 @@ interface SidedSnapshot {
   /**
    * Total is perspective-neutral (over/under don't have a home/away
    * orientation). `overOdds`/`underOdds` are explicit; the upstream
-   * writer maps Over→away_odds, Under→home_odds for storage (see
-   * `ospex-fdb/src/oddsHistory.ts:166-169`), but consumers don't need
-   * to know that — the field names speak for themselves.
+   * writer maps Over→away_odds, Under→home_odds for storage, but
+   * consumers don't need to know that — the field names speak for
+   * themselves.
    */
   total?: { line: number; overOdds: number; underOdds: number };
 }

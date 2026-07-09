@@ -38,8 +38,8 @@ export interface Config {
   /**
    * Public hidden-row (`book_visible=false`) redaction switch — short-lived
    * rollout/rollback guard. Default `true` (redaction enforced). Set `false`
-   * ONLY to revert behavior during a deploy window; remove the flag entirely
-   * after the M7 cutover soak per the spec (see implementation-plan.md §M7).
+   * ONLY to revert behavior during a deploy window; the flag is slated for
+   * removal entirely once the redaction rollout has soaked.
    */
   redactHiddenPublic: boolean;
   /**
@@ -194,7 +194,7 @@ export function loadConfig(): Config {
   const positionModuleAddress = optionalAddressEnv('POSITION_MODULE_ADDRESS');
 
   // Scorer addresses — accept the canonical name first, fall back to the
-  // ospex-agent-server legacy name so a copied-over Heroku env still works.
+  // legacy name so a copied-over deployment env still works.
   const scorerMoneyline = validateAddress(
     'SCORER_MONEYLINE_ADDRESS',
     aliasedEnv('SCORER_MONEYLINE_ADDRESS', 'MONEYLINE_SCORER_ADDRESS'),
@@ -258,14 +258,14 @@ export function loadConfig(): Config {
     process.exit(1);
   }
   const streamAuthAudience = optionalEnv('STREAM_AUTH_AUDIENCE');
-  // TTL bounds per spec §3.3 (challenge 2–5 min) + a sane 60s–30min envelope
-  // for the token. Boot-fatal — silent clamping would hide an operator typo
-  // that weakens the security boundary (e.g. a "1d" token TTL).
+  // TTL bounds: challenge 2–5 min, plus a sane 60s–30min envelope for the
+  // token. Boot-fatal — silent clamping would hide an operator typo that
+  // weakens the security boundary (e.g. a "1d" token TTL).
   const streamChallengeTtlSec = optionalPositiveIntEnv('STREAM_CHALLENGE_TTL_SECONDS') ?? 180;
   if (streamChallengeTtlSec < 120 || streamChallengeTtlSec > 300) {
     logger.fatal(
       { value: streamChallengeTtlSec },
-      'STREAM_CHALLENGE_TTL_SECONDS must be between 120 and 300 (spec §3.3: 2–5 min)',
+      'STREAM_CHALLENGE_TTL_SECONDS must be between 120 and 300 (2–5 min)',
     );
     process.exit(1);
   }
@@ -296,7 +296,7 @@ export function loadConfig(): Config {
       streamChallengeTtlSec,
       streamTokenTtlSec,
     },
-    'env: stream-auth (M3)',
+    'env: stream-auth',
   );
 
   cached = {

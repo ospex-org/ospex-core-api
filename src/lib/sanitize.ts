@@ -1,7 +1,7 @@
 /**
  * Numeric / value sanitization helpers.
  *
- * Ported from ospex-agent-server with the Firebase-Timestamp branches
+ * Ported from the legacy agent server with the Firebase-Timestamp branches
  * removed. Supabase returns timestamps as ISO strings, so the legacy
  * `.toDate()` / `._seconds` handling is gone. The contest-doc helpers
  * (`sanitizeContestDoc`, `extractContestFields`) depended on Firebase

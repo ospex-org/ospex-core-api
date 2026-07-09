@@ -7,8 +7,7 @@
  *     server-generated `challengeId`. Multi-DYNO LIMITATION: a challenge
  *     minted on dyno A cannot be consumed on dyno B. For the current
  *     single-dyno production deployment this is acceptable; scale-out
- *     requires a shared store (Postgres or Redis) — flagged in §M3 of the
- *     migration plan.
+ *     requires a shared store (Postgres or Redis).
  *   - Token codec: compact HMAC-SHA256 `payload.sig` format (essentially a
  *     headerless JWT). `kid: 'v1'` is hardcoded; rotation is a follow-up that
  *     adds a second secret + dual-acceptance, structure already supports it.

@@ -172,7 +172,7 @@ interface WalletPoller {
    * called for the first subscriber on this wallet — the handler invokes
    * `beginLive` only AFTER its catch-up has seeded the cache, so a tick
    * cannot silently absorb a derived-state transition that happened during
-   * the handoff (the preReady-race blocker from review-32 round 2).
+   * the handoff (the preReady-race blocker found in review).
    */
   timer: ReturnType<typeof setInterval> | null;
   commitments: ResourceTipState;

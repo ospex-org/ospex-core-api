@@ -5,13 +5,12 @@
  * requested sport, paginated. Team UUIDs are resolved to names via
  * the `teams` table.
  *
- * The agent-server's version did a best-effort merge with on-chain
- * `contests` rows — flagging which games already have a contest. That
- * merge depended on the `resolveTeam` alias resolver in
- * `db/supabase/queries.ts` to bridge name differences between feeds.
- * The resolver isn't ported in this batch; consumers can cross-check
- * against `GET /v1/contests`. Adding the merge with proper alias
- * resolution is a follow-up.
+ * The legacy agent server's version did a best-effort merge with
+ * on-chain `contests` rows — flagging which games already have a
+ * contest. That merge depended on a `resolveTeam` alias resolver to
+ * bridge name differences between feeds. The resolver isn't ported in
+ * this batch; consumers can cross-check against `GET /v1/contests`.
+ * Adding the merge with proper alias resolution is a follow-up.
  */
 
 import type { Request, Response } from 'express';

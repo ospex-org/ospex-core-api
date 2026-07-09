@@ -39,10 +39,9 @@ import { nextCursor, parseRecovery, recoveryKeysetExpr } from '../lib/recovery.j
 // Previously this file carried a local 5-sport allowlist that omitted
 // `ncaaf`; that local set is now retired in favor of the shared module
 // so the only place to add a new sport is `lib/sports.ts`.
-// Mirrors what `ospex-indexer/src/handlers/contests.ts` writes today
-// (unverified/verified/scored/voided) plus `scored_manually` from
-// agent / ops paths. Keep in sync with the indexer's contest-status
-// emissions.
+// Mirrors what the indexer writes today (unverified/verified/scored/
+// voided) plus `scored_manually` from ops paths. Keep in sync with the
+// indexer's contest-status emissions.
 const VALID_STATUSES = new Set(['unverified', 'verified', 'scored', 'scored_manually', 'voided']);
 
 const DEFAULT_WINDOW_HOURS = 72;
