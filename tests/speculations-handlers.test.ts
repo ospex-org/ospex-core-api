@@ -173,6 +173,95 @@ describe('GET /v1/speculations', () => {
   });
 });
 
+describe('GET /v1/speculations — closing-line enrichment', () => {
+  const SPECS = [
+    {
+      speculation_id: 100,
+      contest_id: 42,
+      speculation_scorer: SCORERS.moneyline,
+      market_type: 'moneyline',
+      line_ticks: 0,
+      speculation_status: 'open',
+    },
+    {
+      speculation_id: 101,
+      contest_id: 42,
+      speculation_scorer: SCORERS.spread,
+      market_type: 'spread',
+      line_ticks: 35, // line 3.5
+      speculation_status: 'open',
+    },
+    {
+      speculation_id: 102,
+      contest_id: 42,
+      speculation_scorer: SCORERS.total,
+      market_type: 'total',
+      line_ticks: 85, // line 8.5
+      speculation_status: 'open',
+    },
+  ];
+
+  interface WireClosing {
+    speculationId: string;
+    type: string;
+    closing?: { awayDecimal: number | null; homeDecimal: number | null; line: number | null; estimated: boolean };
+  }
+
+  async function run(closingRows: unknown): Promise<WireClosing[]> {
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabase({
+        speculations: { data: SPECS, error: null, count: SPECS.length },
+        contests: { data: [{ contest_id: 42, jsonodds_id: 'JID' }], error: null },
+        closing_lines: closingRows,
+      }),
+    );
+    const res = makeRes();
+    await getSpeculationsHandler(makeReq({ contestId: '42' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    return (res.body as { speculations: WireClosing[] }).speculations;
+  }
+
+  it('attaches both no-vig decimals for moneyline (no line to resolve)', async () => {
+    const specs = await run({
+      data: [{ jsonodds_id: 'JID', market: 'moneyline', line: null, away_p_novig: 0.5, home_p_novig: 0.5 }],
+      error: null,
+    });
+    const ml = specs.find((s) => s.type === 'moneyline');
+    expect(ml?.closing).toEqual({ awayDecimal: 2, homeDecimal: 2, line: null, estimated: false });
+  });
+
+  it('attaches decimals for a spread whose line matches the close', async () => {
+    const specs = await run({
+      data: [{ jsonodds_id: 'JID', market: 'spread', line: 3.5, away_p_novig: 0.4, home_p_novig: 0.6 }],
+      error: null,
+    });
+    const spread = specs.find((s) => s.type === 'spread');
+    // 1/0.4 = 2.5 ; 1/0.6 = 1.66667 (5dp)
+    expect(spread?.closing).toEqual({ awayDecimal: 2.5, homeDecimal: 1.66667, line: 3.5, estimated: false });
+  });
+
+  it('nulls the decimals when the total line moved off the speculation line', async () => {
+    const specs = await run({
+      // speculation line 8.5, market closed at 9.0 → half-run move → not price-resolvable
+      data: [{ jsonodds_id: 'JID', market: 'total', line: 9.0, away_p_novig: 0.5, home_p_novig: 0.5 }],
+      error: null,
+    });
+    const total = specs.find((s) => s.type === 'total');
+    expect(total?.closing).toEqual({ awayDecimal: null, homeDecimal: null, line: 9, estimated: false });
+  });
+
+  it('leaves closing absent when no fresh closing line exists', async () => {
+    const specs = await run({ data: [], error: null });
+    for (const s of specs) expect(s.closing).toBeUndefined();
+  });
+
+  it('degrades to unenriched (no throw) when the closing_lines fetch errors', async () => {
+    const specs = await run({ data: null, error: { message: 'boom' } });
+    expect(specs).toHaveLength(3);
+    for (const s of specs) expect(s.closing).toBeUndefined();
+  });
+});
+
 describe('GET /v1/speculations/:speculationId', () => {
   it('returns 400 INVALID_PARAM for a non-numeric id', async () => {
     const res = makeRes();
