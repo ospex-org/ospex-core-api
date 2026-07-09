@@ -255,6 +255,22 @@ Response: `Speculation` (as above) plus:
 
 Static metadata: name, network, chainId, contract addresses (matchingModule, scorers), supported sports, fees.
 
+Also carries a **`build`** block naming the git commit the running service was deployed from:
+
+```json
+"build": {
+  "commit": "a60c919…",
+  "commitUrl": "https://github.com/ospex-org/ospex-core-api/commit/a60c919…",
+  "commitSource": "build",
+  "releaseVersion": "v248",
+  "releasedAt": "2026-07-09T19:10:00Z"
+}
+```
+
+This lets a reader of the public repo confirm which source is live — follow `commitUrl` to the exact reviewed code, and check the commit sits on `main` — and spot deploy drift. It's a **self-reported build identifier, not a cryptographic proof** that the dyno runs unmodified code; it makes honest operation checkable and accidental staleness visible.
+
+`commit` prefers `HEROKU_BUILD_COMMIT` (the current build SHA) and falls back to the **deprecated** `HEROKU_SLUG_COMMIT`, which can reflect the previously-running slug — `commitSource` (`"build"` | `"slug"`) says which was used, so `"slug"` is a signal to enable the build-metadata feature (below). `build` is `null` in local dev and until the Heroku dyno-metadata features are enabled; `releaseVersion`/`releasedAt` are `null` if unavailable.
+
 ### Position helpers
 
 #### `GET /v1/positions/:address`
@@ -542,6 +558,15 @@ See `.env.example`. Required values are validated at boot — missing vars exit 
 Heroku app: `ospex-core-api`. Production URL: `https://ospex-core-api-195f635df864.herokuapp.com/`.
 
 Procfile: `web: node dist/server.js`. Heroku auto-runs `yarn build` (`tsc` → `dist/`) on slug compile.
+
+**Deploy provenance.** The `build` block on `GET /v1/protocol/info` reports the running commit. It is populated from Heroku's dyno-metadata labs features — enable **both** once:
+
+```
+heroku labs:enable runtime-dyno-build-metadata --app ospex-core-api   # HEROKU_BUILD_COMMIT (current)
+heroku labs:enable runtime-dyno-metadata --app ospex-core-api         # HEROKU_RELEASE_VERSION / _CREATED_AT
+```
+
+`runtime-dyno-build-metadata` provides `HEROKU_BUILD_COMMIT`, the current, correct build SHA (Heroku deprecated `HEROKU_SLUG_COMMIT`, which `runtime-dyno-metadata` still emits and the endpoint uses only as a labeled fallback). `runtime-dyno-metadata` provides the release version + timestamp. All are build identifiers injected at dyno boot, not secrets. Until the build-metadata feature is enabled the response shows `commitSource: "slug"` (or `build: null` if neither feature is on) — no other endpoint is affected.
 
 ### Required Heroku config vars
 
