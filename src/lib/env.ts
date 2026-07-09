@@ -66,6 +66,21 @@ export interface Config {
    * cold start, too large defeats the cap's purpose (bounded response time).
    */
   ownStateSnapshotMaxCommitments: number;
+  /**
+   * Deploy provenance — injected by Heroku's `runtime-dyno-metadata` labs
+   * feature (`heroku labs:enable runtime-dyno-metadata`). All optional: absent
+   * in local dev and until the feature is enabled. Surfaced (read-only) by
+   * `GET /v1/protocol/info` so a client can point at the exact public commit
+   * the running service was built from. These are build identifiers, not
+   * secrets.
+   *
+   * `herokuSlugCommit`: git SHA of the deployed slug — a commit on the public
+   * repo (this service deploys via GitHub integration, so the SHA always
+   * resolves to a real commit there).
+   */
+  herokuSlugCommit?: string;
+  herokuReleaseVersion?: string;
+  herokuReleaseCreatedAt?: string;
 }
 
 function requireEnv(name: string): string {
@@ -192,6 +207,11 @@ export function loadConfig(): Config {
   const alchemyRpcUrl = optionalEnv('ALCHEMY_RPC_URL');
   const matchingModuleAddress = optionalAddressEnv('MATCHING_MODULE_ADDRESS');
   const positionModuleAddress = optionalAddressEnv('POSITION_MODULE_ADDRESS');
+
+  // Deploy provenance from Heroku runtime-dyno-metadata (optional; see Config).
+  const herokuSlugCommit = optionalEnv('HEROKU_SLUG_COMMIT');
+  const herokuReleaseVersion = optionalEnv('HEROKU_RELEASE_VERSION');
+  const herokuReleaseCreatedAt = optionalEnv('HEROKU_RELEASE_CREATED_AT');
 
   // Scorer addresses — accept the canonical name first, fall back to the
   // legacy name so a copied-over deployment env still works.
@@ -320,6 +340,9 @@ export function loadConfig(): Config {
     ...(reservedStreamConnectionsPerIpOwner !== undefined ? { reservedStreamConnectionsPerIpOwner } : {}),
     ...(streamAuthHmacSecret !== undefined ? { streamAuthHmacSecret } : {}),
     ...(streamAuthAudience !== undefined ? { streamAuthAudience } : {}),
+    ...(herokuSlugCommit !== undefined ? { herokuSlugCommit } : {}),
+    ...(herokuReleaseVersion !== undefined ? { herokuReleaseVersion } : {}),
+    ...(herokuReleaseCreatedAt !== undefined ? { herokuReleaseCreatedAt } : {}),
   };
   return cached;
 }

@@ -255,6 +255,19 @@ Response: `Speculation` (as above) plus:
 
 Static metadata: name, network, chainId, contract addresses (matchingModule, scorers), supported sports, fees.
 
+Also carries a **`build`** block naming the git commit the running service was deployed from:
+
+```json
+"build": {
+  "commit": "a60c919…",
+  "commitUrl": "https://github.com/ospex-org/ospex-core-api/commit/a60c919…",
+  "releaseVersion": "v248",
+  "releasedAt": "2026-07-09T19:10:00Z"
+}
+```
+
+This lets a reader of the public repo confirm which source is live — follow `commitUrl` to the exact reviewed code, and check the commit sits on `main` — and spot deploy drift. It's a **self-reported build identifier, not a cryptographic proof** that the dyno runs unmodified code; it makes honest operation checkable and accidental staleness visible. `build` is `null` in local dev and until Heroku `runtime-dyno-metadata` is enabled (see config below); `releaseVersion`/`releasedAt` are `null` if only the commit is available.
+
 ### Position helpers
 
 #### `GET /v1/positions/:address`
@@ -542,6 +555,14 @@ See `.env.example`. Required values are validated at boot — missing vars exit 
 Heroku app: `ospex-core-api`. Production URL: `https://ospex-core-api-195f635df864.herokuapp.com/`.
 
 Procfile: `web: node dist/server.js`. Heroku auto-runs `yarn build` (`tsc` → `dist/`) on slug compile.
+
+**Deploy provenance.** The `build` block on `GET /v1/protocol/info` reports the running commit. It is populated from Heroku's runtime-dyno-metadata, enabled once with:
+
+```
+heroku labs:enable runtime-dyno-metadata --app ospex-core-api
+```
+
+That injects `HEROKU_SLUG_COMMIT` / `HEROKU_RELEASE_VERSION` / `HEROKU_RELEASE_CREATED_AT` at dyno boot (build identifiers, not secrets). Until it's enabled, `build` is simply `null` — no other endpoint is affected.
 
 ### Required Heroku config vars
 
