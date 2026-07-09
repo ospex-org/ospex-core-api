@@ -108,8 +108,8 @@ export interface SpeculationParentContext {
    * (see lib/teamIds.ts). Null when the contest has no JSONOdds linkage
    * or the games row is missing. The SDK's resolver layer scopes
    * alias matching to these ids when both are non-null and falls back
-   * to exact + nickname matching otherwise. Added in PR 0 of the
-   * resolver-layer rollout — older clients ignore the fields harmlessly.
+   * to exact + nickname matching otherwise. These fields are additive —
+   * older clients that don't read them are unaffected.
    */
   awayTeamId: string | null;
   homeTeamId: string | null;

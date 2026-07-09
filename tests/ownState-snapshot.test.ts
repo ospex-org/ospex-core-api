@@ -800,11 +800,11 @@ describe('GET /v1/own-state/snapshot — overlap floor + paging regressions', ()
     expect(keysetArgs.some((a) => a.includes('2026-05-29T09:59:30.000Z'))).toBe(true);
   });
 
-  // Blocker 3: f watermark NEVER advances past undelivered fills. Snapshot
+  // Invariant: the f watermark NEVER advances past undelivered fills. Snapshot
   // doesn't carry fills[], so the watermark either preserves (input cursor)
   // or starts at MAX-in-DB (cold start), but it cannot move past the SDK's
   // last-seen point on a recovery call.
-  it('input cursor.f is PRESERVED on the response cursor (blocker #3)', async () => {
+  it('input cursor.f is PRESERVED on the response cursor', async () => {
     const inputF = { s: '2026-05-29T10:00:00.000Z', i: '99' };
     const cursor = encodeOwnStateCursor({
       t: 'own-state',
@@ -835,7 +835,7 @@ describe('GET /v1/own-state/snapshot — overlap floor + paging regressions', ()
     expect(calls.some((c) => c.table === 'position_fills')).toBe(false);
   });
 
-  // Blocker 4: positions truncation surfaces via `positionsTruncated` flag,
+  // Invariant: positions truncation surfaces via `positionsTruncated` flag,
   // and the p watermark is preserved (or sentinel on cold start) so the
   // The own-state stream catches every position transition the snapshot couldn't.
   it('positions categorized count at the 200 cap → positionsTruncated=true + p preserved', async () => {

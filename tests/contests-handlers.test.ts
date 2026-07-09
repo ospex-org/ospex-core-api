@@ -252,8 +252,8 @@ describe('GET /v1/contests/:contestId', () => {
     };
     expect(body.contestId).toBe('42');
     expect(body.jsonoddsId).toBe('a783e37e-4ce1-4f42-9dd6-615568f73044');
-    // No games row mocked → team_ids degrade to null. PR 0 widening
-    // is present in the response shape, just empty.
+    // No games row mocked → team_ids degrade to null. The team-id fields
+    // are present in the response shape, just empty.
     expect(body.awayTeamId).toBeNull();
     expect(body.homeTeamId).toBeNull();
     expect(body.speculations).toHaveLength(1);

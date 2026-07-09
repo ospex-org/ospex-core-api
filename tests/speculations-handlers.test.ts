@@ -328,9 +328,8 @@ describe('GET /v1/speculations/:speculationId', () => {
         contestId: '42',
         awayTeam: 'Lakers',
         homeTeam: 'Celtics',
-        // PR 0 widening: team_ids are null when jsonodds_id is null
-        // (no games linkage to resolve through). SDK falls back to
-        // exact + nickname matching.
+        // team_ids are null when jsonodds_id is null (no games linkage
+        // to resolve through). SDK falls back to exact + nickname matching.
         awayTeamId: null,
         homeTeamId: null,
         sport: 'nba',
