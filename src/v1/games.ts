@@ -33,6 +33,13 @@
  * would still report as creatable. The default `availableOnly=true`
  * applies the same predicate as a DB filter so the list view never
  * includes uncreatable rows.
+ *
+ * `probablePitchers` is advisory supplemental context (MLB only): the
+ * probable/announced starters as last reported by the upstream odds feed,
+ * refreshed by the writer while the game is on the board. Both sides are
+ * null when unannounced and for non-MLB sports. The value means "the last
+ * starter the feed reported", not a guaranteed final starter — it never
+ * affects contest creation, matching, or scoring.
  */
 
 import type { Request, Response } from 'express';
@@ -58,6 +65,11 @@ interface ExternalIds {
   rundown: string | null;
 }
 
+interface ProbablePitchers {
+  home: string | null;
+  away: string | null;
+}
+
 interface GameRow {
   gameId: string;
   slug: string;
@@ -71,6 +83,7 @@ interface GameRow {
   contestId: string | null;
   canCreateContest: boolean;
   externalIds: ExternalIds;
+  probablePitchers: ProbablePitchers;
 }
 
 interface GamesDbRow {
@@ -91,6 +104,8 @@ interface GamesDbRow {
   // (commitments / positions) follow the same pattern for bigint IDs.
   contest_id: string | number | null;
   slug: string;
+  home_probable_pitcher: string | null;
+  away_probable_pitcher: string | null;
 }
 
 interface TeamDbRow {
@@ -100,7 +115,7 @@ interface TeamDbRow {
 }
 
 const GAMES_SELECT =
-  'network, jsonodds_id, sportspage_id, rundown_id, sport, match_time, status, home_team_id, away_team_id, has_odds, contest_created, contest_id, slug';
+  'network, jsonodds_id, sportspage_id, rundown_id, sport, match_time, status, home_team_id, away_team_id, has_odds, contest_created, contest_id, slug, home_probable_pitcher, away_probable_pitcher';
 
 function parseBoolParam(raw: string | undefined): boolean | 'invalid' | undefined {
   if (raw === undefined) return undefined;
@@ -148,6 +163,10 @@ function dbRowToGameRow(row: GamesDbRow, teams: Map<string, TeamInfo>): GameRow 
       jsonodds: row.jsonodds_id,
       sportspage: row.sportspage_id,
       rundown: row.rundown_id,
+    },
+    probablePitchers: {
+      home: row.home_probable_pitcher ?? null,
+      away: row.away_probable_pitcher ?? null,
     },
   };
 }
