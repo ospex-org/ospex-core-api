@@ -37,6 +37,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 import { encodeCursor } from '../src/lib/cursor.js';
+import { RECOVERY_OVERLAP_MS } from '../src/lib/recovery.js';
 
 const SCORERS = {
   moneyline: '0x1111111111111111111111111111111111111111',
@@ -738,25 +739,47 @@ describe('the contests stream resource reads the view', () => {
 //
 // The write-side half lives in the protocol indexer's schema (a trigger that
 // advances the linked contest's `row_updated_at` when `games.match_time`
-// changes). What THIS service owes, and what is tested here, is that once the
-// cursor does advance, the recovery/stream path actually carries the new
-// EARLIER value through to the response body.
+// changes). What THIS service owes, and what is tested here, is the other
+// half: once the cursor does advance — including into the `live` cursor's
+// overlap re-scan — the recovery/stream path actually carries the new EARLIER
+// value through to the response body, off the right relation.
 //
-// The mock below applies the real keyset predicate rather than returning
-// canned rows, so the negative control is a genuine observation: a row whose
-// `row_updated_at` did not advance is filtered out by the same expression the
-// handler sends to PostgREST.
+// ## What these tests CANNOT prove — read before trusting them
+//
+// The double below re-implements Postgres keyset semantics in JavaScript. It
+// evaluates the real `.or()` expression string the handler emits, so the
+// negative controls are not vacuous the way a canned-row mock would be — but
+// they are a SIMULATION of the database, not an observation of one. Nothing
+// here goes red if the write-side trigger is absent, applied to the wrong
+// column, joined on the wrong key, or never applied at all: those guarantees
+// belong to the migration's own suite and to its psql verification block, in
+// the other repo. This service's convergence claim is only true against a
+// database where that migration has been applied.
+//
+// What the double DOES buy, beyond documentation:
+//   - it honours `from(table)`, so a recovery read against the base `contests`
+//     table instead of the view returns nothing and turns these red;
+//   - it evaluates the keyset predicate, so routing a `live` cursor through
+//     the strict `page` expression (dropping the overlap re-scan) turns the
+//     late-commit case red.
 
 describe('a game-only reschedule surfaces on ?since= once the cursor advances', () => {
-  const CURSOR_AT = '2026-05-01T10:00:00.000Z'; // client's last-seen position
-  const TOUCHED_AT = '2026-05-01T14:00:00.000Z'; // after the reschedule write
+  const CURSOR_AT = '2026-05-01T14:00:00.000Z'; // client's last-seen position
+  const STALE_AT = '2026-05-01T10:00:00.000Z'; // untouched: the reported defect
+  const TOUCHED_AT = '2026-05-01T15:00:00.000Z'; // after the reschedule write
+  /** Inside the 30s live-cursor overlap: a slow writer tx landing behind the cursor. */
+  const LATE_COMMIT_AT = new Date(Date.parse(CURSOR_AT) - 10_000).toISOString();
+  /** Outside the overlap — must stay excluded, or the floor means nothing. */
+  const LONG_BEFORE_AT = new Date(Date.parse(CURSOR_AT) - 10 * RECOVERY_OVERLAP_MS).toISOString();
+
   const ROW_ID = 9;
+  const OTHER_ROW_ID = 11; // ≠ ROW_ID, so no test rides the id tie-break
 
   const ORIGINAL_START = '2026-05-04T20:00:00Z';
   const MOVED_UP_START = '2026-05-04T18:00:00Z';
 
   /** The contest row as the view returns it AFTER the game was moved up. */
-  function rescheduledRow(rowUpdatedAt: string): Record<string, unknown> {
+  function rescheduledRow(rowUpdatedAt: string, id: number = OTHER_ROW_ID): Record<string, unknown> {
     return {
       ...recoveryRow({
         name: 'moved up',
@@ -769,31 +792,41 @@ describe('a game-only reschedule surfaces on ?since= once the cursor advances', 
           gameMatchTime: MOVED_UP_START,
         },
       }),
-      id: ROW_ID,
+      id,
       row_updated_at: rowUpdatedAt,
     };
   }
 
   /**
-   * A Supabase double that EVALUATES the `.or()` keyset expression against the
-   * rows, the way Postgres would. Without this the negative control would be
-   * vacuous — any canned-row mock returns the row regardless of the cursor.
+   * A Supabase double that (a) serves rows only for the relation it is told to
+   * hold, and (b) EVALUATES the `.or()` keyset expression against them the way
+   * Postgres would.
    *
-   * Parses the exact expression `keysetOrExpr` emits:
+   * Parses the exact expression `keysetOrExpr` emits, for either cursor kind
+   * (`recoveryKeysetExpr` produces the same grammar with a floored timestamp
+   * and `id.gt.0` for `live`):
    *   `row_updated_at.gt.<s>,and(row_updated_at.eq.<s>,id.gt.<i>)`
    *
    * `Date.parse` is used only HERE, to imitate Postgres timestamptz ordering
    * over millisecond-precision fixtures. Product code must never compare
    * cursors that way — it truncates microseconds.
    */
-  function makeKeysetSupabase(rows: Array<Record<string, unknown>>): {
-    client: { from: (table: string) => unknown };
+  function makeKeysetSupabase(
+    table: string,
+    rows: Array<Record<string, unknown>>,
+  ): {
+    client: { from: (t: string) => unknown };
     orExpressions: string[];
+    tablesRead: string[];
   } {
     const orExpressions: string[] = [];
+    const tablesRead: string[] = [];
     const client = {
-      from(): unknown {
-        let filtered = rows;
+      from(t: string): unknown {
+        tablesRead.push(t);
+        // A read of any other relation finds nothing — the view's contents do
+        // not exist under the base table's name.
+        let filtered = t === table ? rows : [];
         const builder: Record<string, unknown> = {};
         const passthrough =
           () =>
@@ -822,27 +855,29 @@ describe('a game-only reschedule surfaces on ?since= once the cursor advances', 
         return builder;
       },
     };
-    return { client, orExpressions };
+    return { client, orExpressions, tablesRead };
   }
 
-  /** Drive `GET /v1/contests?since=` with a strict `page` cursor. */
+  /** Drive `GET /v1/contests?since=` with a cursor of the given kind. */
   async function recoverSince(
     rows: Array<Record<string, unknown>>,
-  ): Promise<{ contests: TimeFields[]; orExpressions: string[] }> {
-    const { client, orExpressions } = makeKeysetSupabase(rows);
+    kind: 'page' | 'live' = 'page',
+  ): Promise<{ contests: TimeFields[]; orExpressions: string[]; tablesRead: string[] }> {
+    const { client, orExpressions, tablesRead } = makeKeysetSupabase('contests_effective', rows);
     supabaseMock.getSupabase.mockReturnValue(client);
-    const cursor = encodeCursor({ t: 'contests', s: CURSOR_AT, i: String(ROW_ID), k: 'page' });
+    const cursor = encodeCursor({ t: 'contests', s: CURSOR_AT, i: String(ROW_ID), k: kind });
     const res = makeRes();
     await getContestsHandler(makeReq({ since: cursor }), res as unknown as Response);
     expect(res.statusCode).toBe(200);
-    return { contests: (res.body as { contests: TimeFields[] }).contests, orExpressions };
+    return { contests: (res.body as { contests: TimeFields[] }).contests, orExpressions, tablesRead };
   }
 
-  it('the touched row comes back, and its body carries the EARLIER matchTime', async () => {
-    const { contests, orExpressions } = await recoverSince([rescheduledRow(TOUCHED_AT)]);
+  it('the touched row comes back off the VIEW, and its body carries the EARLIER matchTime', async () => {
+    const { contests, orExpressions, tablesRead } = await recoverSince([rescheduledRow(TOUCHED_AT)]);
 
-    // Positive control: the keyset predicate really ran.
+    // Positive controls: the keyset predicate really ran, against the view.
     expect(orExpressions).toHaveLength(1);
+    expect(tablesRead).toContain('contests_effective');
 
     expect(contests).toHaveLength(1);
     const body = contests[0]!;
@@ -854,14 +889,49 @@ describe('a game-only reschedule surfaces on ?since= once the cursor advances', 
     expect(body.gameMatchTime).toBe(MOVED_UP_START);
   });
 
-  it('NEGATIVE CONTROL: an un-touched row is filtered out by the strict page cursor', async () => {
-    // Exactly the reported defect. The served `effective_start_time` has ALREADY
-    // moved to the earlier time, but `contests.row_updated_at` still sits at the
-    // client's cursor — so the keyset predicate excludes it and the reschedule
-    // is invisible to a cursor-based subscriber. This is what the delta looks
-    // like without the write-side trigger, and it is why the fix has to advance
-    // `row_updated_at` rather than be implemented in this repo.
-    const { contests } = await recoverSince([rescheduledRow(CURSOR_AT)]);
+  it('NEGATIVE CONTROL: a row left BEHIND the cursor is not returned', async () => {
+    // The reported defect, in its reported shape: the served
+    // `effective_start_time` has ALREADY moved to the earlier time, but
+    // `contests.row_updated_at` still sits four hours behind the client's
+    // cursor. The keyset predicate excludes it, so the reschedule is invisible
+    // to a cursor-based subscriber — which is why the fix has to advance
+    // `row_updated_at` on the write side and cannot live in this repo.
+    //
+    // Deliberately NOT a row sitting exactly ON the cursor: that case is
+    // excluded by the `id` tie-break alone and would hold for any strict
+    // keyset, proving nothing about this scenario.
+    const { contests } = await recoverSince([rescheduledRow(STALE_AT)]);
+    expect(contests).toHaveLength(0);
+  });
+
+  it('a late-committed reschedule just behind a LIVE cursor is still recovered', async () => {
+    // `now()` is transaction-start time, so a writer tx that began before the
+    // client's cursor and committed after it lands a row whose
+    // `row_updated_at` PREDATES the cursor. A strict keyset would skip it
+    // permanently. Resuming from a `live` cursor re-scans the overlap window,
+    // which is the only thing that recovers it — and a reschedule is exactly
+    // the write this matters for.
+    //
+    // This is the case that pins `getContestsRecovery` routing its cursor
+    // through `recoveryKeysetExpr` rather than the strict `keysetOrExpr`:
+    // swap them and this goes red while every page-cursor test stays green.
+    const { contests, orExpressions } = await recoverSince(
+      [rescheduledRow(LATE_COMMIT_AT)],
+      'live',
+    );
+    // The emitted predicate really is the floored one, not the cursor's own.
+    expect(orExpressions[0]).toContain(
+      `row_updated_at.gt.${new Date(Date.parse(CURSOR_AT) - RECOVERY_OVERLAP_MS).toISOString()}`,
+    );
+    expect(contests).toHaveLength(1);
+    expect(contests[0]!.matchTime).toBe(MOVED_UP_START);
+  });
+
+  it('NEGATIVE CONTROL: the live overlap is bounded — an old row is not re-delivered', async () => {
+    // Pairs with the case above so it cannot pass against a floor widened to
+    // "everything". A row far outside the window stays excluded, which is what
+    // keeps a resume from re-sending the client's whole history.
+    const { contests } = await recoverSince([rescheduledRow(LONG_BEFORE_AT)], 'live');
     expect(contests).toHaveLength(0);
   });
 

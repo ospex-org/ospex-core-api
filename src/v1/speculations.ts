@@ -24,6 +24,7 @@ import type { Request, Response } from 'express';
 import { loadConfig } from '../lib/env.js';
 import { logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
+import { CONTESTS_VIEW } from '../lib/tables.js';
 import { deriveSpeculationKey } from '../lib/eip712.js';
 import { SPORTS as VALID_SPORTS, isSport } from '../lib/sports.js';
 import { resolveTeamIdsForContest } from '../lib/teamIds.js';
@@ -336,7 +337,7 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
   // Reads the `contests_effective` view so the three start-time fields arrive
   // in one row read — see the `/v1/contests` file header for what each means.
   const ctxRes = await sb
-    .from('contests_effective')
+    .from(CONTESTS_VIEW)
     .select(CONTEST_CONTEXT_COLUMNS)
     .eq('network', config.network)
     .eq('contest_id', speculation.contestId)

@@ -62,7 +62,7 @@ Then:
 
 ```bash
 curl http://localhost:3000/healthz   # liveness — always 200 if process is up
-curl http://localhost:3000/readyz    # readiness — 200 when always-required deps (Supabase + EIP-712 relay env) are wired
+curl http://localhost:3000/readyz    # readiness — 200 when always-required deps (Supabase + the contests_effective view + EIP-712 relay env) are wired
 ```
 
 ## Health endpoints
@@ -181,11 +181,15 @@ The minimum is computed in Postgres by the `contests_effective` view (a `LEAST` 
 
 ##### Convergence when only the game moves
 
-Because `matchTime` derives partly from `games.match_time`, a reschedule can change a contest's served start time without any on-chain contest write. `GET /v1/contests?since=` and `GET /v1/stream/contests` are keyset-cursored on `contests.row_updated_at`, so that change is delivered only if the cursor advances with it. The indexer's schema closes this on the write side: a trigger advances the linked contest's `row_updated_at` when `games.match_time` changes, so a game-only reschedule surfaces as an ordinary contest delta on both surfaces, carrying the new earlier `matchTime`.
+Because `matchTime` derives partly from `games.match_time`, a reschedule can change a contest's served start time without any on-chain contest write. `GET /v1/contests?since=` and `GET /v1/stream/contests` are keyset-cursored on `contests.row_updated_at`, so that change is delivered only if the cursor advances with it — and nothing in this service can make it.
+
+The close is a write-side one, owned by the protocol indexer's schema: a trigger that advances the linked contest's `row_updated_at` when `games.match_time` changes. **Where that migration is applied**, a game-only reschedule surfaces as an ordinary contest delta on both surfaces, carrying the new earlier `matchTime`; this service needs no change for it. Operators running against a database without it should read the paragraph below before relying on a cursor to converge a start time.
 
 The trigger keys on `match_time` specifically, not on `games.row_updated_at` — that column is bumped by many writes with no contest-visible effect (odds flags, probable pitchers, external-id claims, final scores), each of which would otherwise re-deliver the contest row.
 
-Against a database where that migration has not been applied, reads are still correct — every response computes `matchTime` from the view at read time — but a cursor-based subscriber can miss a game-only reschedule until an unrelated contest-row update or a cold snapshot. It also reaches `/v1/stream/own-state`: that stream advances its position-status cursor on a derived `sourceUpdatedAt = max(positions, speculations, contests).row_updated_at`, so touching the contest row re-evaluates an owner's affected positions on a reschedule.
+Against a database where that migration has not been applied, reads are still correct — every response computes `matchTime` from the view at read time — but a cursor-based subscriber can miss a game-only reschedule until an unrelated contest-row update or a cold snapshot.
+
+Touching the contest row also reaches `/v1/stream/own-state`, which advances its position-status cursor on a derived `sourceUpdatedAt = max(positions, speculations, contests).row_updated_at`. An owner therefore gets a re-emitted `positionStatus` event for the affected positions on a reschedule. Note what that event does and does not carry: `positionStatus` has no start-time field, so it is a prompt to re-read the contest, not the new time itself.
 
 > **Name collision — `/v1/contests.matchTime` and `/v1/games.matchTime` are different columns from different providers.** On `/v1/games`, `matchTime` is the raw odds-feed schedule — the same value this endpoint calls `gameMatchTime`. On the contest surfaces, `matchTime` is the minimum described above, which for a game that has never moved is the same instant but is *not* the same field. Do not compare them for equality across endpoints; compare `/v1/games.matchTime` against `gameMatchTime`.
 
@@ -465,7 +469,7 @@ Pagination caveat: PostgREST returns at most 1000 rows per request, so `limit` i
 
 The catch-up side of the push contract. A client streams live deltas (SSE — see "SSE streams") and, after a disconnect, asks for everything after its last cursor. These reads are intentionally distinct from the open-book list/snapshot endpoints above.
 
-- **Ordering** is keyset `(row_updated_at, id)` ascending — not offset. `row_updated_at` is trigger-maintained on every UPDATE, so a stored `open → filled/cancelled`, a `settleSpeculation`, or a `claimPosition` advances it and surfaces here. The `id` tie-breaker means same-millisecond updates are never skipped. For `contests` the cursor also advances on a game-only reschedule, so a changed `matchTime` converges even with no on-chain write — see "Convergence when only the game moves".
+- **Ordering** is keyset `(row_updated_at, id)` ascending — not offset. `row_updated_at` is trigger-maintained on every UPDATE, so a stored `open → filled/cancelled`, a `settleSpeculation`, or a `claimPosition` advances it and surfaces here. The `id` tie-breaker means same-millisecond updates are never skipped. For `contests`, where the indexer migration described under "Convergence when only the game moves" is applied, the cursor also advances on a game-only reschedule, so a changed `matchTime` converges even with no on-chain write.
 - **Includes terminal rows.** Recovery does NOT apply the open-book `status`/`expiry`/`nonce_invalidated` defaults — a commitment that went `filled`/`cancelled`, or a speculation that `settled`, must surface so a client converges its local state.
 - **Filters are identity/scope only** (e.g. `maker`, `contestId`, `scorer`, `speculationId`, `address`), not lifecycle-status.
 - **Cursor is opaque.** Treat `nextCursor` as a blob and pass it back as `?since=`; it embeds the resource so a cursor from one stream can't be used on another (400 `INVALID_CURSOR`).
@@ -642,7 +646,7 @@ curl -s "$URL/v1/contests"         # paginated list (empty until indexer ingests
 
 `/readyz` checks the always-required dependencies: Supabase reachability, presence of the `contests_effective` view, and EIP-712 relay env config for `POST /v1/commitments`. The view is reported as its own `contestsView: { present, error? }` block rather than folded into `supabase` — it is created by a migration in the protocol indexer's schema, so it can be missing while Postgres is perfectly healthy, and every contest-shaped read depends on it. A PostgREST "relation not found" response therefore reports `supabase.connected: true` and `contestsView.present: false`, and readiness fails on the second term.
 
-The view probe is a row-less **GET**, and it treats only a returned rows array as proof of presence. Both details are load-bearing: a HEAD response carries no body, and the Supabase client rewrites a body-less 404 into `204` with **no error** — so a HEAD probe, or any probe that infers success from a null error, reports the view present when it is absent. Anything other than a rows array fails closed. Note also that when Supabase is unreachable the client retries idempotent requests three times with backoff, so `/readyz` can take ~7s to answer during an outage; size platform readiness timeouts accordingly. It does **not** include stream-auth readiness — those endpoints are opt-in at the operator level and surface their own `503 NOT_READY` per call when `STREAM_AUTH_HMAC_SECRET` / `STREAM_AUTH_AUDIENCE` / `MATCHING_MODULE_ADDRESS` are unset.
+The view probe is a row-less **GET**, and it treats only a returned rows array as proof of presence. Both details are load-bearing: a HEAD response carries no body, and the Supabase client rewrites a body-less 404 into `204` with **no error** — so a HEAD probe, or any probe that infers success from a null error, reports the view present when it is absent. Anything other than a rows array fails closed. One residual is documented rather than defended: the same client turns a 404 whose body is a JSON *array* into an exact copy of the success envelope, which no check on the returned value can detect. PostgREST never emits that shape, so it takes a misbehaving intermediary to produce — but a probe reading the raw HTTP status, rather than the client's envelope, is what would close it. Note also that when Supabase is unreachable the client retries idempotent requests three times with backoff, so `/readyz` can take ~7s to answer during an outage; size platform readiness timeouts accordingly. It does **not** include stream-auth readiness — those endpoints are opt-in at the operator level and surface their own `503 NOT_READY` per call when `STREAM_AUTH_HMAC_SECRET` / `STREAM_AUTH_AUDIENCE` / `MATCHING_MODULE_ADDRESS` are unset.
 
 ## Project conventions
 

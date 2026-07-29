@@ -44,16 +44,28 @@
  *    asserted POSITIVELY: a healthy `.select(...).limit(0)` returns a rows
  *    ARRAY (`[]`). `error === null` with no array is the rewrite signature and
  *    is reported as NOT present — fail closed.
+ *
+ * ## Known residual: a 404 whose body is a JSON ARRAY still reads as healthy
+ *
+ * postgrest-js has a THIRD rewrite on the same non-ok path: a 404 whose body
+ * parses as a JSON array is turned into `status: 200, statusText: "OK",
+ * data: [], error: null`. That is byte-for-byte the success envelope, so no
+ * check available to this function can tell the two apart — including the
+ * rows-array check above, which that branch synthesises. PostgREST itself
+ * never produces it (its errors are JSON objects: `{"code":"PGRST205",…}`),
+ * so it is not reachable through a correctly-routed database; it is reachable
+ * from the same class of actor as point 2, an intermediary answering 404 with
+ * an array body. Detecting it would take a probe that reads the raw HTTP
+ * status instead of the client envelope. Documented rather than defended,
+ * and pinned by a characterization test so a library change is visible.
  */
 
 import { getSupabase } from './supabase.js';
 import { formatError } from './logger.js';
+import { CONTESTS_VIEW } from './tables.js';
 
 /** PostgREST / Postgres codes for "that relation does not exist". */
 const RELATION_MISSING_CODES = new Set(['PGRST205', '42P01']);
-
-/** The view every contest-shaped read in this service goes through. */
-export const CONTESTS_VIEW = 'contests_effective';
 
 export interface SupabaseReadiness {
   connected: boolean;
@@ -98,6 +110,9 @@ const APPLY_MIGRATION_HINT =
  * - no error but no rows array → connected, view NOT PROVEN present (fail closed)
  * - any other PostgREST error  → not connected
  * - throw / network failure    → not connected
+ *
+ * One case is NOT covered — a 404 carrying a JSON-array body, which the client
+ * rewrites into an exact copy of the success envelope. See the file header.
  */
 export async function checkDependencies(): Promise<DependencyReadiness> {
   try {

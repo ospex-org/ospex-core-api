@@ -17,6 +17,7 @@ import type { Request } from 'express';
 import { isAddress } from 'ethers';
 import type { ApiError } from '../../middleware/errorHandler.js';
 import type { CursorableRow, CursorTable } from '../../lib/cursor.js';
+import { CONTESTS_VIEW } from '../../lib/tables.js';
 
 import {
   commitmentRowToPublicBody,
@@ -180,13 +181,21 @@ export const STREAM_RESOURCES: Record<StreamResourceName, StreamResource> = {
     // cursor-based reconnect would not see it either — a subscriber would
     // hold the LATER start time indefinitely, which fails OPEN.
     //
-    // That is closed on the WRITE side, by a trigger in the protocol
-    // indexer's schema: when `games.match_time` changes, the linked contest's
-    // `row_updated_at` is advanced, so the change becomes cursor-visible here
-    // with no change to this service. The delta is therefore emitted only
-    // where that migration has been applied — this repo cannot enforce it
-    // alone, and reads correctly but silently misses game-only reschedules
-    // against a database without it.
+    // The close is on the WRITE side and lives in ANOTHER repo: a migration in
+    // the protocol indexer's schema adds a trigger that advances the linked
+    // contest's `row_updated_at` when `games.match_time` changes, so the change
+    // becomes cursor-visible here with no change to this service. Nothing in
+    // this repo can enforce or detect that, and no test here can turn red if it
+    // is absent — so state it conditionally: WHERE that migration is applied, a
+    // game-only reschedule surfaces as an ordinary contest delta; where it is
+    // not, reads stay correct (every response recomputes from the view) but a
+    // cursor-based subscriber silently misses the reschedule until an unrelated
+    // contest-row write or a cold snapshot.
+    //
+    // What this service owes, and what IS tested here, is the other half: once
+    // the cursor does advance, the recovery/stream body carries the new earlier
+    // `matchTime` — including for a row that lands just behind a `live` cursor
+    // and is recovered by the overlap re-scan.
     //
     // The trigger keys on `match_time` specifically rather than on
     // `games.row_updated_at`, because that column is bumped by many writes
@@ -194,7 +203,7 @@ export const STREAM_RESOURCES: Record<StreamResourceName, StreamResource> = {
     // external-id claims, final scores) — every one of which would otherwise
     // re-deliver the contest row. `match_time` is the only `games` column
     // feeding a contest body, producing both `matchTime` and `gameMatchTime`.
-    table: 'contests_effective',
+    table: CONTESTS_VIEW,
     columns: CONTEST_RECOVERY_COLUMNS,
     toBody: (row) => contestRecoveryRowToBody(row as unknown as ContestRecoveryRow),
     parseFilters: (req) => collect([['contestId', 'contest_id', vUint(req.query.contestId)]]),

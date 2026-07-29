@@ -31,7 +31,16 @@ import { createClient } from '@supabase/supabase-js';
 const supabaseMock = vi.hoisted(() => ({ getSupabase: vi.fn() }));
 vi.mock('../src/lib/supabase.js', () => supabaseMock);
 
-const { checkDependencies, isReady, CONTESTS_VIEW } = await import('../src/lib/readiness.js');
+const { checkDependencies, isReady } = await import('../src/lib/readiness.js');
+const { CONTESTS_VIEW } = await import('../src/lib/tables.js');
+const { STREAM_RESOURCES } = await import('../src/v1/stream/resources.js');
+
+/**
+ * The relation name, written out. Deliberately a LITERAL and not the imported
+ * constant: an expectation interpolating `CONTESTS_VIEW` moves with any
+ * mutation of it and proves nothing. Renaming the constant must turn this red.
+ */
+const VIEW_NAME = 'contests_effective';
 
 // ── real-transport harness ──────────────────────────────────────────────
 
@@ -77,7 +86,7 @@ const PGRST205_BODY = {
   code: 'PGRST205',
   details: null,
   hint: "Perhaps you meant the table 'public.contests'",
-  message: `Could not find the table 'public.${'contests_effective'}' in the schema cache`,
+  message: `Could not find the table 'public.${VIEW_NAME}' in the schema cache`,
 };
 /** The raw Postgres undefined_table code, as PostgREST relays it. */
 const UNDEFINED_TABLE_BODY = {
@@ -101,6 +110,9 @@ const relationMissing = (method: string): Response =>
 /** A 404 carrying NO body at all, whatever the method (a proxy, not PostgREST). */
 const bodylessNotFound = (): Response => new Response('', { status: 404 });
 
+/** A 404 whose body parses as a JSON ARRAY — see the known-residual test. */
+const arrayBodyNotFound = (): Response => json([{ code: 'PGRST205' }], 404);
+
 async function probeOver(handler: (method: string, url: string) => Response): Promise<{
   result: Awaited<ReturnType<typeof checkDependencies>>;
   requests: SeenRequest[];
@@ -113,10 +125,22 @@ async function probeOver(handler: (method: string, url: string) => Response): Pr
 // ── the probe's request shape ───────────────────────────────────────────
 
 describe('checkDependencies — the request it issues', () => {
+  it('probes the SAME relation the contest handlers read', () => {
+    // The drift guard. A probe naming a different relation from the handlers
+    // is blocker 1 all over again by another route: the probe checks a
+    // relation that still exists, /readyz answers 200, and every contest read
+    // 500s. One constant now feeds `readiness.ts`, the three `contests.ts`
+    // reads, the speculations parent-context read and the stream registry —
+    // and both ends are pinned to the literal here, so a rename cannot move
+    // the expectation along with the code.
+    expect(CONTESTS_VIEW).toBe(VIEW_NAME);
+    expect(STREAM_RESOURCES.contests.table).toBe(VIEW_NAME);
+  });
+
   it('probes contests_effective, not the base contests table', async () => {
     const { requests } = await probeOver(healthy);
     expect(requests).toHaveLength(1);
-    expect(requests[0]!.url).toContain(`/rest/v1/${CONTESTS_VIEW}`);
+    expect(requests[0]!.url).toContain(`/rest/v1/${VIEW_NAME}`);
     // The base table would be `/rest/v1/contests?…` — the view's name is a
     // prefix-superset, so match on the delimiter to keep this non-vacuous.
     expect(requests[0]!.url).not.toMatch(/\/rest\/v1\/contests\?/);
@@ -161,7 +185,7 @@ describe('checkDependencies — verdicts over a real transport', () => {
     expect(result.supabase.connected).toBe(true);
     // …but readiness must still fail, on this term.
     expect(result.contestsView.present).toBe(false);
-    expect(result.contestsView.error).toContain(CONTESTS_VIEW);
+    expect(result.contestsView.error).toContain(VIEW_NAME);
     expect(result.contestsView.error).toContain('PGRST205');
   });
 
@@ -185,7 +209,25 @@ describe('checkDependencies — verdicts over a real transport', () => {
     const { result } = await probeOver(bodylessNotFound);
     expect(result.supabase.connected).toBe(true);
     expect(result.contestsView.present).toBe(false);
-    expect(result.contestsView.error).toContain(CONTESTS_VIEW);
+    expect(result.contestsView.error).toContain(VIEW_NAME);
+  });
+
+  it('KNOWN RESIDUAL: a 404 with a JSON-ARRAY body is indistinguishable from success', async () => {
+    // NOT an endorsement — a characterization test, pinning a gap the header
+    // documents. postgrest-js has a THIRD rewrite on its non-ok path: a 404
+    // whose body parses as an array becomes `status: 200, statusText: "OK",
+    // data: [], error: null` — byte-for-byte the success envelope, including
+    // the rows array this probe uses as positive proof. No check available to
+    // `checkDependencies` can separate them.
+    //
+    // PostgREST never emits it (its errors are JSON objects), so it is not
+    // reachable through a correctly-routed database; it needs an intermediary
+    // answering 404 with an array body. Asserting the CURRENT behaviour keeps
+    // the gap visible and makes a library change that closes (or widens) it
+    // show up here rather than in production.
+    const { result } = await probeOver(arrayBodyNotFound);
+    expect(result.supabase.connected).toBe(true);
+    expect(result.contestsView.present).toBe(true); // ← the residual, on purpose
   });
 
   it('any other PostgREST error reports NOT connected', async () => {
@@ -209,34 +251,42 @@ describe('checkDependencies — verdicts over a real transport', () => {
     expect(result.supabase.error).toContain('ECONNREFUSED');
   });
 
-  it(
-    'a fetch that rejects mid-flight reports NOT connected (through the retry layer)',
-    async () => {
-      // Distinct from the case above: the client builds fine and the failure
-      // comes from the network call itself, which is the realistic outage
-      // shape. postgrest-js retries a rejected fetch on idempotent methods
-      // (GET/HEAD/OPTIONS) up to 3 times with 1s/2s/4s backoff, so this takes
-      // ~7s of wall clock and then surfaces `status: 0` with an error whose
-      // `code` is the empty string — which must NOT be mistaken for either a
-      // relation-missing code or a success.
-      //
-      // That latency is a property of the client library and applies equally
-      // to the previous HEAD probe (both methods are retryable), so it is not
-      // a regression introduced by the GET — but it does mean `/readyz` takes
-      // ~7s to answer while Supabase is unreachable.
+  it('a fetch that rejects mid-flight reports NOT connected (through the retry layer)', async () => {
+    // Distinct from the case above: the client builds fine and the failure
+    // comes from the network call itself, which is the realistic outage
+    // shape. postgrest-js retries a rejected fetch on idempotent methods
+    // (GET/HEAD/OPTIONS) up to 3 times with 1s/2s/4s backoff, then surfaces
+    // `status: 0` with an error whose `code` is the empty string — which must
+    // NOT be mistaken for either a relation-missing code or a success.
+    //
+    // That latency is a property of the client library and applies equally to
+    // the previous HEAD probe (both methods are retryable), so it is not a
+    // regression introduced by the GET — but it does mean `/readyz` takes ~7s
+    // to answer while Supabase is unreachable.
+    //
+    // The backoff runs on `setTimeout`, so FAKE TIMERS keep every assertion
+    // and drop the 7s of wall clock. A 7-second unit test is what gets `.skip`
+    // added to it later; the coverage is worth more than the realism of the
+    // sleep. `runAllTimersAsync` drains each backoff and the microtasks
+    // between them, so all four attempts really happen.
+    vi.useFakeTimers();
+    try {
       const { client, requests } = realClientOver(() => {
         throw new Error('socket hang up');
       });
       supabaseMock.getSupabase.mockReturnValue(client);
-      const result = await checkDependencies();
+      const pending = checkDependencies();
+      await vi.runAllTimersAsync();
+      const result = await pending;
       expect(result.supabase.connected).toBe(false);
       expect(result.contestsView.present).toBe(false);
       // Pins the retry count so a library upgrade that changes it is visible
       // here rather than as a mysterious readiness-latency change.
       expect(requests).toHaveLength(4);
-    },
-    15_000,
-  );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 // ── the composed verdict ────────────────────────────────────────────────

@@ -77,6 +77,7 @@ import type { Request, Response } from 'express';
 import { loadConfig } from '../lib/env.js';
 import { logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
+import { CONTESTS_VIEW } from '../lib/tables.js';
 import { deriveSpeculationKey } from '../lib/eip712.js';
 import { SPORTS as VALID_SPORTS, isSport } from '../lib/sports.js';
 import { resolveTeamIdsForContest } from '../lib/teamIds.js';
@@ -338,7 +339,7 @@ async function getContestsRecovery(req: Request, res: Response): Promise<void> {
     }
   }
 
-  let q = sb.from('contests_effective').select(CONTEST_RECOVERY_COLUMNS).eq('network', config.network);
+  let q = sb.from(CONTESTS_VIEW).select(CONTEST_RECOVERY_COLUMNS).eq('network', config.network);
   if (contestId !== undefined) q = q.eq('contest_id', contestId);
   if (recovery.cursor) q = q.or(recoveryKeysetExpr(recovery.cursor));
   q = q.order('row_updated_at', { ascending: true }).order('id', { ascending: true }).limit(recovery.limit);
@@ -435,7 +436,7 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
   // `effective_start_time` is non-null whenever a games row exists — so
   // without this, unverified contests would newly appear in the list.
   let q = sb
-    .from('contests_effective')
+    .from(CONTESTS_VIEW)
     .select(CONTEST_LIST_COLUMNS, { count: 'exact' })
     .eq('network', config.network)
     .not('start_time', 'is', null)
@@ -535,7 +536,7 @@ export async function getContestByIdHandler(req: Request, res: Response): Promis
 
   const sb = getSupabase();
   const contestRes = await sb
-    .from('contests_effective')
+    .from(CONTESTS_VIEW)
     .select(CONTEST_DETAIL_COLUMNS)
     .eq('network', config.network)
     .eq('contest_id', contestId)
