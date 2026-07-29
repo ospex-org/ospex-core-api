@@ -38,6 +38,8 @@ const { checkDependencies, isReady, CONTESTS_VIEW } = await import('../src/lib/r
 interface SeenRequest {
   url: string;
   method: string;
+  /** `Prefer` request header — where postgrest-js puts `count`, NOT the URL. */
+  prefer: string;
 }
 
 /**
@@ -50,10 +52,14 @@ function realClientOver(handler: (method: string, url: string) => Response): {
   requests: SeenRequest[];
 } {
   const requests: SeenRequest[] = [];
-  const fetchImpl = async (input: unknown, init?: { method?: string }): Promise<Response> => {
+  const fetchImpl = async (
+    input: unknown,
+    init?: { method?: string; headers?: HeadersInit },
+  ): Promise<Response> => {
     const url = String(typeof input === 'string' ? input : (input as Request).url);
     const method = init?.method ?? (input as Request).method ?? 'GET';
-    requests.push({ url, method });
+    const prefer = new Headers(init?.headers ?? {}).get('prefer') ?? '';
+    requests.push({ url, method, prefer });
     return handler(method, url);
   };
   const client = createClient('http://readiness.test.invalid', 'test-service-role-key', {
@@ -129,9 +135,13 @@ describe('checkDependencies — the request it issues', () => {
   it('asks for no rows and no count', async () => {
     // `limit=0` keeps it row-less; an exact count would make the probe scan
     // the view on every readiness poll.
+    //
+    // NOTE `count` is negotiated in the `Prefer` REQUEST HEADER, not the query
+    // string — asserting `url` does not contain "count" is vacuous and stays
+    // green with `{ count: 'exact' }` restored. Assert the header.
     const { requests } = await probeOver(healthy);
     expect(requests[0]!.url).toContain('limit=0');
-    expect(requests[0]!.url).not.toContain('count');
+    expect(requests[0]!.prefer).not.toContain('count=');
   });
 });
 

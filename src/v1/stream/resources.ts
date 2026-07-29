@@ -170,10 +170,30 @@ export const STREAM_RESOURCES: Record<StreamResourceName, StreamResource> = {
     // through, so `id` / `row_updated_at` (and therefore the cursor, whose
     // `cursorTable` stays `contests`) are unchanged.
     //
-    // Known limitation: the poller keys on `contests.row_updated_at`, so a
-    // `games.match_time` change alone does not emit a delta on this stream —
-    // the new value is picked up on the next contest-row update or on a
-    // reconnect/catch-up.
+    // Cursor visibility of a game-only reschedule — a cross-repo dependency.
+    //
+    // The poller and the `?since=` catch-up are keyset-cursored on
+    // `contests.row_updated_at` (hence `cursorTable: 'contests'`). The view
+    // passes that column through unchanged, so on its own a write to
+    // `games.match_time` would change the SERVED `effective_start_time`
+    // without advancing the cursor: no delta on this stream, and a
+    // cursor-based reconnect would not see it either — a subscriber would
+    // hold the LATER start time indefinitely, which fails OPEN.
+    //
+    // That is closed on the WRITE side, by a trigger in the protocol
+    // indexer's schema: when `games.match_time` changes, the linked contest's
+    // `row_updated_at` is advanced, so the change becomes cursor-visible here
+    // with no change to this service. The delta is therefore emitted only
+    // where that migration has been applied — this repo cannot enforce it
+    // alone, and reads correctly but silently misses game-only reschedules
+    // against a database without it.
+    //
+    // The trigger keys on `match_time` specifically rather than on
+    // `games.row_updated_at`, because that column is bumped by many writes
+    // that change nothing contest-visible (odds flags, probable pitchers,
+    // external-id claims, final scores) — every one of which would otherwise
+    // re-deliver the contest row. `match_time` is the only `games` column
+    // feeding a contest body, producing both `matchTime` and `gameMatchTime`.
     table: 'contests_effective',
     columns: CONTEST_RECOVERY_COLUMNS,
     toBody: (row) => contestRecoveryRowToBody(row as unknown as ContestRecoveryRow),

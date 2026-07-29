@@ -725,3 +725,158 @@ describe('the contests stream resource reads the view', () => {
     expect(STREAM_RESOURCES.contests.cursorTable).toBe('contests');
   });
 });
+
+// ── a game-only reschedule must reach a cursor-based subscriber ─────────
+//
+// `matchTime` now derives from `games.match_time`, but `/v1/stream/contests`
+// and `GET /v1/contests?since=` are keyset-cursored on
+// `contests.row_updated_at`. A write that changes only `games.match_time`
+// therefore changes the SERVED value without advancing the cursor — the
+// delta is never emitted and a reconnect does not recover it, so a subscriber
+// keeps the LATER start time. That fails OPEN, which is the failure this
+// whole start-time contract exists to close.
+//
+// The write-side half lives in the protocol indexer's schema (a trigger that
+// advances the linked contest's `row_updated_at` when `games.match_time`
+// changes). What THIS service owes, and what is tested here, is that once the
+// cursor does advance, the recovery/stream path actually carries the new
+// EARLIER value through to the response body.
+//
+// The mock below applies the real keyset predicate rather than returning
+// canned rows, so the negative control is a genuine observation: a row whose
+// `row_updated_at` did not advance is filtered out by the same expression the
+// handler sends to PostgREST.
+
+describe('a game-only reschedule surfaces on ?since= once the cursor advances', () => {
+  const CURSOR_AT = '2026-05-01T10:00:00.000Z'; // client's last-seen position
+  const TOUCHED_AT = '2026-05-01T14:00:00.000Z'; // after the reschedule write
+  const ROW_ID = 9;
+
+  const ORIGINAL_START = '2026-05-04T20:00:00Z';
+  const MOVED_UP_START = '2026-05-04T18:00:00Z';
+
+  /** The contest row as the view returns it AFTER the game was moved up. */
+  function rescheduledRow(rowUpdatedAt: string): Record<string, unknown> {
+    return {
+      ...recoveryRow({
+        name: 'moved up',
+        chain: ORIGINAL_START,
+        game: MOVED_UP_START,
+        eff: MOVED_UP_START,
+        expect: {
+          matchTime: MOVED_UP_START,
+          chainStartTime: ORIGINAL_START,
+          gameMatchTime: MOVED_UP_START,
+        },
+      }),
+      id: ROW_ID,
+      row_updated_at: rowUpdatedAt,
+    };
+  }
+
+  /**
+   * A Supabase double that EVALUATES the `.or()` keyset expression against the
+   * rows, the way Postgres would. Without this the negative control would be
+   * vacuous — any canned-row mock returns the row regardless of the cursor.
+   *
+   * Parses the exact expression `keysetOrExpr` emits:
+   *   `row_updated_at.gt.<s>,and(row_updated_at.eq.<s>,id.gt.<i>)`
+   *
+   * `Date.parse` is used only HERE, to imitate Postgres timestamptz ordering
+   * over millisecond-precision fixtures. Product code must never compare
+   * cursors that way — it truncates microseconds.
+   */
+  function makeKeysetSupabase(rows: Array<Record<string, unknown>>): {
+    client: { from: (table: string) => unknown };
+    orExpressions: string[];
+  } {
+    const orExpressions: string[] = [];
+    const client = {
+      from(): unknown {
+        let filtered = rows;
+        const builder: Record<string, unknown> = {};
+        const passthrough =
+          () =>
+          (...__args: unknown[]): unknown =>
+            builder;
+        for (const m of ['select', 'eq', 'in', 'gt', 'gte', 'lte', 'not', 'order', 'range', 'limit']) {
+          builder[m] = passthrough();
+        }
+        builder['or'] = (expr: unknown): unknown => {
+          const e = String(expr);
+          orExpressions.push(e);
+          const m = /^row_updated_at\.gt\.(.+),and\(row_updated_at\.eq\.(.+),id\.gt\.(\d+)\)$/.exec(e);
+          if (!m) throw new Error(`keyset expression not recognised: ${e}`);
+          const [, gtTs, eqTs, gtId] = m;
+          const bound = Date.parse(gtTs!);
+          const eqBound = Date.parse(eqTs!);
+          const idBound = Number(gtId!);
+          filtered = filtered.filter((r) => {
+            const ts = Date.parse(String(r['row_updated_at']));
+            return ts > bound || (ts === eqBound && Number(r['id']) > idBound);
+          });
+          return builder;
+        };
+        builder['then'] = (resolve: (v: unknown) => void): void =>
+          resolve({ data: filtered, error: null });
+        return builder;
+      },
+    };
+    return { client, orExpressions };
+  }
+
+  /** Drive `GET /v1/contests?since=` with a strict `page` cursor. */
+  async function recoverSince(
+    rows: Array<Record<string, unknown>>,
+  ): Promise<{ contests: TimeFields[]; orExpressions: string[] }> {
+    const { client, orExpressions } = makeKeysetSupabase(rows);
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const cursor = encodeCursor({ t: 'contests', s: CURSOR_AT, i: String(ROW_ID), k: 'page' });
+    const res = makeRes();
+    await getContestsHandler(makeReq({ since: cursor }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    return { contests: (res.body as { contests: TimeFields[] }).contests, orExpressions };
+  }
+
+  it('the touched row comes back, and its body carries the EARLIER matchTime', async () => {
+    const { contests, orExpressions } = await recoverSince([rescheduledRow(TOUCHED_AT)]);
+
+    // Positive control: the keyset predicate really ran.
+    expect(orExpressions).toHaveLength(1);
+
+    expect(contests).toHaveLength(1);
+    const body = contests[0]!;
+    // The point of the whole exercise: the subscriber learns the game moved up.
+    expect(body.matchTime).toBe(MOVED_UP_START);
+    expect(body.matchTime < ORIGINAL_START).toBe(true);
+    // …while the raw on-chain value is unchanged and still visible beside it.
+    expect(body.chainStartTime).toBe(ORIGINAL_START);
+    expect(body.gameMatchTime).toBe(MOVED_UP_START);
+  });
+
+  it('NEGATIVE CONTROL: an un-touched row is filtered out by the strict page cursor', async () => {
+    // Exactly the reported defect. The served `effective_start_time` has ALREADY
+    // moved to the earlier time, but `contests.row_updated_at` still sits at the
+    // client's cursor — so the keyset predicate excludes it and the reschedule
+    // is invisible to a cursor-based subscriber. This is what the delta looks
+    // like without the write-side trigger, and it is why the fix has to advance
+    // `row_updated_at` rather than be implemented in this repo.
+    const { contests } = await recoverSince([rescheduledRow(CURSOR_AT)]);
+    expect(contests).toHaveLength(0);
+  });
+
+  it('the stream mapper serves the same earlier value the recovery body does', async () => {
+    // `/v1/stream/contests` shares this mapper with `?since=`, so the two
+    // cannot diverge — the SSE delta carries the moved-up time too.
+    const streamBody = STREAM_RESOURCES.contests.toBody(
+      rescheduledRow(TOUCHED_AT) as unknown as Parameters<typeof STREAM_RESOURCES.contests.toBody>[0],
+    ) as TimeFields;
+    const { contests } = await recoverSince([rescheduledRow(TOUCHED_AT)]);
+    expect(streamBody.matchTime).toBe(MOVED_UP_START);
+    expect(streamBody).toMatchObject({
+      matchTime: contests[0]!.matchTime,
+      chainStartTime: contests[0]!.chainStartTime,
+      gameMatchTime: contests[0]!.gameMatchTime,
+    });
+  });
+});
