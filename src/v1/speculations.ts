@@ -268,6 +268,10 @@ interface ContestContextRow {
   home_team: string | null;
   sport_slug: string | null;
   start_time: string | null;
+  /** `LEAST(start_time, game_match_time)` from `contests_effective`. */
+  effective_start_time: string | null;
+  /** Joined `games.match_time` from `contests_effective`. */
+  game_match_time: string | null;
   contest_status: string | null;
 }
 
@@ -319,9 +323,15 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
   // on /v1/contests/:contestId; this block is the bare minimum the SDK
   // resolver needs. `jsonodds_id` is selected (but not surfaced in the
   // response body) so we can resolve team UUIDs via the games join.
+  //
+  // Reads the `contests_effective` view so the three start-time fields arrive
+  // in one row read — see the `/v1/contests` file header for what each means.
   const ctxRes = await sb
-    .from('contests')
-    .select('contest_id, jsonodds_id, away_team, home_team, sport_slug, start_time, contest_status')
+    .from('contests_effective')
+    .select(
+      'contest_id, jsonodds_id, away_team, home_team, sport_slug, start_time, ' +
+        'effective_start_time, game_match_time, contest_status',
+    )
     .eq('network', config.network)
     .eq('contest_id', speculation.contestId)
     .maybeSingle();
@@ -347,7 +357,9 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
     awayTeamId: teamIds.awayTeamId,
     homeTeamId: teamIds.homeTeamId,
     sport: ctxRow.sport_slug ?? '',
-    matchTime: ctxRow.start_time ?? '',
+    matchTime: ctxRow.effective_start_time ?? '',
+    chainStartTime: ctxRow.start_time ?? '',
+    gameMatchTime: ctxRow.game_match_time ?? '',
     status: ctxRow.contest_status ?? '',
   };
 

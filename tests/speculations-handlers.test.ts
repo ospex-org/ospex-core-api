@@ -297,7 +297,7 @@ describe('GET /v1/speculations/:speculationId', () => {
           },
           error: null,
         },
-        contests: {
+        contests_effective: {
           data: {
             contest_id: 42,
             jsonodds_id: null,
@@ -305,6 +305,10 @@ describe('GET /v1/speculations/:speculationId', () => {
             home_team: 'Celtics',
             sport_slug: 'nba',
             start_time: '2026-05-04T01:00:00Z',
+            // No jsonodds_id → no games row joined by the view, so the game
+            // side is null and LEAST() degrades to the chain value.
+            effective_start_time: '2026-05-04T01:00:00Z',
+            game_match_time: null,
             contest_status: 'verified',
           },
           error: null,
@@ -333,7 +337,11 @@ describe('GET /v1/speculations/:speculationId', () => {
         awayTeamId: null,
         homeTeamId: null,
         sport: 'nba',
+        // With no game side, all three time fields degrade to the chain value
+        // (gameMatchTime to the `''` sentinel, never to epoch).
         matchTime: '2026-05-04T01:00:00Z',
+        chainStartTime: '2026-05-04T01:00:00Z',
+        gameMatchTime: '',
         status: 'verified',
       },
     });
@@ -356,7 +364,7 @@ describe('GET /v1/speculations/:speculationId', () => {
           },
           error: null,
         },
-        contests: {
+        contests_effective: {
           data: {
             contest_id: 2,
             jsonodds_id: null,
@@ -364,6 +372,8 @@ describe('GET /v1/speculations/:speculationId', () => {
             home_team: 'Baltimore Orioles',
             sport_slug: 'mlb',
             start_time: '2026-06-30T22:35:00Z',
+            effective_start_time: '2026-06-30T22:35:00Z',
+            game_match_time: null,
             contest_status: 'scored',
           },
           error: null,
@@ -384,7 +394,7 @@ describe('GET /v1/speculations/:speculationId', () => {
     });
   });
 
-  it('populates team_ids on the parent contest context when the games row is present', async () => {
+  it('populates team_ids and serves the EARLIER of chain/game start when the games row is present', async () => {
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabase({
         speculations: {
@@ -398,14 +408,18 @@ describe('GET /v1/speculations/:speculationId', () => {
           },
           error: null,
         },
-        contests: {
+        contests_effective: {
           data: {
             contest_id: 42,
             jsonodds_id: 'a783e37e-4ce1-4f42-9dd6-615568f73044',
             away_team: 'Lakers',
             home_team: 'Celtics',
             sport_slug: 'nba',
+            // Mode A: the game moved 50 minutes EARLIER than the frozen
+            // on-chain start, so the view's LEAST() picks the game side.
             start_time: '2026-05-04T01:00:00Z',
+            effective_start_time: '2026-05-04T00:10:00Z',
+            game_match_time: '2026-05-04T00:10:00Z',
             contest_status: 'verified',
           },
           error: null,
@@ -422,9 +436,20 @@ describe('GET /v1/speculations/:speculationId', () => {
     await getSpeculationByIdHandler(makeReq({}, { speculationId: '100' }), res as unknown as Response);
     expect(res.statusCode).toBe(200);
     const body = res.body as {
-      contest: { awayTeamId: string | null; homeTeamId: string | null };
+      contest: {
+        awayTeamId: string | null;
+        homeTeamId: string | null;
+        matchTime: string;
+        chainStartTime: string;
+        gameMatchTime: string;
+      };
     };
     expect(body.contest.awayTeamId).toBe('lakers-uuid');
     expect(body.contest.homeTeamId).toBe('celtics-uuid');
+    // Goes RED if `matchTime` reverts to serving the raw chain `start_time`.
+    expect(body.contest.matchTime).toBe('2026-05-04T00:10:00Z');
+    expect(body.contest.matchTime).not.toBe('2026-05-04T01:00:00Z');
+    expect(body.contest.chainStartTime).toBe('2026-05-04T01:00:00Z');
+    expect(body.contest.gameMatchTime).toBe('2026-05-04T00:10:00Z');
   });
 });

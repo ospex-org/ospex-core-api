@@ -11,7 +11,7 @@ Live on Polygon mainnet. The API surface today:
 - `/healthz` (liveness), `/readyz` (readiness)
 - `POST /v1/commitments` — EIP-712 commitment relay
 - `GET /v1/commitments` — list with filters / pagination
-- `GET /v1/contests`, `GET /v1/contests/:contestId` — contest list / detail (renamed from `/v1/markets/*`)
+- `GET /v1/contests`, `GET /v1/contests/:contestId` — contest list / detail (renamed from `/v1/markets/*`). Carries three start-time fields: `matchTime` (the earliest start we know of — gate on this), `chainStartTime` (the immutable on-chain value), `gameMatchTime` (the odds-feed schedule). See "Contest start times" below
 - `GET /v1/speculations`, `GET /v1/speculations/:speculationId` — speculation list (filters: `contestId`, `sport`, `status`) / detail (with orderbook + parent contest context)
 - `GET /v1/protocol/info` — static protocol metadata
 - `GET /v1/auth/domain` — EIP-712 self-discovery: the signing `domain`, every registered action's typed-field schema, and a per-endpoint map of which `action.type` each signed endpoint accepts. Copy `domain` + the action's fields straight into `wallet.signTypedData(...)`. Returns `503 NOT_READY` if `MATCHING_MODULE_ADDRESS` is unset
@@ -147,7 +147,25 @@ List upcoming contests within a configurable time window (default 72h, max 168h)
 
 Query params: `sport` (one of `nba`, `nhl`, `ncaab`, `nfl`, `mlb`), `status`, `window` (hours), `limit` (max 200), `offset`.
 
-Response: `{ contests: ContestListItem[], pagination }`. Each contest has `contestId`, team names, sport, `matchTime`, status, and a list of speculations. Each embedded speculation carries the same base shape as the `GET /v1/speculations` response (below): `speculationId`, `contestId`, `type` (`moneyline`/`spread`/`total`), `lineTicks` (raw int32, 10x format per the contracts), `line` (`lineTicks / 10`), `speculationStatus`, the settlement outcome `winSide` / `settledAt` / `voided` (see that section for the value set and the `speculationStatus === 1` ⟺ `winSide !== null` invariant), and for spread also `awayLine` / `homeLine`. The optional `closing` object that the `GET /v1/speculations` **list** endpoint attaches (below) is **not** present on embedded contest speculations.
+Response: `{ contests: ContestListItem[], pagination }`. Each contest has `contestId`, team names, sport, the three start-time fields `matchTime` / `chainStartTime` / `gameMatchTime` (see **Contest start times** below), status, and a list of speculations. Each embedded speculation carries the same base shape as the `GET /v1/speculations` response (below): `speculationId`, `contestId`, `type` (`moneyline`/`spread`/`total`), `lineTicks` (raw int32, 10x format per the contracts), `line` (`lineTicks / 10`), `speculationStatus`, the settlement outcome `winSide` / `settledAt` / `voided` (see that section for the value set and the `speculationStatus === 1` ⟺ `winSide !== null` invariant), and for spread also `awayLine` / `homeLine`. The optional `closing` object that the `GET /v1/speculations` **list** endpoint attaches (below) is **not** present on embedded contest speculations.
+
+The `window` filter and the result ordering both run on the same value served as `matchTime`, so a contest never appears in a window its own served start time falls outside. Contests with no on-chain start time yet (`unverified`) are excluded from this list, as they always have been.
+
+#### Contest start times
+
+Every contest-shaped body — `GET /v1/contests`, `GET /v1/contests?since=`, `GET /v1/stream/contests`, `GET /v1/contests/:contestId`, and the `contest` block on `GET /v1/speculations/:speculationId` — carries three time fields. All three are ISO-8601 UTC strings, or `""` when the underlying value is null.
+
+| Field | What it is |
+|---|---|
+| `matchTime` | **The earliest start time we know of** — `min(chainStartTime, gameMatchTime)`. A **conservative safety bound, not a prediction of first pitch**. Gate on this. Guaranteed `<= chainStartTime`, so off-chain gating is never more permissive than the protocol's immutable on-chain gates. |
+| `chainStartTime` | The immutable value written on-chain at verification (TheRundown's `event_date`), mirrored into `contests.start_time`. This is what the protocol's own leaderboard / live-betting gates compare against. Never changes. |
+| `gameMatchTime` | The odds-feed (JsonOdds) schedule for the same game, which tracks reschedules. `""` when no game row is linked. |
+
+A recorded start time is a **prediction**, not ground truth — real first pitch drifts in both directions, and a game that moves *earlier* than the frozen on-chain value would otherwise leave every "has it started?" check reading a time in the future. Serving the minimum is a safety rule, not a truth-recovery rule: it does not claim to know the true start, only to never be later than any start we have evidence for. Anyone who wants the last pre-game minutes on a contest whose feed time moved can read `chainStartTime` and decide for themselves.
+
+The minimum is computed in Postgres by the `contests_effective` view (a `LEAST` over a `contests` → `games` join on `(network, jsonodds_id)` — never on the `games.contest_id` back-pointer, which is not unique per contest), so it arrives in the same row read that produces the rest of the body. Every contest-shaped read in this service goes through that view; it is owned by the protocol indexer's schema and must exist before this service is deployed.
+
+> **Name collision — `/v1/contests.matchTime` and `/v1/games.matchTime` are different columns from different providers.** On `/v1/games`, `matchTime` is the raw odds-feed schedule — the same value this endpoint calls `gameMatchTime`. On the contest surfaces, `matchTime` is the minimum described above, which for a game that has never moved is the same instant but is *not* the same field. Do not compare them for equality across endpoints; compare `/v1/games.matchTime` against `gameMatchTime`.
 
 ### `GET /v1/contests/:contestId`
 
@@ -249,7 +267,7 @@ Single speculation detail with the orderbook of currently fillable commitments a
 Response: `Speculation` (as above) plus:
 
 - `orderbook: Array<CommitmentBody | CommitmentHiddenBody>` — same default filter as `GET /v1/commitments` (open/partially_filled, not invalidated, not expired), keyed on the speculation's `speculation_key`. In normal operation every entry is a full `CommitmentBody`; the union is defense-in-depth — a hidden row that ever slipped past the `book_visible=true` filter surfaces as a redacted body (`redacted: true`, `payloadAvailable: false`), matching the list/recovery/SSE redaction paths (see "Hidden-row redaction" above).
-- `contest: { contestId, awayTeam, homeTeam, awayTeamId, homeTeamId, sport, matchTime, status }` — keeps the response useful without a second fetch. `awayTeamId` / `homeTeamId` are UUIDs from the `teams` table (resolved via the `games` join — null when no game linkage exists). Source hashes / scores / lifecycle timestamps stay on the contest detail endpoint.
+- `contest: { contestId, awayTeam, homeTeam, awayTeamId, homeTeamId, sport, matchTime, chainStartTime, gameMatchTime, status }` — keeps the response useful without a second fetch. `awayTeamId` / `homeTeamId` are UUIDs from the `teams` table (resolved via the `games` join — null when no game linkage exists). The three start-time fields carry the same meanings as on `/v1/contests` (see **Contest start times** above): `matchTime` is the earliest known start and the one to gate on; `chainStartTime` is the immutable on-chain value; `gameMatchTime` is the raw odds-feed schedule. Source hashes / scores / lifecycle timestamps stay on the contest detail endpoint.
 
 ### `GET /v1/protocol/info`
 

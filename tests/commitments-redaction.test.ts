@@ -242,6 +242,10 @@ function contestDetailRow(overrides: Record<string, unknown> = {}): Record<strin
     sport_slug: 'nba',
     jsonodds_sport_id: 2,
     start_time: FUTURE,
+    // `contests_effective` view columns — no games row joined, so the game
+    // side is null and LEAST() degrades to the chain value.
+    effective_start_time: FUTURE,
+    game_match_time: null,
     contest_status: 'verified',
     away_score: null,
     home_score: null,
@@ -262,6 +266,8 @@ function contestContextRow(overrides: Record<string, unknown> = {}): Record<stri
     home_team: 'Home',
     sport_slug: 'nba',
     start_time: FUTURE,
+    effective_start_time: FUTURE,
+    game_match_time: null,
     contest_status: 'verified',
     ...overrides,
   };
@@ -558,7 +564,7 @@ describe('REDACT_HIDDEN_PUBLIC=false rollback', () => {
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabaseByTable({
         speculations: { data: specRowMoneyline(), error: null },
-        contests: { data: contestContextRow(), error: null },
+        contests_effective: { data: contestContextRow(), error: null },
         commitments: { data: [hiddenRow()], error: null },
       }),
     );
@@ -578,7 +584,7 @@ describe('REDACT_HIDDEN_PUBLIC=false rollback', () => {
     const specKey = deriveSpeculationKey(42n, SCORERS.moneyline.toLowerCase(), 0);
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabaseByTable({
-        contests: { data: contestDetailRow(), error: null },
+        contests_effective: { data: contestDetailRow(), error: null },
         speculations: { data: [specRowMoneyline()], error: null },
         commitments: { data: [hiddenRow({ speculation_key: specKey })], error: null },
       }),
@@ -674,7 +680,7 @@ describe('Leak path 6 — GET /v1/contests/:contestId orderbook embed', () => {
     const specKey = deriveSpeculationKey(42n, SCORERS.moneyline.toLowerCase(), 0);
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabaseByTable({
-        contests: { data: contestDetailRow(), error: null },
+        contests_effective: { data: contestDetailRow(), error: null },
         speculations: { data: [specRowMoneyline()], error: null },
         commitments: { data: [hiddenRow({ speculation_key: specKey })], error: null },
       }),
@@ -705,7 +711,7 @@ describe('Leak path 6 — GET /v1/contests/:contestId orderbook embed', () => {
     const hidden = hiddenRow({ commitment_hash: HIDDEN_HASH, speculation_key: specKey, signature: HIDDEN_SIG });
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabaseByTable({
-        contests: { data: contestDetailRow(), error: null },
+        contests_effective: { data: contestDetailRow(), error: null },
         speculations: { data: [specRowMoneyline()], error: null },
         commitments: { data: [visible1, hidden, visible2], error: null },
       }),
@@ -736,7 +742,7 @@ describe('Leak path 7 — GET /v1/speculations/:speculationId orderbook embed', 
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabaseByTable({
         speculations: { data: specRowMoneyline(), error: null },
-        contests: { data: contestContextRow(), error: null },
+        contests_effective: { data: contestContextRow(), error: null },
         commitments: { data: [hiddenRow()], error: null },
       }),
     );
@@ -756,7 +762,7 @@ describe('Leak path 7 — GET /v1/speculations/:speculationId orderbook embed', 
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabaseByTable({
         speculations: { data: specRowMoneyline(), error: null },
-        contests: { data: contestContextRow(), error: null },
+        contests_effective: { data: contestContextRow(), error: null },
         commitments: { data: [visibleRow({ speculation_key: specKey })], error: null },
       }),
     );

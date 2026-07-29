@@ -162,7 +162,19 @@ export const STREAM_RESOURCES: Record<StreamResourceName, StreamResource> = {
   contests: {
     name: 'contests',
     cursorTable: 'contests',
-    table: 'contests',
+    // The `contests_effective` view (contests LEFT JOIN games on
+    // `(network, jsonodds_id)`) — `CONTEST_RECOVERY_COLUMNS` selects
+    // `effective_start_time` / `game_match_time`, which exist only there, and
+    // `toBody` is a SYNCHRONOUS interface so the value has to arrive in the
+    // polled row rather than from a second lookup. The view passes `contests.*`
+    // through, so `id` / `row_updated_at` (and therefore the cursor, whose
+    // `cursorTable` stays `contests`) are unchanged.
+    //
+    // Known limitation: the poller keys on `contests.row_updated_at`, so a
+    // `games.match_time` change alone does not emit a delta on this stream —
+    // the new value is picked up on the next contest-row update or on a
+    // reconnect/catch-up.
+    table: 'contests_effective',
     columns: CONTEST_RECOVERY_COLUMNS,
     toBody: (row) => contestRecoveryRowToBody(row as unknown as ContestRecoveryRow),
     parseFilters: (req) => collect([['contestId', 'contest_id', vUint(req.query.contestId)]]),
