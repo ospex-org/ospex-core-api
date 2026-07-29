@@ -17,6 +17,7 @@ import type { Request } from 'express';
 import { isAddress } from 'ethers';
 import type { ApiError } from '../../middleware/errorHandler.js';
 import type { CursorableRow, CursorTable } from '../../lib/cursor.js';
+import { CONTESTS_VIEW } from '../../lib/tables.js';
 
 import {
   commitmentRowToPublicBody,
@@ -162,7 +163,47 @@ export const STREAM_RESOURCES: Record<StreamResourceName, StreamResource> = {
   contests: {
     name: 'contests',
     cursorTable: 'contests',
-    table: 'contests',
+    // The `contests_effective` view (contests LEFT JOIN games on
+    // `(network, jsonodds_id)`) — `CONTEST_RECOVERY_COLUMNS` selects
+    // `effective_start_time` / `game_match_time`, which exist only there, and
+    // `toBody` is a SYNCHRONOUS interface so the value has to arrive in the
+    // polled row rather than from a second lookup. The view passes `contests.*`
+    // through, so `id` / `row_updated_at` (and therefore the cursor, whose
+    // `cursorTable` stays `contests`) are unchanged.
+    //
+    // Cursor visibility of a game-only reschedule — a cross-repo dependency.
+    //
+    // The poller and the `?since=` catch-up are keyset-cursored on
+    // `contests.row_updated_at` (hence `cursorTable: 'contests'`). The view
+    // passes that column through unchanged, so on its own a write to
+    // `games.match_time` would change the SERVED `effective_start_time`
+    // without advancing the cursor: no delta on this stream, and a
+    // cursor-based reconnect would not see it either — a subscriber would
+    // hold the LATER start time indefinitely, which fails OPEN.
+    //
+    // The close is on the WRITE side and lives in ANOTHER repo: a migration in
+    // the protocol indexer's schema adds a trigger that advances the linked
+    // contest's `row_updated_at` when `games.match_time` changes, so the change
+    // becomes cursor-visible here with no change to this service. Nothing in
+    // this repo can enforce or detect that, and no test here can turn red if it
+    // is absent — so state it conditionally: WHERE that migration is applied, a
+    // game-only reschedule surfaces as an ordinary contest delta; where it is
+    // not, reads stay correct (every response recomputes from the view) but a
+    // cursor-based subscriber silently misses the reschedule until an unrelated
+    // contest-row write or a cold snapshot.
+    //
+    // What this service owes, and what IS tested here, is the other half: once
+    // the cursor does advance, the recovery/stream body carries the new earlier
+    // `matchTime` — including for a row that lands just behind a `live` cursor
+    // and is recovered by the overlap re-scan.
+    //
+    // The trigger keys on `match_time` specifically rather than on
+    // `games.row_updated_at`, because that column is bumped by many writes
+    // that change nothing contest-visible (odds flags, probable pitchers,
+    // external-id claims, final scores) — every one of which would otherwise
+    // re-deliver the contest row. `match_time` is the only `games` column
+    // feeding a contest body, producing both `matchTime` and `gameMatchTime`.
+    table: CONTESTS_VIEW,
     columns: CONTEST_RECOVERY_COLUMNS,
     toBody: (row) => contestRecoveryRowToBody(row as unknown as ContestRecoveryRow),
     parseFilters: (req) => collect([['contestId', 'contest_id', vUint(req.query.contestId)]]),

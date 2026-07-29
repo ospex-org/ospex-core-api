@@ -15,12 +15,69 @@
  * mapping (back-compat — preserves the exact wire output the prior
  * `/v1/markets` endpoint produced). New code should prefer reading
  * `speculations.market_type` directly — see `/v1/speculations*`.
+ *
+ * ## Start-time fields
+ *
+ * Contest-shaped bodies carry THREE time fields, all read from the
+ * `contests_effective` view (never computed here — see below):
+ *
+ *   - `matchTime`      — `min(chainStartTime, gameMatchTime)`, i.e. the
+ *                        EARLIEST start we know of. A conservative safety
+ *                        bound, NOT a prediction of first pitch. Gate on this.
+ *   - `chainStartTime` — the raw `contests.start_time` written on-chain at
+ *                        verification.
+ *   - `gameMatchTime`  — the raw odds-feed schedule (`games.match_time`),
+ *                        which tracks reschedules.
+ *
+ * ### The ordering guarantee, and its one exception
+ *
+ * `matchTime <= chainStartTime` holds WHENEVER `chainStartTime` is non-empty
+ * — off-chain gating is then never more permissive than the protocol's
+ * immutable on-chain gates.
+ *
+ * It does NOT hold unconditionally. `contests.start_time` is NULL between
+ * `CONTEST_CREATED` and `CONTEST_VERIFIED` — a window every contest passes
+ * through — so an unverified contest with a linked games row serves
+ * `chainStartTime: ""` alongside a non-empty `matchTime`. A comparison that
+ * does not first check `chainStartTime !== ''` is false for exactly that
+ * window. The list endpoint excludes those rows; the detail, recovery, and
+ * stream surfaces do not. Any consumer gate must read:
+ *
+ *     chainStartTime === '' || matchTime <= chainStartTime
+ *
+ * For the same reason `chainStartTime` is not immutable-from-first-sight: it
+ * transitions once, from `""` to its on-chain value, when the contest is
+ * verified. After that the protocol never rewrites it.
+ *
+ * The recorded start time is a PREDICTION, not ground truth. `min(...)` is
+ * a SAFETY rule, not a truth-recovery rule — it does not "serve the correct
+ * time", it serves the earliest time we have any evidence for.
+ *
+ * The minimum is computed in Postgres by the `contests_effective` view
+ * (`LEAST(c.start_time, g.match_time)` over a `(network, jsonodds_id)`
+ * join — never over the `games.contest_id` back-pointer, which is not unique
+ * per contest). It is deliberately NOT computed in JS: doing it in the DB
+ * keeps `contestRecoveryRowToBody` synchronous (`StreamResource.toBody` is a
+ * sync interface called from the SSE poller), lets the list endpoint filter
+ * and order on the value at the DB layer, and avoids a `Date.parse`
+ * comparison that would truncate `timestamptz` microseconds.
+ *
+ * The view is owned by the protocol indexer's schema; this service only reads
+ * it, and every contest-shaped read here goes through it. It must exist before
+ * this service is deployed — otherwise every contest query fails at the DB
+ * layer.
+ *
+ * NOTE: `/v1/contests.matchTime` and `/v1/games.matchTime` are DIFFERENT
+ * columns from different providers. `games.matchTime` is the raw odds-feed
+ * schedule (equal to `gameMatchTime` here for the same game); a contest's
+ * `matchTime` is the min described above. Do not assume they agree.
  */
 
 import type { Request, Response } from 'express';
 import { loadConfig } from '../lib/env.js';
 import { logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
+import { CONTESTS_VIEW } from '../lib/tables.js';
 import { deriveSpeculationKey } from '../lib/eip712.js';
 import { SPORTS as VALID_SPORTS, isSport } from '../lib/sports.js';
 import { resolveTeamIdsForContest } from '../lib/teamIds.js';
@@ -55,7 +112,12 @@ interface ContestBody {
   homeTeam: string;
   sport: string;
   sportId: number;
+  /** Earliest known start — `min(chainStartTime, gameMatchTime)`. See the file header. */
   matchTime: string;
+  /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
+  chainStartTime: string;
+  /** Raw odds-feed schedule (`games.match_time`), joined on `(network, jsonodds_id)`. */
+  gameMatchTime: string;
   status: string;
 }
 
@@ -107,6 +169,21 @@ interface ContestDetail extends ContestBody {
   speculations: SpeculationDetail[];
 }
 
+/** Explicit row shape for the list query (see the cast in getContestsHandler). */
+interface ContestListRow {
+  contest_id: string | number;
+  away_team: string | null;
+  home_team: string | null;
+  sport_slug: string | null;
+  jsonodds_sport_id: number | null;
+  start_time: string | null;
+  /** `LEAST(start_time, game_match_time)` from `contests_effective`. */
+  effective_start_time: string | null;
+  /** Joined `games.match_time` from `contests_effective`. */
+  game_match_time: string | null;
+  contest_status: string | null;
+}
+
 /**
  * Explicit row shape for the detail query. Supabase's inference gives
  * up at this column count and falls back to `GenericStringError`, so
@@ -127,6 +204,10 @@ interface ContestDetailRow {
   sport_slug: string | null;
   jsonodds_sport_id: number | null;
   start_time: string | null;
+  /** `LEAST(start_time, game_match_time)` from `contests_effective`. */
+  effective_start_time: string | null;
+  /** Joined `games.match_time` from `contests_effective`. */
+  game_match_time: string | null;
   contest_status: string | null;
   away_score: number | null;
   home_score: number | null;
@@ -150,6 +231,10 @@ export interface ContestRecoveryRow extends CursorableRow {
   sport_slug: string | null;
   jsonodds_sport_id: number | null;
   start_time: string | null;
+  /** `LEAST(start_time, game_match_time)` from `contests_effective`. */
+  effective_start_time: string | null;
+  /** Joined `games.match_time` from `contests_effective`. */
+  game_match_time: string | null;
   contest_status: string | null;
   away_score: number | null;
   home_score: number | null;
@@ -165,7 +250,12 @@ export interface ContestRecoveryBody {
   homeTeam: string;
   sport: string;
   sportId: number;
+  /** Earliest known start — `min(chainStartTime, gameMatchTime)`. See the file header. */
   matchTime: string;
+  /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
+  chainStartTime: string;
+  /** Raw odds-feed schedule (`games.match_time`), joined on `(network, jsonodds_id)`. */
+  gameMatchTime: string;
   status: string;
   awayScore: number | null;
   homeScore: number | null;
@@ -175,8 +265,32 @@ export interface ContestRecoveryBody {
   contestCreatedAt: string | null;
 }
 
+// ── column lists ────────────────────────────────────────────────────────
+//
+// PostgREST projects to exactly the columns named here — an omitted column
+// arrives as `undefined`, which the mappers below turn into the `''` sentinel
+// rather than an error. Dropping `effective_start_time` would therefore serve
+// `matchTime: ""` silently, and a consumer that parses that gets NaN. Every
+// contest-shaped list is named so the query shape is assertable in tests; keep
+// all three time columns in each.
+
+/** `GET /v1/contests` (list). */
+const CONTEST_LIST_COLUMNS =
+  'contest_id, away_team, home_team, sport_slug, jsonodds_sport_id, start_time, ' +
+  'effective_start_time, game_match_time, contest_status';
+
+/** `GET /v1/contests/:contestId` (detail). */
+const CONTEST_DETAIL_COLUMNS =
+  'contest_id, jsonodds_id, rundown_id, sportspage_id, contest_creator, league_id, ' +
+  'verify_source_hash, market_update_source_hash, score_contest_source_hash, ' +
+  'away_team, home_team, sport_slug, jsonodds_sport_id, start_time, ' +
+  'effective_start_time, game_match_time, contest_status, ' +
+  'away_score, home_score, contest_created_at, verified_at, scored_at, voided_at';
+
+/** `GET /v1/contests?since=` (recovery) AND `GET /v1/stream/contests`. */
 export const CONTEST_RECOVERY_COLUMNS =
   'contest_id, away_team, home_team, sport_slug, jsonodds_sport_id, start_time, ' +
+  'effective_start_time, game_match_time, ' +
   'contest_status, away_score, home_score, verified_at, scored_at, voided_at, ' +
   'contest_created_at, id, row_updated_at';
 
@@ -187,7 +301,12 @@ export function contestRecoveryRowToBody(c: ContestRecoveryRow): ContestRecovery
     homeTeam: c.home_team ?? '',
     sport: c.sport_slug ?? '',
     sportId: c.jsonodds_sport_id ?? 0,
-    matchTime: c.start_time ?? '',
+    // The min arrives pre-computed from the view — this mapper stays sync
+    // (it is `StreamResource.toBody` for the contests SSE resource) and never
+    // parses a timestamp.
+    matchTime: c.effective_start_time ?? '',
+    chainStartTime: c.start_time ?? '',
+    gameMatchTime: c.game_match_time ?? '',
     status: c.contest_status ?? '',
     awayScore: c.away_score ?? null,
     homeScore: c.home_score ?? null,
@@ -220,7 +339,7 @@ async function getContestsRecovery(req: Request, res: Response): Promise<void> {
     }
   }
 
-  let q = sb.from('contests').select(CONTEST_RECOVERY_COLUMNS).eq('network', config.network);
+  let q = sb.from(CONTESTS_VIEW).select(CONTEST_RECOVERY_COLUMNS).eq('network', config.network);
   if (contestId !== undefined) q = q.eq('contest_id', contestId);
   if (recovery.cursor) q = q.or(recoveryKeysetExpr(recovery.cursor));
   q = q.order('row_updated_at', { ascending: true }).order('id', { ascending: true }).limit(recovery.limit);
@@ -305,13 +424,25 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
   const now = new Date().toISOString();
   const upper = new Date(Date.now() + windowHours * 3600_000).toISOString();
 
+  // The window filter + ordering run on `effective_start_time`, the same value
+  // served as `matchTime`, so the endpoint never returns a row whose served
+  // start falls outside its own window. Consequence for a moved-up contest: it
+  // drops out of the listing at the EARLIER time and a run-loop consumer
+  // untracks it, rather than keeping it listed until the frozen chain time.
+  //
+  // `.not('start_time', 'is', null)` preserves a pre-existing behaviour that
+  // would otherwise silently change: `.gte('start_time', now)` excluded rows
+  // with a NULL `start_time` (an unverified contest), and
+  // `effective_start_time` is non-null whenever a games row exists — so
+  // without this, unverified contests would newly appear in the list.
   let q = sb
-    .from('contests')
-    .select('contest_id, away_team, home_team, sport_slug, jsonodds_sport_id, start_time, contest_status', { count: 'exact' })
+    .from(CONTESTS_VIEW)
+    .select(CONTEST_LIST_COLUMNS, { count: 'exact' })
     .eq('network', config.network)
-    .gte('start_time', now)
-    .lte('start_time', upper)
-    .order('start_time', { ascending: true })
+    .not('start_time', 'is', null)
+    .gte('effective_start_time', now)
+    .lte('effective_start_time', upper)
+    .order('effective_start_time', { ascending: true })
     .range(offset, offset + limit - 1);
 
   if (sportFilter) q = q.eq('sport_slug', sportFilter);
@@ -324,7 +455,10 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
     return;
   }
 
-  const contests = contestsRes.data ?? [];
+  // Supabase's select-string inference gives up at this column count and
+  // falls back to `GenericStringError`, so narrow with an explicit row shape
+  // at the consumer — same pattern as `ContestDetailRow` below.
+  const contests = (contestsRes.data ?? []) as unknown as ContestListRow[];
   const total = contestsRes.count ?? 0;
   if (contests.length === 0) {
     res.status(200).json({
@@ -363,7 +497,9 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
     homeTeam: c.home_team ?? '',
     sport: c.sport_slug ?? '',
     sportId: c.jsonodds_sport_id ?? 0,
-    matchTime: c.start_time ?? '',
+    matchTime: c.effective_start_time ?? '',
+    chainStartTime: c.start_time ?? '',
+    gameMatchTime: c.game_match_time ?? '',
     status: c.contest_status ?? '',
     speculations: specsByContest.get(String(c.contest_id)) ?? [],
   }));
@@ -400,13 +536,8 @@ export async function getContestByIdHandler(req: Request, res: Response): Promis
 
   const sb = getSupabase();
   const contestRes = await sb
-    .from('contests')
-    .select(
-      'contest_id, jsonodds_id, rundown_id, sportspage_id, contest_creator, league_id, ' +
-        'verify_source_hash, market_update_source_hash, score_contest_source_hash, ' +
-        'away_team, home_team, sport_slug, jsonodds_sport_id, start_time, contest_status, ' +
-        'away_score, home_score, contest_created_at, verified_at, scored_at, voided_at',
-    )
+    .from(CONTESTS_VIEW)
+    .select(CONTEST_DETAIL_COLUMNS)
     .eq('network', config.network)
     .eq('contest_id', contestId)
     .maybeSingle();
@@ -504,7 +635,9 @@ export async function getContestByIdHandler(req: Request, res: Response): Promis
     homeTeam: c.home_team ?? '',
     sport: c.sport_slug ?? '',
     sportId: c.jsonodds_sport_id ?? 0,
-    matchTime: c.start_time ?? '',
+    matchTime: c.effective_start_time ?? '',
+    chainStartTime: c.start_time ?? '',
+    gameMatchTime: c.game_match_time ?? '',
     status: c.contest_status ?? '',
     awayScore: c.away_score ?? null,
     homeScore: c.home_score ?? null,

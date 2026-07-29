@@ -3,8 +3,9 @@ import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
 import { loadConfig } from './lib/env.js';
-import { logger, formatError } from './lib/logger.js';
-import { getSupabase } from './lib/supabase.js';
+import { logger } from './lib/logger.js';
+import { checkDependencies, isReady } from './lib/readiness.js';
+import type { ContestsViewReadiness, SupabaseReadiness } from './lib/readiness.js';
 import { asyncHandler } from './middleware/asyncHandler.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { v1Router } from './v1/router.js';
@@ -24,7 +25,13 @@ interface ReadinessResponse {
   service: 'ospex-core-api';
   network: 'polygon' | 'amoy';
   chainId: 137 | 80002;
-  supabase: { connected: boolean; error?: string };
+  supabase: SupabaseReadiness;
+  /**
+   * Presence of the `contests_effective` view. Reported separately from
+   * `supabase.connected` because the view is created by an indexer migration
+   * and can be absent while Postgres is healthy — see lib/readiness.ts.
+   */
+  contestsView: ContestsViewReadiness;
   commitments: { configured: boolean; missing?: string[] };
   uptimeSeconds: number;
   timestamp: string;
@@ -38,29 +45,6 @@ function checkCommitmentsConfig(
   if (!config.scorers) missing.push('SCORER_*_ADDRESS');
   if (missing.length === 0) return { configured: true };
   return { configured: false, missing };
-}
-
-async function checkSupabase(): Promise<{ connected: boolean; error?: string }> {
-  try {
-    const sb = getSupabase();
-    // Lightweight ping: HEAD-style query. The chosen table doesn't have to
-    // exist for this scaffold — any PostgREST response (including a 404 for
-    // a missing table) proves we reached the service. We treat network-level
-    // errors as "not connected" and PostgREST table-existence errors as
-    // "connected" since they confirm round-trip.
-    const { error } = await sb
-      .from('contests')
-      .select('contest_id', { head: true, count: 'exact' })
-      .limit(0);
-    if (!error) return { connected: true };
-    // PostgREST "table not found" still proves connectivity
-    if (error.code === 'PGRST205' || error.code === '42P01') {
-      return { connected: true };
-    }
-    return { connected: false, error: error.message };
-  } catch (err) {
-    return { connected: false, error: formatError(err) };
-  }
 }
 
 function buildApp(config: ReturnType<typeof loadConfig>): express.Express {
@@ -107,15 +91,17 @@ function buildApp(config: ReturnType<typeof loadConfig>): express.Express {
   app.get(
     '/readyz',
     asyncHandler(async (_req: Request, res: Response) => {
-      const supabase = await checkSupabase();
+      const deps = await checkDependencies();
+      const { supabase, contestsView } = deps;
       const commitments = checkCommitmentsConfig(config);
-      const ok = supabase.connected && commitments.configured;
+      const ok = isReady(deps, commitments);
       const body: ReadinessResponse = {
         ok,
         service: 'ospex-core-api',
         network: config.network,
         chainId: config.chainId,
         supabase,
+        contestsView,
         commitments,
         uptimeSeconds: Math.round(process.uptime()),
         timestamp: new Date().toISOString(),

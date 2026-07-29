@@ -114,7 +114,19 @@ export interface SpeculationParentContext {
   awayTeamId: string | null;
   homeTeamId: string | null;
   sport: string;
+  /**
+   * Earliest known start — `min(chainStartTime, gameMatchTime)`. A
+   * conservative safety bound, NOT a prediction of first pitch; gate on this.
+   * `<= chainStartTime` whenever `chainStartTime` is non-empty — but NOT when
+   * it is `''` (the unverified window), so a consumer gate must read
+   * `chainStartTime === '' || matchTime <= chainStartTime`. See the
+   * `/v1/contests` file header for the full three-field contract.
+   */
   matchTime: string;
+  /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
+  chainStartTime: string;
+  /** Raw odds-feed schedule (`games.match_time`), joined on `(network, jsonodds_id)`. */
+  gameMatchTime: string;
   status: string;
 }
 

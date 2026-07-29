@@ -27,12 +27,26 @@
  * for symmetry with the other two IDs.
  *
  * `canCreateContest` is computed: all three external IDs present AND
- * `contest_created = false` AND `status = 'upcoming'`. Status is part
- * of the predicate because the schema admits `live | final | postponed |
- * cancelled` — without the status check, a postponed game with all IDs
- * would still report as creatable. The default `availableOnly=true`
- * applies the same predicate as a DB filter so the list view never
- * includes uncreatable rows.
+ * `contest_created = false` AND `status = 'upcoming'`. The default
+ * `availableOnly=true` applies the same predicate as a DB filter so the
+ * list view matches the computed flag.
+ *
+ * CAVEAT — the `status` term is INERT as of this writing. The schema admits
+ * `live | final | postponed | cancelled`, but a production sweep on
+ * 2026-07-29 found all 1200 rows reading `'upcoming'`, including 212 with
+ * final scores and 7 with `final_type = 'Postponed'`. No writer observed in
+ * the swept repos updates the column. So the check excludes nothing today
+ * and a postponed game still reports `canCreateContest: true`. The column
+ * that actually carries the postponement signal is `games.final_type`
+ * (`'Postponed'` / `'Finished'`), which this endpoint does not select.
+ *
+ * This is a snapshot, not a guarantee: populating `games.status` from the
+ * upstream in-play signal is a proposed writer change. If that lands, this
+ * term and the `availableOnly` DB filter below both become live and
+ * `/v1/games` output changes — including values that external preflight
+ * tooling compares by exact equality. Tightening the predicate onto
+ * `final_type` is a deliberate follow-up, not part of this change, for the
+ * same reason.
  *
  * `probablePitchers` is advisory supplemental context (MLB only): the
  * probable/announced starters as last reported by the upstream odds feed,
@@ -135,6 +149,12 @@ function buildTeamLookup(rows: TeamDbRow[]): Map<string, TeamInfo> {
 
 const FALLBACK_TEAM: TeamInfo = { name: 'Unknown', abbreviation: '???' };
 
+/**
+ * All three external IDs present AND not already created AND `status ===
+ * 'upcoming'`. The status term is inert against production data as of this
+ * writing — see the file header for why, and why fixing it is a separate
+ * change.
+ */
 function computeCanCreateContest(row: GamesDbRow): boolean {
   return (
     row.sportspage_id !== null &&
@@ -258,9 +278,11 @@ export async function getGamesHandler(req: Request, res: Response): Promise<void
 
   // The DB has no single "available" boolean; emulate canCreateContest
   // server-side so callers don't have to filter client-side AND so we
-  // don't return rows that would be wasted page-fill. Status check
-  // ('upcoming') is required — without it, a postponed/cancelled game
-  // with all three IDs would still pass the filter.
+  // don't return rows that would be wasted page-fill. The `status`
+  // ('upcoming') term mirrors computeCanCreateContest so the filter and the
+  // flag agree — but as of this writing no production row carries a
+  // non-'upcoming' status (see the file header), so it excludes nothing today
+  // and a postponed game is still returned.
   if (availableOnly) {
     q = q
       .not('sportspage_id', 'is', null)

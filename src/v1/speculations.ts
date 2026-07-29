@@ -24,6 +24,7 @@ import type { Request, Response } from 'express';
 import { loadConfig } from '../lib/env.js';
 import { logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
+import { CONTESTS_VIEW } from '../lib/tables.js';
 import { deriveSpeculationKey } from '../lib/eip712.js';
 import { SPORTS as VALID_SPORTS, isSport } from '../lib/sports.js';
 import { resolveTeamIdsForContest } from '../lib/teamIds.js';
@@ -261,6 +262,15 @@ export async function getSpeculationsHandler(req: Request, res: Response): Promi
 
 // ── GET /v1/speculations/:speculationId ────────────────────────────────
 
+/**
+ * Parent-contest context columns, read from the `contests_effective` view.
+ * PostgREST projects to exactly what is named here, so all three time columns
+ * must stay in this list — dropping one serves the `''` sentinel silently.
+ */
+const CONTEST_CONTEXT_COLUMNS =
+  'contest_id, jsonodds_id, away_team, home_team, sport_slug, start_time, ' +
+  'effective_start_time, game_match_time, contest_status';
+
 interface ContestContextRow {
   contest_id: string | number;
   jsonodds_id: string | null;
@@ -268,6 +278,10 @@ interface ContestContextRow {
   home_team: string | null;
   sport_slug: string | null;
   start_time: string | null;
+  /** `LEAST(start_time, game_match_time)` from `contests_effective`. */
+  effective_start_time: string | null;
+  /** Joined `games.match_time` from `contests_effective`. */
+  game_match_time: string | null;
   contest_status: string | null;
 }
 
@@ -319,9 +333,12 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
   // on /v1/contests/:contestId; this block is the bare minimum the SDK
   // resolver needs. `jsonodds_id` is selected (but not surfaced in the
   // response body) so we can resolve team UUIDs via the games join.
+  //
+  // Reads the `contests_effective` view so the three start-time fields arrive
+  // in one row read — see the `/v1/contests` file header for what each means.
   const ctxRes = await sb
-    .from('contests')
-    .select('contest_id, jsonodds_id, away_team, home_team, sport_slug, start_time, contest_status')
+    .from(CONTESTS_VIEW)
+    .select(CONTEST_CONTEXT_COLUMNS)
     .eq('network', config.network)
     .eq('contest_id', speculation.contestId)
     .maybeSingle();
@@ -347,7 +364,9 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
     awayTeamId: teamIds.awayTeamId,
     homeTeamId: teamIds.homeTeamId,
     sport: ctxRow.sport_slug ?? '',
-    matchTime: ctxRow.start_time ?? '',
+    matchTime: ctxRow.effective_start_time ?? '',
+    chainStartTime: ctxRow.start_time ?? '',
+    gameMatchTime: ctxRow.game_match_time ?? '',
     status: ctxRow.contest_status ?? '',
   };
 

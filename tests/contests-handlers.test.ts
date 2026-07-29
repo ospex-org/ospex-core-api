@@ -87,6 +87,7 @@ function makeSupabase(tables: Record<string, MockResponse | MockResponse[]>): {
         gt: () => builder,
         gte: () => builder,
         lte: () => builder,
+        not: () => builder,
         order: () => builder,
         range: () => builder,
         limit: () => builder,
@@ -116,7 +117,7 @@ describe('GET /v1/contests', () => {
   it('returns 200 with embedded speculations grouped per contest', async () => {
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabase({
-        contests: {
+        contests_effective: {
           data: [
             {
               contest_id: 42,
@@ -125,6 +126,8 @@ describe('GET /v1/contests', () => {
               sport_slug: 'nba',
               jsonodds_sport_id: 1,
               start_time: '2026-05-04T01:00:00Z',
+              effective_start_time: '2026-05-04T01:00:00Z',
+              game_match_time: '2026-05-04T01:00:00Z',
               contest_status: 'verified',
             },
           ],
@@ -180,7 +183,7 @@ describe('GET /v1/contests/:contestId', () => {
   it('returns 404 NOT_FOUND when the contest row does not exist', async () => {
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabase({
-        contests: { data: null, error: null },
+        contests_effective: { data: null, error: null },
       }),
     );
 
@@ -193,7 +196,7 @@ describe('GET /v1/contests/:contestId', () => {
   it('returns 200 with the contest detail block + speculations[].orderbook populated', async () => {
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabase({
-        contests: {
+        contests_effective: {
           data: {
             contest_id: 42,
             jsonodds_id: 'a783e37e-4ce1-4f42-9dd6-615568f73044',
@@ -209,6 +212,8 @@ describe('GET /v1/contests/:contestId', () => {
             sport_slug: 'nba',
             jsonodds_sport_id: 1,
             start_time: '2026-05-04T01:00:00Z',
+            effective_start_time: '2026-05-04T01:00:00Z',
+            game_match_time: '2026-05-04T01:00:00Z',
             contest_status: 'verified',
             away_score: null,
             home_score: null,
@@ -265,7 +270,7 @@ describe('GET /v1/contests/:contestId', () => {
   it('populates awayTeamId / homeTeamId when the games row is present', async () => {
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabase({
-        contests: {
+        contests_effective: {
           data: {
             contest_id: 42,
             jsonodds_id: 'a783e37e-4ce1-4f42-9dd6-615568f73044',
@@ -281,6 +286,8 @@ describe('GET /v1/contests/:contestId', () => {
             sport_slug: 'nba',
             jsonodds_sport_id: 1,
             start_time: '2026-05-04T01:00:00Z',
+            effective_start_time: '2026-05-04T01:00:00Z',
+            game_match_time: '2026-05-04T01:00:00Z',
             contest_status: 'verified',
             away_score: null,
             home_score: null,
@@ -314,7 +321,7 @@ describe('GET /v1/contests/:contestId', () => {
   it('degrades awayTeamId / homeTeamId to null on games-side errors', async () => {
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabase({
-        contests: {
+        contests_effective: {
           data: {
             contest_id: 42,
             jsonodds_id: 'a783e37e-4ce1-4f42-9dd6-615568f73044',
@@ -330,6 +337,8 @@ describe('GET /v1/contests/:contestId', () => {
             sport_slug: 'nba',
             jsonodds_sport_id: 1,
             start_time: '2026-05-04T01:00:00Z',
+            effective_start_time: '2026-05-04T01:00:00Z',
+            game_match_time: '2026-05-04T01:00:00Z',
             contest_status: 'verified',
             away_score: null,
             home_score: null,
