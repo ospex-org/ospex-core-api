@@ -23,14 +23,31 @@
  *
  *   - `matchTime`      — `min(chainStartTime, gameMatchTime)`, i.e. the
  *                        EARLIEST start we know of. A conservative safety
- *                        bound, NOT a prediction of first pitch. Gate on
- *                        this. Guaranteed `<= chainStartTime`, so off-chain
- *                        gating is never more permissive than the protocol's
- *                        immutable on-chain gates.
- *   - `chainStartTime` — the raw immutable `contests.start_time` written
- *                        on-chain at verification. Never changes.
+ *                        bound, NOT a prediction of first pitch. Gate on this.
+ *   - `chainStartTime` — the raw `contests.start_time` written on-chain at
+ *                        verification.
  *   - `gameMatchTime`  — the raw odds-feed schedule (`games.match_time`),
  *                        which tracks reschedules.
+ *
+ * ### The ordering guarantee, and its one exception
+ *
+ * `matchTime <= chainStartTime` holds WHENEVER `chainStartTime` is non-empty
+ * — off-chain gating is then never more permissive than the protocol's
+ * immutable on-chain gates.
+ *
+ * It does NOT hold unconditionally. `contests.start_time` is NULL between
+ * `CONTEST_CREATED` and `CONTEST_VERIFIED` — a window every contest passes
+ * through — so an unverified contest with a linked games row serves
+ * `chainStartTime: ""` alongside a non-empty `matchTime`. A comparison that
+ * does not first check `chainStartTime !== ''` is false for exactly that
+ * window. The list endpoint excludes those rows; the detail, recovery, and
+ * stream surfaces do not. Any consumer gate must read:
+ *
+ *     chainStartTime === '' || matchTime <= chainStartTime
+ *
+ * For the same reason `chainStartTime` is not immutable-from-first-sight: it
+ * transitions once, from `""` to its on-chain value, when the contest is
+ * verified. After that the protocol never rewrites it.
  *
  * The recorded start time is a PREDICTION, not ground truth. `min(...)` is
  * a SAFETY rule, not a truth-recovery rule — it does not "serve the correct
@@ -96,7 +113,7 @@ interface ContestBody {
   sportId: number;
   /** Earliest known start — `min(chainStartTime, gameMatchTime)`. See the file header. */
   matchTime: string;
-  /** Raw immutable on-chain start (`contests.start_time`). */
+  /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
   chainStartTime: string;
   /** Raw odds-feed schedule (`games.match_time`), joined on `(network, jsonodds_id)`. */
   gameMatchTime: string;
@@ -234,7 +251,7 @@ export interface ContestRecoveryBody {
   sportId: number;
   /** Earliest known start — `min(chainStartTime, gameMatchTime)`. See the file header. */
   matchTime: string;
-  /** Raw immutable on-chain start (`contests.start_time`). */
+  /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
   chainStartTime: string;
   /** Raw odds-feed schedule (`games.match_time`), joined on `(network, jsonodds_id)`. */
   gameMatchTime: string;
@@ -247,6 +264,29 @@ export interface ContestRecoveryBody {
   contestCreatedAt: string | null;
 }
 
+// ── column lists ────────────────────────────────────────────────────────
+//
+// PostgREST projects to exactly the columns named here — an omitted column
+// arrives as `undefined`, which the mappers below turn into the `''` sentinel
+// rather than an error. Dropping `effective_start_time` would therefore serve
+// `matchTime: ""` silently, and a consumer that parses that gets NaN. Every
+// contest-shaped list is named so the query shape is assertable in tests; keep
+// all three time columns in each.
+
+/** `GET /v1/contests` (list). */
+const CONTEST_LIST_COLUMNS =
+  'contest_id, away_team, home_team, sport_slug, jsonodds_sport_id, start_time, ' +
+  'effective_start_time, game_match_time, contest_status';
+
+/** `GET /v1/contests/:contestId` (detail). */
+const CONTEST_DETAIL_COLUMNS =
+  'contest_id, jsonodds_id, rundown_id, sportspage_id, contest_creator, league_id, ' +
+  'verify_source_hash, market_update_source_hash, score_contest_source_hash, ' +
+  'away_team, home_team, sport_slug, jsonodds_sport_id, start_time, ' +
+  'effective_start_time, game_match_time, contest_status, ' +
+  'away_score, home_score, contest_created_at, verified_at, scored_at, voided_at';
+
+/** `GET /v1/contests?since=` (recovery) AND `GET /v1/stream/contests`. */
 export const CONTEST_RECOVERY_COLUMNS =
   'contest_id, away_team, home_team, sport_slug, jsonodds_sport_id, start_time, ' +
   'effective_start_time, game_match_time, ' +
@@ -396,11 +436,7 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
   // without this, unverified contests would newly appear in the list.
   let q = sb
     .from('contests_effective')
-    .select(
-      'contest_id, away_team, home_team, sport_slug, jsonodds_sport_id, start_time, ' +
-        'effective_start_time, game_match_time, contest_status',
-      { count: 'exact' },
-    )
+    .select(CONTEST_LIST_COLUMNS, { count: 'exact' })
     .eq('network', config.network)
     .not('start_time', 'is', null)
     .gte('effective_start_time', now)
@@ -500,13 +536,7 @@ export async function getContestByIdHandler(req: Request, res: Response): Promis
   const sb = getSupabase();
   const contestRes = await sb
     .from('contests_effective')
-    .select(
-      'contest_id, jsonodds_id, rundown_id, sportspage_id, contest_creator, league_id, ' +
-        'verify_source_hash, market_update_source_hash, score_contest_source_hash, ' +
-        'away_team, home_team, sport_slug, jsonodds_sport_id, start_time, ' +
-        'effective_start_time, game_match_time, contest_status, ' +
-        'away_score, home_score, contest_created_at, verified_at, scored_at, voided_at',
-    )
+    .select(CONTEST_DETAIL_COLUMNS)
     .eq('network', config.network)
     .eq('contest_id', contestId)
     .maybeSingle();

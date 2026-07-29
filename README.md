@@ -68,7 +68,7 @@ curl http://localhost:3000/readyz    # readiness — 200 when always-required de
 ## Health endpoints
 
 - `/healthz` — **liveness**. The process is up and the event loop is responsive. Always returns 200. Heroku/uptime monitors should target this — restarting the dyno doesn't fix a downstream outage, so we don't fail liveness when Supabase is down.
-- `/readyz` — **readiness**. The process is up *and* its required dependencies are reachable. Returns 503 if Supabase is unreachable so traffic routers / smoke tests can avoid sending requests that would fail.
+- `/readyz` — **readiness**. The process is up *and* its required dependencies are reachable. Returns 503 if Supabase is unreachable, or if the `contests_effective` view every contest-shaped read depends on is absent, so traffic routers / smoke tests can avoid sending requests that would fail.
 
 ## Endpoints
 
@@ -151,17 +151,31 @@ Response: `{ contests: ContestListItem[], pagination }`. Each contest has `conte
 
 The `window` filter and the result ordering both run on the same value served as `matchTime`, so a contest never appears in a window its own served start time falls outside. Contests with no on-chain start time yet (`unverified`) are excluded from this list, as they always have been.
 
+Because the window bounds the *minimum*, a contest's listing lifetime is coupled to the odds feed as well as the chain: a `gameMatchTime` that moves into the past drops the contest out of this list even though its `chainStartTime` is still hours away. That is the intended fail-closed direction — a consumer stops quoting rather than quoting into a live game — but it does mean a bad feed value can retire a market early. `GET /v1/contests/:contestId` is unfiltered and still returns the contest, with all three fields, for anyone who needs to tell the two cases apart.
+
 #### Contest start times
 
 Every contest-shaped body — `GET /v1/contests`, `GET /v1/contests?since=`, `GET /v1/stream/contests`, `GET /v1/contests/:contestId`, and the `contest` block on `GET /v1/speculations/:speculationId` — carries three time fields. All three are ISO-8601 UTC strings, or `""` when the underlying value is null.
 
 | Field | What it is |
 |---|---|
-| `matchTime` | **The earliest start time we know of** — `min(chainStartTime, gameMatchTime)`. A **conservative safety bound, not a prediction of first pitch**. Gate on this. Guaranteed `<= chainStartTime`, so off-chain gating is never more permissive than the protocol's immutable on-chain gates. |
-| `chainStartTime` | The immutable value written on-chain at verification (TheRundown's `event_date`), mirrored into `contests.start_time`. This is what the protocol's own leaderboard / live-betting gates compare against. Never changes. |
+| `matchTime` | **The earliest start time we know of** — `min(chainStartTime, gameMatchTime)`. A **conservative safety bound, not a prediction of first pitch**. Gate on this. `<= chainStartTime` whenever `chainStartTime` is non-empty (see the ordering guarantee below), so off-chain gating is never more permissive than the protocol's own on-chain gates. |
+| `chainStartTime` | The value written on-chain at verification (TheRundown's `event_date`), mirrored into `contests.start_time`. This is what the protocol's own leaderboard / live-betting gates compare against. `""` until the contest is verified; once set, the protocol never rewrites it. |
 | `gameMatchTime` | The odds-feed (JsonOdds) schedule for the same game, which tracks reschedules. `""` when no game row is linked. |
 
 A recorded start time is a **prediction**, not ground truth — real first pitch drifts in both directions, and a game that moves *earlier* than the frozen on-chain value would otherwise leave every "has it started?" check reading a time in the future. Serving the minimum is a safety rule, not a truth-recovery rule: it does not claim to know the true start, only to never be later than any start we have evidence for. Anyone who wants the last pre-game minutes on a contest whose feed time moved can read `chainStartTime` and decide for themselves.
+
+##### The ordering guarantee, and its one exception
+
+`matchTime <= chainStartTime` holds **whenever `chainStartTime` is non-empty**. It is **not** unconditional.
+
+`contests.start_time` is null between contest creation and contest verification — a window every contest passes through — so an **unverified** contest that already has a linked game row serves `chainStartTime: ""` next to a non-empty `matchTime`. A naive `matchTime <= chainStartTime` string comparison is `false` for exactly that window. `GET /v1/contests` (the list) excludes those rows, but the detail, `?since=` recovery, and `/v1/stream/contests` surfaces do **not**. Write the check as:
+
+```
+chainStartTime === '' || matchTime <= chainStartTime
+```
+
+Both values are ISO-8601 `…Z`, so lexicographic comparison equals chronological comparison and no date parsing is needed — which is also the safer choice, since `Date.parse` truncates the underlying `timestamptz` to milliseconds.
 
 The minimum is computed in Postgres by the `contests_effective` view (a `LEAST` over a `contests` → `games` join on `(network, jsonodds_id)` — never on the `games.contest_id` back-pointer, which is not unique per contest), so it arrives in the same row read that produces the rest of the body. Every contest-shaped read in this service goes through that view; it is owned by the protocol indexer's schema and must exist before this service is deployed.
 
@@ -613,12 +627,12 @@ The stream-auth challenge store is **in-memory, per-process**. A challenge minte
 ```bash
 URL=https://ospex-core-api-195f635df864.herokuapp.com
 curl -s "$URL/healthz"            # 200 + service / network / chainId
-curl -s "$URL/readyz"              # 200 only when supabase.connected and commitments.configured
+curl -s "$URL/readyz"              # 200 only when supabase.connected, contestsView.present and commitments.configured
 curl -s "$URL/v1/protocol/info"    # mainnet contract addresses
 curl -s "$URL/v1/contests"         # paginated list (empty until indexer ingests data)
 ```
 
-`/readyz` checks the always-required dependencies: Supabase reachability + EIP-712 relay env config for `POST /v1/commitments`. It does **not** include stream-auth readiness — those endpoints are opt-in at the operator level and surface their own `503 NOT_READY` per call when `STREAM_AUTH_HMAC_SECRET` / `STREAM_AUTH_AUDIENCE` / `MATCHING_MODULE_ADDRESS` are unset.
+`/readyz` checks the always-required dependencies: Supabase reachability, presence of the `contests_effective` view, and EIP-712 relay env config for `POST /v1/commitments`. The view is reported as its own `contestsView: { present, error? }` block rather than folded into `supabase` — it is created by a migration in the protocol indexer's schema, so it can be missing while Postgres is perfectly healthy, and every contest-shaped read depends on it. A PostgREST "relation not found" response therefore reports `supabase.connected: true` and `contestsView.present: false`, and readiness fails on the second term. It does **not** include stream-auth readiness — those endpoints are opt-in at the operator level and surface their own `503 NOT_READY` per call when `STREAM_AUTH_HMAC_SECRET` / `STREAM_AUTH_AUDIENCE` / `MATCHING_MODULE_ADDRESS` are unset.
 
 ## Project conventions
 

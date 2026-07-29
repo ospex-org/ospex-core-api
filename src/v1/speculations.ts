@@ -261,6 +261,15 @@ export async function getSpeculationsHandler(req: Request, res: Response): Promi
 
 // ── GET /v1/speculations/:speculationId ────────────────────────────────
 
+/**
+ * Parent-contest context columns, read from the `contests_effective` view.
+ * PostgREST projects to exactly what is named here, so all three time columns
+ * must stay in this list — dropping one serves the `''` sentinel silently.
+ */
+const CONTEST_CONTEXT_COLUMNS =
+  'contest_id, jsonodds_id, away_team, home_team, sport_slug, start_time, ' +
+  'effective_start_time, game_match_time, contest_status';
+
 interface ContestContextRow {
   contest_id: string | number;
   jsonodds_id: string | null;
@@ -328,10 +337,7 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
   // in one row read — see the `/v1/contests` file header for what each means.
   const ctxRes = await sb
     .from('contests_effective')
-    .select(
-      'contest_id, jsonodds_id, away_team, home_team, sport_slug, start_time, ' +
-        'effective_start_time, game_match_time, contest_status',
-    )
+    .select(CONTEST_CONTEXT_COLUMNS)
     .eq('network', config.network)
     .eq('contest_id', speculation.contestId)
     .maybeSingle();
