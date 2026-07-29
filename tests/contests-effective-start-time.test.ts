@@ -505,20 +505,24 @@ describe('every contest-shaped query selects all three time columns', () => {
     for (const col of TIME_COLUMNS) expect(cols).toContain(col);
   });
 
-  it('negative control: a column NOT requested is absent from the served body', async () => {
-    // Proves the projection is live — without it the assertions above would be
-    // decorative and a dropped select column would still serve the right value.
-    const { client } = makeRecordingSupabase({
-      contests_effective: { data: [{ ...listRow(CASES[0]!), not_requested: 'x' }], error: null, count: 1 },
-      speculations: { data: [], error: null },
-    });
-    supabaseMock.getSupabase.mockReturnValue(client);
-    const res = makeRes();
-    await getContestsHandler(makeReq({ limit: '10' }), res as unknown as Response);
-    const row = (res.body as { contests: Array<Record<string, unknown>> }).contests[0]!;
-    expect(row['not_requested']).toBeUndefined();
-    // …and the requested columns still made it through.
-    expect(row['matchTime']).toBe(CASES[0]!.expect.matchTime);
+  it('MOCK SELF-CHECK: the projector really drops unrequested keys', () => {
+    // Asserts the test double, not product code — labelled so it is not
+    // mistaken for a product guarantee. Its purpose is to keep the projection
+    // honest: without it, the matrix above would pass on a query that had
+    // stopped selecting the column, because the mock would hand back a field
+    // nobody asked for.
+    //
+    // A response-body negative control CANNOT show this: the handlers build
+    // their bodies key by key, so an unrequested row column never reaches the
+    // wire either way. (An earlier draft of this test tried exactly that and
+    // was vacuous — it stayed green with the projection disabled.) The
+    // product-level proof is a mutation: dropping a column from a select
+    // string turns the matrix red even with these name assertions skipped.
+    const cols = new Set(['a', 'b']);
+    expect(projectRow({ a: 1, b: 2, c: 3 }, cols)).toEqual({ a: 1, b: 2 });
+    expect(projectRow([{ a: 1, c: 3 }], cols)).toEqual([{ a: 1 }]);
+    // `null` cols = "don't project" (a `*` or embedded select) — pass through.
+    expect(projectRow({ a: 1, c: 3 }, null)).toEqual({ a: 1, c: 3 });
   });
 });
 
