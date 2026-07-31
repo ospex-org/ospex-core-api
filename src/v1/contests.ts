@@ -21,9 +21,15 @@
  * Contest-shaped bodies carry THREE time fields, all read from the
  * `contests_effective` view (never computed here — see below):
  *
- *   - `matchTime`      — `min(chainStartTime, gameMatchTime)`, i.e. the
- *                        EARLIEST start we know of. A conservative safety
- *                        bound, NOT a prediction of first pitch. Gate on this.
+ *   - `matchTime`      — the EARLIEST start we know of: the minimum over
+ *                        `chainStartTime`, `gameMatchTime`, AND the game's
+ *                        monotone floor (a THIRD input, not served as a
+ *                        field). A conservative safety bound, NOT a
+ *                        prediction of first pitch. Gate on this.
+ *                        Because the floor is unexposed, `matchTime` can sit
+ *                        strictly BELOW both published fields after a feed
+ *                        rollback — correct, and deliberately not following
+ *                        the feed back up.
  *   - `chainStartTime` — the raw `contests.start_time` written on-chain at
  *                        verification.
  *   - `gameMatchTime`  — the raw odds-feed schedule (`games.match_time`),
@@ -54,7 +60,8 @@
  * time", it serves the earliest time we have any evidence for.
  *
  * The minimum is computed in Postgres by the `contests_effective` view
- * (`LEAST(c.start_time, g.match_time)` over a `(network, jsonodds_id)`
+ * (`LEAST(c.start_time, g.match_time, g.earliest_match_time)` over a
+ * `(network, jsonodds_id)`
  * join — never over the `games.contest_id` back-pointer, which is not unique
  * per contest). It is deliberately NOT computed in JS: doing it in the DB
  * keeps `contestRecoveryRowToBody` synchronous (`StreamResource.toBody` is a
@@ -112,7 +119,8 @@ interface ContestBody {
   homeTeam: string;
   sport: string;
   sportId: number;
-  /** Earliest known start — `min(chainStartTime, gameMatchTime)`. See the file header. */
+  /** Earliest known start — the min over chain start, feed schedule, and the
+   *  game's unexposed monotone floor. See the file header. */
   matchTime: string;
   /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
   chainStartTime: string;
@@ -177,7 +185,8 @@ interface ContestListRow {
   sport_slug: string | null;
   jsonodds_sport_id: number | null;
   start_time: string | null;
-  /** `LEAST(start_time, game_match_time)` from `contests_effective`. */
+  /** `LEAST(start_time, game_match_time, game_earliest_match_time)` from
+   *  `contests_effective` — three inputs; the third is the monotone floor. */
   effective_start_time: string | null;
   /** Joined `games.match_time` from `contests_effective`. */
   game_match_time: string | null;
@@ -204,7 +213,8 @@ interface ContestDetailRow {
   sport_slug: string | null;
   jsonodds_sport_id: number | null;
   start_time: string | null;
-  /** `LEAST(start_time, game_match_time)` from `contests_effective`. */
+  /** `LEAST(start_time, game_match_time, game_earliest_match_time)` from
+   *  `contests_effective` — three inputs; the third is the monotone floor. */
   effective_start_time: string | null;
   /** Joined `games.match_time` from `contests_effective`. */
   game_match_time: string | null;
@@ -231,7 +241,8 @@ export interface ContestRecoveryRow extends CursorableRow {
   sport_slug: string | null;
   jsonodds_sport_id: number | null;
   start_time: string | null;
-  /** `LEAST(start_time, game_match_time)` from `contests_effective`. */
+  /** `LEAST(start_time, game_match_time, game_earliest_match_time)` from
+   *  `contests_effective` — three inputs; the third is the monotone floor. */
   effective_start_time: string | null;
   /** Joined `games.match_time` from `contests_effective`. */
   game_match_time: string | null;
@@ -250,7 +261,8 @@ export interface ContestRecoveryBody {
   homeTeam: string;
   sport: string;
   sportId: number;
-  /** Earliest known start — `min(chainStartTime, gameMatchTime)`. See the file header. */
+  /** Earliest known start — the min over chain start, feed schedule, and the
+   *  game's unexposed monotone floor. See the file header. */
   matchTime: string;
   /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
   chainStartTime: string;

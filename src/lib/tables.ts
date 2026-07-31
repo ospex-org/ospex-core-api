@@ -15,8 +15,15 @@
 
 /**
  * `contests` LEFT JOIN `games` on `(network, jsonodds_id)`, projecting
- * `effective_start_time = LEAST(contests.start_time, games.match_time)` and
- * the raw `game_match_time` alongside `contests.*`.
+ * `effective_start_time = LEAST(contests.start_time, games.match_time,
+ * games.earliest_match_time)` and the raw `game_match_time` alongside
+ * `contests.*`.
+ *
+ * THREE inputs, not two. The third is the game's MONOTONE FLOOR — the
+ * earliest start the game was ever recorded with, which no schedule write can
+ * raise. Without it the bound is not monotone: `games.match_time` moves in
+ * both directions, so a feed rollback would lift `effective_start_time` back
+ * up and reopen a gate that had already closed.
  *
  * Every contest-shaped read in this service goes through it. It is created by
  * a migration in the protocol indexer's schema, so it can be absent while
