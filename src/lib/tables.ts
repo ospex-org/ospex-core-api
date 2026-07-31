@@ -15,8 +15,23 @@
 
 /**
  * `contests` LEFT JOIN `games` on `(network, jsonodds_id)`, projecting
- * `effective_start_time = LEAST(contests.start_time, games.match_time)` and
- * the raw `game_match_time` alongside `contests.*`.
+ * `effective_start_time = LEAST(contests.start_time, games.match_time,
+ * games.earliest_match_time)` and the raw `game_match_time` alongside
+ * `contests.*`.
+ *
+ * THREE inputs, not two. The third is the game's CURRENT RETAINED SAFETY
+ * FLOOR. Without it the bound is not stable: `games.match_time` moves in both
+ * directions, so a feed rollback would lift `effective_start_time` back up and
+ * reopen a gate that had already closed.
+ *
+ * ⚠ STATE THE GUARANTEE AT ITS ACTUAL WIDTH. What the schema enforces is that
+ * ORDINARY schedule writes cannot raise the floor (the trigger recomputes it
+ * from the prior value on any write touching `match_time`). It is not an
+ * absolute: an explicit floor-only operator remedy CAN raise it, an insert may
+ * supply the initial floor, a delete-then-reinsert reseeds it, and exactly ONE
+ * value is retained — it is not a history of every start this game was ever
+ * scheduled at. Nothing served here should be read as proving when, why, or
+ * from which source a start moved.
  *
  * Every contest-shaped read in this service goes through it. It is created by
  * a migration in the protocol indexer's schema, so it can be absent while

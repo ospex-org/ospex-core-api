@@ -196,15 +196,25 @@ function selectArg(calls: RecordedCall[], table: string, nth = 0): string {
 
 // ── the matrix ──────────────────────────────────────────────────────────
 //
-// `eff` is what Postgres `LEAST(start_time, game_match_time)` returns for the
-// pair (LEAST ignores NULLs; it is NULL only when both are). The expectations
-// are written out as literals rather than derived, so a mapping bug can't be
-// masked by a shared helper.
+// `eff` is what Postgres
+// `LEAST(start_time, game_match_time, game_earliest_match_time)` returns for
+// the TRIPLE (LEAST ignores NULLs; it is NULL only when all three are). The
+// expectations are written out as literals rather than derived, so a mapping
+// bug can't be masked by a shared helper.
+//
+// THE FLOOR IS A MODELLED INPUT, NOT A SERVED FIELD. `game_earliest_match_time`
+// is a third input to the view's LEAST since ospex-indexer migration 070, and
+// core-api does not expose it. That is exactly why it has to be modelled here:
+// without it the matrix cannot express the one shape that distinguishes the
+// three-input derivation from the obsolete two-input one — `matchTime` strictly
+// below BOTH published fields. See FLOOR_BELOW_BOTH_CASE.
 
 interface TimeCase {
   name: string;
   chain: string | null;
   game: string | null;
+  /** `games.earliest_match_time` — the current retained safety floor. */
+  floor: string | null;
   eff: string | null;
   expect: { matchTime: string; chainStartTime: string; gameMatchTime: string };
 }
@@ -214,6 +224,7 @@ const CASES: TimeCase[] = [
     name: 'game EARLIER than chain (Mode A move-up) → serves the game time',
     chain: '2026-05-04T01:00:00Z',
     game: '2026-05-04T00:10:00Z',
+    floor: '2026-05-04T00:10:00Z',
     eff: '2026-05-04T00:10:00Z',
     expect: {
       matchTime: '2026-05-04T00:10:00Z',
@@ -225,6 +236,7 @@ const CASES: TimeCase[] = [
     name: 'game LATER than chain (reschedule) → serves the chain time',
     chain: '2026-05-04T01:00:00Z',
     game: '2026-05-04T02:45:00Z',
+    floor: '2026-05-04T02:45:00Z',
     eff: '2026-05-04T01:00:00Z',
     expect: {
       matchTime: '2026-05-04T01:00:00Z',
@@ -236,6 +248,7 @@ const CASES: TimeCase[] = [
     name: 'chain and game AGREE',
     chain: '2026-05-04T01:00:00Z',
     game: '2026-05-04T01:00:00Z',
+    floor: '2026-05-04T01:00:00Z',
     eff: '2026-05-04T01:00:00Z',
     expect: {
       matchTime: '2026-05-04T01:00:00Z',
@@ -247,6 +260,7 @@ const CASES: TimeCase[] = [
     name: 'NO games row joined → degrades to the chain time, gameMatchTime is the "" sentinel',
     chain: '2026-05-04T01:00:00Z',
     game: null,
+    floor: null,
     eff: '2026-05-04T01:00:00Z',
     expect: {
       matchTime: '2026-05-04T01:00:00Z',
@@ -258,6 +272,7 @@ const CASES: TimeCase[] = [
     name: 'NULL chain start (unverified) with a games row → degrades to the game time',
     chain: null,
     game: '2026-05-04T02:00:00Z',
+    floor: '2026-05-04T02:00:00Z',
     eff: '2026-05-04T02:00:00Z',
     expect: {
       matchTime: '2026-05-04T02:00:00Z',
@@ -269,19 +284,58 @@ const CASES: TimeCase[] = [
     name: 'BOTH null → all three are the "" sentinel, never an epoch date',
     chain: null,
     game: null,
+    floor: null,
     eff: null,
     expect: { matchTime: '', chainStartTime: '', gameMatchTime: '' },
+  },
+  {
+    // THE DIAGNOSTIC ROW. The retained floor is below BOTH published fields, so
+    // the served `matchTime` is strictly lower than `chainStartTime` AND
+    // `gameMatchTime`. A two-input LEAST(chain, game) returns 02:00 here and
+    // gets this wrong; only the three-input derivation returns 01:00.
+    //
+    // Reachable in production after a feed rollback: the floor keeps the
+    // earlier observation while `match_time` moves back up to meet the chain.
+    name: 'FLOOR below BOTH published fields → matchTime is lower than chainStartTime AND gameMatchTime',
+    chain: '2026-05-04T02:00:00Z',
+    game: '2026-05-04T02:00:00Z',
+    floor: '2026-05-04T01:00:00Z',
+    eff: '2026-05-04T01:00:00Z',
+    expect: {
+      matchTime: '2026-05-04T01:00:00Z',
+      chainStartTime: '2026-05-04T02:00:00Z',
+      gameMatchTime: '2026-05-04T02:00:00Z',
+    },
   },
 ];
 
 /** The one case that falsifies a naive `matchTime <= chainStartTime`. */
 const UNVERIFIED_CASE = CASES[4]!;
 
-/** Fixture sanity: each case's `eff` really is LEAST(chain, game). Not a product guarantee. */
-function leastOf(a: string | null, b: string | null): string | null {
-  if (a === null) return b;
-  if (b === null) return a;
-  return a <= b ? a : b;
+/**
+ * The only case that can tell the THREE-input derivation from the obsolete
+ * TWO-input one: the retained floor sits strictly below both published fields,
+ * so `matchTime < chainStartTime` AND `matchTime < gameMatchTime`.
+ *
+ * Every other row in the matrix returns the same answer under either formula,
+ * which is why the suite went on asserting `LEAST(chain, game)` long after the
+ * view became three-input. The live contest-85 example is non-diagnostic for
+ * the same reason — its chain value is already the minimum.
+ */
+const FLOOR_BELOW_BOTH_CASE = CASES[6]!;
+
+/**
+ * Fixture sanity: each case's `eff` really is `LEAST(...)` over the inputs it
+ * declares. Variadic because the view's LEAST is variadic — pinning it at two
+ * arguments is what let the stale contract survive. Not a product guarantee.
+ */
+function leastOf(...values: Array<string | null>): string | null {
+  let min: string | null = null;
+  for (const v of values) {
+    if (v === null) continue;
+    if (min === null || v < min) min = v;
+  }
+  return min;
 }
 
 // ── row builders (shapes the view returns) ──────────────────────────────
@@ -459,8 +513,20 @@ const SURFACES: Array<{ name: string; run: (c: TimeCase) => Promise<SurfaceRun> 
 // ── the sweep ───────────────────────────────────────────────────────────
 
 describe('start-time fields — matrix across every contest-shaped surface', () => {
-  it('every fixture encodes LEAST(chain, game) correctly (fixture self-check)', () => {
-    for (const c of CASES) expect(leastOf(c.chain, c.game)).toBe(c.eff);
+  it('every fixture encodes LEAST(chain, game, floor) correctly (fixture self-check)', () => {
+    for (const c of CASES) expect(leastOf(c.chain, c.game, c.floor)).toBe(c.eff);
+  });
+
+  it('the floor case is DIAGNOSTIC — a two-input LEAST(chain, game) would disagree', () => {
+    // Without this the floor row could be added with a floor that never binds
+    // and the matrix would still pass under the obsolete formula, which is
+    // exactly the state this suite was in before.
+    const c = FLOOR_BELOW_BOTH_CASE;
+    expect(leastOf(c.chain, c.game, c.floor)).toBe(c.eff);
+    expect(leastOf(c.chain, c.game)).not.toBe(c.eff);
+    // And it is the shape the README documents: strictly below BOTH.
+    expect(c.expect.matchTime < c.expect.chainStartTime).toBe(true);
+    expect(c.expect.matchTime < c.expect.gameMatchTime).toBe(true);
   });
 
   for (const c of CASES) {
@@ -641,6 +707,7 @@ describe('the games join key is jsonodds_id — never the poisoned games.contest
     name: 'stale-pointer guard',
     chain: '2026-05-04T01:00:00Z',
     game: '2026-05-04T00:10:00Z',
+    floor: '2026-05-04T00:10:00Z',
     eff: '2026-05-04T00:10:00Z',
     expect: {
       matchTime: '2026-05-04T00:10:00Z',
@@ -785,6 +852,7 @@ describe('a game-only reschedule surfaces on ?since= once the cursor advances', 
         name: 'moved up',
         chain: ORIGINAL_START,
         game: MOVED_UP_START,
+        floor: MOVED_UP_START,
         eff: MOVED_UP_START,
         expect: {
           matchTime: MOVED_UP_START,

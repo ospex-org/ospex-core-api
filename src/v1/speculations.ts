@@ -278,7 +278,8 @@ interface ContestContextRow {
   home_team: string | null;
   sport_slug: string | null;
   start_time: string | null;
-  /** `LEAST(start_time, game_match_time)` from `contests_effective`. */
+  /** `LEAST(start_time, game_match_time, game_earliest_match_time)` from
+   *  `contests_effective` — three inputs; the third is the current retained safety floor. */
   effective_start_time: string | null;
   /** Joined `games.match_time` from `contests_effective`. */
   game_match_time: string | null;
