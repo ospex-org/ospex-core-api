@@ -154,11 +154,7 @@ function makeRes(): { statusCode: number; body: unknown; status: (c: number) => 
 async function fetchGames(rows: RawGameRow[]): Promise<{ games: WireGame[]; selects: Record<string, string> }> {
   const { selects } = makeSupabase(rows);
   const res = makeRes();
-  await getGamesHandler(
-    { query: {} } as never,
-    res as never,
-    (() => undefined) as never,
-  );
+  await getGamesHandler({ query: {} } as never, res as never);
   const body = res.body as { games: WireGame[] };
   return { games: body.games, selects };
 }
@@ -288,5 +284,47 @@ describe('GET /v1/games — unparseable input degrades to the raw value', () => 
       gameRow({ match_time: 'nope', earliest_match_time: 'also-nope' }),
     ]);
     expect(games[0]?.matchTime).toBe('nope');
+  });
+});
+
+describe('GET /v1/games — the minimum is taken at microsecond resolution', () => {
+  // Both columns are timestamptz, which Postgres stores and PostgREST renders at
+  // microseconds. `Date.parse` truncates to milliseconds and would map these two
+  // onto the same number, failing to see the floor as the minimum. Same defect
+  // class as ospex-writer#20's blocker, fixed here before it was reported.
+  it('serves a floor that is one MICROSECOND below match_time', async () => {
+    const { games } = await fetchGames([
+      gameRow({
+        match_time: '2026-07-31T00:15:00.000001+00:00',
+        earliest_match_time: '2026-07-31T00:15:00.000000+00:00',
+      }),
+    ]);
+    expect(games[0]?.matchTime).toBe('2026-07-31T00:15:00.000000+00:00');
+  });
+
+  it('NEGATIVE CONTROL — one microsecond ABOVE match_time is not the minimum', async () => {
+    const { games } = await fetchGames([
+      gameRow({
+        match_time: '2026-07-31T00:15:00.000000+00:00',
+        earliest_match_time: '2026-07-31T00:15:00.000001+00:00',
+      }),
+    ]);
+    expect(games[0]?.matchTime).toBe('2026-07-31T00:15:00.000000+00:00');
+  });
+
+  // Strict grammar: Date.parse accepted both of these and produced a usable
+  // instant, so a malformed floor could have won the comparison.
+  it('a calendar-impossible floor is ignored rather than normalised', async () => {
+    const { games } = await fetchGames([
+      gameRow({ match_time: LATER, earliest_match_time: '2026-02-30T00:00:00Z' }),
+    ]);
+    expect(games[0]?.matchTime).toBe(LATER);
+  });
+
+  it('a floor with no zone designator is ignored rather than read as server-local', async () => {
+    const { games } = await fetchGames([
+      gameRow({ match_time: LATER, earliest_match_time: '2026-07-30T23:10:00' }),
+    ]);
+    expect(games[0]?.matchTime).toBe(LATER);
   });
 });

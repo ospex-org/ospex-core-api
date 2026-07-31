@@ -170,22 +170,71 @@ const GAMES_SELECT =
  * today (0 nulls of 1227), but a null must degrade to `match_time` rather than
  * to `null`, which would erase the field for every affected row.
  *
- * Unparseable input degrades to `match_time` too, and does so through the
- * comparison rather than a separate guard: `Date.parse` yields NaN, and every
- * `<` against NaN is false, so the expression already falls through to
- * `matchTime`. An explicit `Number.isFinite` check here was removed after a
- * mutation battery showed no test could turn it red — it was dead code
- * restating what the comparison already does. The behaviour it described is
- * asserted directly instead.
+ * Unparseable input degrades to `match_time`, which is the safe direction here:
+ * this endpoint must still serve a start time, so a value it cannot read is
+ * ignored rather than allowed to produce a bound.
  *
- * The comparison is on INSTANTS, not strings. `2026-07-30T20:10:00-05:00` sorts
- * before `2026-07-31T00:15:00+00:00` lexicographically while being the LATER
- * instant, so a string compare would serve a start an hour earlier than the
- * real one.
+ * The comparison is on INSTANTS, not strings, and at MICROSECOND resolution.
+ * Both columns are `timestamptz`, which Postgres stores and PostgREST renders
+ * at microseconds; `Date.parse` truncates to milliseconds and maps
+ * `…00.000000Z` and `…00.000001Z` onto the same number, so a floor a
+ * microsecond below `match_time` would not be detected as the minimum. It is
+ * also far too permissive for this to reject anything: `2026-02-30T00:00:00Z`
+ * is silently normalised to March 2, and a timestamp with no zone designator is
+ * read in the SERVER'S LOCAL time, which is a different instant per deployment.
+ *
+ * String comparison is wrong for a second reason: `2026-07-30T20:10:00-05:00`
+ * sorts before `2026-07-31T00:15:00+00:00` lexicographically while being the
+ * LATER instant, so it would serve a start an hour earlier than the real one.
+ *
+ * The parser is the same shape as ospex-writer's `parseTimestampMicros`,
+ * deliberately duplicated rather than shared: these are separate deployables
+ * with no common package, and a copied 30-line grammar is cheaper than a
+ * dependency between them.
  */
+const RFC3339 =
+  /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(?:([Zz])|([+-])(\d{2}):(\d{2}))$/;
+
+function parseTimestampMicros(iso: string): bigint | null {
+  const m = RFC3339.exec(iso);
+  if (m === null) return null;
+  const [, yS, moS, dS, hS, miS, sS, fracS, zulu, sign, offHS, offMS] = m;
+  const y = Number(yS);
+  const mo = Number(moS);
+  const d = Number(dS);
+  const h = Number(hS);
+  const mi = Number(miS);
+  const s = Number(sS);
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+  if (h > 23 || mi > 59 || s > 59) return null;
+  // Beyond timestamptz resolution; truncating would move the value EARLIER.
+  if (fracS !== undefined && fracS.length > 6) return null;
+  const micros = fracS === undefined ? 0 : Number(fracS.padEnd(6, '0'));
+  const baseMs = Date.UTC(y, mo - 1, d, h, mi, s);
+  if (!Number.isFinite(baseMs)) return null;
+  // Date.UTC ROLLS OVER an impossible day (Feb 30 -> Mar 2); this rejects it.
+  const rt = new Date(baseMs);
+  if (rt.getUTCFullYear() !== y || rt.getUTCMonth() !== mo - 1 || rt.getUTCDate() !== d) {
+    return null;
+  }
+  let total = BigInt(baseMs) * 1000n + BigInt(micros);
+  if (zulu === undefined) {
+    const offH = Number(offHS);
+    const offM = Number(offMS);
+    if (offH > 23 || offM > 59) return null;
+    const offsetMicros = BigInt((offH * 60 + offM) * 60_000_000);
+    // Fields are wall-clock at that offset; the instant is fields - offset.
+    total += sign === '-' ? offsetMicros : -offsetMicros;
+  }
+  return total;
+}
+
 function effectiveMatchTime(matchTime: string, earliest: string | null): string {
   if (earliest === null) return matchTime;
-  return Date.parse(earliest) < Date.parse(matchTime) ? earliest : matchTime;
+  const e = parseTimestampMicros(earliest);
+  const m = parseTimestampMicros(matchTime);
+  if (e === null || m === null) return matchTime;
+  return e < m ? earliest : matchTime;
 }
 
 function parseBoolParam(raw: string | undefined): boolean | 'invalid' | undefined {
