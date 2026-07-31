@@ -115,7 +115,7 @@ export interface SpeculationParentContext {
   homeTeamId: string | null;
   sport: string;
   /**
-   * Earliest known start — the minimum over `chainStartTime`,
+   * Current conservative start-time safety bound — the minimum over `chainStartTime`,
    * `gameMatchTime`, and the game's unexposed retained safety floor. A
    * conservative safety bound, NOT a prediction of first pitch; gate on this.
    * `<= chainStartTime` whenever `chainStartTime` is non-empty — but NOT when

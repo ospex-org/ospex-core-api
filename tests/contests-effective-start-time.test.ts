@@ -707,6 +707,7 @@ describe('the games join key is jsonodds_id — never the poisoned games.contest
     name: 'stale-pointer guard',
     chain: '2026-05-04T01:00:00Z',
     game: '2026-05-04T00:10:00Z',
+    floor: '2026-05-04T00:10:00Z',
     eff: '2026-05-04T00:10:00Z',
     expect: {
       matchTime: '2026-05-04T00:10:00Z',
@@ -851,6 +852,7 @@ describe('a game-only reschedule surfaces on ?since= once the cursor advances', 
         name: 'moved up',
         chain: ORIGINAL_START,
         game: MOVED_UP_START,
+        floor: MOVED_UP_START,
         eff: MOVED_UP_START,
         expect: {
           matchTime: MOVED_UP_START,

@@ -11,7 +11,7 @@ Live on Polygon mainnet. The API surface today:
 - `/healthz` (liveness), `/readyz` (readiness)
 - `POST /v1/commitments` — EIP-712 commitment relay
 - `GET /v1/commitments` — list with filters / pagination
-- `GET /v1/contests`, `GET /v1/contests/:contestId` — contest list / detail (renamed from `/v1/markets/*`). Carries three start-time fields: `matchTime` (the earliest start we know of — gate on this), `chainStartTime` (the immutable on-chain value), `gameMatchTime` (the odds-feed schedule). See "Contest start times" below
+- `GET /v1/contests`, `GET /v1/contests/:contestId` — contest list / detail (renamed from `/v1/markets/*`). Carries three start-time fields: `matchTime` (the current conservative start-time safety bound — gate on this), `chainStartTime` (the immutable on-chain value), `gameMatchTime` (the odds-feed schedule). See "Contest start times" below
 - `GET /v1/speculations`, `GET /v1/speculations/:speculationId` — speculation list (filters: `contestId`, `sport`, `status`) / detail (with orderbook + parent contest context)
 - `GET /v1/protocol/info` — static protocol metadata
 - `GET /v1/auth/domain` — EIP-712 self-discovery: the signing `domain`, every registered action's typed-field schema, and a per-endpoint map of which `action.type` each signed endpoint accepts. Copy `domain` + the action's fields straight into `wallet.signTypedData(...)`. Returns `503 NOT_READY` if `MATCHING_MODULE_ADDRESS` is unset
@@ -159,7 +159,7 @@ Every contest-shaped body — `GET /v1/contests`, `GET /v1/contests?since=`, `GE
 
 | Field | What it is |
 |---|---|
-| `matchTime` | **The earliest start time we know of** — the minimum over **three** inputs: `chainStartTime`, `gameMatchTime`, and a current retained safety floor on the game's schedule that is not itself served as a field (see below). A **conservative safety bound, not a prediction of first pitch**. Gate on this. `<= chainStartTime` whenever `chainStartTime` is non-empty (see the ordering guarantee below), so off-chain gating is never more permissive than the protocol's own on-chain gates. |
+| `matchTime` | **The current conservative start-time safety bound** — the minimum over **three** inputs: `chainStartTime`, `gameMatchTime`, and a current retained safety floor on the game's schedule that is not itself served as a field (see below). It is **not a prediction of first pitch**. Gate on this. `<= chainStartTime` whenever `chainStartTime` is non-empty (see the ordering guarantee below), so off-chain gating is never more permissive than the protocol's own on-chain gates. |
 | `chainStartTime` | The value written on-chain at verification (TheRundown's `event_date`), mirrored into `contests.start_time`. This is what the protocol's own leaderboard / live-betting gates compare against. `""` until the contest is verified; once set, the protocol never rewrites it. |
 | `gameMatchTime` | The odds-feed (JsonOdds) schedule for the same game, which tracks reschedules **in both directions**. `""` when no game row is linked. |
 
@@ -179,7 +179,7 @@ A consumer seeing it should read it as exactly what it is: **the retained floor 
 
 The floor closes the rollback hole. It does not detect a start that moved earlier without anything upstream noticing.
 
-A recorded start time is a **prediction**, not ground truth — real first pitch drifts in both directions, and a game that moves *earlier* than the frozen on-chain value would otherwise leave every "has it started?" check reading a time in the future. Serving the minimum is a safety rule, not a truth-recovery rule: it does not claim to know the true start, only to never be later than any start we have evidence for. Anyone who wants the last pre-game minutes on a contest whose feed time moved can read `chainStartTime` and decide for themselves.
+A recorded start time is a **prediction**, not ground truth — real first pitch drifts in both directions, and a game that moves *earlier* than the frozen on-chain value would otherwise leave every "has it started?" check reading a time in the future. Serving the minimum is a safety rule, not a truth-recovery rule: it does not claim to know the true start; it serves the minimum of the three current retained inputs described above. Anyone who wants the last pre-game minutes on a contest whose feed time moved can read `chainStartTime` and decide for themselves.
 
 ##### The ordering guarantee, and its one exception
 
@@ -309,7 +309,7 @@ Single speculation detail with the orderbook of currently fillable commitments a
 Response: `Speculation` (as above) plus:
 
 - `orderbook: Array<CommitmentBody | CommitmentHiddenBody>` — same default filter as `GET /v1/commitments` (open/partially_filled, not invalidated, not expired), keyed on the speculation's `speculation_key`. In normal operation every entry is a full `CommitmentBody`; the union is defense-in-depth — a hidden row that ever slipped past the `book_visible=true` filter surfaces as a redacted body (`redacted: true`, `payloadAvailable: false`), matching the list/recovery/SSE redaction paths (see "Hidden-row redaction" above).
-- `contest: { contestId, awayTeam, homeTeam, awayTeamId, homeTeamId, sport, matchTime, chainStartTime, gameMatchTime, status }` — keeps the response useful without a second fetch. `awayTeamId` / `homeTeamId` are UUIDs from the `teams` table (resolved via the `games` join — null when no game linkage exists). The three start-time fields carry the same meanings as on `/v1/contests` (see **Contest start times** above): `matchTime` is the earliest known start and the one to gate on; `chainStartTime` is the immutable on-chain value; `gameMatchTime` is the raw odds-feed schedule. Source hashes / scores / lifecycle timestamps stay on the contest detail endpoint.
+- `contest: { contestId, awayTeam, homeTeam, awayTeamId, homeTeamId, sport, matchTime, chainStartTime, gameMatchTime, status }` — keeps the response useful without a second fetch. `awayTeamId` / `homeTeamId` are UUIDs from the `teams` table (resolved via the `games` join — null when no game linkage exists). The three start-time fields carry the same meanings as on `/v1/contests` (see **Contest start times** above): `matchTime` is the current conservative safety bound and the one to gate on; `chainStartTime` is the immutable on-chain value; `gameMatchTime` is the raw odds-feed schedule. Source hashes / scores / lifecycle timestamps stay on the contest detail endpoint.
 
 ### `GET /v1/protocol/info`
 

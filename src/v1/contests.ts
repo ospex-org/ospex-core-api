@@ -21,7 +21,7 @@
  * Contest-shaped bodies carry THREE time fields, all read from the
  * `contests_effective` view (never computed here — see below):
  *
- *   - `matchTime`      — the EARLIEST start we know of: the minimum over
+ *   - `matchTime`      — the CURRENT CONSERVATIVE SAFETY BOUND: the minimum over
  *                        `chainStartTime`, `gameMatchTime`, AND the game's
  *                        current retained safety floor (a THIRD input, not
  *                        served as a field). A conservative safety bound, NOT
@@ -60,7 +60,7 @@
  *
  * The recorded start time is a PREDICTION, not ground truth. `min(...)` is
  * a SAFETY rule, not a truth-recovery rule — it does not "serve the correct
- * time", it serves the earliest time we have any evidence for.
+ * time"; it serves the minimum of the three current retained inputs.
  *
  * The minimum is computed in Postgres by the `contests_effective` view
  * (`LEAST(c.start_time, g.match_time, g.earliest_match_time)` over a
@@ -122,7 +122,7 @@ interface ContestBody {
   homeTeam: string;
   sport: string;
   sportId: number;
-  /** Earliest known start — the min over chain start, feed schedule, and the
+  /** Current conservative start-time safety bound — the min over chain start, feed schedule, and the
    *  game's unexposed retained safety floor. See the file header. */
   matchTime: string;
   /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
@@ -264,7 +264,7 @@ export interface ContestRecoveryBody {
   homeTeam: string;
   sport: string;
   sportId: number;
-  /** Earliest known start — the min over chain start, feed schedule, and the
+  /** Current conservative start-time safety bound — the min over chain start, feed schedule, and the
    *  game's unexposed retained safety floor. See the file header. */
   matchTime: string;
   /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
