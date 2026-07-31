@@ -282,7 +282,7 @@ Settlement fields:
 
 (`scoredAt` is a contest-level field — read it from `GET /v1/contests/:contestId` (`scoredAt`), not the speculation.)
 
-**Closing line (`closing`)** — optional, **list endpoint only**. When a `fresh` closing line has been captured for the speculation's market (the materialized `closing_lines` table, written by `ospex-writer`), the row carries:
+**Closing line (`closing`)** — optional, **list endpoint only**. When a servable closing line exists for the speculation's market (the materialized `closing_lines` table, written by `ospex-writer` — `fresh` *and* not polled past its own lock; see the conditions below), the row carries:
 
 ```jsonc
 "closing": {
@@ -295,7 +295,13 @@ Settlement fields:
 
 Both sides are the de-vig'd fair close (their implied probabilities sum to 1). Consumers derive CLV by comparing a taker's actual transacted price to the fair closing decimal for their side.
 
-- **Absent** when no `fresh` closing line exists for the market — never captured, or captured `stale` / `missing` (the writer's poll-liveness gate) — and when the enrichment fetch fails (best-effort: the speculations read still succeeds either way).
+- **Absent** when no servable closing line exists for the market, and when the enrichment fetch fails (best-effort: the speculations read still succeeds either way). Two independent conditions withhold it:
+  - the row was never captured, or captured `stale` / `missing` (the writer's poll-liveness gate); **or**
+  - the row is `fresh` but was **polled at or after its own recorded lock**, meaning the feed was still quoting that market past the start it was captured against.
+
+  The second condition is not implied by the first. `confidence` applies only an *upper* bound on the writer's poll gap, so a market polled *after* its lock still classifies `fresh`. `ospex-benchmark`'s CLV scorer independently refuses exactly those rows (`close_after_start`), so surfacing them here made this API the more permissive of two CLV surfaces over the same data. On the corpus measured 2026-07-31 that was **147 rows, 4.05%**, and the two sets partition exactly — every negative-gap row is a scorer refusal and vice versa. The predicate is replicated from the scorer (raw instants, not the stored `poll_gap_seconds`; `>=` a 1000 ms sub-second tolerance; a null `last_polled_at` is not a refusal), so the two agree by construction rather than by coincidence.
+
+  This is a **reduction in served data, not a contract change** — `closing` was already optional, and a withheld market renders as "CLV not yet measurable" exactly as an uncaptured one does.
 - For a **spread/total whose line moved** off the speculation's line, `closing` is present but `awayDecimal` / `homeDecimal` are `null` (the price isn't resolvable at the speculation's line; a push-probability estimate is deferred). `line` still reports what the market closed at.
 - Moneyline has no line, so it always resolves when a `fresh` row exists.
 - **Only** this list endpoint attaches `closing`. It is NOT present on `GET /v1/speculations/:speculationId`, the `?since=` recovery mode, the SSE stream, or embedded contest speculations.
