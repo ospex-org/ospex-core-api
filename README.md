@@ -25,7 +25,7 @@ Live on Polygon mainnet. The API surface today:
 - `GET /v1/positions/claim-result/:txHash` — parse `PositionClaimed` from a tx
 - `GET /v1/leaderboard` — current active leaderboard
 - `GET /v1/schedule?sport=` — upcoming games
-- `GET /v1/games`, `GET /v1/games/:gameId` — upcoming games available for contest creation, including the `externalIds` (`jsonodds`, `sportspage`, `rundown`) contest creation needs. `gameId` is the immutable `jsonodds_id`; the human-readable `slug` is exposed separately and is **mutable** (the writer renames it on a reschedule or doubleheader), so anything persisting a game id between calls must store the `jsonodds_id` form. Each game also carries `probablePitchers: { home, away }` — advisory MLB probable/announced starters as last reported by the upstream odds feed (both null when unannounced and for non-MLB sports); never an input to contest creation, matching, or scoring
+- `GET /v1/games`, `GET /v1/games/:gameId` — upcoming games available for contest creation. **`matchTime` is a conservative safety bound** — `LEAST(match_time, earliest_match_time)`, the same shape the contest-shaped surfaces serve — with the raw inputs published alongside it as `gameMatchTime` and `earliestMatchTime`. Includes the `externalIds` (`jsonodds`, `sportspage`, `rundown`) contest creation needs. `gameId` is the immutable `jsonodds_id`; the human-readable `slug` is exposed separately and is **mutable** (the writer renames it on a reschedule or doubleheader), so anything persisting a game id between calls must store the `jsonodds_id` form. Each game also carries `probablePitchers: { home, away }` — advisory MLB probable/announced starters as last reported by the upstream odds feed (both null when unannounced and for non-MLB sports); never an input to contest creation, matching, or scoring
 - `GET /v1/teams/aliases?sport=` — flat list of team aliases (full name / nickname / abbrev / city) joined to canonical team metadata. Consumed by `@ospex/sdk`'s resolver layer to map free-form `--side` input ("Lakers", "LAL") to a canonical team id when staking a commitment.
 - `GET /v1/contests/:contestId/odds` — current upstream reference odds for the contest's underlying game (moneyline / spread / total snapshot from `current_odds`). Per-market response shapes are explicit (no shared "line + away/home" envelope) so consumers can't misread the semantics — see "`GET /v1/contests/:contestId/odds`" below for the exact shape.
 - `GET /v1/analytics/odds-history/:contestId` — opening + current odds for analytics callers (deprecated SDK-internal use; new code should prefer `/contests/:contestId/odds` for current-state reads).
@@ -438,6 +438,12 @@ Current active leaderboard (the soonest-ending one whose start has passed) with 
 Query params: `limit` (max 500), `offset`.
 
 ### `GET /v1/schedule?sport=`
+
+> ⚠ **Dormant — this endpoint returns an empty list for every sport.** It reads `current_schedules`, an ESPN-sourced table that stopped being refreshed: on production 2026-07-31 it holds 6,580 rows whose newest `game_date` is 2026-04-19 and whose newest `fetched_at` is 2026-04-15, and no writer in the project populates it. The window below is forward-only, so nothing falls inside it. Verified against the deployed service: `GET /v1/schedule?sport=nba` and `?sport=mlb` both return `{"games":[], "pagination":{"total":0,...}}`.
+>
+> This is recorded because an empty list is indistinguishable from "no games in the next 36 hours", which is an ordinary answer — a caller cannot tell a dormant endpoint from a quiet one. **Use `GET /v1/games` for a live schedule**; it is backed by the writer-managed `games` table.
+>
+> Its `gameDate` is also **not** subject to the `LEAST`-over-inputs rule the contest-shaped surfaces and `/v1/games` apply: it is a raw start from a different table and a different provider, with no monotone floor and no second input. It is deliberately left that way — retrofitting a floor onto a table nothing writes would be inventing a guarantee. Whether to repopulate or retire this endpoint is an open decision, not something to patch silently.
 
 Upcoming games within `windowHours` (default 36, max 168). Returns games with team names resolved from the `teams` table.
 

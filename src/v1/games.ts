@@ -88,7 +88,20 @@ interface GameRow {
   gameId: string;
   slug: string;
   sport: Sport;
+  /**
+   * The earliest start we currently hold for this game: the minimum of the raw
+   * feed value and the monotone floor. A conservative safety bound, NOT an
+   * observation — compare `gameMatchTime` below to see the raw value it came
+   * from. Matches the derivation `/v1/contests*` and `/v1/speculations` apply.
+   */
   matchTime: string;
+  /** The raw current feed value, unminimised. Diagnostic. */
+  gameMatchTime: string;
+  /**
+   * The retained monotone floor, or null if the column is unset. Diagnostic:
+   * when this is below `gameMatchTime`, it is what is driving `matchTime`.
+   */
+  earliestMatchTime: string | null;
   status: string;
   homeTeam: TeamInfo;
   awayTeam: TeamInfo;
@@ -107,6 +120,7 @@ interface GamesDbRow {
   rundown_id: string | null;
   sport: string;
   match_time: string;
+  earliest_match_time: string | null;
   status: string;
   home_team_id: string;
   away_team_id: string;
@@ -129,7 +143,50 @@ interface TeamDbRow {
 }
 
 const GAMES_SELECT =
-  'network, jsonodds_id, sportspage_id, rundown_id, sport, match_time, status, home_team_id, away_team_id, has_odds, contest_created, contest_id, slug, home_probable_pitcher, away_probable_pitcher';
+  'network, jsonodds_id, sportspage_id, rundown_id, sport, match_time, earliest_match_time, status, home_team_id, away_team_id, has_odds, contest_created, contest_id, slug, home_probable_pitcher, away_probable_pitcher';
+
+/**
+ * The earliest start this game is known to have carried, as a bound.
+ *
+ * `games.earliest_match_time` is a monotone floor maintained by a DB trigger
+ * (indexer migration 070): an ordinary write cannot raise it, so it retains an
+ * earlier start the feed has since rolled back. `match_time` alone is the CURRENT
+ * feed value and follows a rollback back up, which is why this endpoint used to
+ * have no second input to minimise over — a pre-contest caller had exactly one
+ * temporal field and could take no minimum at all.
+ *
+ * Be precise about what the floor does and does not buy. It protects against a
+ * MOVE-UP BEING ROLLED BACK by the same provider. It gives ZERO protection
+ * against providers disagreeing at record time, because pre-contest we hold no
+ * second provider's time at all — that needs persisted provider times in the
+ * writer and is separate, larger work.
+ *
+ * Exactly ONE value is retained, so this is not a history: a `matchTime` below
+ * both raw fields means only that the retained floor is currently the minimum.
+ * It does not establish source, causality, or that any particular earlier start
+ * was ever scheduled.
+ *
+ * Null-safe in both directions — the column is fully populated on production
+ * today (0 nulls of 1227), but a null must degrade to `match_time` rather than
+ * to `null`, which would erase the field for every affected row.
+ *
+ * Unparseable input degrades to `match_time` too, and does so through the
+ * comparison rather than a separate guard: `Date.parse` yields NaN, and every
+ * `<` against NaN is false, so the expression already falls through to
+ * `matchTime`. An explicit `Number.isFinite` check here was removed after a
+ * mutation battery showed no test could turn it red — it was dead code
+ * restating what the comparison already does. The behaviour it described is
+ * asserted directly instead.
+ *
+ * The comparison is on INSTANTS, not strings. `2026-07-30T20:10:00-05:00` sorts
+ * before `2026-07-31T00:15:00+00:00` lexicographically while being the LATER
+ * instant, so a string compare would serve a start an hour earlier than the
+ * real one.
+ */
+function effectiveMatchTime(matchTime: string, earliest: string | null): string {
+  if (earliest === null) return matchTime;
+  return Date.parse(earliest) < Date.parse(matchTime) ? earliest : matchTime;
+}
 
 function parseBoolParam(raw: string | undefined): boolean | 'invalid' | undefined {
   if (raw === undefined) return undefined;
@@ -171,7 +228,9 @@ function dbRowToGameRow(row: GamesDbRow, teams: Map<string, TeamInfo>): GameRow 
     gameId: row.jsonodds_id,
     slug: row.slug,
     sport: row.sport as Sport,
-    matchTime: row.match_time,
+    matchTime: effectiveMatchTime(row.match_time, row.earliest_match_time),
+    gameMatchTime: row.match_time,
+    earliestMatchTime: row.earliest_match_time,
     status: row.status,
     homeTeam: teams.get(row.home_team_id) ?? FALLBACK_TEAM,
     awayTeam: teams.get(row.away_team_id) ?? FALLBACK_TEAM,
@@ -266,6 +325,26 @@ export async function getGamesHandler(req: Request, res: Response): Promise<void
   const start = new Date().toISOString();
   const end = new Date(Date.now() + windowHours * 3600_000).toISOString();
 
+  // KNOWN LIMITATION, stated rather than hidden: the window and the ordering key
+  // on the RAW `match_time`, while the response serves the MINIMUM of that and
+  // the monotone floor. The two can disagree.
+  //
+  // Why it is not fixed here: PostgREST cannot express a `LEAST(a, b)` filter or
+  // sort. `/v1/contests*` avoids this only because `contests_effective` is a
+  // VIEW that materialises the minimum as a real column, so its window and sort
+  // key on the same value they serve. `games` has no such view.
+  //
+  // Consequences, both small and both real. A game whose floor is earlier than
+  // `start` can be returned carrying a `matchTime` before the requested window.
+  // A game whose floor falls inside the window but whose `match_time` is past
+  // `end` is NOT returned. On production this can affect only rows where the
+  // floor is strictly below `match_time` — 1 of 1227 as of 2026-07-31 — because
+  // an ordinary write cannot raise the floor, so the two are equal until a
+  // move-up is rolled back.
+  //
+  // Closing it properly means a `games_effective` view mirroring
+  // `contests_effective`, which is an indexer migration and is deliberately out
+  // of scope here.
   let q = sb
     .from('games')
     .select(GAMES_SELECT, { count: 'exact' })
