@@ -23,13 +23,16 @@
  *
  *   - `matchTime`      — the EARLIEST start we know of: the minimum over
  *                        `chainStartTime`, `gameMatchTime`, AND the game's
- *                        monotone floor (a THIRD input, not served as a
- *                        field). A conservative safety bound, NOT a
- *                        prediction of first pitch. Gate on this.
+ *                        current retained safety floor (a THIRD input, not
+ *                        served as a field). A conservative safety bound, NOT
+ *                        a prediction of first pitch. Gate on this.
  *                        Because the floor is unexposed, `matchTime` can sit
  *                        strictly BELOW both published fields after a feed
  *                        rollback — correct, and deliberately not following
- *                        the feed back up.
+ *                        the feed back up. That shape says only that the
+ *                        retained floor is currently the minimum; it proves
+ *                        nothing about when, why, or from which source the
+ *                        schedule moved.
  *   - `chainStartTime` — the raw `contests.start_time` written on-chain at
  *                        verification.
  *   - `gameMatchTime`  — the raw odds-feed schedule (`games.match_time`),
@@ -120,7 +123,7 @@ interface ContestBody {
   sport: string;
   sportId: number;
   /** Earliest known start — the min over chain start, feed schedule, and the
-   *  game's unexposed monotone floor. See the file header. */
+   *  game's unexposed retained safety floor. See the file header. */
   matchTime: string;
   /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
   chainStartTime: string;
@@ -186,7 +189,7 @@ interface ContestListRow {
   jsonodds_sport_id: number | null;
   start_time: string | null;
   /** `LEAST(start_time, game_match_time, game_earliest_match_time)` from
-   *  `contests_effective` — three inputs; the third is the monotone floor. */
+   *  `contests_effective` — three inputs; the third is the current retained safety floor. */
   effective_start_time: string | null;
   /** Joined `games.match_time` from `contests_effective`. */
   game_match_time: string | null;
@@ -214,7 +217,7 @@ interface ContestDetailRow {
   jsonodds_sport_id: number | null;
   start_time: string | null;
   /** `LEAST(start_time, game_match_time, game_earliest_match_time)` from
-   *  `contests_effective` — three inputs; the third is the monotone floor. */
+   *  `contests_effective` — three inputs; the third is the current retained safety floor. */
   effective_start_time: string | null;
   /** Joined `games.match_time` from `contests_effective`. */
   game_match_time: string | null;
@@ -242,7 +245,7 @@ export interface ContestRecoveryRow extends CursorableRow {
   jsonodds_sport_id: number | null;
   start_time: string | null;
   /** `LEAST(start_time, game_match_time, game_earliest_match_time)` from
-   *  `contests_effective` — three inputs; the third is the monotone floor. */
+   *  `contests_effective` — three inputs; the third is the current retained safety floor. */
   effective_start_time: string | null;
   /** Joined `games.match_time` from `contests_effective`. */
   game_match_time: string | null;
@@ -262,7 +265,7 @@ export interface ContestRecoveryBody {
   sport: string;
   sportId: number;
   /** Earliest known start — the min over chain start, feed schedule, and the
-   *  game's unexposed monotone floor. See the file header. */
+   *  game's unexposed retained safety floor. See the file header. */
   matchTime: string;
   /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
   chainStartTime: string;

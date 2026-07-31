@@ -116,7 +116,7 @@ export interface SpeculationParentContext {
   sport: string;
   /**
    * Earliest known start — the minimum over `chainStartTime`,
-   * `gameMatchTime`, and the game's unexposed monotone floor. A
+   * `gameMatchTime`, and the game's unexposed retained safety floor. A
    * conservative safety bound, NOT a prediction of first pitch; gate on this.
    * `<= chainStartTime` whenever `chainStartTime` is non-empty — but NOT when
    * it is `''` (the unverified window), so a consumer gate must read
