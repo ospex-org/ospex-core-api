@@ -11,6 +11,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 import type { SupabaseClient } from '@supabase/supabase-js';
+// Type-only: erased at runtime, so it does not perturb the deliberate
+// `vi.mock` + `await import` ordering the runtime bindings below rely on.
+import type { OwnStateCursor } from '../src/v1/ownState/cursor.js';
 
 const NOW = Date.parse('2026-05-29T16:00:00.000Z');
 const NOW_ISO = new Date(NOW).toISOString();
@@ -708,8 +711,8 @@ describe('GET /v1/stream/own-state — resume catchup', () => {
     class RacingPositionHub extends OwnStateHub {
       subscribe(
         address: string,
-        cb: Parameters<OwnStateHub['subscribe']>[1],
-      ): ReturnType<OwnStateHub['subscribe']> {
+        cb: Parameters<InstanceType<typeof OwnStateHub>['subscribe']>[1],
+      ): ReturnType<InstanceType<typeof OwnStateHub>['subscribe']> {
         const sub = super.subscribe(address, cb);
         // Fire a derived-status event synchronously BEFORE the handler's
         // catch-up has run. The handler's onPositionStatus runs with
@@ -759,8 +762,8 @@ describe('GET /v1/stream/own-state — resume catchup', () => {
     class RacingHub extends OwnStateHub {
       subscribe(
         address: string,
-        cb: Parameters<OwnStateHub['subscribe']>[1],
-      ): ReturnType<OwnStateHub['subscribe']> {
+        cb: Parameters<InstanceType<typeof OwnStateHub>['subscribe']>[1],
+      ): ReturnType<InstanceType<typeof OwnStateHub>['subscribe']> {
         const sub = super.subscribe(address, cb);
         cb.onResync('test_race');
         return sub;
@@ -799,7 +802,7 @@ describe('advancePositions — monotonic guard', () => {
     // skip the earlier-but-already-delivered event).
     const { advancePositions } = await import('../src/v1/ownState/stream.js');
     const { OWN_STATE_CURSOR_VERSION } = await import('../src/v1/ownState/cursor.js');
-    const initial = {
+    const initial: OwnStateCursor = {
       t: 'own-state' as const,
       v: OWN_STATE_CURSOR_VERSION,
       c: { s: '2026-05-29T14:00:00.000Z', i: '0' },
@@ -819,7 +822,7 @@ describe('advancePositions — monotonic guard', () => {
   it('respects microsecond precision on the guard', async () => {
     const { advancePositions } = await import('../src/v1/ownState/stream.js');
     const { OWN_STATE_CURSOR_VERSION } = await import('../src/v1/ownState/cursor.js');
-    const initial = {
+    const initial: OwnStateCursor = {
       t: 'own-state' as const,
       v: OWN_STATE_CURSOR_VERSION,
       c: { s: '2026-05-29T14:00:00.000Z', i: '0' },
@@ -838,7 +841,7 @@ describe('advancePositions — monotonic guard', () => {
   it('uses id as tie-breaker when sourceUpdatedAt is equal (microsecond-exact)', async () => {
     const { advancePositions } = await import('../src/v1/ownState/stream.js');
     const { OWN_STATE_CURSOR_VERSION } = await import('../src/v1/ownState/cursor.js');
-    const initial = {
+    const initial: OwnStateCursor = {
       t: 'own-state' as const,
       v: OWN_STATE_CURSOR_VERSION,
       c: { s: '2026-05-29T14:00:00.000Z', i: '0' },

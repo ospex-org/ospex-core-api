@@ -56,7 +56,7 @@ interface MockResponse {
   error: unknown;
 }
 interface RecordedCall {
-  table?: string;
+  table?: string | undefined;
   method: string;
   args: unknown[];
 }

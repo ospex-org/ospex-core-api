@@ -9,7 +9,11 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 
 // Mutable catch-up response the handler's runCatchUp sees via getSupabase().
 const sb = vi.hoisted(() => {
-  const state: { response: { data: unknown; error: unknown }; lastOr?: string; gate?: Promise<void> } = {
+  const state: {
+    response: { data: unknown; error: unknown };
+    lastOr?: string | undefined;
+    gate?: Promise<void> | undefined;
+  } = {
     response: { data: [], error: null },
   };
   const client = {

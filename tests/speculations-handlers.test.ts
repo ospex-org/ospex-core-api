@@ -207,7 +207,7 @@ describe('GET /v1/speculations — closing-line enrichment', () => {
     closing?: { awayDecimal: number | null; homeDecimal: number | null; line: number | null; estimated: boolean };
   }
 
-  async function run(closingRows: unknown): Promise<WireClosing[]> {
+  async function run(closingRows: MockResponse | MockResponse[]): Promise<WireClosing[]> {
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabase({
         speculations: { data: SPECS, error: null, count: SPECS.length },

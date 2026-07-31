@@ -589,7 +589,16 @@ All counters are **process-local and cumulative since process start** (reset on 
 | `yarn build` | `tsc` → `dist/` |
 | `yarn start` | `node dist/server.js` (production / Heroku) |
 | `yarn typecheck` | `tsc --noEmit` |
+| `yarn typecheck:tests` | `tsc --noEmit -p tsconfig.tests.json` — typechecks `tests/` as well as `src/`. Reporting-only; see below |
 | `yarn lint` | ESLint over `src/` |
+
+### Typechecking the test tree
+
+`yarn typecheck` and the Heroku release build both compile `tsconfig.json`, whose `include` is `["src"]` — so nothing under `tests/` was ever typechecked. Vitest does not close the gap either: it transpiles through esbuild, which strips types without checking them. The result was that a test file could carry an outright type error and still sail through `typecheck`, `build`, `lint` and the suite itself.
+
+`yarn typecheck:tests` compiles `tsconfig.tests.json`, which extends the base config and includes **both** `src` and `tests` — the tests import from `src`, so `src` has to be in the program. It inherits `strict`, `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes` unchanged; the only overrides are `noEmit`, the three emit-related options it turns off, and a `rootDir` widened to the repo root so `tests/` is admissible at all.
+
+**It is reporting-only, and it must stay that way.** It is deliberately not wired into `test`, `build`, `typecheck`, `prepare`, CI, or any git hook, and it should not become a required check. Run it when you touch tests, read what it reports, and keep going — a type error in a test file blocks nothing by itself. The test suite and review are what gate a merge.
 
 ## Environment
 
