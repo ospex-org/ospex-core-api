@@ -11,6 +11,35 @@
  * bridge name differences between feeds. The resolver isn't ported in
  * this batch; consumers can cross-check against `GET /v1/contests`.
  * Adding the merge with proper alias resolution is a follow-up.
+ *
+ * ⚠ THIS ENDPOINT IS DORMANT. IT RETURNS AN EMPTY LIST FOR EVERY SPORT.
+ *
+ * `current_schedules` is an ESPN-sourced table that stopped being refreshed:
+ * measured on production 2026-07-31, it holds 6,580 rows whose newest
+ * `game_date` is 2026-04-19 and whose newest `fetched_at` is 2026-04-15. No
+ * writer in the project populates it. Because the window below is forward-only
+ * (`now` .. `now + windowHours`, max 168h), every row is far outside it, and
+ * the deployed service confirms the result at the artifact level:
+ *
+ *   GET /v1/schedule?sport=nba -> {"games":[], "pagination":{"total":0,...}}
+ *   GET /v1/schedule?sport=mlb -> {"games":[], "pagination":{"total":0,...}}
+ *
+ * Recorded here because the emptiness is indistinguishable from "no games
+ * scheduled in the next 36 hours", which is a perfectly ordinary answer — so a
+ * caller has no way to tell a dormant endpoint from a quiet one.
+ *
+ * CONSEQUENCE FOR START-TIME HANDLING: `game_date` here is a raw, unminimised
+ * start from a DIFFERENT table and a DIFFERENT provider than `games.match_time`.
+ * It has no monotone floor and no second input, so it is NOT subject to the
+ * `LEAST`-over-inputs rule that `/v1/contests*`, `/v1/speculations` and (as of
+ * this change) `/v1/games` apply. It is deliberately left that way rather than
+ * given a floor it has no source for: retrofitting one onto a table nothing
+ * writes would be inventing a guarantee. The correct resolution is to decide
+ * whether this endpoint should be repopulated or retired — tracked separately,
+ * not silently patched here.
+ *
+ * Anything that needs a live schedule should read `GET /v1/games`, which is
+ * backed by the writer-managed `games` table.
  */
 
 import type { Request, Response } from 'express';
