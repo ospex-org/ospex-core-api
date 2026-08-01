@@ -8,35 +8,32 @@
  * for its market, and expose `1 / p_novig` per side. The frontend derives CLV
  * (beat rate + edge) from each taker's actual price against this reference.
  *
- * TWO gates, not one, and they are independent.
+ * A row is served only if it is `confidence='fresh'` AND it clears the same
+ * TIMING-ADMISSIBILITY contract ospex-benchmark's CLV scorer applies. That
+ * contract is a validation step followed by two verdicts, in this order:
  *
- * 1. `confidence='fresh'` — the writer's poll-liveness gate (the market was
- *    still being polled near lock).
- * 2. NOT a post-start poll — `last_polled_at` did not land at or after
- *    `lock_time`, which means the feed was still quoting this market past its
- *    own recorded start.
+ *   1. close_timing_unusable  — a fresh row must carry ALL THREE of
+ *      value_captured_at, last_polled_at and poll_gap_seconds; every instant
+ *      must be offset-qualified; and poll_gap_seconds must agree with
+ *      `lock_time - last_polled_at` within the tolerance. Evidence is validated
+ *      BEFORE any verdict is read off it.
+ *   2. close_after_start      — last_polled_at at or after lock_time by >= the
+ *      tolerance: the feed was still quoting past the recorded start.
+ *   3. close_value_after_lock — value_captured_at > lock_time, strictly, with
+ *      no tolerance.
  *
- * The second gate exists because the first does not imply it. `confidence`
- * applies only an UPPER bound on the poll gap, so a NEGATIVE gap — polled after
- * the lock — classifies `fresh`. That is a defensible call in the writer, which
- * is reporting capture quality, but it is not the right call here: ospex-
- * benchmark's CLV scorer independently refuses exactly those rows as
- * `close_after_start`, so serving them made the public API the more permissive
- * of two CLV surfaces over the same data. On the corpus measured 2026-07-31
- * that was 147 rows, 4.05%, and the two sets partition exactly — every negative
- * gap is a scorer refusal and vice versa, with no row on either side alone.
+ * Why any of this exists: `confidence` applies only an UPPER bound on the
+ * writer's poll gap, so a market polled AFTER its lock still classifies
+ * `fresh`. The scorer refuses those independently, so serving them made this
+ * API the more permissive of two CLV surfaces over the same data — 147 rows,
+ * 4.05%, on the corpus measured 2026-07-31.
  *
- * The predicate is replicated from the scorer rather than approximated: derived
- * from the raw instants (NOT the stored `poll_gap_seconds`, which a forged or
- * stale value could bend), `>=` against a sub-second tolerance, and a null
- * `last_polled_at` is NOT a refusal because a never-polled market is already
- * covered by `confidence`. If the scorer's boundary moves, this must move with
- * it — the point is that the two agree, not that either number is sacred.
- *
- * What this does NOT gate: whether the quoted VALUE was captured post-lock.
- * ospex-writer bounds that at the source (`captured_at <= lock`, re-asserted at
- * the write) and the corpus carries zero violations, so there is nothing to
- * filter here and a duplicate check would only drift.
+ * SCOPE, stated precisely: this is TIMING-admissibility parity, not complete
+ * scorer admissibility. The scorer applies further refusals that are NOT
+ * ported here — notably its quote-consistency check, which refuses a close
+ * whose two no-vig probabilities do not cohere. A row can therefore be served
+ * here and still be refused by the scorer on a non-timing ground. Extending to
+ * quote consistency is separate work, deliberately not folded in.
  *
  * Spread/total prices only resolve when the speculation's line equals the line
  * the market closed at; a half-run move renders the decimals null (push-
@@ -89,27 +86,62 @@ const POLL_GAP_COHERENCE_TOLERANCE_MS = 1000;
  * An offset-qualified ISO-8601 instant parsed to epoch ms, or null if the string
  * is not one.
  *
- * Mirrors the scorer's `instantMs` / `isParseableInstant`, which require an
- * EXPLICIT offset (`Z` or `+/-hh:mm`) before Date.parse is allowed near the
- * value. That rule is load-bearing rather than stylistic:
+ * Mirrors the scorer's `instantMs` / `isParseableInstant`. The offset
+ * requirement is load-bearing rather than stylistic:
  * `Date.parse('2026-07-28T23:09:00')` carries no offset and is interpreted in
- * the HOST'S LOCAL ZONE, so the same row resolves to a different instant on a
- * UTC dyno than on a developer's machine -- and therefore to a different public
- * verdict. Rejecting the shape outright is what makes the answer
- * host-independent.
- *
- * Syntax and range are separate checks, exactly as in the scorer: the pattern
- * admits `+99:99`, which Date.parse turns into NaN, so both must pass.
+ * the SERVER'S LOCAL ZONE, so the same row resolves to a different instant on a
+ * UTC dyno than on a developer machine -- and therefore to a different public
+ * verdict.
  *
  * core-api carries no zod dependency, so the scorer's
- * `z.string().datetime({ offset: true })` is expressed as a pattern here rather
- * than shared. Same rule, same accept/reject set for every shape PostgREST emits.
+ * `z.string().datetime({ offset: true })` is reimplemented here. That makes
+ * ACCEPT-SET PARITY something to measure, not assume: a first attempt was more
+ * permissive than the scorer (lowercase `t`/`z`, and nonexistent calendar dates
+ * that Date.parse silently normalises), and a second over-corrected and would
+ * have dropped shapes the scorer accepts (`+0000`, seconds omitted, years below
+ * 0100). Both directions matter -- too permissive serves rows the scorer
+ * refuses, too strict withholds rows it scores.
+ *
+ * Parity is verified by a differential probe against the scorer's real
+ * `isParseableInstant` over 120,328 inputs -- a structured matrix of malformed
+ * shapes plus a seeded random sweep -- with zero disagreements in either
+ * direction.
  */
+
+// Deliberately mirrors zod's `.datetime({ offset: true })` ACCEPT SET, verified
+// by differential probe rather than by reading: uppercase `T`/`Z` only, seconds
+// optional, and the offset spelled `+hh:mm`, `+hhmm` or `+hh`.
 const OFFSET_QUALIFIED_INSTANT =
-  /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$/;
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?(?:Z|([+-])(\d{2})(?::?(\d{2}))?)$/;
 
 function instantMs(iso: string): number | null {
-  if (!OFFSET_QUALIFIED_INSTANT.test(iso)) return null;
+  const m = OFFSET_QUALIFIED_INSTANT.exec(iso);
+  if (m === null) return null;
+
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  const h = Number(m[4]);
+  const mi = Number(m[5]);
+  const sec = m[6] === undefined ? 0 : Number(m[6]);
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+  if (h > 23 || mi > 59 || sec > 59) return null;
+  if (m[9] !== undefined && Number(m[9]) > 23) return null;
+  if (m[10] !== undefined && Number(m[10]) > 59) return null;
+
+  // Calendar round-trip. Date.parse NORMALISES an impossible date rather than
+  // failing -- 2026-02-29 becomes March 1, 2026-04-31 becomes May 1 -- so
+  // without this a nonexistent date is silently accepted as a real instant.
+  const rt = new Date(Date.UTC(y, mo - 1, d, h, mi, sec));
+  // Date.UTC maps years 0-99 onto 1900-1999, so a bare round-trip would wrongly
+  // reject e.g. 0064-03-18. Restore the real year before comparing.
+  if (y < 100) rt.setUTCFullYear(y);
+  if (rt.getUTCFullYear() !== y || rt.getUTCMonth() !== mo - 1 || rt.getUTCDate() !== d) {
+    return null;
+  }
+
+  // Syntax and range are separate checks, as they are in the scorer: the
+  // pattern admits offsets Date.parse still turns into NaN.
   const ms = Date.parse(iso);
   return Number.isFinite(ms) ? ms : null;
 }

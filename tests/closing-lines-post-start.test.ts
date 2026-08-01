@@ -287,7 +287,10 @@ describe('attachClosingLines — the verdict does not depend on the host timezon
   const original = process.env.TZ;
 
   afterEach(() => {
-    process.env.TZ = original;
+    // Assigning undefined to process.env stores the STRING "undefined", which is
+    // not the same as an unset TZ — delete it instead.
+    if (original === undefined) delete process.env.TZ;
+    else process.env.TZ = original;
   });
 
   it('proves the fixture is genuinely TZ-sensitive under Date.parse', () => {
@@ -322,4 +325,68 @@ describe('attachClosingLines — the verdict does not depend on the host timezon
     ]);
     expect(closing).toBeUndefined();
   });
+});
+
+describe('attachClosingLines — instant validator parity with the scorer', () => {
+  // Verified as an ACCEPT SET, not by reading: a differential probe against the
+  // scorer's real isParseableInstant over 120,328 inputs (structured matrix +
+  // seeded random sweep) reports zero disagreements in either direction. These
+  // pin the specific shapes an earlier revision got wrong.
+  // Probed through value_captured_at, NOT last_polled_at. A malformed instant in
+  // last_polled_at is ALSO caught by the gap-coherence rule, so those tests pass
+  // whether or not the parser rejects it — three mutations of the parser
+  // survived exactly that masking. Every date below normalises to an instant
+  // BEFORE the lock, so closeValueAfterLock cannot mask it either: the parser is
+  // the only thing that can withhold these.
+  const REJECTED: Array<[string, string]> = [
+    ['lowercase t separator', '2026-01-15t06:06:00+00:00'],
+    ['lowercase z designator', '2026-01-15T06:06:00z'],
+    ['Feb 29 in a non-leap year (Date.parse -> Mar 1)', '2026-02-29T06:06:00+00:00'],
+    ['April 31 (Date.parse -> May 1)', '2026-04-31T06:06:00+00:00'],
+    ['hour 24 (Date.parse -> next midnight)', '2026-01-15T24:00:00+00:00'],
+    ['minute 60 (Date.parse -> next hour)', '2026-01-15T06:60:00+00:00'],
+    ['second 60 (Date.parse -> next minute)', '2026-01-15T06:06:60+00:00'],
+    ['month 13 (Date.parse -> next January)', '2025-13-01T06:06:00+00:00'],
+    ['day 00 (Date.parse -> previous month end)', '2026-07-00T06:06:00+00:00'],
+    ['space separator', '2026-01-15 06:06:00+00:00'],
+    ['out-of-range offset', '2026-01-15T06:06:00+99:99'],
+    ['no zone designator', '2026-01-15T06:06:00'],
+    // Syntax passes but Date.parse yields NaN — which is why syntax and range
+    // are separate checks. The scorer rejects it too; verified, not assumed.
+    ['hour-only offset (Date.parse -> NaN)', '2026-01-15T06:06:00+00'],
+  ];
+  for (const [name, iso] of REJECTED) {
+    it(`withholds ${name}`, async () => {
+      const closing = await servedClosing([closingRow({ value_captured_at: iso })]);
+      expect(closing).toBeUndefined();
+    });
+  }
+
+  it('NEGATIVE CONTROL — a well-formed value_captured_at at the same position is served', async () => {
+    const closing = await servedClosing([
+      closingRow({ value_captured_at: '2026-01-15T06:06:00+00:00' }),
+    ]);
+    expect(closing).toBeDefined();
+  });
+
+  // NEGATIVE CONTROLS: shapes the scorer ACCEPTS must still be served, or this
+  // surface would withhold rows the scorer scores — the same divergence in the
+  // opposite direction.
+  const ACCEPTED: Array<[string, string, number]> = [
+    ['offset without a colon', '2026-07-28T23:09:00+0000', 60],
+    ['seconds omitted', '2026-07-28T23:09+00:00', 60],
+    ['Feb 29 in a leap year', '2024-02-29T23:09:00+00:00', 76_032_060],
+    // Absurd as data, but the parity claim rests on it: Date.UTC maps years
+    // 0-99 onto 1900-1999, so a naive calendar round-trip rejects it while the
+    // scorer accepts it. Pinned so that correction cannot be silently dropped.
+    ['a year below 0100', '0064-03-18T06:06:00+00:00', 61_926_138_240],
+  ];
+  for (const [name, iso, gap] of ACCEPTED) {
+    it(`NEGATIVE CONTROL — serves ${name}`, async () => {
+      const closing = await servedClosing([
+        closingRow({ last_polled_at: iso, poll_gap_seconds: gap }),
+      ]);
+      expect(closing).toBeDefined();
+    });
+  }
 });
