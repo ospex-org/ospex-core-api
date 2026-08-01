@@ -282,7 +282,7 @@ Settlement fields:
 
 (`scoredAt` is a contest-level field — read it from `GET /v1/contests/:contestId` (`scoredAt`), not the speculation.)
 
-**Closing line (`closing`)** — optional, **list endpoint only**. When a `fresh` closing line has been captured for the speculation's market (the materialized `closing_lines` table, written by `ospex-writer`), the row carries:
+**Closing line (`closing`)** — optional, **list endpoint only**. When a servable closing line exists for the speculation's market (the materialized `closing_lines` table, written by `ospex-writer` — `fresh` *and* not polled past its own lock; see the conditions below), the row carries:
 
 ```jsonc
 "closing": {
@@ -295,7 +295,24 @@ Settlement fields:
 
 Both sides are the de-vig'd fair close (their implied probabilities sum to 1). Consumers derive CLV by comparing a taker's actual transacted price to the fair closing decimal for their side.
 
-- **Absent** when no `fresh` closing line exists for the market — never captured, or captured `stale` / `missing` (the writer's poll-liveness gate) — and when the enrichment fetch fails (best-effort: the speculations read still succeeds either way).
+- **Absent** when no servable closing line exists for the market, and when the enrichment fetch fails (best-effort: the speculations read still succeeds either way).
+
+  A row is served only if it is `confidence='fresh'` **and** it clears the same **timing-admissibility** contract `ospex-benchmark`'s CLV scorer applies. That contract is a validation step followed by two verdicts, in this order:
+
+  1. **Timing evidence must be usable.** A `fresh` row must carry all three of `value_captured_at`, `last_polled_at` and `poll_gap_seconds`; every instant must be **offset-qualified** (`Z` or `±hh:mm`); and `poll_gap_seconds` must agree with `lock_time - last_polled_at` within 1000 ms. A row failing any of these is withheld (scorer: `close_timing_unusable`) — it establishes nothing, so no verdict is read off it.
+  2. **Not polled past its own lock** — `last_polled_at` at or after `lock_time` by ≥ 1000 ms means the feed was still quoting past the recorded start (scorer: `close_after_start`).
+  3. **Value not captured past the lock** — `value_captured_at > lock_time`, strictly, with no tolerance (scorer: `close_value_after_lock`).
+
+  The offset requirement is not cosmetic: an offsetless timestamp is read by `Date.parse` in the **server's local zone**, so the same row could produce different public verdicts on different hosts. Requiring the offset removes the question.
+
+  Why any of this exists: `confidence` applies only an *upper* bound on the writer's poll gap, so a market polled *after* its lock still classifies `fresh`. The scorer refuses those independently, so serving them made this API the more permissive of two CLV surfaces over the same data — 147 rows, 4.05%, on the corpus measured 2026-07-31.
+
+  Ported as the full **timing** contract rather than its final comparison — copying only the last step reproduces the scorer's answer for well-formed rows and silently disagrees on every malformed one. The instant validator's accept set is verified against the scorer's by differential probe over 120,328 inputs, zero disagreements in either direction.
+
+  **Scope, stated precisely:** this is timing-admissibility parity, **not** complete scorer admissibility. The scorer applies further refusals that are not ported — notably its quote-consistency check, which refuses a close whose two no-vig probabilities do not cohere. A row can therefore be served here and still be refused by the scorer on a non-timing ground. Extending to quote consistency is separate work.
+
+  This is a **reduction in served data, not a contract change** — `closing` was already optional, and a withheld market renders as "CLV not yet measurable" exactly as an uncaptured one does. Each refusal is logged under its own reason.
+
 - For a **spread/total whose line moved** off the speculation's line, `closing` is present but `awayDecimal` / `homeDecimal` are `null` (the price isn't resolvable at the speculation's line; a push-probability estimate is deferred). `line` still reports what the market closed at.
 - Moneyline has no line, so it always resolves when a `fresh` row exists.
 - **Only** this list endpoint attaches `closing`. It is NOT present on `GET /v1/speculations/:speculationId`, the `?since=` recovery mode, the SSE stream, or embedded contest speculations.
