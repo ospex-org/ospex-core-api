@@ -96,7 +96,10 @@ describe('decode — structural rejections', () => {
   });
 
   it('rejects a cursor with the wrong version (forward-compat block)', () => {
-    const wrongV = encodeOwnStateCursor({ ...sample, v: 999 as unknown as 1 });
+    const wrongV = encodeOwnStateCursor({
+      ...sample,
+      v: 999 as unknown as typeof OWN_STATE_CURSOR_VERSION,
+    });
     expect(() => decodeOwnStateCursor(wrongV)).toThrow(OwnStateCursorError);
   });
 

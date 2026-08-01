@@ -225,7 +225,7 @@ describe('GET /v1/speculations — closing-line enrichment', () => {
     poll_gap_seconds: 60,
   };
 
-  async function run(closingRows: unknown): Promise<WireClosing[]> {
+  async function run(closingRows: MockResponse | MockResponse[]): Promise<WireClosing[]> {
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabase({
         speculations: { data: SPECS, error: null, count: SPECS.length },

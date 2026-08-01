@@ -52,6 +52,13 @@ interface SeenRequest {
 }
 
 /**
+ * `Headers` is a global under @types/node, but the DOM-lib name `HeadersInit`
+ * is not (this project's `lib` is ES2022 only). Derive the init type from the
+ * constructor actually called below rather than pulling in the DOM lib.
+ */
+type HeadersInitLike = ConstructorParameters<typeof Headers>[0];
+
+/**
  * A real `SupabaseClient` whose only fake is `fetch`. Everything downstream of
  * the HTTP boundary — URL building, header negotiation, `processResponse` —
  * is the production code path.
@@ -63,7 +70,7 @@ function realClientOver(handler: (method: string, url: string) => Response): {
   const requests: SeenRequest[] = [];
   const fetchImpl = async (
     input: unknown,
-    init?: { method?: string; headers?: HeadersInit },
+    init?: { method?: string; headers?: HeadersInitLike },
   ): Promise<Response> => {
     const url = String(typeof input === 'string' ? input : (input as Request).url);
     const method = init?.method ?? (input as Request).method ?? 'GET';

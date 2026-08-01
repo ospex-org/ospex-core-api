@@ -12,6 +12,7 @@
     "start": "node dist/server.js",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",
+    "typecheck:tests": "tsc --noEmit -p tsconfig.tests.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "bench:ownstate": "node --import tsx bench/ownstate-load/harness.ts",
