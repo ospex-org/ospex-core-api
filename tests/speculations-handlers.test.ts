@@ -207,6 +207,24 @@ describe('GET /v1/speculations — closing-line enrichment', () => {
     closing?: { awayDecimal: number | null; homeDecimal: number | null; line: number | null; estimated: boolean };
   }
 
+  /**
+   * The capture timestamps every real closing_lines row carries. Fixtures need
+   * them because the enrichment now gates on them: a row polled at or after its
+   * own lock is withheld (ospex-benchmark's scorer refuses those as
+   * `close_after_start`, and serving them made this API the more permissive of
+   * two CLV surfaces). A row with no timing fails CLOSED, so omitting these
+   * would silently turn every case below into an assertion about the refusal
+   * path rather than the enrichment.
+   */
+  const POLLED_BEFORE_LOCK = {
+    lock_time: '2026-07-28T23:10:00+00:00',
+    last_polled_at: '2026-07-28T23:09:00+00:00',
+    value_captured_at: '2026-07-28T23:05:00+00:00',
+    // Must corroborate lock_time - last_polled_at (60s), or the row is refused
+    // as `close_timing_unusable` — the stored gap never overrides the instants.
+    poll_gap_seconds: 60,
+  };
+
   async function run(closingRows: MockResponse | MockResponse[]): Promise<WireClosing[]> {
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabase({
@@ -223,7 +241,7 @@ describe('GET /v1/speculations — closing-line enrichment', () => {
 
   it('attaches both no-vig decimals for moneyline (no line to resolve)', async () => {
     const specs = await run({
-      data: [{ jsonodds_id: 'JID', market: 'moneyline', line: null, away_p_novig: 0.5, home_p_novig: 0.5 }],
+      data: [{ jsonodds_id: 'JID', market: 'moneyline', line: null, away_p_novig: 0.5, home_p_novig: 0.5, ...POLLED_BEFORE_LOCK }],
       error: null,
     });
     const ml = specs.find((s) => s.type === 'moneyline');
@@ -232,7 +250,7 @@ describe('GET /v1/speculations — closing-line enrichment', () => {
 
   it('attaches decimals for a spread whose line matches the close', async () => {
     const specs = await run({
-      data: [{ jsonodds_id: 'JID', market: 'spread', line: 3.5, away_p_novig: 0.4, home_p_novig: 0.6 }],
+      data: [{ jsonodds_id: 'JID', market: 'spread', line: 3.5, away_p_novig: 0.4, home_p_novig: 0.6, ...POLLED_BEFORE_LOCK }],
       error: null,
     });
     const spread = specs.find((s) => s.type === 'spread');
@@ -243,7 +261,7 @@ describe('GET /v1/speculations — closing-line enrichment', () => {
   it('nulls the decimals when the total line moved off the speculation line', async () => {
     const specs = await run({
       // speculation line 8.5, market closed at 9.0 → half-run move → not price-resolvable
-      data: [{ jsonodds_id: 'JID', market: 'total', line: 9.0, away_p_novig: 0.5, home_p_novig: 0.5 }],
+      data: [{ jsonodds_id: 'JID', market: 'total', line: 9.0, away_p_novig: 0.5, home_p_novig: 0.5, ...POLLED_BEFORE_LOCK }],
       error: null,
     });
     const total = specs.find((s) => s.type === 'total');
