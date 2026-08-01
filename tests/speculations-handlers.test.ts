@@ -219,6 +219,10 @@ describe('GET /v1/speculations — closing-line enrichment', () => {
   const POLLED_BEFORE_LOCK = {
     lock_time: '2026-07-28T23:10:00+00:00',
     last_polled_at: '2026-07-28T23:09:00+00:00',
+    value_captured_at: '2026-07-28T23:05:00+00:00',
+    // Must corroborate lock_time - last_polled_at (60s), or the row is refused
+    // as `close_timing_unusable` — the stored gap never overrides the instants.
+    poll_gap_seconds: 60,
   };
 
   async function run(closingRows: unknown): Promise<WireClosing[]> {

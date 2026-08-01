@@ -18,7 +18,7 @@
  * projection is replayed here so that removal fails.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { attachClosingLines } from '../src/v1/utils/closingLines.js';
 import type { Speculation } from '../src/v1/utils/speculations.js';
@@ -34,6 +34,8 @@ interface RawClosingRow {
   home_p_novig: number | null;
   lock_time: string | null;
   last_polled_at: string | null;
+  value_captured_at: string | null;
+  poll_gap_seconds: number | null;
 }
 
 function closingRow(over: Partial<RawClosingRow> = {}): RawClosingRow {
@@ -46,6 +48,9 @@ function closingRow(over: Partial<RawClosingRow> = {}): RawClosingRow {
     lock_time: LOCK,
     // Default: polled one minute BEFORE lock — an ordinary, servable close.
     last_polled_at: '2026-07-28T23:09:00+00:00',
+    value_captured_at: '2026-07-28T23:05:00+00:00',
+    // Must agree with lock_time - last_polled_at (60s) or the row is unusable.
+    poll_gap_seconds: 60,
     ...over,
   };
 }
@@ -132,7 +137,7 @@ async function servedClosing(rows: RawClosingRow[]): Promise<Speculation['closin
 describe('attachClosingLines — the post-start-poll gate', () => {
   it('withholds a fresh close whose last poll landed after its own lock', async () => {
     const closing = await servedClosing([
-      closingRow({ last_polled_at: '2026-07-28T23:15:00+00:00' }), // 5 min PAST lock
+      closingRow({ last_polled_at: '2026-07-28T23:15:00+00:00', poll_gap_seconds: -300 }), // 5 min PAST lock
     ]);
     expect(closing).toBeUndefined();
   });
@@ -146,7 +151,7 @@ describe('attachClosingLines — the post-start-poll gate', () => {
 
   it('withholds a close polled hours past its lock', async () => {
     const closing = await servedClosing([
-      closingRow({ last_polled_at: '2026-07-29T02:00:00+00:00' }),
+      closingRow({ last_polled_at: '2026-07-29T02:00:00+00:00', poll_gap_seconds: -10200 }),
     ]);
     expect(closing).toBeUndefined();
   });
@@ -156,40 +161,81 @@ describe('attachClosingLines — the post-start-poll gate', () => {
   // constant cannot drift in either direction unnoticed.
   it('BOUNDARY — 999ms past lock is within tolerance and still served', async () => {
     const closing = await servedClosing([
-      closingRow({ last_polled_at: '2026-07-28T23:10:00.999+00:00' }),
+      closingRow({ last_polled_at: '2026-07-28T23:10:00.999+00:00', poll_gap_seconds: 0 }),
     ]);
     expect(closing).toBeDefined();
   });
 
   it('BOUNDARY — exactly 1000ms past lock is withheld', async () => {
     const closing = await servedClosing([
-      closingRow({ last_polled_at: '2026-07-28T23:10:01.000+00:00' }),
+      closingRow({ last_polled_at: '2026-07-28T23:10:01.000+00:00', poll_gap_seconds: -1 }),
     ]);
     expect(closing).toBeUndefined();
   });
 
   it('a poll exactly AT the lock is served (a zero gap is not "after")', async () => {
-    const closing = await servedClosing([closingRow({ last_polled_at: LOCK })]);
+    const closing = await servedClosing([closingRow({ last_polled_at: LOCK, poll_gap_seconds: 0 })]);
     expect(closing).toBeDefined();
   });
 
-  // A market never seen in the poll snapshot is already covered by `confidence`.
-  // Refusing it here too would withhold on a different ground than the scorer
-  // uses, which re-opens the same disagreement from the other side.
-  it('a null last_polled_at is NOT treated as post-start', async () => {
+  // A fresh row is a CLAIM that the capture observed this market at a known
+  // instant. Missing any of the three instants makes it evidence of nothing, and
+  // the scorer refuses it as `close_timing_unusable`. An earlier revision of
+  // this file asserted the OPPOSITE — that a null last_polled_at is served —
+  // which is precisely where this surface and the scorer diverged.
+  it('a null last_polled_at is WITHHELD (incomplete timing evidence)', async () => {
     const closing = await servedClosing([closingRow({ last_polled_at: null })]);
-    expect(closing).toBeDefined();
+    expect(closing).toBeUndefined();
   });
 
-  // Fails closed: this decides what reaches a public CLV surface.
+  it('a null value_captured_at is withheld', async () => {
+    const closing = await servedClosing([closingRow({ value_captured_at: null })]);
+    expect(closing).toBeUndefined();
+  });
+
+  it('a null poll_gap_seconds is withheld', async () => {
+    const closing = await servedClosing([closingRow({ poll_gap_seconds: null })]);
+    expect(closing).toBeUndefined();
+  });
+
   it('an unparseable last_polled_at is withheld', async () => {
     const closing = await servedClosing([closingRow({ last_polled_at: 'not-a-date' })]);
     expect(closing).toBeUndefined();
   });
 
-  it('a null lock_time is withheld — there is nothing to judge the poll against', async () => {
+  it('a null lock_time is withheld — there is nothing to judge anything against', async () => {
     const closing = await servedClosing([closingRow({ lock_time: null })]);
     expect(closing).toBeUndefined();
+  });
+
+  // The stored gap must corroborate the instants, never override them. A row
+  // claiming a 60s gap whose instants say otherwise establishes nothing.
+  it('a stored poll_gap_seconds that contradicts the instants is withheld', async () => {
+    const closing = await servedClosing([
+      closingRow({ last_polled_at: '2026-07-28T23:09:00+00:00', poll_gap_seconds: 99_999 }),
+    ]);
+    expect(closing).toBeUndefined();
+  });
+
+  it('NEGATIVE CONTROL — a gap within the 1000ms coherence tolerance is served', async () => {
+    const closing = await servedClosing([
+      closingRow({ last_polled_at: '2026-07-28T23:09:00.400+00:00', poll_gap_seconds: 60 }),
+    ]);
+    expect(closing).toBeDefined();
+  });
+
+  // closeValueAfterLock — the scorer's third refusal. STRICTLY after, no
+  // tolerance: value_captured_at is a direct timestamp with no quantisation.
+  it('a VALUE captured after the lock is withheld, with no tolerance', async () => {
+    const closing = await servedClosing([
+      closingRow({ value_captured_at: '2026-07-28T23:10:00.001+00:00' }),
+    ]);
+    expect(closing).toBeUndefined();
+  });
+
+  it('NEGATIVE CONTROL — a value captured exactly AT the lock is served', async () => {
+    const closing = await servedClosing([closingRow({ value_captured_at: LOCK })]);
+    expect(closing).toBeDefined();
   });
 
   it('one game can have a servable market and a withheld one at the same time', async () => {
@@ -201,6 +247,7 @@ describe('attachClosingLines — the post-start-poll gate', () => {
         market: 'total',
         line: 8.5,
         last_polled_at: '2026-07-28T23:30:00+00:00',
+        poll_gap_seconds: -1200,
       }),
     ]);
     await attachClosingLines(sb, NETWORK, [ml, total]);
@@ -226,5 +273,53 @@ describe('attachClosingLines — the gate reads columns it actually requests', (
     for (const col of ['jsonodds_id', 'market', 'line', 'away_p_novig', 'home_p_novig']) {
       expect(selects['closing_lines']).toContain(col);
     }
+  });
+});
+
+describe('attachClosingLines — the verdict does not depend on the host timezone', () => {
+  // The sharpest form of the bug this file exists to prevent. `Date.parse` on an
+  // offsetless timestamp reads it in the HOST'S LOCAL ZONE, so the same row
+  // resolved to different instants on a UTC dyno and a developer machine — and
+  // a reviewer demonstrated the PUBLIC verdict flipping between TZ=UTC and
+  // TZ=America/New_York. Requiring an explicit offset removes the question
+  // rather than making the two zones happen to agree.
+  const ZONES = ['UTC', 'America/New_York', 'Asia/Tokyo'];
+  const original = process.env.TZ;
+
+  afterEach(() => {
+    process.env.TZ = original;
+  });
+
+  it('proves the fixture is genuinely TZ-sensitive under Date.parse', () => {
+    // Without this, the assertions below could pass because the input happens to
+    // be zone-independent rather than because the parser rejects it.
+    process.env.TZ = 'UTC';
+    const utc = Date.parse('2026-07-28T23:09:00');
+    process.env.TZ = 'America/New_York';
+    const ny = Date.parse('2026-07-28T23:09:00');
+    expect(utc).not.toBe(ny);
+  });
+
+  for (const tz of ZONES) {
+    it(`withholds an offsetless last_polled_at under TZ=${tz}`, async () => {
+      process.env.TZ = tz;
+      const closing = await servedClosing([
+        closingRow({ last_polled_at: '2026-07-28T23:09:00' }),
+      ]);
+      expect(closing).toBeUndefined();
+    });
+
+    it(`NEGATIVE CONTROL — an offset-qualified row is served under TZ=${tz}`, async () => {
+      process.env.TZ = tz;
+      const closing = await servedClosing([closingRow()]);
+      expect(closing).toBeDefined();
+    });
+  }
+
+  it('withholds an out-of-range offset (syntax valid, instant not)', async () => {
+    const closing = await servedClosing([
+      closingRow({ last_polled_at: '2026-07-28T23:09:00+99:99' }),
+    ]);
+    expect(closing).toBeUndefined();
   });
 });
