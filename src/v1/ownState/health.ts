@@ -5,20 +5,29 @@
  *   → 200 { indexerLagSeconds, lastIndexedAt, lagSource }
  *
  * PUBLIC (no stream-auth). Indexer lag is a GLOBAL, wallet-independent
- * signal; the market-maker polls this at ~10s cadence to feed its
- * stream-health gate (`indexerLagSeconds < INDEXER_LAG_MAX`). Requiring a
- * minted bearer per poll would be pure overhead for a value that carries no
- * per-wallet information.
+ * signal; the market-maker polls it once per runner tick (its
+ * `ownState.auditPollIntervalMs` — default 60s, floor 10s) to drive a
+ * posting-only health latch. Requiring a minted bearer per poll would be pure
+ * overhead for a value that carries no per-wallet information.
  *
  * Lag source — `indexer_cursor.updated_at`, NOT `max(now - row_updated_at)`
  * over the own-state data tables (commitments / positions / fills). The
- * indexer advances `indexer_cursor` on EVERY confirmed block it processes —
- * Polygon mints a block every ~2s, so `updated_at` advances continuously
- * regardless of whether any Ospex event landed. That makes `now - updated_at`
- * a TRUE liveness/lag measure: a row-age approach over the data tables would
- * report false-high lag during any quiet, no-activity window — common for a
- * sparse P2P book — and spuriously trip the consumer's health gate even when
- * the indexer is perfectly current.
+ * indexer advances `indexer_cursor` ONCE PER POLL CYCLE — `advanceCursor` runs
+ * per chunk at the end of a cycle, and the indexer's `POLL_INTERVAL_MS` has a
+ * hard 15000ms floor — and it does so whether or not any Ospex event landed.
+ * That last part is what makes `now - updated_at` a TRUE liveness/lag measure:
+ * a row-age approach over the data tables would report false-high lag during
+ * any quiet, no-activity window — common for a sparse P2P book — and
+ * spuriously trip the consumer's health gate even when the indexer is
+ * perfectly current.
+ *
+ * CONSEQUENCE FOR CONSUMERS: because the cursor moves once per cycle rather
+ * than continuously, this value SAWTOOTHS 0 → ~15s in steady state. A lag
+ * threshold at or below the cursor cadence therefore trips on a perfectly
+ * healthy indexer. (An earlier revision of this comment described the cursor
+ * as advancing on every confirmed block, ~2s; live measurement on 2026-06-12
+ * falsified that, and a threshold sized against the ~2s figure would be well
+ * inside the normal sawtooth.)
  *
  * (`indexer_cursor` is the table the live indexer actually maintains; the
  * `sync_state` table + `advance_sync_state` function exist in the schema but
