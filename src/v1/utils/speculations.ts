@@ -91,7 +91,7 @@ export interface SpeculationDetail extends Speculation {
   // redacted body lacks; see getContestByIdHandler.)
   orderbook: Array<CommitmentBody | CommitmentHiddenBody>;
   /**
-   * Parent contest context — kept small (5 fields) so consumers don't
+   * Parent contest context — kept small so consumers don't
    * have to fetch `/v1/contests/:contestId` for the common "what game
    * is this on?" question. Source hashes / scores / lifecycle
    * timestamps stay on the contest detail endpoint.
@@ -116,18 +116,23 @@ export interface SpeculationParentContext {
   sport: string;
   /**
    * Current conservative start-time safety bound — the minimum over `chainStartTime`,
-   * `gameMatchTime`, and the game's unexposed retained safety floor. A
-   * conservative safety bound, NOT a prediction of first pitch; gate on this.
+   * `gameMatchTime`, and the game's retained safety floor (served here as
+   * `gameEarliestMatchTime`). A conservative safety bound, NOT a prediction of
+   * first pitch; gate on this.
    * `<= chainStartTime` whenever `chainStartTime` is non-empty — but NOT when
    * it is `''` (the unverified window), so a consumer gate must read
    * `chainStartTime === '' || matchTime <= chainStartTime`. See the
-   * `/v1/contests` file header for the full three-field contract.
+   * `/v1/contests` file header for the full four-field contract.
    */
   matchTime: string;
   /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
   chainStartTime: string;
   /** Raw odds-feed schedule (`games.match_time`), joined on `(network, jsonodds_id)`. */
   gameMatchTime: string;
+  /** The game's current retained safety floor (`games.earliest_match_time`), verbatim — never
+   *  clamped. `""` when no games row is linked. When it is the minimum of the three inputs, it
+   *  is what is driving `matchTime`. See the `/v1/contests` file header. */
+  gameEarliestMatchTime: string;
   status: string;
 }
 

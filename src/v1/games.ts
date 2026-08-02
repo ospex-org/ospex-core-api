@@ -149,7 +149,7 @@ const GAMES_SELECT =
  * The earliest start this game is known to have carried, as a bound.
  *
  * `games.earliest_match_time` is a monotone floor maintained by a DB trigger
- * (indexer migration 070): an ordinary write cannot raise it, so it retains an
+ * in the protocol indexer's schema: an ordinary write cannot raise it, so it retains an
  * earlier start the feed has since rolled back. `match_time` alone is the CURRENT
  * feed value and follows a rollback back up, which is why this endpoint used to
  * have no second input to minimise over — a pre-contest caller had exactly one
@@ -187,10 +187,10 @@ const GAMES_SELECT =
  * sorts before `2026-07-31T00:15:00+00:00` lexicographically while being the
  * LATER instant, so it would serve a start an hour earlier than the real one.
  *
- * The parser is the same shape as ospex-writer's `parseTimestampMicros`,
- * deliberately duplicated rather than shared: these are separate deployables
- * with no common package, and a copied 30-line grammar is cheaper than a
- * dependency between them.
+ * The parser is the same grammar the protocol's off-chain writer applies at
+ * capture time, deliberately duplicated rather than shared: they are separate
+ * deployables with no common package, and a copied 30-line grammar is cheaper
+ * than a dependency between them.
  */
 const RFC3339 =
   /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(?:([Zz])|([+-])(\d{2}):(\d{2}))$/;
