@@ -120,6 +120,39 @@ const bodylessNotFound = (): Response => new Response('', { status: 404 });
 /** A 404 whose body parses as a JSON ARRAY — see the known-residual test. */
 const arrayBodyNotFound = (): Response => json([{ code: 'PGRST205' }], 404);
 
+/**
+ * A server whose view EXISTS but predates migration 072: it validates the
+ * requested projection the way PostgREST does (even at `limit=0`) and answers
+ * 42703 for any column outside its column set. This is the
+ * deploy/rollback/environment-compatibility hazard one level below relation
+ * presence: a presence-only probe reads this server as healthy while every
+ * contest-shaped query fails.
+ */
+const PRE_072_COLUMNS = new Set([
+  'contest_id',
+  'start_time',
+  'effective_start_time',
+  'game_match_time',
+  'game_earliest_match_time',
+]);
+const pre072View = (_method: string, url: string): Response => {
+  const select = new URL(url).searchParams.get('select') ?? '';
+  const missing = select
+    .split(',')
+    .map((c) => c.trim())
+    .find((c) => c.length > 0 && !PRE_072_COLUMNS.has(c));
+  if (missing === undefined) return json([], 200);
+  return json(
+    {
+      code: '42703',
+      details: null,
+      hint: null,
+      message: `column ${VIEW_NAME}.${missing} does not exist`,
+    },
+    400,
+  );
+};
+
 async function probeOver(handler: (method: string, url: string) => Response): Promise<{
   result: Awaited<ReturnType<typeof checkDependencies>>;
   requests: SeenRequest[];
@@ -173,6 +206,27 @@ describe('checkDependencies — the request it issues', () => {
     const { requests } = await probeOver(healthy);
     expect(requests[0]!.url).toContain('limit=0');
     expect(requests[0]!.prefer).not.toContain('count=');
+  });
+
+  it('projects every column the service requires — the schema-compatibility contract', async () => {
+    // PostgREST validates projected columns even at `limit=0`, so the select
+    // list is what turns "the view predates a required migration" into a
+    // readiness failure. A probe selecting only `contest_id` re-opens the
+    // stale-view fail-open the pre-072 regression below reproduces.
+    const { requests } = await probeOver(healthy);
+    const select = decodeURIComponent(new URL(requests[0]!.url).searchParams.get('select') ?? '');
+    const cols = select.split(',').map((c) => c.trim());
+    for (const required of [
+      'contest_id',
+      'start_time',
+      'effective_start_time',
+      'game_match_time',
+      'game_earliest_match_time',
+      'game_rundown_match_time',
+      'game_sportspage_match_time',
+    ]) {
+      expect(cols).toContain(required);
+    }
   });
 });
 
@@ -235,6 +289,30 @@ describe('checkDependencies — verdicts over a real transport', () => {
     const { result } = await probeOver(arrayBodyNotFound);
     expect(result.supabase.connected).toBe(true);
     expect(result.contestsView.present).toBe(true); // ← the residual, on purpose
+  });
+
+  it('an OUT-OF-DATE view (pre-072 projection) → connected, present FALSE', async () => {
+    // THE STALE-SCHEMA REGRESSION. The view EXISTS, so a presence-only probe
+    // (`select('contest_id')`) read this server as healthy — while every
+    // changed contest list/detail/recovery/SSE/speculation-context query
+    // failed at PostgREST with this same 42703. Reverting the probe's select
+    // to `contest_id` turns this red (the fake's self-check below proves the
+    // discrimination is real, not an always-error fake).
+    const { result } = await probeOver(pre072View);
+    expect(result.supabase.connected).toBe(true);
+    expect(result.contestsView.present).toBe(false);
+    expect(result.contestsView.error).toContain('42703');
+    expect(result.contestsView.error).toContain(VIEW_NAME);
+  });
+
+  it('FAKE SELF-CHECK: the pre-072 server accepts a presence-only probe', async () => {
+    // Asserts the test double, not product code: the stale-view fake answers
+    // a `contest_id`-only select with a healthy empty rows array. Without
+    // this, the regression above could pass against a fake that rejects
+    // everything — proving nothing about the probe's column list.
+    const res = pre072View('GET', `http://x.invalid/rest/v1/${VIEW_NAME}?select=contest_id&limit=0`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([]);
   });
 
   it('any other PostgREST error reports NOT connected', async () => {
@@ -329,6 +407,11 @@ describe('end to end: a missing view makes the composed verdict NOT ready', () =
 
   it('body-less 404 → isReady is false', async () => {
     const { result } = await probeOver(bodylessNotFound);
+    expect(isReady(result, { configured: true })).toBe(false);
+  });
+
+  it('an out-of-date view → isReady is false', async () => {
+    const { result } = await probeOver(pre072View);
     expect(isReady(result, { configured: true })).toBe(false);
   });
 

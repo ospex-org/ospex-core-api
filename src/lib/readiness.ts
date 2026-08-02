@@ -14,6 +14,13 @@
  * primary surface. Probing the base table would report the platform healthy
  * throughout.
  *
+ * The probe asserts SHAPE, not just presence: its select names the projection
+ * columns this service's queries require (READINESS_VIEW_COLUMNS below), so a
+ * view that exists but predates a required migration — the same
+ * deploy-order/rollback hazard one level down — also fails readiness. A
+ * presence-only probe (`select('contest_id')`) passed against a stale view
+ * while every contest read 42703'd.
+ *
  * Connectivity and view-presence are reported as SEPARATE terms because they
  * are separate facts: a PostgREST "relation not found" response proves the
  * round trip succeeded, so the transport is connected AND the view is missing.
@@ -67,6 +74,28 @@ import { CONTESTS_VIEW } from './tables.js';
 /** PostgREST / Postgres codes for "that relation does not exist". */
 const RELATION_MISSING_CODES = new Set(['PGRST205', '42P01']);
 
+/** Postgres code for "that column does not exist" — the OUT-OF-DATE-VIEW
+ *  signature: the relation answered, but its projection predates a required
+ *  migration. Connected, therefore, and NOT usable. */
+const COLUMN_MISSING_CODES = new Set(['42703']);
+
+/**
+ * The probe's select list IS the schema-compatibility contract. PostgREST
+ * validates every projected column even at `limit=0`, so a row-less GET that
+ * names the columns this service's queries require turns "the view exists but
+ * predates a required migration" into a readiness failure instead of a green
+ * /readyz over a surface where every contest read 42703s — the exact
+ * fail-open this module exists to prevent, one level below relation presence.
+ *
+ * `contest_id` proves the relation; the six time columns are the
+ * migration-managed projections every contest-shaped surface selects (the
+ * `CONTEST_*_COLUMNS` lists in v1/contests.ts and the speculation context
+ * list). A column added to those lists belongs here too.
+ */
+export const READINESS_VIEW_COLUMNS =
+  'contest_id, start_time, effective_start_time, game_match_time, ' +
+  'game_earliest_match_time, game_rundown_match_time, game_sportspage_match_time';
+
 export interface SupabaseReadiness {
   connected: boolean;
   error?: string;
@@ -117,7 +146,10 @@ const APPLY_MIGRATION_HINT =
 export async function checkDependencies(): Promise<DependencyReadiness> {
   try {
     const sb = getSupabase();
-    const { data, error, status } = await sb.from(CONTESTS_VIEW).select('contest_id').limit(0);
+    const { data, error, status } = await sb
+      .from(CONTESTS_VIEW)
+      .select(READINESS_VIEW_COLUMNS)
+      .limit(0);
 
     // The ONLY success branch: a real rows array came back.
     if (!error && Array.isArray(data)) {
@@ -130,6 +162,23 @@ export async function checkDependencies(): Promise<DependencyReadiness> {
         contestsView: {
           present: false,
           error: `relation "${CONTESTS_VIEW}" not found (${error.code}). ${APPLY_MIGRATION_HINT}`,
+        },
+      };
+    }
+
+    if (error && COLUMN_MISSING_CODES.has(error.code)) {
+      // The relation answered but its projection predates a migration this
+      // service version requires. The round trip succeeded, so the transport
+      // is connected — and the view is NOT usable: every contest-shaped read
+      // would fail with this same code while a presence-only probe stayed
+      // green.
+      return {
+        supabase: { connected: true },
+        contestsView: {
+          present: false,
+          error:
+            `"${CONTESTS_VIEW}" exists but lacks a required column (${error.code}: ${error.message}). ` +
+            `The view predates a migration this service version requires. ${APPLY_MIGRATION_HINT}`,
         },
       };
     }
