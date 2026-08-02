@@ -264,12 +264,13 @@ export async function getSpeculationsHandler(req: Request, res: Response): Promi
 
 /**
  * Parent-contest context columns, read from the `contests_effective` view.
- * PostgREST projects to exactly what is named here, so all four time columns
+ * PostgREST projects to exactly what is named here, so all six time columns
  * must stay in this list — dropping one serves the `''` sentinel silently.
  */
 const CONTEST_CONTEXT_COLUMNS =
   'contest_id, jsonodds_id, away_team, home_team, sport_slug, start_time, ' +
-  'effective_start_time, game_match_time, game_earliest_match_time, contest_status';
+  'effective_start_time, game_match_time, game_earliest_match_time, ' +
+  'game_rundown_match_time, game_sportspage_match_time, contest_status';
 
 interface ContestContextRow {
   contest_id: string | number;
@@ -278,14 +279,19 @@ interface ContestContextRow {
   home_team: string | null;
   sport_slug: string | null;
   start_time: string | null;
-  /** `LEAST(start_time, game_match_time, game_earliest_match_time)` from
-   *  `contests_effective` — three inputs; the third is the current retained safety floor. */
+  /** The bounded min from `contests_effective`: `LEAST` over `start_time`,
+   *  `game_match_time`, `game_earliest_match_time`, and the two provider
+   *  snapshots (each admitted only within one hour below `game_match_time`). */
   effective_start_time: string | null;
   /** Joined `games.match_time` from `contests_effective`. */
   game_match_time: string | null;
   /** Joined `games.earliest_match_time` (the current retained safety floor)
    *  from `contests_effective`. */
   game_earliest_match_time: string | null;
+  /** Joined provider start-time snapshots (`games.rundown_match_time` /
+   *  `games.sportspage_match_time`) from `contests_effective`. */
+  game_rundown_match_time: string | null;
+  game_sportspage_match_time: string | null;
   contest_status: string | null;
 }
 
@@ -372,6 +378,8 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
     chainStartTime: ctxRow.start_time ?? '',
     gameMatchTime: ctxRow.game_match_time ?? '',
     gameEarliestMatchTime: ctxRow.game_earliest_match_time ?? '',
+    gameRundownMatchTime: ctxRow.game_rundown_match_time ?? '',
+    gameSportspageMatchTime: ctxRow.game_sportspage_match_time ?? '',
     status: ctxRow.contest_status ?? '',
   };
 

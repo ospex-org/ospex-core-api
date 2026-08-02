@@ -15,14 +15,22 @@
 
 /**
  * `contests` LEFT JOIN `games` on `(network, jsonodds_id)`, projecting
- * `effective_start_time = LEAST(contests.start_time, games.match_time,
- * games.earliest_match_time)` and the raw `game_match_time` +
- * `game_earliest_match_time` alongside `contests.*`.
+ * `effective_start_time` — a bounded LEAST over `contests.start_time`,
+ * `games.match_time`, `games.earliest_match_time`, and the two provider
+ * start-time snapshots (`games.rundown_match_time` /
+ * `games.sportspage_match_time`, each admitted only while within one hour
+ * below `games.match_time`) — plus the raw `game_match_time`,
+ * `game_earliest_match_time`, `game_rundown_match_time`, and
+ * `game_sportspage_match_time` alongside `contests.*`.
  *
- * THREE inputs, not two. The third is the game's CURRENT RETAINED SAFETY
- * FLOOR. Without it the bound is not stable: `games.match_time` moves in both
- * directions, so a feed rollback would lift `effective_start_time` back up and
- * reopen a gate that had already closed.
+ * FIVE inputs, two of them guarded. The floor is the game's CURRENT RETAINED
+ * SAFETY FLOOR — without it the bound is not stable: `games.match_time` moves
+ * in both directions, so a feed rollback would lift `effective_start_time`
+ * back up and reopen a gate that had already closed. The snapshots are DATED
+ * OBSERVATIONS from the enrichment providers; the one-hour read-time guard is
+ * what keeps a stale observation from wrong-closing the bound, and it
+ * self-heals — a snapshot the feed later moves away from drops out of the min
+ * on the next read.
  *
  * ⚠ STATE THE GUARANTEE AT ITS ACTUAL WIDTH. What the schema enforces is that
  * ORDINARY schedule writes cannot raise the floor (the trigger recomputes it

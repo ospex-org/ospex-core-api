@@ -89,10 +89,13 @@ interface GameRow {
   slug: string;
   sport: Sport;
   /**
-   * The earliest start we currently hold for this game: the minimum of the raw
-   * feed value and the monotone floor. A conservative safety bound, NOT an
-   * observation — compare `gameMatchTime` below to see the raw value it came
-   * from. Matches the derivation `/v1/contests*` and `/v1/speculations` apply.
+   * The earliest start we currently hold for this game: a bounded minimum of
+   * the raw feed value, the monotone floor, and the two provider snapshots
+   * (each admitted only within one hour below the feed value — the same
+   * freshness guard the `contests_effective` view applies). A conservative
+   * safety bound, NOT an observation — compare the raw fields below to see
+   * the value it came from. Matches the games-side derivation `/v1/contests*`
+   * and `/v1/speculations` read from the view.
    */
   matchTime: string;
   /** The raw current feed value, unminimised. Diagnostic. */
@@ -102,6 +105,16 @@ interface GameRow {
    * when this is below `gameMatchTime`, it is what is driving `matchTime`.
    */
   earliestMatchTime: string | null;
+  /**
+   * Provider start-time snapshots (`games.rundown_match_time` /
+   * `games.sportspage_match_time`), verbatim, or null when unset. Dated
+   * observations, not live values (captured at id claim, re-observed after
+   * absorbed feed moves, nulled on id release); they enter `matchTime` only
+   * through the one-hour freshness guard, so a value far below
+   * `gameMatchTime` is stale and deliberately NOT driving the minimum.
+   */
+  rundownMatchTime: string | null;
+  sportspageMatchTime: string | null;
   status: string;
   homeTeam: TeamInfo;
   awayTeam: TeamInfo;
@@ -121,6 +134,8 @@ interface GamesDbRow {
   sport: string;
   match_time: string;
   earliest_match_time: string | null;
+  rundown_match_time: string | null;
+  sportspage_match_time: string | null;
   status: string;
   home_team_id: string;
   away_team_id: string;
@@ -143,7 +158,7 @@ interface TeamDbRow {
 }
 
 const GAMES_SELECT =
-  'network, jsonodds_id, sportspage_id, rundown_id, sport, match_time, earliest_match_time, status, home_team_id, away_team_id, has_odds, contest_created, contest_id, slug, home_probable_pitcher, away_probable_pitcher';
+  'network, jsonodds_id, sportspage_id, rundown_id, sport, match_time, earliest_match_time, rundown_match_time, sportspage_match_time, status, home_team_id, away_team_id, has_odds, contest_created, contest_id, slug, home_probable_pitcher, away_probable_pitcher';
 
 /**
  * The earliest start this game is known to have carried, as a bound.
@@ -155,11 +170,15 @@ const GAMES_SELECT =
  * have no second input to minimise over — a pre-contest caller had exactly one
  * temporal field and could take no minimum at all.
  *
- * Be precise about what the floor does and does not buy. It protects against a
- * MOVE-UP BEING ROLLED BACK by the same provider. It gives ZERO protection
- * against providers disagreeing at record time, because pre-contest we hold no
- * second provider's time at all — that needs persisted provider times in the
- * writer and is separate, larger work.
+ * Be precise about what each input buys. The floor protects against a MOVE-UP
+ * BEING ROLLED BACK by the same provider. The provider snapshots (persisted by
+ * the protocol's off-chain writer at id claim, re-observed after absorbed feed
+ * moves) are what protect against providers DISAGREEING at record time — the
+ * pre-contest gap this endpoint used to state as separate, larger work. They
+ * are dated observations, so each is admitted only while within ONE HOUR below
+ * the live feed value — the same read-time freshness guard the
+ * `contests_effective` view applies — and a stale snapshot is excluded rather
+ * than allowed to wrong-close the bound.
  *
  * Exactly ONE value is retained, so this is not a history: a `matchTime` below
  * both raw fields means only that the retained floor is currently the minimum.
@@ -229,12 +248,36 @@ function parseTimestampMicros(iso: string): bigint | null {
   return total;
 }
 
-function effectiveMatchTime(matchTime: string, earliest: string | null): string {
-  if (earliest === null) return matchTime;
-  const e = parseTimestampMicros(earliest);
+/** One hour in microseconds — the snapshot freshness window. Must match the
+ *  `interval '1 hour'` guard in the `contests_effective` view: two
+ *  implementations of one rule, deliberately (this endpoint reads the games
+ *  TABLE, not the view), so a drift here silently forks the served bound. */
+const SNAPSHOT_FRESHNESS_MICROS = 3_600_000_000n;
+
+function effectiveMatchTime(
+  matchTime: string,
+  earliest: string | null,
+  rundown: string | null,
+  sportspage: string | null,
+): string {
   const m = parseTimestampMicros(matchTime);
-  if (e === null || m === null) return matchTime;
-  return e < m ? earliest : matchTime;
+  if (m === null) return matchTime;
+  let best = m;
+  let bestIso = matchTime;
+  const consider = (iso: string | null, freshnessGuarded: boolean): void => {
+    if (iso === null) return;
+    const v = parseTimestampMicros(iso);
+    if (v === null) return; // unparseable degrades to the other inputs
+    if (freshnessGuarded && v < m - SNAPSHOT_FRESHNESS_MICROS) return; // stale — excluded
+    if (v < best) {
+      best = v;
+      bestIso = iso;
+    }
+  };
+  consider(earliest, false);
+  consider(rundown, true);
+  consider(sportspage, true);
+  return bestIso;
 }
 
 function parseBoolParam(raw: string | undefined): boolean | 'invalid' | undefined {
@@ -277,9 +320,16 @@ function dbRowToGameRow(row: GamesDbRow, teams: Map<string, TeamInfo>): GameRow 
     gameId: row.jsonodds_id,
     slug: row.slug,
     sport: row.sport as Sport,
-    matchTime: effectiveMatchTime(row.match_time, row.earliest_match_time),
+    matchTime: effectiveMatchTime(
+      row.match_time,
+      row.earliest_match_time,
+      row.rundown_match_time,
+      row.sportspage_match_time,
+    ),
     gameMatchTime: row.match_time,
     earliestMatchTime: row.earliest_match_time,
+    rundownMatchTime: row.rundown_match_time,
+    sportspageMatchTime: row.sportspage_match_time,
     status: row.status,
     homeTeam: teams.get(row.home_team_id) ?? FALLBACK_TEAM,
     awayTeam: teams.get(row.away_team_id) ?? FALLBACK_TEAM,
