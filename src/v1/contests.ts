@@ -29,11 +29,14 @@
  *                        start-time snapshots (served below as
  *                        `gameRundownMatchTime` / `gameSportspageMatchTime`).
  *                        A conservative safety bound, NOT a prediction of
- *                        first pitch. Gate on this. After a feed rollback
- *                        `matchTime` can sit strictly BELOW every raw
- *                        published field — correct, and deliberately not
- *                        following the feed back up. It proves nothing about
- *                        when, why, or from which source the schedule moved.
+ *                        first pitch. Gate on this. `matchTime` can sit
+ *                        strictly BELOW both raw published SCHEDULE fields
+ *                        (`chainStartTime` and `gameMatchTime`) — correct,
+ *                        not a bug — but it always EQUALS at least one served
+ *                        input: the floor or an eligible snapshot is then the
+ *                        driver, identifiable from the body. It proves
+ *                        nothing about when, why, or from which source the
+ *                        schedule moved.
  *   - `chainStartTime` — the raw `contests.start_time` written on-chain at
  *                        verification.
  *   - `gameMatchTime`  — the raw odds-feed schedule (`games.match_time`),

@@ -344,7 +344,7 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
   // resolver needs. `jsonodds_id` is selected (but not surfaced in the
   // response body) so we can resolve team UUIDs via the games join.
   //
-  // Reads the `contests_effective` view so the four start-time fields arrive
+  // Reads the `contests_effective` view so the six start-time fields arrive
   // in one row read — see the `/v1/contests` file header for what each means.
   const ctxRes = await sb
     .from(CONTESTS_VIEW)

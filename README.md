@@ -176,7 +176,7 @@ Every contest-shaped body — `GET /v1/contests`, `GET /v1/contests?since=`, `GE
 - an insert may supply the initial floor, and a delete-then-reinsert reseeds it;
 - exactly **one** value is retained. It is **not** a history of every start this game has ever been scheduled at.
 
-**Every input to the minimum is served raw**, which keeps a below-both `matchTime` explicable from the body alone: `matchTime` can sit **strictly less than both `chainStartTime` and `gameMatchTime`**, and the body identifies the driver — it is whichever served lower input **equals** the served `matchTime`. Two inputs can produce that shape:
+**Every input to the minimum is served raw**, which keeps a below-both `matchTime` explicable from the body alone: `matchTime` can sit **strictly less than both `chainStartTime` and `gameMatchTime`**, and the body identifies the driver — it is whichever served lower input **equals** the served `matchTime`. Two classes of input — three candidate fields — can produce that shape:
 
 - `gameEarliestMatchTime` equals it → the retained floor is driving, typically after a feed rollback the bound is deliberately refusing to follow back up;
 - `gameRundownMatchTime` or `gameSportspageMatchTime` equals it → a **fresh provider snapshot** (within its one-hour window below `gameMatchTime`) is driving, while the floor can remain higher. Do **not** infer from a below-both `matchTime` that the floor equals it — that inference broke when the snapshot inputs landed.
