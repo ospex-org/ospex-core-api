@@ -165,7 +165,8 @@ export const STREAM_RESOURCES: Record<StreamResourceName, StreamResource> = {
     cursorTable: 'contests',
     // The `contests_effective` view (contests LEFT JOIN games on
     // `(network, jsonodds_id)`) — `CONTEST_RECOVERY_COLUMNS` selects
-    // `effective_start_time` / `game_match_time`, which exist only there, and
+    // `effective_start_time` / `game_match_time` / `game_earliest_match_time`,
+    // which exist only there, and
     // `toBody` is a SYNCHRONOUS interface so the value has to arrive in the
     // polled row rather than from a second lookup. The view passes `contests.*`
     // through, so `id` / `row_updated_at` (and therefore the cursor, whose
@@ -181,13 +182,14 @@ export const STREAM_RESOURCES: Record<StreamResourceName, StreamResource> = {
     // cursor-based reconnect would not see it either — a subscriber would
     // hold the LATER start time indefinitely, which fails OPEN.
     //
-    // The close is on the WRITE side and lives in ANOTHER repo: a migration in
-    // the protocol indexer's schema adds a trigger that advances the linked
-    // contest's `row_updated_at` when `games.match_time` changes, so the change
+    // The close is on the WRITE side and lives in ANOTHER repo: triggers in
+    // the protocol indexer's schema advance the linked contest's
+    // `row_updated_at` when `games.match_time` or `games.earliest_match_time`
+    // changes, so the change
     // becomes cursor-visible here with no change to this service. Nothing in
     // this repo can enforce or detect that, and no test here can turn red if it
-    // is absent — so state it conditionally: WHERE that migration is applied, a
-    // game-only reschedule surfaces as an ordinary contest delta; where it is
+    // is absent — so state it conditionally: WHERE those triggers are applied, a
+    // game-only reschedule surfaces as an ordinary contest delta; where they are
     // not, reads stay correct (every response recomputes from the view) but a
     // cursor-based subscriber silently misses the reschedule until an unrelated
     // contest-row write or a cold snapshot.
@@ -197,12 +199,17 @@ export const STREAM_RESOURCES: Record<StreamResourceName, StreamResource> = {
     // `matchTime` — including for a row that lands just behind a `live` cursor
     // and is recovered by the overlap re-scan.
     //
-    // The trigger keys on `match_time` specifically rather than on
+    // The triggers key on those two columns specifically rather than on
     // `games.row_updated_at`, because that column is bumped by many writes
     // that change nothing contest-visible (odds flags, probable pitchers,
     // external-id claims, final scores) — every one of which would otherwise
-    // re-deliver the contest row. `match_time` is the only `games` column
-    // feeding a contest body, producing both `matchTime` and `gameMatchTime`.
+    // re-deliver the contest row. `match_time` and `earliest_match_time` are
+    // the two `games` columns feeding a contest body: between them they
+    // produce `gameMatchTime`, `gameEarliestMatchTime`, and two of
+    // `matchTime`'s three inputs. The `match_time` trigger covers ordinary
+    // schedule writes (which also move the floor); the companion trigger on
+    // `earliest_match_time` covers a floor-only update — the operator remedy —
+    // which touches no `match_time`.
     table: CONTESTS_VIEW,
     columns: CONTEST_RECOVERY_COLUMNS,
     toBody: (row) => contestRecoveryRowToBody(row as unknown as ContestRecoveryRow),

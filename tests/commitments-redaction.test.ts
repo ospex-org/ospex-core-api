@@ -246,6 +246,7 @@ function contestDetailRow(overrides: Record<string, unknown> = {}): Record<strin
     // side is null and LEAST() degrades to the chain value.
     effective_start_time: FUTURE,
     game_match_time: null,
+    game_earliest_match_time: null,
     contest_status: 'verified',
     away_score: null,
     home_score: null,
@@ -268,6 +269,7 @@ function contestContextRow(overrides: Record<string, unknown> = {}): Record<stri
     start_time: FUTURE,
     effective_start_time: FUTURE,
     game_match_time: null,
+    game_earliest_match_time: null,
     contest_status: 'verified',
     ...overrides,
   };

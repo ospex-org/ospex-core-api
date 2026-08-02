@@ -9,14 +9,17 @@
  *   3. `GET /v1/contests/:contestId`   (detail)
  *   4. `GET /v1/speculations/:id`      (parent-contest context)
  *
- * Each serves THREE fields:
+ * Each serves FOUR fields:
  *   - `matchTime`      = the view's `effective_start_time`, i.e. the EARLIEST
  *                        start we know of. A conservative safety bound, not a
  *                        prediction of first pitch.
  *   - `chainStartTime` = the raw `contests.start_time`.
  *   - `gameMatchTime`  = the raw joined `games.match_time`.
+ *   - `gameEarliestMatchTime` = the raw joined `games.earliest_match_time` —
+ *                        the game's current retained safety floor, served
+ *                        verbatim (never clamped).
  *
- * All three use the `?? ''` sentinel, never a parsed date — a null must never
+ * All four use the `?? ''` sentinel, never a parsed date — a null must never
  * become epoch (that would read as "already started" and stand the fleet down).
  *
  * SCOPE NOTE: the minimum itself is computed in Postgres by the
@@ -24,10 +27,10 @@
  * join). This suite cannot execute that SQL. What it DOES enforce is
  * everything this service owns:
  *
- *   - the three columns are SELECTED on every surface (the mock projects rows
+ *   - the four columns are SELECTED on every surface (the mock projects rows
  *     to the requested column list exactly as PostgREST does, so dropping a
  *     column from a select string serves `''` and turns the matrix red);
- *   - they are mapped to the right three wire fields without swapping;
+ *   - they are mapped to the right four wire fields without swapping;
  *   - the list window filters/orders on the same value it serves;
  *   - no handler reconstructs the join itself, off the poisoned
  *     `games.contest_id` pointer OR off a correctly-keyed second lookup;
@@ -202,12 +205,15 @@ function selectArg(calls: RecordedCall[], table: string, nth = 0): string {
 // expectations are written out as literals rather than derived, so a mapping
 // bug can't be masked by a shared helper.
 //
-// THE FLOOR IS A MODELLED INPUT, NOT A SERVED FIELD. `game_earliest_match_time`
-// is a third input to the view's LEAST since ospex-indexer migration 070, and
-// core-api does not expose it. That is exactly why it has to be modelled here:
-// without it the matrix cannot express the one shape that distinguishes the
-// three-input derivation from the obsolete two-input one — `matchTime` strictly
-// below BOTH published fields. See FLOOR_BELOW_BOTH_CASE.
+// THE FLOOR IS BOTH AN INPUT AND A SERVED FIELD. `game_earliest_match_time` —
+// a monotone per-game floor maintained by triggers in the protocol indexer's
+// schema — is the third input to the view's LEAST and is served verbatim as
+// `gameEarliestMatchTime`. The matrix therefore asserts two things at once:
+// the derivation (the `eff` column) and the served floor itself — including
+// the one shape that distinguishes the three-input derivation from the
+// obsolete two-input one (`matchTime` strictly below BOTH raw published
+// fields), where the body now explains the gap: the served floor equals the
+// served `matchTime`. See FLOOR_BELOW_BOTH_CASE and FLOOR_ABOVE_GAME_CASE.
 
 interface TimeCase {
   name: string;
@@ -216,7 +222,12 @@ interface TimeCase {
   /** `games.earliest_match_time` — the current retained safety floor. */
   floor: string | null;
   eff: string | null;
-  expect: { matchTime: string; chainStartTime: string; gameMatchTime: string };
+  expect: {
+    matchTime: string;
+    chainStartTime: string;
+    gameMatchTime: string;
+    gameEarliestMatchTime: string;
+  };
 }
 
 const CASES: TimeCase[] = [
@@ -230,6 +241,7 @@ const CASES: TimeCase[] = [
       matchTime: '2026-05-04T00:10:00Z',
       chainStartTime: '2026-05-04T01:00:00Z',
       gameMatchTime: '2026-05-04T00:10:00Z',
+      gameEarliestMatchTime: '2026-05-04T00:10:00Z',
     },
   },
   {
@@ -242,6 +254,7 @@ const CASES: TimeCase[] = [
       matchTime: '2026-05-04T01:00:00Z',
       chainStartTime: '2026-05-04T01:00:00Z',
       gameMatchTime: '2026-05-04T02:45:00Z',
+      gameEarliestMatchTime: '2026-05-04T02:45:00Z',
     },
   },
   {
@@ -254,10 +267,11 @@ const CASES: TimeCase[] = [
       matchTime: '2026-05-04T01:00:00Z',
       chainStartTime: '2026-05-04T01:00:00Z',
       gameMatchTime: '2026-05-04T01:00:00Z',
+      gameEarliestMatchTime: '2026-05-04T01:00:00Z',
     },
   },
   {
-    name: 'NO games row joined → degrades to the chain time, gameMatchTime is the "" sentinel',
+    name: 'NO games row joined → degrades to the chain time, game-side fields are the "" sentinel',
     chain: '2026-05-04T01:00:00Z',
     game: null,
     floor: null,
@@ -266,6 +280,7 @@ const CASES: TimeCase[] = [
       matchTime: '2026-05-04T01:00:00Z',
       chainStartTime: '2026-05-04T01:00:00Z',
       gameMatchTime: '',
+      gameEarliestMatchTime: '',
     },
   },
   {
@@ -278,21 +293,24 @@ const CASES: TimeCase[] = [
       matchTime: '2026-05-04T02:00:00Z',
       chainStartTime: '',
       gameMatchTime: '2026-05-04T02:00:00Z',
+      gameEarliestMatchTime: '2026-05-04T02:00:00Z',
     },
   },
   {
-    name: 'BOTH null → all three are the "" sentinel, never an epoch date',
+    name: 'BOTH null → all four are the "" sentinel, never an epoch date',
     chain: null,
     game: null,
     floor: null,
     eff: null,
-    expect: { matchTime: '', chainStartTime: '', gameMatchTime: '' },
+    expect: { matchTime: '', chainStartTime: '', gameMatchTime: '', gameEarliestMatchTime: '' },
   },
   {
     // THE DIAGNOSTIC ROW. The retained floor is below BOTH published fields, so
     // the served `matchTime` is strictly lower than `chainStartTime` AND
     // `gameMatchTime`. A two-input LEAST(chain, game) returns 02:00 here and
-    // gets this wrong; only the three-input derivation returns 01:00.
+    // gets this wrong; only the three-input derivation returns 01:00. The
+    // served `gameEarliestMatchTime` equals the served `matchTime`, so the
+    // body itself explains the gap.
     //
     // Reachable in production after a feed rollback: the floor keeps the
     // earlier observation while `match_time` moves back up to meet the chain.
@@ -305,6 +323,27 @@ const CASES: TimeCase[] = [
       matchTime: '2026-05-04T01:00:00Z',
       chainStartTime: '2026-05-04T02:00:00Z',
       gameMatchTime: '2026-05-04T02:00:00Z',
+      gameEarliestMatchTime: '2026-05-04T01:00:00Z',
+    },
+  },
+  {
+    // THE POST-REMEDY ROW. A floor-only operator remedy raised the retained
+    // floor ABOVE the current schedule: `floor <= gameMatchTime` is NOT an
+    // invariant, and the floor is served VERBATIM — never clamped — while
+    // `matchTime` keeps tracking the lower inputs. The three raw inputs are
+    // pairwise distinct here, so any single-column swap among `start_time` /
+    // `game_match_time` / `game_earliest_match_time` changes a served value
+    // and turns this case red on its own.
+    name: 'FLOOR above gameMatchTime (post-remedy) → floor served verbatim, matchTime tracks the game time',
+    chain: '2026-05-04T03:00:00Z',
+    game: '2026-05-04T01:00:00Z',
+    floor: '2026-05-04T02:00:00Z',
+    eff: '2026-05-04T01:00:00Z',
+    expect: {
+      matchTime: '2026-05-04T01:00:00Z',
+      chainStartTime: '2026-05-04T03:00:00Z',
+      gameMatchTime: '2026-05-04T01:00:00Z',
+      gameEarliestMatchTime: '2026-05-04T02:00:00Z',
     },
   },
 ];
@@ -313,16 +352,28 @@ const CASES: TimeCase[] = [
 const UNVERIFIED_CASE = CASES[4]!;
 
 /**
- * The only case that can tell the THREE-input derivation from the obsolete
- * TWO-input one: the retained floor sits strictly below both published fields,
- * so `matchTime < chainStartTime` AND `matchTime < gameMatchTime`.
- *
- * Every other row in the matrix returns the same answer under either formula,
- * which is why the suite went on asserting `LEAST(chain, game)` long after the
- * view became three-input. The live contest-85 example is non-diagnostic for
- * the same reason — its chain value is already the minimum.
+ * The only case where the served floor sits strictly below both raw published
+ * fields, so `matchTime < chainStartTime` AND `matchTime < gameMatchTime`. It
+ * pins two things at once: the THREE-input derivation (a two-input
+ * `LEAST(chain, game)` returns a different `eff` here — every other pre-remedy
+ * row agrees under either formula, which is why the suite once went on
+ * asserting the obsolete contract; the live contest-85 example is
+ * non-diagnostic for the same reason), and the body-level explanation of that
+ * gap — the served `gameEarliestMatchTime` equals the served `matchTime`, so
+ * a consumer can see FROM THE BODY that the retained floor is what is driving
+ * the bound.
  */
 const FLOOR_BELOW_BOTH_CASE = CASES[6]!;
+
+/**
+ * The post-remedy shape: the retained floor sits strictly ABOVE the current
+ * schedule. Pins that `floor <= gameMatchTime` is NOT an invariant and that
+ * the floor is served verbatim rather than clamped, while `matchTime` keeps
+ * tracking the lower inputs. Also the one row whose three raw inputs are
+ * pairwise distinct, so any single-column swap among the raw select columns
+ * is caught by this case alone.
+ */
+const FLOOR_ABOVE_GAME_CASE = CASES[7]!;
 
 /**
  * Fixture sanity: each case's `eff` really is `LEAST(...)` over the inputs it
@@ -350,6 +401,7 @@ function listRow(c: TimeCase): Record<string, unknown> {
     start_time: c.chain,
     effective_start_time: c.eff,
     game_match_time: c.game,
+    game_earliest_match_time: c.floor,
     contest_status: 'verified',
   };
 }
@@ -364,6 +416,7 @@ function recoveryRow(c: TimeCase): Record<string, unknown> {
     start_time: c.chain,
     effective_start_time: c.eff,
     game_match_time: c.game,
+    game_earliest_match_time: c.floor,
     contest_status: 'verified',
     away_score: null,
     home_score: null,
@@ -394,6 +447,7 @@ function detailRow(c: TimeCase, overrides: Record<string, unknown> = {}): Record
     start_time: c.chain,
     effective_start_time: c.eff,
     game_match_time: c.game,
+    game_earliest_match_time: c.floor,
     contest_status: 'verified',
     away_score: null,
     home_score: null,
@@ -415,6 +469,7 @@ function contextRow(c: TimeCase, overrides: Record<string, unknown> = {}): Recor
     start_time: c.chain,
     effective_start_time: c.eff,
     game_match_time: c.game,
+    game_earliest_match_time: c.floor,
     contest_status: 'verified',
     ...overrides,
   };
@@ -436,6 +491,7 @@ interface TimeFields {
   matchTime: string;
   chainStartTime: string;
   gameMatchTime: string;
+  gameEarliestMatchTime: string;
 }
 
 // ── per-surface drivers ─────────────────────────────────────────────────
@@ -524,9 +580,26 @@ describe('start-time fields — matrix across every contest-shaped surface', () 
     const c = FLOOR_BELOW_BOTH_CASE;
     expect(leastOf(c.chain, c.game, c.floor)).toBe(c.eff);
     expect(leastOf(c.chain, c.game)).not.toBe(c.eff);
-    // And it is the shape the README documents: strictly below BOTH.
+    // And it is the shape the README documents: strictly below BOTH…
     expect(c.expect.matchTime < c.expect.chainStartTime).toBe(true);
     expect(c.expect.matchTime < c.expect.gameMatchTime).toBe(true);
+    // …with the body explaining the gap: the served floor IS the served bound.
+    expect(c.expect.gameEarliestMatchTime).toBe(c.expect.matchTime);
+  });
+
+  it('the post-remedy case pins the floor as VERBATIM — floor <= gameMatchTime is NOT an invariant', () => {
+    // The matrix run of this case is what asserts the served values on every
+    // surface; this fixture check pins the shape that makes it diagnostic. If
+    // the mapper ever clamped the floor to the schedule, the matrix would
+    // serve 01:00 for `gameEarliestMatchTime` and every surface would go red.
+    const c = FLOOR_ABOVE_GAME_CASE;
+    expect(leastOf(c.chain, c.game, c.floor)).toBe(c.eff);
+    // The served floor sits strictly ABOVE the served schedule…
+    expect(c.expect.gameEarliestMatchTime > c.expect.gameMatchTime).toBe(true);
+    // …and `matchTime` does NOT follow it up — it tracks the game time.
+    expect(c.expect.matchTime).toBe(c.expect.gameMatchTime);
+    // The three raw inputs are pairwise distinct (the single-column-swap kill).
+    expect(new Set([c.chain, c.game, c.floor]).size).toBe(3);
   });
 
   for (const c of CASES) {
@@ -548,14 +621,19 @@ describe('start-time fields — matrix across every contest-shaped surface', () 
   }
 });
 
-// ── every surface actually SELECTS all three time columns ───────────────
+// ── every surface actually SELECTS all four time columns ────────────────
 //
 // The mock projects to the requested column list, so these two layers are
 // independent: the assertions below name the defect precisely, and the matrix
 // above goes red from the served value even if these were deleted.
 
-describe('every contest-shaped query selects all three time columns', () => {
-  const TIME_COLUMNS = ['start_time', 'effective_start_time', 'game_match_time'] as const;
+describe('every contest-shaped query selects all four time columns', () => {
+  const TIME_COLUMNS = [
+    'start_time',
+    'effective_start_time',
+    'game_match_time',
+    'game_earliest_match_time',
+  ] as const;
 
   for (const surface of SURFACES) {
     it(`${surface.name} selects them from contests_effective`, async () => {
@@ -713,6 +791,7 @@ describe('the games join key is jsonodds_id — never the poisoned games.contest
       matchTime: '2026-05-04T00:10:00Z',
       chainStartTime: '2026-05-04T01:00:00Z',
       gameMatchTime: '2026-05-04T00:10:00Z',
+      gameEarliestMatchTime: '2026-05-04T00:10:00Z',
     },
   };
   // A stale-pointer row from a previous deployment: different jsonodds_id, its
@@ -858,6 +937,7 @@ describe('a game-only reschedule surfaces on ?since= once the cursor advances', 
           matchTime: MOVED_UP_START,
           chainStartTime: ORIGINAL_START,
           gameMatchTime: MOVED_UP_START,
+          gameEarliestMatchTime: MOVED_UP_START,
         },
       }),
       id,
@@ -1015,6 +1095,7 @@ describe('a game-only reschedule surfaces on ?since= once the cursor advances', 
       matchTime: contests[0]!.matchTime,
       chainStartTime: contests[0]!.chainStartTime,
       gameMatchTime: contests[0]!.gameMatchTime,
+      gameEarliestMatchTime: contests[0]!.gameEarliestMatchTime,
     });
   });
 });

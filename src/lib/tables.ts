@@ -16,8 +16,8 @@
 /**
  * `contests` LEFT JOIN `games` on `(network, jsonodds_id)`, projecting
  * `effective_start_time = LEAST(contests.start_time, games.match_time,
- * games.earliest_match_time)` and the raw `game_match_time` alongside
- * `contests.*`.
+ * games.earliest_match_time)` and the raw `game_match_time` +
+ * `game_earliest_match_time` alongside `contests.*`.
  *
  * THREE inputs, not two. The third is the game's CURRENT RETAINED SAFETY
  * FLOOR. Without it the bound is not stable: `games.match_time` moves in both

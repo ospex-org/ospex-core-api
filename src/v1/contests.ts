@@ -18,25 +18,31 @@
  *
  * ## Start-time fields
  *
- * Contest-shaped bodies carry THREE time fields, all read from the
+ * Contest-shaped bodies carry FOUR time fields, all read from the
  * `contests_effective` view (never computed here — see below):
  *
  *   - `matchTime`      — the CURRENT CONSERVATIVE SAFETY BOUND: the minimum over
  *                        `chainStartTime`, `gameMatchTime`, AND the game's
- *                        current retained safety floor (a THIRD input, not
- *                        served as a field). A conservative safety bound, NOT
- *                        a prediction of first pitch. Gate on this.
- *                        Because the floor is unexposed, `matchTime` can sit
- *                        strictly BELOW both published fields after a feed
- *                        rollback — correct, and deliberately not following
- *                        the feed back up. That shape says only that the
- *                        retained floor is currently the minimum; it proves
- *                        nothing about when, why, or from which source the
- *                        schedule moved.
+ *                        current retained safety floor (served below as
+ *                        `gameEarliestMatchTime`). A conservative safety
+ *                        bound, NOT a prediction of first pitch. Gate on this.
+ *                        After a feed rollback `matchTime` can sit strictly
+ *                        BELOW both raw published fields — correct, and
+ *                        deliberately not following the feed back up. In that
+ *                        shape the served `gameEarliestMatchTime` equals
+ *                        `matchTime`: the body itself says the retained floor
+ *                        is currently the minimum. It proves nothing about
+ *                        when, why, or from which source the schedule moved.
  *   - `chainStartTime` — the raw `contests.start_time` written on-chain at
  *                        verification.
  *   - `gameMatchTime`  — the raw odds-feed schedule (`games.match_time`),
  *                        which tracks reschedules.
+ *   - `gameEarliestMatchTime` — the game's current retained safety floor
+ *                        (`games.earliest_match_time`), served VERBATIM —
+ *                        never clamped. `floor <= gameMatchTime` is NOT an
+ *                        invariant: a floor-only operator remedy can raise
+ *                        the floor above the current schedule, in which case
+ *                        `matchTime` keeps tracking the lower inputs.
  *
  * ### The ordering guarantee, and its one exception
  *
@@ -77,10 +83,14 @@
  * this service is deployed — otherwise every contest query fails at the DB
  * layer.
  *
- * NOTE: `/v1/contests.matchTime` and `/v1/games.matchTime` are DIFFERENT
- * columns from different providers. `games.matchTime` is the raw odds-feed
- * schedule (equal to `gameMatchTime` here for the same game); a contest's
- * `matchTime` is the min described above. Do not assume they agree.
+ * NOTE: `/v1/contests.matchTime` and `/v1/games.matchTime` are BOTH derived
+ * conservative bounds, computed over DIFFERENT input sets: the contest
+ * surfaces minimise over the chain start as well, while `/v1/games` (whose
+ * rows precede any contest) has no chain input. They are still not
+ * equality-comparable across endpoints. Compare raw with raw: `gameMatchTime`
+ * here against `/v1/games.gameMatchTime`, and `gameEarliestMatchTime` here
+ * against `/v1/games.earliestMatchTime` — the same underlying columns; note
+ * the null encodings differ (`""` here, `null` on `/v1/games`).
  */
 
 import type { Request, Response } from 'express';
@@ -123,12 +133,16 @@ interface ContestBody {
   sport: string;
   sportId: number;
   /** Current conservative start-time safety bound — the min over chain start, feed schedule, and the
-   *  game's unexposed retained safety floor. See the file header. */
+   *  game's retained safety floor (served below as `gameEarliestMatchTime`). See the file header. */
   matchTime: string;
   /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
   chainStartTime: string;
   /** Raw odds-feed schedule (`games.match_time`), joined on `(network, jsonodds_id)`. */
   gameMatchTime: string;
+  /** The game's current retained safety floor (`games.earliest_match_time`), verbatim — never
+   *  clamped. `""` when no games row is linked. When it is the minimum of the three inputs, it
+   *  is what is driving `matchTime`. See the file header. */
+  gameEarliestMatchTime: string;
   status: string;
 }
 
@@ -193,6 +207,9 @@ interface ContestListRow {
   effective_start_time: string | null;
   /** Joined `games.match_time` from `contests_effective`. */
   game_match_time: string | null;
+  /** Joined `games.earliest_match_time` (the current retained safety floor)
+   *  from `contests_effective`. */
+  game_earliest_match_time: string | null;
   contest_status: string | null;
 }
 
@@ -221,6 +238,9 @@ interface ContestDetailRow {
   effective_start_time: string | null;
   /** Joined `games.match_time` from `contests_effective`. */
   game_match_time: string | null;
+  /** Joined `games.earliest_match_time` (the current retained safety floor)
+   *  from `contests_effective`. */
+  game_earliest_match_time: string | null;
   contest_status: string | null;
   away_score: number | null;
   home_score: number | null;
@@ -249,6 +269,9 @@ export interface ContestRecoveryRow extends CursorableRow {
   effective_start_time: string | null;
   /** Joined `games.match_time` from `contests_effective`. */
   game_match_time: string | null;
+  /** Joined `games.earliest_match_time` (the current retained safety floor)
+   *  from `contests_effective`. */
+  game_earliest_match_time: string | null;
   contest_status: string | null;
   away_score: number | null;
   home_score: number | null;
@@ -265,12 +288,16 @@ export interface ContestRecoveryBody {
   sport: string;
   sportId: number;
   /** Current conservative start-time safety bound — the min over chain start, feed schedule, and the
-   *  game's unexposed retained safety floor. See the file header. */
+   *  game's retained safety floor (served below as `gameEarliestMatchTime`). See the file header. */
   matchTime: string;
   /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
   chainStartTime: string;
   /** Raw odds-feed schedule (`games.match_time`), joined on `(network, jsonodds_id)`. */
   gameMatchTime: string;
+  /** The game's current retained safety floor (`games.earliest_match_time`), verbatim — never
+   *  clamped. `""` when no games row is linked. When it is the minimum of the three inputs, it
+   *  is what is driving `matchTime`. See the file header. */
+  gameEarliestMatchTime: string;
   status: string;
   awayScore: number | null;
   homeScore: number | null;
@@ -287,25 +314,25 @@ export interface ContestRecoveryBody {
 // rather than an error. Dropping `effective_start_time` would therefore serve
 // `matchTime: ""` silently, and a consumer that parses that gets NaN. Every
 // contest-shaped list is named so the query shape is assertable in tests; keep
-// all three time columns in each.
+// all four time columns in each.
 
 /** `GET /v1/contests` (list). */
 const CONTEST_LIST_COLUMNS =
   'contest_id, away_team, home_team, sport_slug, jsonodds_sport_id, start_time, ' +
-  'effective_start_time, game_match_time, contest_status';
+  'effective_start_time, game_match_time, game_earliest_match_time, contest_status';
 
 /** `GET /v1/contests/:contestId` (detail). */
 const CONTEST_DETAIL_COLUMNS =
   'contest_id, jsonodds_id, rundown_id, sportspage_id, contest_creator, league_id, ' +
   'verify_source_hash, market_update_source_hash, score_contest_source_hash, ' +
   'away_team, home_team, sport_slug, jsonodds_sport_id, start_time, ' +
-  'effective_start_time, game_match_time, contest_status, ' +
+  'effective_start_time, game_match_time, game_earliest_match_time, contest_status, ' +
   'away_score, home_score, contest_created_at, verified_at, scored_at, voided_at';
 
 /** `GET /v1/contests?since=` (recovery) AND `GET /v1/stream/contests`. */
 export const CONTEST_RECOVERY_COLUMNS =
   'contest_id, away_team, home_team, sport_slug, jsonodds_sport_id, start_time, ' +
-  'effective_start_time, game_match_time, ' +
+  'effective_start_time, game_match_time, game_earliest_match_time, ' +
   'contest_status, away_score, home_score, verified_at, scored_at, voided_at, ' +
   'contest_created_at, id, row_updated_at';
 
@@ -322,6 +349,7 @@ export function contestRecoveryRowToBody(c: ContestRecoveryRow): ContestRecovery
     matchTime: c.effective_start_time ?? '',
     chainStartTime: c.start_time ?? '',
     gameMatchTime: c.game_match_time ?? '',
+    gameEarliestMatchTime: c.game_earliest_match_time ?? '',
     status: c.contest_status ?? '',
     awayScore: c.away_score ?? null,
     homeScore: c.home_score ?? null,
@@ -515,6 +543,7 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
     matchTime: c.effective_start_time ?? '',
     chainStartTime: c.start_time ?? '',
     gameMatchTime: c.game_match_time ?? '',
+    gameEarliestMatchTime: c.game_earliest_match_time ?? '',
     status: c.contest_status ?? '',
     speculations: specsByContest.get(String(c.contest_id)) ?? [],
   }));
@@ -653,6 +682,7 @@ export async function getContestByIdHandler(req: Request, res: Response): Promis
     matchTime: c.effective_start_time ?? '',
     chainStartTime: c.start_time ?? '',
     gameMatchTime: c.game_match_time ?? '',
+    gameEarliestMatchTime: c.game_earliest_match_time ?? '',
     status: c.contest_status ?? '',
     awayScore: c.away_score ?? null,
     homeScore: c.home_score ?? null,

@@ -327,6 +327,7 @@ describe('GET /v1/speculations/:speculationId', () => {
             // side is null and LEAST() degrades to the chain value.
             effective_start_time: '2026-05-04T01:00:00Z',
             game_match_time: null,
+            game_earliest_match_time: null,
             contest_status: 'verified',
           },
           error: null,
@@ -355,11 +356,13 @@ describe('GET /v1/speculations/:speculationId', () => {
         awayTeamId: null,
         homeTeamId: null,
         sport: 'nba',
-        // With no game side, all three time fields degrade to the chain value
-        // (gameMatchTime to the `''` sentinel, never to epoch).
+        // With no game side, the derived bound degrades to the chain value and
+        // the game-side fields `gameMatchTime` / `gameEarliestMatchTime`
+        // degrade to the `''` sentinel, never to epoch.
         matchTime: '2026-05-04T01:00:00Z',
         chainStartTime: '2026-05-04T01:00:00Z',
         gameMatchTime: '',
+        gameEarliestMatchTime: '',
         status: 'verified',
       },
     });
@@ -392,6 +395,7 @@ describe('GET /v1/speculations/:speculationId', () => {
             start_time: '2026-06-30T22:35:00Z',
             effective_start_time: '2026-06-30T22:35:00Z',
             game_match_time: null,
+            game_earliest_match_time: null,
             contest_status: 'scored',
           },
           error: null,
@@ -434,10 +438,12 @@ describe('GET /v1/speculations/:speculationId', () => {
             home_team: 'Celtics',
             sport_slug: 'nba',
             // Mode A: the game moved 50 minutes EARLIER than the frozen
-            // on-chain start, so the view's LEAST() picks the game side.
+            // on-chain start, so the view's LEAST() picks the game side. The
+            // retained floor tracks the move-up.
             start_time: '2026-05-04T01:00:00Z',
             effective_start_time: '2026-05-04T00:10:00Z',
             game_match_time: '2026-05-04T00:10:00Z',
+            game_earliest_match_time: '2026-05-04T00:10:00Z',
             contest_status: 'verified',
           },
           error: null,
@@ -460,6 +466,7 @@ describe('GET /v1/speculations/:speculationId', () => {
         matchTime: string;
         chainStartTime: string;
         gameMatchTime: string;
+        gameEarliestMatchTime: string;
       };
     };
     expect(body.contest.awayTeamId).toBe('lakers-uuid');
@@ -469,5 +476,6 @@ describe('GET /v1/speculations/:speculationId', () => {
     expect(body.contest.matchTime).not.toBe('2026-05-04T01:00:00Z');
     expect(body.contest.chainStartTime).toBe('2026-05-04T01:00:00Z');
     expect(body.contest.gameMatchTime).toBe('2026-05-04T00:10:00Z');
+    expect(body.contest.gameEarliestMatchTime).toBe('2026-05-04T00:10:00Z');
   });
 });

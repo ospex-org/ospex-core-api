@@ -128,6 +128,7 @@ describe('GET /v1/contests', () => {
               start_time: '2026-05-04T01:00:00Z',
               effective_start_time: '2026-05-04T01:00:00Z',
               game_match_time: '2026-05-04T01:00:00Z',
+              game_earliest_match_time: '2026-05-04T01:00:00Z',
               contest_status: 'verified',
             },
           ],
@@ -162,10 +163,17 @@ describe('GET /v1/contests', () => {
     await getContestsHandler(makeReq({ sport: 'nba', limit: '10' }), res as unknown as Response);
     expect(res.statusCode).toBe(200);
     const body = res.body as {
-      contests: Array<{ contestId: string; speculations: Array<{ type: string; awayLine?: number }> }>;
+      contests: Array<{
+        contestId: string;
+        gameEarliestMatchTime: string;
+        speculations: Array<{ type: string; awayLine?: number }>;
+      }>;
     };
     expect(body.contests).toHaveLength(1);
     expect(body.contests[0]!.contestId).toBe('42');
+    // The retained safety floor is served on list rows (the full cross-surface
+    // matrix lives in contests-effective-start-time.test.ts).
+    expect(body.contests[0]!.gameEarliestMatchTime).toBe('2026-05-04T01:00:00Z');
     expect(body.contests[0]!.speculations).toHaveLength(2);
     const spread = body.contests[0]!.speculations.find((s) => s.type === 'spread');
     expect(spread?.awayLine).toBe(-3.5);
@@ -214,6 +222,7 @@ describe('GET /v1/contests/:contestId', () => {
             start_time: '2026-05-04T01:00:00Z',
             effective_start_time: '2026-05-04T01:00:00Z',
             game_match_time: '2026-05-04T01:00:00Z',
+            game_earliest_match_time: '2026-05-04T01:00:00Z',
             contest_status: 'verified',
             away_score: null,
             home_score: null,
@@ -253,10 +262,13 @@ describe('GET /v1/contests/:contestId', () => {
       jsonoddsId: string | null;
       awayTeamId: string | null;
       homeTeamId: string | null;
+      gameEarliestMatchTime: string;
       speculations: Array<{ speculationId: string; contestId: string; orderbook: unknown[] }>;
     };
     expect(body.contestId).toBe('42');
     expect(body.jsonoddsId).toBe('a783e37e-4ce1-4f42-9dd6-615568f73044');
+    // The retained safety floor is served on the detail body too.
+    expect(body.gameEarliestMatchTime).toBe('2026-05-04T01:00:00Z');
     // No games row mocked → team_ids degrade to null. The team-id fields
     // are present in the response shape, just empty.
     expect(body.awayTeamId).toBeNull();
@@ -288,6 +300,7 @@ describe('GET /v1/contests/:contestId', () => {
             start_time: '2026-05-04T01:00:00Z',
             effective_start_time: '2026-05-04T01:00:00Z',
             game_match_time: '2026-05-04T01:00:00Z',
+            game_earliest_match_time: '2026-05-04T01:00:00Z',
             contest_status: 'verified',
             away_score: null,
             home_score: null,
@@ -339,6 +352,7 @@ describe('GET /v1/contests/:contestId', () => {
             start_time: '2026-05-04T01:00:00Z',
             effective_start_time: '2026-05-04T01:00:00Z',
             game_match_time: '2026-05-04T01:00:00Z',
+            game_earliest_match_time: '2026-05-04T01:00:00Z',
             contest_status: 'verified',
             away_score: null,
             home_score: null,
