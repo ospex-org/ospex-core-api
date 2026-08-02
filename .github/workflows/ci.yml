@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Node 20.19 is this repo's Node floor - the strictest engines.node
+      # requirement in the lockfile-pinned tree (vite 7.x needs
+      # '^20.19.0 || >=22.12.0') - and it is the floor rather than the
+      # deployed version on purpose: the dyno runs a newer Node, so testing
+      # the MINIMUM is what catches a dependency that quietly needs more
+      # than we promise to support.
+      #
+      # Example on this repo: @supabase/realtime-js still bundles 'ws', so
+      # Node 20 works today. If a future release drops it for native
+      # WebSocket (Node 22+), this run goes red at Install (yarn enforces
+      # dependency engines) instead of the floor silently going stale.
+      - name: Set up Node 20.19
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20.19'
+          cache: 'yarn'
+
+      - name: Install
+        run: corepack yarn install --frozen-lockfile
+
+      - name: Typecheck
+        run: corepack yarn typecheck
+
+      - name: Lint
+        run: corepack yarn lint
+
+      - name: Build
+        run: corepack yarn build
+
+      - name: Test
+        run: corepack yarn test
+
+      - name: Bench harness typecheck
+        run: corepack yarn bench:check
