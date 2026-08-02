@@ -35,7 +35,7 @@
  *   - the six columns are SELECTED on every surface (the mock projects rows
  *     to the requested column list exactly as PostgREST does, so dropping a
  *     column from a select string serves `''` and turns the matrix red);
- *   - they are mapped to the right four wire fields without swapping;
+ *   - they are mapped to the right six wire fields without swapping;
  *   - the list window filters/orders on the same value it serves;
  *   - no handler reconstructs the join itself, off the poisoned
  *     `games.contest_id` pointer OR off a correctly-keyed second lookup;
@@ -204,21 +204,23 @@ function selectArg(calls: RecordedCall[], table: string, nth = 0): string {
 
 // ── the matrix ──────────────────────────────────────────────────────────
 //
-// `eff` is what Postgres
-// `LEAST(start_time, game_match_time, game_earliest_match_time)` returns for
-// the TRIPLE (LEAST ignores NULLs; it is NULL only when all three are). The
+// `eff` is what Postgres's bounded LEAST returns for the input tuple: chain,
+// feed, floor, plus each provider snapshot admitted only within one hour
+// below the feed value (LEAST ignores NULLs; it is NULL only when every
+// input is). The fixture self-check below re-models exactly that. The
 // expectations are written out as literals rather than derived, so a mapping
 // bug can't be masked by a shared helper.
 //
-// THE FLOOR IS BOTH AN INPUT AND A SERVED FIELD. `game_earliest_match_time` —
-// a monotone per-game floor maintained by triggers in the protocol indexer's
-// schema — is the third input to the view's LEAST and is served verbatim as
-// `gameEarliestMatchTime`. The matrix therefore asserts two things at once:
-// the derivation (the `eff` column) and the served floor itself — including
-// the one shape that distinguishes the three-input derivation from the
-// obsolete two-input one (`matchTime` strictly below BOTH raw published
-// fields), where the body now explains the gap: the served floor equals the
-// served `matchTime`. See FLOOR_BELOW_BOTH_CASE and FLOOR_ABOVE_GAME_CASE.
+// EVERY MIN INPUT IS ALSO A SERVED FIELD. The floor
+// (`game_earliest_match_time`, a monotone per-game floor maintained by
+// triggers in the protocol indexer's schema) and the two provider snapshots
+// are inputs to the view's bounded LEAST and are served verbatim. The matrix
+// therefore asserts two things at once: the modelled derivation (the `eff`
+// column) and the served raw inputs — including the shapes where `matchTime`
+// sits strictly below BOTH raw published schedule fields, and the body
+// explains the gap through whichever served input equals it: the floor
+// (FLOOR_BELOW_BOTH_CASE) or a fresh snapshot (the FRESH SNAPSHOT case).
+// See also FLOOR_ABOVE_GAME_CASE and the STALE snapshot case.
 
 interface TimeCase {
   name: string;
@@ -322,7 +324,7 @@ const CASES: TimeCase[] = [
     },
   },
   {
-    name: 'BOTH null → all four are the "" sentinel, never an epoch date',
+    name: 'BOTH null → all six are the "" sentinel, never an epoch date',
     chain: null,
     game: null,
     floor: null,
@@ -340,7 +342,7 @@ const CASES: TimeCase[] = [
     // THE DIAGNOSTIC ROW. The retained floor is below BOTH published fields, so
     // the served `matchTime` is strictly lower than `chainStartTime` AND
     // `gameMatchTime`. A two-input LEAST(chain, game) returns 02:00 here and
-    // gets this wrong; only the three-input derivation returns 01:00. The
+    // gets this wrong; the floor-carrying derivation returns 01:00. The
     // served `gameEarliestMatchTime` equals the served `matchTime`, so the
     // body itself explains the gap.
     //
@@ -741,7 +743,7 @@ describe('start-time fields — matrix across every contest-shaped surface', () 
   }
 });
 
-// ── every surface actually SELECTS all four time columns ────────────────
+// ── every surface actually SELECTS all six time columns ─────────────────
 //
 // The mock projects to the requested column list, so these two layers are
 // independent: the assertions below name the defect precisely, and the matrix

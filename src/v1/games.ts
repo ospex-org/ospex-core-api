@@ -180,10 +180,12 @@ const GAMES_SELECT =
  * `contests_effective` view applies — and a stale snapshot is excluded rather
  * than allowed to wrong-close the bound.
  *
- * Exactly ONE value is retained, so this is not a history: a `matchTime` below
- * both raw fields means only that the retained floor is currently the minimum.
- * It does not establish source, causality, or that any particular earlier start
- * was ever scheduled.
+ * Exactly ONE value is retained per column, so none of this is a history: a
+ * `matchTime` below the raw feed value means only that one of the retained
+ * lower inputs — the floor, or a fresh provider snapshot — is currently the
+ * minimum; the served raw field equal to `matchTime` identifies which. It does
+ * not establish source, causality, or that any particular earlier start was
+ * ever scheduled.
  *
  * Null-safe in both directions — the column is fully populated on production
  * today (0 nulls of 1227), but a null must degrade to `match_time` rather than
@@ -425,21 +427,26 @@ export async function getGamesHandler(req: Request, res: Response): Promise<void
   const end = new Date(Date.now() + windowHours * 3600_000).toISOString();
 
   // KNOWN LIMITATION, stated rather than hidden: the window and the ordering key
-  // on the RAW `match_time`, while the response serves the MINIMUM of that and
-  // the monotone floor. The two can disagree.
+  // on the RAW `match_time`, while the response serves the bounded MINIMUM over
+  // that, the monotone floor, and the freshness-guarded provider snapshots. The
+  // window key and the served value can disagree.
   //
-  // Why it is not fixed here: PostgREST cannot express a `LEAST(a, b)` filter or
+  // Why it is not fixed here: PostgREST cannot express a `LEAST(...)` filter or
   // sort. `/v1/contests*` avoids this only because `contests_effective` is a
   // VIEW that materialises the minimum as a real column, so its window and sort
   // key on the same value they serve. `games` has no such view.
   //
-  // Consequences, both small and both real. A game whose floor is earlier than
-  // `start` can be returned carrying a `matchTime` before the requested window.
-  // A game whose floor falls inside the window but whose `match_time` is past
-  // `end` is NOT returned. On production this can affect only rows where the
-  // floor is strictly below `match_time` — 1 of 1227 as of 2026-07-31 — because
-  // an ordinary write cannot raise the floor, so the two are equal until a
-  // move-up is rolled back.
+  // Consequences, small and real. A game whose minimum-driving input (a floor
+  // below the feed value, or a FRESH provider snapshot below it) is earlier
+  // than `start` can be returned carrying a `matchTime` before the requested
+  // window; one whose lower input falls inside the window while `match_time`
+  // is past `end` is NOT returned. Divergence needs some input strictly below
+  // `match_time`: floor-below-feed rows are rare by construction (1 of 1227 as
+  // of 2026-07-31 — an ordinary write cannot raise the floor, so the two are
+  // equal until a move-up is rolled back), and a snapshot can now diverge by
+  // up to its one-hour window whenever a provider quotes an earlier start than
+  // the odds feed — the sub-hour disagreement class this endpoint exists to
+  // surface, so expect it at a low steady rate rather than never.
   //
   // Closing it properly means a `games_effective` view mirroring
   // `contests_effective`, which is an indexer migration and is deliberately out

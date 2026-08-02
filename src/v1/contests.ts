@@ -78,7 +78,7 @@
  *
  * The recorded start time is a PREDICTION, not ground truth. `min(...)` is
  * a SAFETY rule, not a truth-recovery rule — it does not "serve the correct
- * time"; it serves the minimum of the three current retained inputs.
+ * time"; it serves the bounded minimum of the current retained inputs.
  *
  * The minimum is computed in Postgres by the `contests_effective` view — a
  * bounded LEAST over `c.start_time`, `g.match_time`, `g.earliest_match_time`,
