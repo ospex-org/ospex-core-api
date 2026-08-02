@@ -390,7 +390,7 @@ const CASES: TimeCase[] = [
     // it — and every input is pairwise distinct, so a swap among any of the
     // five time columns changes a served value and turns this case red on its
     // own.
-    name: 'FRESH SNAPSHOT below everything → drives matchTime; both snapshots served verbatim',
+    name: 'FRESH SNAPSHOT below chain, feed, and floor → drives matchTime; both snapshots served verbatim',
     chain: '2026-05-04T03:00:00Z',
     game: '2026-05-04T02:10:00Z',
     floor: '2026-05-04T02:08:00Z',
