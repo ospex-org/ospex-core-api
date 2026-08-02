@@ -43,7 +43,7 @@ Not ported (no analog in the current protocol — see "Position helpers" section
 
 ## Stack
 
-- Node.js 20+, TypeScript (strict, `exactOptionalPropertyTypes`)
+- Node.js 20.19+, TypeScript (strict, `exactOptionalPropertyTypes`)
 - Express 5
 - Supabase (`@supabase/supabase-js`) — the only data layer. **No Firebase.**
 - ethers v6 — EIP-712 typed-data hashing / signature recovery
