@@ -9,28 +9,33 @@
  *   3. `GET /v1/contests/:contestId`   (detail)
  *   4. `GET /v1/speculations/:id`      (parent-contest context)
  *
- * Each serves FOUR fields:
+ * Each serves SIX fields:
  *   - `matchTime`      = the view's `effective_start_time`, i.e. the EARLIEST
- *                        start we know of. A conservative safety bound, not a
- *                        prediction of first pitch.
+ *                        start we know of (a bounded min — the snapshots are
+ *                        admitted only within one hour below `gameMatchTime`).
+ *                        A conservative safety bound, not a prediction of
+ *                        first pitch.
  *   - `chainStartTime` = the raw `contests.start_time`.
  *   - `gameMatchTime`  = the raw joined `games.match_time`.
  *   - `gameEarliestMatchTime` = the raw joined `games.earliest_match_time` —
  *                        the game's current retained safety floor, served
  *                        verbatim (never clamped).
+ *   - `gameRundownMatchTime` / `gameSportspageMatchTime` = the raw joined
+ *                        provider start-time snapshots, served verbatim.
  *
- * All four use the `?? ''` sentinel, never a parsed date — a null must never
+ * All six use the `?? ''` sentinel, never a parsed date — a null must never
  * become epoch (that would read as "already started" and stand the fleet down).
  *
  * SCOPE NOTE: the minimum itself is computed in Postgres by the
- * `contests_effective` view (`LEAST(...)` over a `(network, jsonodds_id)`
+ * `contests_effective` view (a bounded `LEAST(...)` over a
+ * `(network, jsonodds_id)`
  * join). This suite cannot execute that SQL. What it DOES enforce is
  * everything this service owns:
  *
- *   - the four columns are SELECTED on every surface (the mock projects rows
+ *   - the six columns are SELECTED on every surface (the mock projects rows
  *     to the requested column list exactly as PostgREST does, so dropping a
  *     column from a select string serves `''` and turns the matrix red);
- *   - they are mapped to the right four wire fields without swapping;
+ *   - they are mapped to the right six wire fields without swapping;
  *   - the list window filters/orders on the same value it serves;
  *   - no handler reconstructs the join itself, off the poisoned
  *     `games.contest_id` pointer OR off a correctly-keyed second lookup;
@@ -199,21 +204,23 @@ function selectArg(calls: RecordedCall[], table: string, nth = 0): string {
 
 // ── the matrix ──────────────────────────────────────────────────────────
 //
-// `eff` is what Postgres
-// `LEAST(start_time, game_match_time, game_earliest_match_time)` returns for
-// the TRIPLE (LEAST ignores NULLs; it is NULL only when all three are). The
+// `eff` is what Postgres's bounded LEAST returns for the input tuple: chain,
+// feed, floor, plus each provider snapshot admitted only within one hour
+// below the feed value (LEAST ignores NULLs; it is NULL only when every
+// input is). The fixture self-check below re-models exactly that. The
 // expectations are written out as literals rather than derived, so a mapping
 // bug can't be masked by a shared helper.
 //
-// THE FLOOR IS BOTH AN INPUT AND A SERVED FIELD. `game_earliest_match_time` —
-// a monotone per-game floor maintained by triggers in the protocol indexer's
-// schema — is the third input to the view's LEAST and is served verbatim as
-// `gameEarliestMatchTime`. The matrix therefore asserts two things at once:
-// the derivation (the `eff` column) and the served floor itself — including
-// the one shape that distinguishes the three-input derivation from the
-// obsolete two-input one (`matchTime` strictly below BOTH raw published
-// fields), where the body now explains the gap: the served floor equals the
-// served `matchTime`. See FLOOR_BELOW_BOTH_CASE and FLOOR_ABOVE_GAME_CASE.
+// EVERY MIN INPUT IS ALSO A SERVED FIELD. The floor
+// (`game_earliest_match_time`, a monotone per-game floor maintained by
+// triggers in the protocol indexer's schema) and the two provider snapshots
+// are inputs to the view's bounded LEAST and are served verbatim. The matrix
+// therefore asserts two things at once: the modelled derivation (the `eff`
+// column) and the served raw inputs — including the shapes where `matchTime`
+// sits strictly below BOTH raw published schedule fields, and the body
+// explains the gap through whichever served input equals it: the floor
+// (FLOOR_BELOW_BOTH_CASE) or a fresh snapshot (the FRESH SNAPSHOT case).
+// See also FLOOR_ABOVE_GAME_CASE and the STALE snapshot case.
 
 interface TimeCase {
   name: string;
@@ -221,12 +228,22 @@ interface TimeCase {
   game: string | null;
   /** `games.earliest_match_time` — the current retained safety floor. */
   floor: string | null;
+  /** Provider start-time snapshots (`games.rundown_match_time` /
+   *  `games.sportspage_match_time`). Omitted = null (no snapshot captured) —
+   *  the pre-071 steady state most cases model. `eff` stays MODELLED: the
+   *  view's bounded LEAST (snapshots admitted only within one hour below
+   *  `game`) is computed by Postgres; these cases pin the PLUMBING — that the
+   *  modelled min and both raw snapshots reach every surface verbatim. */
+  rundown?: string | null;
+  sportspage?: string | null;
   eff: string | null;
   expect: {
     matchTime: string;
     chainStartTime: string;
     gameMatchTime: string;
     gameEarliestMatchTime: string;
+    gameRundownMatchTime: string;
+    gameSportspageMatchTime: string;
   };
 }
 
@@ -242,6 +259,8 @@ const CASES: TimeCase[] = [
       chainStartTime: '2026-05-04T01:00:00Z',
       gameMatchTime: '2026-05-04T00:10:00Z',
       gameEarliestMatchTime: '2026-05-04T00:10:00Z',
+      gameRundownMatchTime: '',
+      gameSportspageMatchTime: '',
     },
   },
   {
@@ -255,6 +274,8 @@ const CASES: TimeCase[] = [
       chainStartTime: '2026-05-04T01:00:00Z',
       gameMatchTime: '2026-05-04T02:45:00Z',
       gameEarliestMatchTime: '2026-05-04T02:45:00Z',
+      gameRundownMatchTime: '',
+      gameSportspageMatchTime: '',
     },
   },
   {
@@ -268,6 +289,8 @@ const CASES: TimeCase[] = [
       chainStartTime: '2026-05-04T01:00:00Z',
       gameMatchTime: '2026-05-04T01:00:00Z',
       gameEarliestMatchTime: '2026-05-04T01:00:00Z',
+      gameRundownMatchTime: '',
+      gameSportspageMatchTime: '',
     },
   },
   {
@@ -281,6 +304,8 @@ const CASES: TimeCase[] = [
       chainStartTime: '2026-05-04T01:00:00Z',
       gameMatchTime: '',
       gameEarliestMatchTime: '',
+      gameRundownMatchTime: '',
+      gameSportspageMatchTime: '',
     },
   },
   {
@@ -294,21 +319,30 @@ const CASES: TimeCase[] = [
       chainStartTime: '',
       gameMatchTime: '2026-05-04T02:00:00Z',
       gameEarliestMatchTime: '2026-05-04T02:00:00Z',
+      gameRundownMatchTime: '',
+      gameSportspageMatchTime: '',
     },
   },
   {
-    name: 'BOTH null → all four are the "" sentinel, never an epoch date',
+    name: 'BOTH null → all six are the "" sentinel, never an epoch date',
     chain: null,
     game: null,
     floor: null,
     eff: null,
-    expect: { matchTime: '', chainStartTime: '', gameMatchTime: '', gameEarliestMatchTime: '' },
+    expect: {
+      matchTime: '',
+      chainStartTime: '',
+      gameMatchTime: '',
+      gameEarliestMatchTime: '',
+      gameRundownMatchTime: '',
+      gameSportspageMatchTime: '',
+    },
   },
   {
     // THE DIAGNOSTIC ROW. The retained floor is below BOTH published fields, so
     // the served `matchTime` is strictly lower than `chainStartTime` AND
     // `gameMatchTime`. A two-input LEAST(chain, game) returns 02:00 here and
-    // gets this wrong; only the three-input derivation returns 01:00. The
+    // gets this wrong; the floor-carrying derivation returns 01:00. The
     // served `gameEarliestMatchTime` equals the served `matchTime`, so the
     // body itself explains the gap.
     //
@@ -324,6 +358,8 @@ const CASES: TimeCase[] = [
       chainStartTime: '2026-05-04T02:00:00Z',
       gameMatchTime: '2026-05-04T02:00:00Z',
       gameEarliestMatchTime: '2026-05-04T01:00:00Z',
+      gameRundownMatchTime: '',
+      gameSportspageMatchTime: '',
     },
   },
   {
@@ -344,6 +380,52 @@ const CASES: TimeCase[] = [
       chainStartTime: '2026-05-04T03:00:00Z',
       gameMatchTime: '2026-05-04T01:00:00Z',
       gameEarliestMatchTime: '2026-05-04T02:00:00Z',
+      gameRundownMatchTime: '',
+      gameSportspageMatchTime: '',
+    },
+  },
+  {
+    // THE SNAPSHOT ROW. A fresh provider snapshot sits below chain, feed, and
+    // floor, inside its one-hour window, so the MODELLED bounded min follows
+    // it — and every input is pairwise distinct, so a swap among any of the
+    // five time columns changes a served value and turns this case red on its
+    // own.
+    name: 'FRESH SNAPSHOT below chain, feed, and floor → drives matchTime; both snapshots served verbatim',
+    chain: '2026-05-04T03:00:00Z',
+    game: '2026-05-04T02:10:00Z',
+    floor: '2026-05-04T02:08:00Z',
+    rundown: '2026-05-04T02:00:00Z',
+    sportspage: '2026-05-04T02:05:00Z',
+    eff: '2026-05-04T02:00:00Z',
+    expect: {
+      matchTime: '2026-05-04T02:00:00Z',
+      chainStartTime: '2026-05-04T03:00:00Z',
+      gameMatchTime: '2026-05-04T02:10:00Z',
+      gameEarliestMatchTime: '2026-05-04T02:08:00Z',
+      gameRundownMatchTime: '2026-05-04T02:00:00Z',
+      gameSportspageMatchTime: '2026-05-04T02:05:00Z',
+    },
+  },
+  {
+    // THE STALE-SNAPSHOT ROW. A snapshot more than an hour below the live
+    // feed value is excluded by the view's freshness guard, so the modelled
+    // min ignores it — yet it is still SERVED verbatim, far below the served
+    // matchTime. This is the wire shape consumers must expect: a served
+    // snapshot below matchTime is not necessarily driving it.
+    name: 'STALE snapshot (>1h below the feed) → excluded from matchTime, still served verbatim',
+    chain: '2026-05-04T02:10:00Z',
+    game: '2026-05-04T02:10:00Z',
+    floor: '2026-05-04T02:10:00Z',
+    rundown: '2026-05-03T20:00:00Z',
+    sportspage: null,
+    eff: '2026-05-04T02:10:00Z',
+    expect: {
+      matchTime: '2026-05-04T02:10:00Z',
+      chainStartTime: '2026-05-04T02:10:00Z',
+      gameMatchTime: '2026-05-04T02:10:00Z',
+      gameEarliestMatchTime: '2026-05-04T02:10:00Z',
+      gameRundownMatchTime: '2026-05-03T20:00:00Z',
+      gameSportspageMatchTime: '',
     },
   },
 ];
@@ -389,6 +471,25 @@ function leastOf(...values: Array<string | null>): string | null {
   return min;
 }
 
+/**
+ * The view's bounded five-input min, re-modelled for the fixture self-check:
+ * a snapshot participates only while within ONE HOUR below `game` (the
+ * `interval '1 hour'` CASE guard in `contests_effective`). Lexicographic
+ * comparison is sound here because every fixture uses same-length Zulu
+ * timestamps; the production comparison is Postgres's, not this one.
+ */
+function boundedLeastOf(c: TimeCase): string | null {
+  const guard = (snapshot: string | null | undefined): string | null => {
+    if (snapshot === null || snapshot === undefined) return null;
+    if (c.game === null) return null;
+    const cutoff = new Date(Date.parse(c.game) - 3_600_000)
+      .toISOString()
+      .replace('.000Z', 'Z');
+    return snapshot >= cutoff ? snapshot : null;
+  };
+  return leastOf(c.chain, c.game, c.floor, guard(c.rundown), guard(c.sportspage));
+}
+
 // ── row builders (shapes the view returns) ──────────────────────────────
 
 function listRow(c: TimeCase): Record<string, unknown> {
@@ -402,6 +503,8 @@ function listRow(c: TimeCase): Record<string, unknown> {
     effective_start_time: c.eff,
     game_match_time: c.game,
     game_earliest_match_time: c.floor,
+    game_rundown_match_time: c.rundown ?? null,
+    game_sportspage_match_time: c.sportspage ?? null,
     contest_status: 'verified',
   };
 }
@@ -417,6 +520,8 @@ function recoveryRow(c: TimeCase): Record<string, unknown> {
     effective_start_time: c.eff,
     game_match_time: c.game,
     game_earliest_match_time: c.floor,
+    game_rundown_match_time: c.rundown ?? null,
+    game_sportspage_match_time: c.sportspage ?? null,
     contest_status: 'verified',
     away_score: null,
     home_score: null,
@@ -448,6 +553,8 @@ function detailRow(c: TimeCase, overrides: Record<string, unknown> = {}): Record
     effective_start_time: c.eff,
     game_match_time: c.game,
     game_earliest_match_time: c.floor,
+    game_rundown_match_time: c.rundown ?? null,
+    game_sportspage_match_time: c.sportspage ?? null,
     contest_status: 'verified',
     away_score: null,
     home_score: null,
@@ -470,6 +577,8 @@ function contextRow(c: TimeCase, overrides: Record<string, unknown> = {}): Recor
     effective_start_time: c.eff,
     game_match_time: c.game,
     game_earliest_match_time: c.floor,
+    game_rundown_match_time: c.rundown ?? null,
+    game_sportspage_match_time: c.sportspage ?? null,
     contest_status: 'verified',
     ...overrides,
   };
@@ -569,8 +678,21 @@ const SURFACES: Array<{ name: string; run: (c: TimeCase) => Promise<SurfaceRun> 
 // ── the sweep ───────────────────────────────────────────────────────────
 
 describe('start-time fields — matrix across every contest-shaped surface', () => {
-  it('every fixture encodes LEAST(chain, game, floor) correctly (fixture self-check)', () => {
-    for (const c of CASES) expect(leastOf(c.chain, c.game, c.floor)).toBe(c.eff);
+  it('every fixture encodes the bounded five-input min correctly (fixture self-check)', () => {
+    for (const c of CASES) expect(boundedLeastOf(c)).toBe(c.eff);
+  });
+
+  it('the snapshot cases are DIAGNOSTIC against the unbounded and three-input forms', () => {
+    // The fresh-snapshot row: a three-input LEAST(chain, game, floor) returns
+    // the floor here, not the snapshot — so a view quietly reverted to the
+    // three-input form fails that case's matrix rows.
+    const fresh = CASES.find((c) => c.name.startsWith('FRESH SNAPSHOT'))!;
+    expect(leastOf(fresh.chain, fresh.game, fresh.floor)).not.toBe(fresh.eff);
+    // The stale-snapshot row: an UNBOUNDED five-input LEAST returns the stale
+    // snapshot — so a view that dropped the freshness guard also disagrees
+    // with the modelled eff. Together the pair discriminates all three forms.
+    const stale = CASES.find((c) => c.name.startsWith('STALE snapshot'))!;
+    expect(leastOf(stale.chain, stale.game, stale.floor, stale.rundown ?? null)).not.toBe(stale.eff);
   });
 
   it('the floor case is DIAGNOSTIC — a two-input LEAST(chain, game) would disagree', () => {
@@ -621,18 +743,20 @@ describe('start-time fields — matrix across every contest-shaped surface', () 
   }
 });
 
-// ── every surface actually SELECTS all four time columns ────────────────
+// ── every surface actually SELECTS all six time columns ─────────────────
 //
 // The mock projects to the requested column list, so these two layers are
 // independent: the assertions below name the defect precisely, and the matrix
 // above goes red from the served value even if these were deleted.
 
-describe('every contest-shaped query selects all four time columns', () => {
+describe('every contest-shaped query selects all six time columns', () => {
   const TIME_COLUMNS = [
     'start_time',
     'effective_start_time',
     'game_match_time',
     'game_earliest_match_time',
+    'game_rundown_match_time',
+    'game_sportspage_match_time',
   ] as const;
 
   for (const surface of SURFACES) {
@@ -792,6 +916,8 @@ describe('the games join key is jsonodds_id — never the poisoned games.contest
       chainStartTime: '2026-05-04T01:00:00Z',
       gameMatchTime: '2026-05-04T00:10:00Z',
       gameEarliestMatchTime: '2026-05-04T00:10:00Z',
+      gameRundownMatchTime: '',
+      gameSportspageMatchTime: '',
     },
   };
   // A stale-pointer row from a previous deployment: different jsonodds_id, its
@@ -938,6 +1064,8 @@ describe('a game-only reschedule surfaces on ?since= once the cursor advances', 
           chainStartTime: ORIGINAL_START,
           gameMatchTime: MOVED_UP_START,
           gameEarliestMatchTime: MOVED_UP_START,
+          gameRundownMatchTime: '',
+          gameSportspageMatchTime: '',
         },
       }),
       id,

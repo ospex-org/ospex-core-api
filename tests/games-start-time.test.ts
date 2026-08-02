@@ -38,6 +38,8 @@ interface RawGameRow {
   sport: string;
   match_time: string;
   earliest_match_time: string | null;
+  rundown_match_time: string | null;
+  sportspage_match_time: string | null;
   status: string;
   home_team_id: string;
   away_team_id: string;
@@ -58,6 +60,8 @@ function gameRow(over: Partial<RawGameRow> = {}): RawGameRow {
     sport: 'mlb',
     match_time: LATER,
     earliest_match_time: LATER,
+    rundown_match_time: null,
+    sportspage_match_time: null,
     status: 'upcoming',
     home_team_id: 'home-uuid',
     away_team_id: 'away-uuid',
@@ -133,6 +137,8 @@ interface WireGame {
   matchTime: string;
   gameMatchTime: string;
   earliestMatchTime: string | null;
+  rundownMatchTime: string | null;
+  sportspageMatchTime: string | null;
 }
 
 function makeRes(): { statusCode: number; body: unknown; status: (c: number) => unknown; json: (b: unknown) => unknown } {
@@ -326,5 +332,94 @@ describe('GET /v1/games — the minimum is taken at microsecond resolution', () 
       gameRow({ match_time: LATER, earliest_match_time: '2026-07-30T23:10:00' }),
     ]);
     expect(games[0]?.matchTime).toBe(LATER);
+  });
+});
+
+describe('GET /v1/games — provider snapshots enter through the one-hour freshness guard', () => {
+  // The guard is the ONLY thing separating these inputs from the floor path:
+  // every case pins the guard itself, not the min (the floor is held equal to
+  // match_time throughout so nothing else can produce the expected answer).
+  const FEED = '2026-07-31T00:15:00+00:00';
+  const FRESH = '2026-07-31T00:05:00+00:00'; // 10 min below the feed
+  const STALE = '2026-07-30T20:00:00+00:00'; // >4h below the feed
+
+  it('a FRESH snapshot (10 min below the feed) drives the minimum', async () => {
+    const { games } = await fetchGames([
+      gameRow({ match_time: FEED, earliest_match_time: FEED, rundown_match_time: FRESH }),
+    ]);
+    expect(games[0]?.matchTime).toBe(FRESH);
+    expect(games[0]?.rundownMatchTime).toBe(FRESH);
+  });
+
+  it('a STALE snapshot (>1h below the feed) is EXCLUDED — served verbatim, not the minimum', async () => {
+    const { games } = await fetchGames([
+      gameRow({ match_time: FEED, earliest_match_time: FEED, rundown_match_time: STALE }),
+    ]);
+    expect(games[0]?.matchTime).toBe(FEED);
+    expect(games[0]?.rundownMatchTime).toBe(STALE);
+  });
+
+  it('BOUNDARY — exactly one hour below the feed is still admitted (>= in the guard)', async () => {
+    const { games } = await fetchGames([
+      gameRow({
+        match_time: FEED,
+        earliest_match_time: FEED,
+        sportspage_match_time: '2026-07-30T23:15:00+00:00',
+      }),
+    ]);
+    expect(games[0]?.matchTime).toBe('2026-07-30T23:15:00+00:00');
+  });
+
+  it('BOUNDARY — one microsecond past the hour is excluded', async () => {
+    const { games } = await fetchGames([
+      gameRow({
+        match_time: '2026-07-31T00:15:00.000000+00:00',
+        earliest_match_time: '2026-07-31T00:15:00.000000+00:00',
+        sportspage_match_time: '2026-07-30T23:14:59.999999+00:00',
+      }),
+    ]);
+    expect(games[0]?.matchTime).toBe('2026-07-31T00:15:00.000000+00:00');
+  });
+
+  it('a snapshot LATER than the feed passes the guard but cannot lower the minimum', async () => {
+    const { games } = await fetchGames([
+      gameRow({
+        match_time: FEED,
+        earliest_match_time: FEED,
+        rundown_match_time: '2026-07-31T01:00:00+00:00',
+      }),
+    ]);
+    expect(games[0]?.matchTime).toBe(FEED);
+  });
+
+  it('null snapshots degrade to the two-input minimum, and are served as null', async () => {
+    const { games } = await fetchGames([
+      gameRow({ match_time: LATER, earliest_match_time: EARLIER }),
+    ]);
+    expect(games[0]?.matchTime).toBe(EARLIER);
+    expect(games[0]?.rundownMatchTime).toBeNull();
+    expect(games[0]?.sportspageMatchTime).toBeNull();
+  });
+
+  it('an unparseable snapshot is ignored rather than allowed to produce a bound', async () => {
+    const { games } = await fetchGames([
+      gameRow({ match_time: FEED, earliest_match_time: FEED, rundown_match_time: 'not-a-date' }),
+    ]);
+    expect(games[0]?.matchTime).toBe(FEED);
+  });
+
+  it('the UNGUARDED floor still binds where a guarded snapshot would not', async () => {
+    // NEGATIVE CONTROL for the guard's scope: the same >1h-early value in the
+    // FLOOR column drives the minimum — only snapshots are freshness-guarded.
+    const { games } = await fetchGames([
+      gameRow({ match_time: FEED, earliest_match_time: STALE }),
+    ]);
+    expect(games[0]?.matchTime).toBe(STALE);
+  });
+
+  it('the query selects both snapshot columns', async () => {
+    const { selects } = await fetchGames([gameRow()]);
+    expect(selects['games']).toContain('rundown_match_time');
+    expect(selects['games']).toContain('sportspage_match_time');
   });
 });

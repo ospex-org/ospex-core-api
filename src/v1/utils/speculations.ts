@@ -115,14 +115,15 @@ export interface SpeculationParentContext {
   homeTeamId: string | null;
   sport: string;
   /**
-   * Current conservative start-time safety bound — the minimum over `chainStartTime`,
-   * `gameMatchTime`, and the game's retained safety floor (served here as
-   * `gameEarliestMatchTime`). A conservative safety bound, NOT a prediction of
-   * first pitch; gate on this.
+   * Current conservative start-time safety bound — a bounded minimum over
+   * `chainStartTime`, `gameMatchTime`, the game's retained safety floor
+   * (served here as `gameEarliestMatchTime`), and the provider snapshots
+   * within their one-hour freshness window. A conservative safety bound, NOT
+   * a prediction of first pitch; gate on this.
    * `<= chainStartTime` whenever `chainStartTime` is non-empty — but NOT when
    * it is `''` (the unverified window), so a consumer gate must read
    * `chainStartTime === '' || matchTime <= chainStartTime`. See the
-   * `/v1/contests` file header for the full four-field contract.
+   * `/v1/contests` file header for the full six-field contract.
    */
   matchTime: string;
   /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
@@ -130,9 +131,15 @@ export interface SpeculationParentContext {
   /** Raw odds-feed schedule (`games.match_time`), joined on `(network, jsonodds_id)`. */
   gameMatchTime: string;
   /** The game's current retained safety floor (`games.earliest_match_time`), verbatim — never
-   *  clamped. `""` when no games row is linked. When it is the minimum of the three inputs, it
+   *  clamped. `""` when no games row is linked. When it is the minimum of the inputs, it
    *  is what is driving `matchTime`. See the `/v1/contests` file header. */
   gameEarliestMatchTime: string;
+  /** Provider start-time snapshots (`games.rundown_match_time` /
+   *  `games.sportspage_match_time`), verbatim. Dated observations; they enter
+   *  `matchTime` only through the view's one-hour freshness guard. `""` when
+   *  no games row is linked or no snapshot has been captured. */
+  gameRundownMatchTime: string;
+  gameSportspageMatchTime: string;
   status: string;
 }
 

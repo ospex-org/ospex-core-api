@@ -165,7 +165,8 @@ export const STREAM_RESOURCES: Record<StreamResourceName, StreamResource> = {
     cursorTable: 'contests',
     // The `contests_effective` view (contests LEFT JOIN games on
     // `(network, jsonodds_id)`) — `CONTEST_RECOVERY_COLUMNS` selects
-    // `effective_start_time` / `game_match_time` / `game_earliest_match_time`,
+    // `effective_start_time` / `game_match_time` / `game_earliest_match_time`
+    // / `game_rundown_match_time` / `game_sportspage_match_time`,
     // which exist only there, and
     // `toBody` is a SYNCHRONOUS interface so the value has to arrive in the
     // polled row rather than from a second lookup. The view passes `contests.*`
@@ -199,17 +200,19 @@ export const STREAM_RESOURCES: Record<StreamResourceName, StreamResource> = {
     // `matchTime` — including for a row that lands just behind a `live` cursor
     // and is recovered by the overlap re-scan.
     //
-    // The triggers key on those two columns specifically rather than on
+    // The triggers key on the projected columns specifically rather than on
     // `games.row_updated_at`, because that column is bumped by many writes
     // that change nothing contest-visible (odds flags, probable pitchers,
     // external-id claims, final scores) — every one of which would otherwise
-    // re-deliver the contest row. `match_time` and `earliest_match_time` are
-    // the two `games` columns feeding a contest body: between them they
-    // produce `gameMatchTime`, `gameEarliestMatchTime`, and two of
-    // `matchTime`'s three inputs. The `match_time` trigger covers ordinary
-    // schedule writes (which also move the floor); the companion trigger on
-    // `earliest_match_time` covers a floor-only update — the operator remedy —
-    // which touches no `match_time`.
+    // re-deliver the contest row. `match_time`, `earliest_match_time`,
+    // `rundown_match_time`, and `sportspage_match_time` are the `games`
+    // columns feeding a contest body: between them they produce the four raw
+    // `game*` fields and every games-side input to `matchTime`. The
+    // `match_time` trigger covers ordinary schedule writes; the
+    // `earliest_match_time` companion covers a floor-only update — the
+    // operator remedy — and the snapshot-column trigger covers the writer's
+    // claim/release/recheck snapshot writes, which name no other projected
+    // column.
     table: CONTESTS_VIEW,
     columns: CONTEST_RECOVERY_COLUMNS,
     toBody: (row) => contestRecoveryRowToBody(row as unknown as ContestRecoveryRow),
