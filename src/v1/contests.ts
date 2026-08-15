@@ -18,8 +18,12 @@
  * `effective_start_time` the listing orders on and serves as `matchTime` —
  * so an agent can enumerate a past day's contests for the settle-and-claim
  * half of its lifecycle. `date` and `window` are mutually exclusive (400 on
- * both), and the day must sit in the plain 4-digit ISO year domain —
- * `9999-12-31`, whose +1-day bound leaves it, is refused (see parseUtcDay).
+ * both). The accepted domain is `0100-01-01` through `9999-12-30`: years
+ * below 0100 are real calendar dates but are refused (JS `Date.UTC` remaps
+ * years 0–99 into 1900–1999, and the round-trip guard rejects the remap
+ * rather than silently shifting the century), and `9999-12-31` is refused
+ * because its +1-day upper bound leaves the 4-digit ISO year domain (see
+ * parseUtcDay). Nothing this endpoint serves sits outside that domain.
  * Dated ordering adds a unique `contest_id` tiebreaker after
  * `effective_start_time`: the mode enumerates a whole day, and offset
  * pagination over tied start instants would otherwise be able to skip or
@@ -503,10 +507,15 @@ async function getContestsRecovery(req: Request, res: Response): Promise<void> {
 
 /**
  * `YYYY-MM-DD` → the UTC day window `[date 00:00Z, date+1 00:00Z)`, or null
- * when the input is not a real calendar date. Same round-trip idiom as
- * `games.ts`'s `parseTimestampMicros`: `Date.UTC` ROLLS OVER an impossible
- * day (Feb 30 → Mar 2), so the components are compared back after the
- * conversion and a rolled-over value is rejected.
+ * for anything outside the ACCEPTED DOMAIN: real calendar dates from
+ * `0100-01-01` through `9999-12-30`. Same round-trip idiom as `games.ts`'s
+ * `parseTimestampMicros`: `Date.UTC` ROLLS OVER an impossible day
+ * (Feb 30 → Mar 2), so the components are compared back after the
+ * conversion and a rolled-over value is rejected. The same comparison also
+ * refuses years 0001–0099 — real dates, but `Date.UTC` remaps years 0–99
+ * into 1900–1999, and refusing the remap beats silently shifting the
+ * century; deliberate, since nothing this endpoint serves predates 0100.
+ * The upper edge is the clamp below.
  */
 function parseUtcDay(raw: string): { gte: string; lt: string } | null {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);

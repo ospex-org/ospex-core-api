@@ -3,9 +3,13 @@
  *
  * What this suite enforces:
  *
- *   - `date` validation: real-calendar UTC days only (the `Date.UTC`
- *     rollover of an impossible day is rejected), and `date`×`window`
- *     mutual exclusion — each with a passing negative control.
+ *   - `date` validation: the accepted domain is `0100-01-01` through
+ *     `9999-12-30` — calendar rollovers (Feb 30) are rejected, years below
+ *     0100 fall to the `Date.UTC` century-remap round-trip guard (real
+ *     dates, deliberately refused), and `9999-12-31`'s next-day bound
+ *     leaves the 4-digit ISO domain — plus `date`×`window` mutual
+ *     exclusion, each with a passing negative control (both domain edges
+ *     are pinned accepted).
  *   - The dated query shape: a HALF-OPEN `[date 00:00Z, date+1 00:00Z)`
  *     window on `effective_start_time` — `gte`/`lt` with the exact literal
  *     bounds (they are input-derived, unlike the now-based default window,
@@ -246,7 +250,11 @@ describe('GET /v1/contests?date= — validation', () => {
   // '9999-12-31' is a real calendar day whose +1-day upper bound leaves
   // the 4-digit ISO year domain (`+010000-…`, which Postgres refuses with
   // SQLSTATE 22009) — refused here as a 400 rather than becoming a 500.
-  const BAD_DATES = ['2026-02-29', '2026-02-30', '2026-13-01', '2026-8-14', '2026-08-14T00:00:00Z', 'yesterday', '', '9999-12-31'];
+  // '0001-01-01' and '0099-12-31' are real calendar days too, but sit
+  // below the accepted domain: `Date.UTC` remaps years 0–99 into
+  // 1900–1999, and the round-trip guard refuses the remap rather than
+  // silently shifting the century.
+  const BAD_DATES = ['2026-02-29', '2026-02-30', '2026-13-01', '2026-8-14', '2026-08-14T00:00:00Z', 'yesterday', '', '9999-12-31', '0001-01-01', '0099-12-31'];
   for (const bad of BAD_DATES) {
     it(`rejects ${JSON.stringify(bad)}`, async () => {
       const { res } = await runDated({ date: bad });
@@ -263,8 +271,18 @@ describe('GET /v1/contests?date= — validation', () => {
     expect(res.statusCode).toBe(200);
   });
 
-  it('negative control: 9999-12-30 is accepted — the domain clamp refuses only the crossover day', async () => {
+  it('negative control: 9999-12-30 is accepted — the upper edge of the accepted domain', async () => {
     const { res } = await runDated({ date: '9999-12-30' }, {
+      contests_effective: { data: [], error: null, count: 0 },
+      speculations: { data: [], error: null },
+    });
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('negative control: 0100-01-01 is accepted — the lower edge of the accepted domain', async () => {
+    // Pairs with the rejected '0099-12-31' above: the low-year refusal is
+    // the century-remap guard, not a blanket old-date refusal.
+    const { res } = await runDated({ date: '0100-01-01' }, {
       contests_effective: { data: [], error: null, count: 0 },
       speculations: { data: [], error: null },
     });
