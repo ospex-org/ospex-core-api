@@ -2,7 +2,7 @@
  * /v1/contests/* — contest read endpoints.
  *
  *   GET /v1/contests                        — list upcoming contests with their speculations
- *   GET /v1/contests?date=YYYY-MM-DD        — dated discovery: one UTC day, any day
+ *   GET /v1/contests?date=YYYY-MM-DD        — dated discovery: one UTC day, past or future
  *   GET /v1/contests/:contestId             — single contest detail with populated orderbooks
  *
  * The list endpoint stays lean (no orderbook population — heavy and not
@@ -18,9 +18,15 @@
  * `effective_start_time` the listing orders on and serves as `matchTime` —
  * so an agent can enumerate a past day's contests for the settle-and-claim
  * half of its lifecycle. `date` and `window` are mutually exclusive (400 on
- * both). Everything else about the listing is unchanged: same eligibility
- * (unverified contests stay excluded), same `sport` / `status` filters, same
- * limit caps, signer-free reads.
+ * both), and the day must sit in the plain 4-digit ISO year domain —
+ * `9999-12-31`, whose +1-day bound leaves it, is refused (see parseUtcDay).
+ * Dated ordering adds a unique `contest_id` tiebreaker after
+ * `effective_start_time`: the mode enumerates a whole day, and offset
+ * pagination over tied start instants would otherwise be able to skip or
+ * repeat a row between pages. The forward listing keeps its single-key
+ * ordering. Eligibility (unverified contests stay excluded), the `sport` /
+ * `status` filters, the limit caps, and signer-free reads are all the
+ * default listing's.
  *
  * Dated rows additionally carry `gameFinalType` — the linked game's
  * `games.final_type`, VERBATIM. The `contests_effective` view deliberately
@@ -169,8 +175,10 @@ interface ContestBody {
   homeTeam: string;
   sport: string;
   sportId: number;
-  /** Current conservative start-time safety bound — the min over chain start, feed schedule, and the
-   *  game's retained safety floor (served below as `gameEarliestMatchTime`). See the file header. */
+  /** Current conservative start-time safety bound — the bounded min over chain start, feed schedule,
+   *  the game's retained safety floor (served below as `gameEarliestMatchTime`), and the two provider
+   *  snapshots behind their one-hour freshness guard (served below as `gameRundownMatchTime` /
+   *  `gameSportspageMatchTime`). See the file header. */
   matchTime: string;
   /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
   chainStartTime: string;
@@ -356,8 +364,10 @@ export interface ContestRecoveryBody {
   homeTeam: string;
   sport: string;
   sportId: number;
-  /** Current conservative start-time safety bound — the min over chain start, feed schedule, and the
-   *  game's retained safety floor (served below as `gameEarliestMatchTime`). See the file header. */
+  /** Current conservative start-time safety bound — the bounded min over chain start, feed schedule,
+   *  the game's retained safety floor (served below as `gameEarliestMatchTime`), and the two provider
+   *  snapshots behind their one-hour freshness guard (served below as `gameRundownMatchTime` /
+   *  `gameSportspageMatchTime`). See the file header. */
   matchTime: string;
   /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
   chainStartTime: string;
