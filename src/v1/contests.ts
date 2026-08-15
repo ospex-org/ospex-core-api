@@ -2,6 +2,7 @@
  * /v1/contests/* — contest read endpoints.
  *
  *   GET /v1/contests                        — list upcoming contests with their speculations
+ *   GET /v1/contests?date=YYYY-MM-DD        — dated discovery: one UTC day, any day
  *   GET /v1/contests/:contestId             — single contest detail with populated orderbooks
  *
  * The list endpoint stays lean (no orderbook population — heavy and not
@@ -9,6 +10,25 @@
  * `speculation_key` and applies the same default open-book filter set
  * as `GET /v1/commitments` (status open or partially_filled, not
  * invalidated, not expired).
+ *
+ * ## Dated discovery (`?date=`)
+ *
+ * `date=YYYY-MM-DD` (a UTC calendar day) replaces the forward-only hours
+ * window with `[date 00:00Z, date+1 00:00Z)` on the same
+ * `effective_start_time` the listing orders on and serves as `matchTime` —
+ * so an agent can enumerate a past day's contests for the settle-and-claim
+ * half of its lifecycle. `date` and `window` are mutually exclusive (400 on
+ * both). Everything else about the listing is unchanged: same eligibility
+ * (unverified contests stay excluded), same `sport` / `status` filters, same
+ * limit caps, signer-free reads.
+ *
+ * Dated rows additionally carry `gameFinalType` — the linked game's
+ * `games.final_type`, VERBATIM. The `contests_effective` view deliberately
+ * projects no games finality column, so dated mode reads `games` directly
+ * over the same `(network, jsonodds_id)` join the view uses. The default
+ * (no-`date`) response is unchanged and does not carry the field; the
+ * contest's own scored state is already served as `status`
+ * (`scored` / `scored_manually`).
  *
  * `/v1/contests` was previously mounted at `/v1/markets`. The handlers
  * keep using `scorerToType(scorer, scorers)` for the scorer→market_type
@@ -170,6 +190,13 @@ interface ContestBody {
 }
 
 interface ContestListItem extends ContestBody {
+  /** The linked game's upstream result status (`games.final_type`), served
+   *  VERBATIM — free upstream text, e.g. `'Finished'`, `'Postponed'`,
+   *  `'Canceled'` (upstream spelling). `''` when no games row is linked or
+   *  the feed has reported no result status. Present in dated (`?date=`)
+   *  mode ONLY — the default forward-window listing is unchanged and does
+   *  not carry the key. */
+  gameFinalType?: string;
   speculations: Speculation[];
 }
 
@@ -220,6 +247,10 @@ interface ContestDetail extends ContestBody {
 /** Explicit row shape for the list query (see the cast in getContestsHandler). */
 interface ContestListRow {
   contest_id: string | number;
+  /** Selected only in dated (`?date=`) mode — see CONTEST_DATED_LIST_COLUMNS.
+   *  Used server-side for the `(network, jsonodds_id)` games finality join;
+   *  never served on list rows (it stays a detail-only response field). */
+  jsonodds_id?: string | null;
   away_team: string | null;
   home_team: string | null;
   sport_slug: string | null;
@@ -366,6 +397,11 @@ const CONTEST_LIST_COLUMNS =
   'effective_start_time, game_match_time, game_earliest_match_time, ' +
   'game_rundown_match_time, game_sportspage_match_time, contest_status';
 
+/** `GET /v1/contests?date=` (dated discovery). Extends the list columns with
+ *  `jsonodds_id`, consumed server-side by the `(network, jsonodds_id)` games
+ *  finality join that supplies `gameFinalType` — not served on list rows. */
+const CONTEST_DATED_LIST_COLUMNS = CONTEST_LIST_COLUMNS + ', jsonodds_id';
+
 /** `GET /v1/contests/:contestId` (detail). */
 const CONTEST_DETAIL_COLUMNS =
   'contest_id, jsonodds_id, rundown_id, sportspage_id, contest_creator, league_id, ' +
@@ -455,6 +491,33 @@ async function getContestsRecovery(req: Request, res: Response): Promise<void> {
 
 // ── GET /v1/contests ───────────────────────────────────────────────────
 
+/**
+ * `YYYY-MM-DD` → the UTC day window `[date 00:00Z, date+1 00:00Z)`, or null
+ * when the input is not a real calendar date. Same round-trip idiom as
+ * `games.ts`'s `parseTimestampMicros`: `Date.UTC` ROLLS OVER an impossible
+ * day (Feb 30 → Mar 2), so the components are compared back after the
+ * conversion and a rolled-over value is rejected.
+ */
+function parseUtcDay(raw: string): { gte: string; lt: string } | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  const ms = Date.UTC(y, mo - 1, d);
+  if (!Number.isFinite(ms)) return null;
+  const rt = new Date(ms);
+  if (rt.getUTCFullYear() !== y || rt.getUTCMonth() !== mo - 1 || rt.getUTCDate() !== d) return null;
+  const end = ms + 86_400_000;
+  // Both bounds must serialize inside the plain 4-digit ISO year domain:
+  // year 10000 serializes as the expanded form `+010000-…`, which Postgres
+  // rejects (SQLSTATE 22009, measured) — so date=9999-12-31, the one
+  // accepted input whose +1-day bound crosses over, is refused here as a
+  // 400 rather than surfacing as a 500 from the DB layer.
+  if (end > Date.UTC(9999, 11, 31)) return null;
+  return { gte: new Date(ms).toISOString(), lt: new Date(end).toISOString() };
+}
+
 export async function getContestsHandler(req: Request, res: Response): Promise<void> {
   if (req.query.since !== undefined) {
     await getContestsRecovery(req, res);
@@ -484,6 +547,29 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
       code: 'INVALID_PARAM',
     } satisfies ApiError);
     return;
+  }
+
+  // Dated discovery: a UTC calendar day replaces the forward-only hours
+  // window (see the file header). Mutually exclusive with `window` — the
+  // two describe incompatible windows, so a request naming both is a
+  // caller bug and fails loudly rather than picking one.
+  let datedDay: { gte: string; lt: string } | null = null;
+  if (req.query.date !== undefined) {
+    if (req.query.window !== undefined) {
+      res.status(400).json({
+        error: 'date and window are mutually exclusive. Pass exactly one.',
+        code: 'INVALID_PARAM',
+      } satisfies ApiError);
+      return;
+    }
+    datedDay = parseUtcDay(String(req.query.date));
+    if (datedDay === null) {
+      res.status(400).json({
+        error: 'date must be a real calendar date in YYYY-MM-DD form (a UTC day).',
+        code: 'INVALID_PARAM',
+      } satisfies ApiError);
+      return;
+    }
   }
 
   const windowHours = req.query.window ? Number(req.query.window) : DEFAULT_WINDOW_HOURS;
@@ -527,15 +613,32 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
   // with a NULL `start_time` (an unverified contest), and
   // `effective_start_time` is non-null whenever a games row exists — so
   // without this, unverified contests would newly appear in the list.
+  // Dated mode keeps the same eligibility rule for the same reason — the day
+  // window is a different bound, not a different listing.
+  //
+  // The dated window is HALF-OPEN — `.lt`, not `.lte` — so a start at exactly
+  // `date+1 00:00:00Z` belongs to the next day and each contest lands in
+  // exactly one day. The bound comparison happens in Postgres at full
+  // `timestamptz` precision; nothing here parses a served timestamp.
   let q = sb
     .from(CONTESTS_VIEW)
-    .select(CONTEST_LIST_COLUMNS, { count: 'exact' })
+    .select(datedDay === null ? CONTEST_LIST_COLUMNS : CONTEST_DATED_LIST_COLUMNS, { count: 'exact' })
     .eq('network', config.network)
-    .not('start_time', 'is', null)
-    .gte('effective_start_time', now)
-    .lte('effective_start_time', upper)
-    .order('effective_start_time', { ascending: true })
-    .range(offset, offset + limit - 1);
+    .not('start_time', 'is', null);
+  q =
+    datedDay === null
+      ? q.gte('effective_start_time', now).lte('effective_start_time', upper)
+      : q.gte('effective_start_time', datedDay.gte).lt('effective_start_time', datedDay.lt);
+  q = q.order('effective_start_time', { ascending: true });
+  // Dated mode exists to enumerate a whole day COMPLETELY, and slates
+  // cluster on shared start instants — so ties are routine and an
+  // order-by without a unique key makes offset pagination able to skip or
+  // repeat a tied row between pages. `contest_id` is unique within the
+  // `.eq('network', …)` scope. The forward listing shares the tie hazard
+  // but is left untouched here to keep the no-date path unchanged;
+  // aligning it is a follow-up decision.
+  if (datedDay !== null) q = q.order('contest_id', { ascending: true });
+  q = q.range(offset, offset + limit - 1);
 
   if (sportFilter) q = q.eq('sport_slug', sportFilter);
   if (statusFilter) q = q.eq('contest_status', statusFilter);
@@ -573,6 +676,44 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
     return;
   }
 
+  // Dated mode: attach the linked game's finality. `contests_effective`
+  // deliberately projects no games finality column, so this reads `games`
+  // directly over the SAME `(network, jsonodds_id)` join the view uses —
+  // NEVER `games.contest_id`, which still carries R4-epoch ids that resolve
+  // to the wrong game. Finality is the point of a dated query, so a failed
+  // read is a 500 like the other list queries — not a silent `''` degrade
+  // that postgame tooling would misread as "not final".
+  let finalTypeByJsonoddsId: Map<string, string> | null = null;
+  if (datedDay !== null) {
+    finalTypeByJsonoddsId = new Map();
+    const jsonoddsIds = [
+      ...new Set(
+        contests
+          .map((c) => c.jsonodds_id)
+          .filter((v): v is string => typeof v === 'string' && v !== ''),
+      ),
+    ];
+    if (jsonoddsIds.length > 0) {
+      const gamesRes = await sb
+        .from('games')
+        .select('jsonodds_id, final_type')
+        .eq('network', config.network)
+        .in('jsonodds_id', jsonoddsIds);
+      if (gamesRes.error) {
+        logger.error({ err: gamesRes.error.message }, 'contests: dated finality query failed');
+        res.status(500).json({ error: 'Failed to fetch game finality.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+        return;
+      }
+      const gameRows = (gamesRes.data ?? []) as unknown as Array<{
+        jsonodds_id: string;
+        final_type: string | null;
+      }>;
+      for (const g of gameRows) {
+        if (g.final_type != null) finalTypeByJsonoddsId.set(g.jsonodds_id, g.final_type);
+      }
+    }
+  }
+
   const specsByContest = new Map<string, Speculation[]>();
   for (const s of specsRes.data ?? []) {
     const ms = specRowToSpeculationViaScorer(s as SpeculationRow, scorers);
@@ -583,21 +724,31 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
     specsByContest.set(key, list);
   }
 
-  const contestsList: ContestListItem[] = contests.map((c) => ({
-    contestId: String(c.contest_id),
-    awayTeam: c.away_team ?? '',
-    homeTeam: c.home_team ?? '',
-    sport: c.sport_slug ?? '',
-    sportId: c.jsonodds_sport_id ?? 0,
-    matchTime: c.effective_start_time ?? '',
-    chainStartTime: c.start_time ?? '',
-    gameMatchTime: c.game_match_time ?? '',
-    gameEarliestMatchTime: c.game_earliest_match_time ?? '',
-    gameRundownMatchTime: c.game_rundown_match_time ?? '',
-    gameSportspageMatchTime: c.game_sportspage_match_time ?? '',
-    status: c.contest_status ?? '',
-    speculations: specsByContest.get(String(c.contest_id)) ?? [],
-  }));
+  const contestsList: ContestListItem[] = contests.map((c) => {
+    const item: ContestListItem = {
+      contestId: String(c.contest_id),
+      awayTeam: c.away_team ?? '',
+      homeTeam: c.home_team ?? '',
+      sport: c.sport_slug ?? '',
+      sportId: c.jsonodds_sport_id ?? 0,
+      matchTime: c.effective_start_time ?? '',
+      chainStartTime: c.start_time ?? '',
+      gameMatchTime: c.game_match_time ?? '',
+      gameEarliestMatchTime: c.game_earliest_match_time ?? '',
+      gameRundownMatchTime: c.game_rundown_match_time ?? '',
+      gameSportspageMatchTime: c.game_sportspage_match_time ?? '',
+      status: c.contest_status ?? '',
+      speculations: specsByContest.get(String(c.contest_id)) ?? [],
+    };
+    // The key is ADDED only in dated mode — the default listing's rows
+    // carry no new key (pinned by the dated-discovery suite's absence
+    // test), and its query shape is unchanged.
+    if (finalTypeByJsonoddsId !== null) {
+      item.gameFinalType =
+        c.jsonodds_id != null ? (finalTypeByJsonoddsId.get(c.jsonodds_id) ?? '') : '';
+    }
+    return item;
+  });
 
   res.status(200).json({
     contests: contestsList,
