@@ -508,7 +508,14 @@ function parseUtcDay(raw: string): { gte: string; lt: string } | null {
   if (!Number.isFinite(ms)) return null;
   const rt = new Date(ms);
   if (rt.getUTCFullYear() !== y || rt.getUTCMonth() !== mo - 1 || rt.getUTCDate() !== d) return null;
-  return { gte: new Date(ms).toISOString(), lt: new Date(ms + 86_400_000).toISOString() };
+  const end = ms + 86_400_000;
+  // Both bounds must serialize inside the plain 4-digit ISO year domain:
+  // year 10000 serializes as the expanded form `+010000-…`, which Postgres
+  // rejects (SQLSTATE 22009, measured) — so date=9999-12-31, the one
+  // accepted input whose +1-day bound crosses over, is refused here as a
+  // 400 rather than surfacing as a 500 from the DB layer.
+  if (end > Date.UTC(9999, 11, 31)) return null;
+  return { gte: new Date(ms).toISOString(), lt: new Date(end).toISOString() };
 }
 
 export async function getContestsHandler(req: Request, res: Response): Promise<void> {
@@ -622,7 +629,16 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
     datedDay === null
       ? q.gte('effective_start_time', now).lte('effective_start_time', upper)
       : q.gte('effective_start_time', datedDay.gte).lt('effective_start_time', datedDay.lt);
-  q = q.order('effective_start_time', { ascending: true }).range(offset, offset + limit - 1);
+  q = q.order('effective_start_time', { ascending: true });
+  // Dated mode exists to enumerate a whole day COMPLETELY, and slates
+  // cluster on shared start instants — so ties are routine and an
+  // order-by without a unique key makes offset pagination able to skip or
+  // repeat a tied row between pages. `contest_id` is unique within the
+  // `.eq('network', …)` scope. The forward listing shares the tie hazard
+  // but is left untouched here to keep the no-date path unchanged;
+  // aligning it is a follow-up decision.
+  if (datedDay !== null) q = q.order('contest_id', { ascending: true });
+  q = q.range(offset, offset + limit - 1);
 
   if (sportFilter) q = q.eq('sport_slug', sportFilter);
   if (statusFilter) q = q.eq('contest_status', statusFilter);
@@ -724,8 +740,9 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
       status: c.contest_status ?? '',
       speculations: specsByContest.get(String(c.contest_id)) ?? [],
     };
-    // The key is ADDED only in dated mode — the default listing's body
-    // stays byte-identical to the pre-`date` shape.
+    // The key is ADDED only in dated mode — the default listing's rows
+    // carry no new key (pinned by the dated-discovery suite's absence
+    // test), and its query shape is unchanged.
     if (finalTypeByJsonoddsId !== null) {
       item.gameFinalType =
         c.jsonodds_id != null ? (finalTypeByJsonoddsId.get(c.jsonodds_id) ?? '') : '';

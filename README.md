@@ -143,7 +143,7 @@ With `includeFillability=true`, each `CommitmentBody` also carries a `fillabilit
 
 ### `GET /v1/contests`
 
-List upcoming contests within a configurable time window (default 72h, max 168h) — or, with `date=`, every contest on one UTC calendar day, past or future.
+List upcoming contests within a configurable time window (default 72h, max 168h) — or, with `date=`, the contests of one UTC calendar day, past or future (same eligibility as the default listing: unverified contests stay excluded).
 
 Query params: `sport` (one of `mlb`, `nba`, `ncaab`, `ncaaf`, `nfl`, `nhl` — the shared list in `src/lib/sports.ts`), `status`, `window` (hours), `date` (`YYYY-MM-DD`, see **Dated discovery** below), `limit` (max 200), `offset`. `window` and `date` are mutually exclusive (400 on both).
 
@@ -157,7 +157,7 @@ Because the window bounds the *minimum*, a contest's listing lifetime is coupled
 
 `date=` replaces the forward-only hours window with one UTC calendar day — `[date 00:00Z, date+1 00:00Z)`, half-open — on the same `effective_start_time` the listing orders on and serves as `matchTime`. It exists for the settle-and-claim half of an agent's lifecycle: after a day's games, "which contests from date D exist, are their events final, and are they scored yet?" is answerable signer-free from this one call. Everything else about the listing is unchanged — same eligibility (unverified contests stay excluded), same `sport` / `status` filters (`date` + `status=scored` composes), same limit caps. `date` must be a real calendar date (`2026-02-30` is rejected, not normalized) and is mutually exclusive with `window`.
 
-Each dated row additionally carries **`gameFinalType`** — the linked game's `games.final_type`, verbatim: the upstream feed's result status as free text (e.g. `Finished`, `Postponed`, `Canceled` — upstream spellings), `""` when no games row is linked or the feed has reported no result status. Event completion is signaled by `gameFinalType === 'Finished'` — not by the games table's inert `status` column, which this endpoint deliberately does not serve. The contest's own scored state is already on the row as `status` (`scored` / `scored_manually`) — postgame needs both signals, and a dated row carries both. The default (no-`date`) response does **not** carry `gameFinalType`; it is byte-for-byte the pre-`date` shape.
+Each dated row additionally carries **`gameFinalType`** — the linked game's `games.final_type`, verbatim: the upstream feed's result status as free text (e.g. `Finished`, `Postponed`, `Canceled` — upstream spellings), `""` when no games row is linked or the feed has reported no result status. Event completion is signaled by `gameFinalType === 'Finished'` — not by the games table's inert `status` column, which this endpoint deliberately does not serve. The contest's own scored state is already on the row as `status` (`scored` / `scored_manually`) — postgame needs both signals, and a dated row carries both. The default (no-`date`) response does **not** carry `gameFinalType`: no row gains the key, no `games` query runs, and the query keeps its pre-`date` select string, filters, and ordering — each of those pinned by tests.
 
 #### Contest start times
 

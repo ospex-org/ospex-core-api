@@ -243,7 +243,10 @@ describe('GET /v1/contests?date= — validation', () => {
   // would roll it over to Mar 1, and the round-trip check refuses that.
   // '2028-02-29' is the same shape on a real leap day and must pass, so
   // the rejection is calendar integrity, not a blanket Feb-29 refusal.
-  const BAD_DATES = ['2026-02-29', '2026-02-30', '2026-13-01', '2026-8-14', '2026-08-14T00:00:00Z', 'yesterday', ''];
+  // '9999-12-31' is a real calendar day whose +1-day upper bound leaves
+  // the 4-digit ISO year domain (`+010000-…`, which Postgres refuses with
+  // SQLSTATE 22009) — refused here as a 400 rather than becoming a 500.
+  const BAD_DATES = ['2026-02-29', '2026-02-30', '2026-13-01', '2026-8-14', '2026-08-14T00:00:00Z', 'yesterday', '', '9999-12-31'];
   for (const bad of BAD_DATES) {
     it(`rejects ${JSON.stringify(bad)}`, async () => {
       const { res } = await runDated({ date: bad });
@@ -254,6 +257,14 @@ describe('GET /v1/contests?date= — validation', () => {
 
   it('negative control: the real leap day 2028-02-29 is accepted', async () => {
     const { res } = await runDated({ date: '2028-02-29' }, {
+      contests_effective: { data: [], error: null, count: 0 },
+      speculations: { data: [], error: null },
+    });
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('negative control: 9999-12-30 is accepted — the domain clamp refuses only the crossover day', async () => {
+    const { res } = await runDated({ date: '9999-12-30' }, {
       contests_effective: { data: [], error: null, count: 0 },
       speculations: { data: [], error: null },
     });
@@ -270,13 +281,18 @@ describe('GET /v1/contests?date= — query shape', () => {
     const lt = callsOn(calls, 'contests_effective', 'lt').map((c) => c.args);
     // The bounds are derived from the input, so the VALUES are pinned —
     // a wrong day-window arithmetic can't hide behind a column-name check.
-    expect(gte).toContainEqual(['effective_start_time', '2026-08-14T00:00:00.000Z']);
-    expect(lt).toContainEqual(['effective_start_time', '2026-08-15T00:00:00.000Z']);
+    // `toEqual` on the WHOLE call list (not containment) also bounds the
+    // COUNT to exactly one each: an implementation that kept the forward
+    // listing's `.gte(effective_start_time, now)` floor beside the dated
+    // lower bound would return nothing for any past day and still satisfy
+    // a containment assertion.
+    expect(gte).toEqual([['effective_start_time', '2026-08-14T00:00:00.000Z']]);
+    expect(lt).toEqual([['effective_start_time', '2026-08-15T00:00:00.000Z']]);
     // Half-open: the forward-window `.lte` upper bound must NOT run here.
     expect(callsOn(calls, 'contests_effective', 'lte')).toHaveLength(0);
   });
 
-  it('keeps the eligibility + ordering of the default listing', async () => {
+  it('keeps the eligibility of the default listing and orders with a unique tiebreaker', async () => {
     const { calls } = await runDated({ date: '2026-08-14' });
     const notCalls = callsOn(calls, 'contests_effective', 'not').map((c) => JSON.stringify(c.args));
     expect(notCalls).toContain(JSON.stringify(['start_time', 'is', null]));
@@ -284,9 +300,14 @@ describe('GET /v1/contests?date= — query shape', () => {
       'network',
       'polygon',
     ]);
-    expect(callsOn(calls, 'contests_effective', 'order').map((c) => c.args[0])).toContain(
+    // Dated mode enumerates a whole day for settle-and-claim, and slates
+    // cluster on shared start instants — without a unique secondary key,
+    // offset pagination can silently skip or repeat a tied row between
+    // pages. `contest_id` is unique within the network scope.
+    expect(callsOn(calls, 'contests_effective', 'order').map((c) => c.args[0])).toEqual([
       'effective_start_time',
-    );
+      'contest_id',
+    ]);
     expect(callsOn(calls, 'contests_effective', 'range').length).toBeGreaterThan(0);
   });
 
@@ -389,6 +410,11 @@ describe('GET /v1/contests without date — unchanged by dated discovery', () =>
       'effective_start_time',
     );
     expect(callsOn(calls, 'contests_effective', 'lt')).toHaveLength(0);
+    // The dated tiebreaker deliberately does NOT reach the forward
+    // listing — its ordering is exactly the pre-`date` single key.
+    expect(callsOn(calls, 'contests_effective', 'order').map((c) => c.args[0])).toEqual([
+      'effective_start_time',
+    ]);
     const cols = selectArg(calls, 'contests_effective')
       .split(',')
       .map((s) => s.trim());
