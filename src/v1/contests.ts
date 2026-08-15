@@ -2,7 +2,7 @@
  * /v1/contests/* — contest read endpoints.
  *
  *   GET /v1/contests                        — list upcoming contests with their speculations
- *   GET /v1/contests?date=YYYY-MM-DD        — dated discovery: one UTC day, any day
+ *   GET /v1/contests?date=YYYY-MM-DD        — dated discovery: one UTC day, past or future
  *   GET /v1/contests/:contestId             — single contest detail with populated orderbooks
  *
  * The list endpoint stays lean (no orderbook population — heavy and not
@@ -18,9 +18,19 @@
  * `effective_start_time` the listing orders on and serves as `matchTime` —
  * so an agent can enumerate a past day's contests for the settle-and-claim
  * half of its lifecycle. `date` and `window` are mutually exclusive (400 on
- * both). Everything else about the listing is unchanged: same eligibility
- * (unverified contests stay excluded), same `sport` / `status` filters, same
- * limit caps, signer-free reads.
+ * both). The accepted domain is `0100-01-01` through `9999-12-30`: years
+ * below 0100 are real calendar dates but are refused (JS `Date.UTC` remaps
+ * years 0–99 into 1900–1999, and the round-trip guard rejects the remap
+ * rather than silently shifting the century), and `9999-12-31` is refused
+ * because its +1-day upper bound leaves the 4-digit ISO year domain (see
+ * parseUtcDay). Nothing this endpoint serves sits outside that domain.
+ * Dated ordering adds a unique `contest_id` tiebreaker after
+ * `effective_start_time`: the mode enumerates a whole day, and offset
+ * pagination over tied start instants would otherwise be able to skip or
+ * repeat a row between pages. The forward listing keeps its single-key
+ * ordering. Eligibility (unverified contests stay excluded), the `sport` /
+ * `status` filters, the limit caps, and signer-free reads are all the
+ * default listing's.
  *
  * Dated rows additionally carry `gameFinalType` — the linked game's
  * `games.final_type`, VERBATIM. The `contests_effective` view deliberately
@@ -169,8 +179,10 @@ interface ContestBody {
   homeTeam: string;
   sport: string;
   sportId: number;
-  /** Current conservative start-time safety bound — the min over chain start, feed schedule, and the
-   *  game's retained safety floor (served below as `gameEarliestMatchTime`). See the file header. */
+  /** Current conservative start-time safety bound — the bounded min over chain start, feed schedule,
+   *  the game's retained safety floor (served below as `gameEarliestMatchTime`), and the two provider
+   *  snapshots behind their one-hour freshness guard (served below as `gameRundownMatchTime` /
+   *  `gameSportspageMatchTime`). See the file header. */
   matchTime: string;
   /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
   chainStartTime: string;
@@ -356,8 +368,10 @@ export interface ContestRecoveryBody {
   homeTeam: string;
   sport: string;
   sportId: number;
-  /** Current conservative start-time safety bound — the min over chain start, feed schedule, and the
-   *  game's retained safety floor (served below as `gameEarliestMatchTime`). See the file header. */
+  /** Current conservative start-time safety bound — the bounded min over chain start, feed schedule,
+   *  the game's retained safety floor (served below as `gameEarliestMatchTime`), and the two provider
+   *  snapshots behind their one-hour freshness guard (served below as `gameRundownMatchTime` /
+   *  `gameSportspageMatchTime`). See the file header. */
   matchTime: string;
   /** Raw on-chain start (`contests.start_time`). `""` until the contest is verified. */
   chainStartTime: string;
@@ -493,10 +507,15 @@ async function getContestsRecovery(req: Request, res: Response): Promise<void> {
 
 /**
  * `YYYY-MM-DD` → the UTC day window `[date 00:00Z, date+1 00:00Z)`, or null
- * when the input is not a real calendar date. Same round-trip idiom as
- * `games.ts`'s `parseTimestampMicros`: `Date.UTC` ROLLS OVER an impossible
- * day (Feb 30 → Mar 2), so the components are compared back after the
- * conversion and a rolled-over value is rejected.
+ * for anything outside the ACCEPTED DOMAIN: real calendar dates from
+ * `0100-01-01` through `9999-12-30`. Same round-trip idiom as `games.ts`'s
+ * `parseTimestampMicros`: `Date.UTC` ROLLS OVER an impossible day
+ * (Feb 30 → Mar 2), so the components are compared back after the
+ * conversion and a rolled-over value is rejected. The same comparison also
+ * refuses years 0001–0099 — real dates, but `Date.UTC` remaps years 0–99
+ * into 1900–1999, and refusing the remap beats silently shifting the
+ * century; deliberate, since nothing this endpoint serves predates 0100.
+ * The upper edge is the clamp below.
  */
 function parseUtcDay(raw: string): { gte: string; lt: string } | null {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
