@@ -61,9 +61,14 @@
  *                    `games.ts`.
  *
  * Both keys are always present and serve `null` when the contest has no
- * JSONOdds linkage — an empty-string linkage is normalized to null here
- * too, so two linkage-less rows can never compare equal on an identity
- * key. The value is otherwise the contest row's OWN
+ * JSONOdds linkage. `null` means NO identity, not a joinable value:
+ * consumers must reject or skip the row before any identity comparison —
+ * only non-null ids participate in equality joins, since comparing the
+ * nulls themselves would still match (`null === null` is true in JS). An
+ * empty-string linkage is normalized to null so a missing identity has
+ * exactly one sentinel; served verbatim, `''` is value-shaped and would
+ * slip past a `=== null` missing-check into an equality join.
+ * The value is otherwise the contest row's OWN
  * binding, chosen at creation — deliberately not gated on a `games` row
  * existing, so identity stays servable even when the games mirror row is
  * absent (dated `gameFinalType` is then `''`). Detail, `?since=`
@@ -237,9 +242,11 @@ interface ContestListItem extends ContestBody {
    *  contest's JSONOdds linkage (`contests.jsonodds_id`), the same string
    *  `/v1/games` serves as its `gameId` — the games table has no surrogate
    *  UUID; `(network, jsonodds_id)` is its primary key. `null` when the
-   *  contest has no linkage (an empty-string linkage is normalized to null
-   *  here too — identity keys are compared for equality, and '' would let
-   *  two linkage-less rows compare equal); the key is always present.
+   *  contest has no linkage — null means NO identity: consumers skip or
+   *  reject the row before joining and compare only non-null ids (an
+   *  empty-string linkage is normalized to null too, so missing identity
+   *  has one sentinel instead of a value-shaped `''` that would slip past
+   *  a null guard into an equality join); the key is always present.
    *  Deliberately NOT gated on a `games` row existing — this is the
    *  contest row's own binding. See the file header. */
   gameId: string | null;
@@ -795,10 +802,12 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
       // Game identity, both modes, always-present keys (see the file
       // header): the same string under the games-surface name and the
       // contest-detail name. `||` (not `??`) is deliberate: an
-      // empty-string linkage is served as null too — identity keys are
-      // compared for equality, and '' would let two linkage-less rows
-      // compare equal. Same classification the dated finality join below
-      // applies to ''.
+      // empty-string linkage is served as null too, so a missing identity
+      // always surfaces as the one documented sentinel — `''` is
+      // value-shaped and would slip past a consumer's `=== null`
+      // missing-check into an equality join. (null itself marks MISSING,
+      // not a joinable value — consumers skip it before comparing.) Same
+      // classification the dated finality join below applies to ''.
       gameId: c.jsonodds_id || null,
       jsonoddsId: c.jsonodds_id || null,
       awayTeam: c.away_team ?? '',

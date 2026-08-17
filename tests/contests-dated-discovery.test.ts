@@ -478,8 +478,12 @@ describe('game identity (gameId / jsonoddsId) on every list row', () => {
     // '' is in-domain for contests.jsonodds_id (nullable text, no CHECK)
     // and other wire boundaries normalize it (odds.ts) or classify it as
     // no-linkage (the finality join's own filter). Served verbatim, ''
-    // would let two linkage-less rows compare EQUAL on an identity key —
-    // the exact false-match class the identity keys exist to prevent.
+    // is value-shaped: it would slip past a consumer's `=== null`
+    // missing-check and false-match another unlinked row in an equality
+    // join. Normalizing to null gives missing identity exactly one
+    // sentinel — null itself marks MISSING and consumers must skip it
+    // before joining (`null === null` is true, so comparing nulls would
+    // still match).
     for (const query of [{ date: '2026-08-14' }, {}]) {
       const { res } = await runDated(query, {
         contests_effective: {
