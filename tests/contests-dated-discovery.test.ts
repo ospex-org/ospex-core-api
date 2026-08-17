@@ -18,9 +18,15 @@
  *   - The finality join: `games.final_type` read over `(network,
  *     jsonodds_id)` — never the poisoned `games.contest_id` back-pointer —
  *     and served VERBATIM as `gameFinalType` with the `''` sentinel.
- *   - The default (no-`date`) listing is UNCHANGED: same select string
- *     (no `jsonodds_id`), same `gte`/`lte` window, no `games` query, and
- *     no `gameFinalType` key on any row.
+ *   - Game identity on every list row, BOTH modes: `gameId` /
+ *     `jsonoddsId` — the contest's `jsonodds_id`, the same string
+ *     `/v1/games` serves as its `gameId` — always-present keys, `null`
+ *     when the contest has no linkage, NOT gated on a games row existing.
+ *   - The default (no-`date`) listing keeps its own shape: same
+ *     `gte`/`lte` window, no `games` query, and no `gameFinalType` key on
+ *     any row. (Both modes now share one select string, including
+ *     `jsonodds_id` — the identity change deliberately inverted the old
+ *     "forward selects no jsonodds_id" pin.)
  *
  * The mock projects rows to the select()-ed column list the way PostgREST
  * does (see the MOCK SELF-CHECK), so "selects final_type" is enforced by
@@ -205,6 +211,8 @@ interface DatedItem {
   contestId: string;
   matchTime: string;
   status: string;
+  gameId?: string | null;
+  jsonoddsId?: string | null;
   gameFinalType?: string;
 }
 
@@ -412,10 +420,86 @@ describe('GET /v1/contests?date= — gameFinalType via the (network, jsonodds_id
   });
 });
 
+// ── game identity on every list row ─────────────────────────────────────
+//
+// `gameId` / `jsonoddsId` are the contest's `jsonodds_id` under two naming
+// conventions (games surface / contest detail). The projecting mock is what
+// gives these teeth: dropping `jsonodds_id` from the select string strips
+// the column before the mapper sees it, so the literal expectations below
+// go red — the pin is the served VALUE, not a select-string assertion.
+
+describe('game identity (gameId / jsonoddsId) on every list row', () => {
+  it('dated mode: serves the row jsonodds_id under both keys, verbatim', async () => {
+    const { res } = await runDated({ date: '2026-08-14' });
+    expect(res.statusCode).toBe(200);
+    const items = (res.body as { contests: DatedItem[] }).contests;
+    const byId = new Map(items.map((i) => [i.contestId, i]));
+    expect(byId.get('42')!.gameId).toBe('jo-cubs-reds');
+    expect(byId.get('42')!.jsonoddsId).toBe('jo-cubs-reds');
+    expect(byId.get('45')!.gameId).toBe('jo-cards-brewers');
+    expect(byId.get('45')!.jsonoddsId).toBe('jo-cards-brewers');
+    // The doubleheader-ish sibling shares 42's game — identity makes the
+    // shared linkage explicit instead of leaving it to teams+time.
+    expect(byId.get('46')!.gameId).toBe('jo-cubs-reds');
+  });
+
+  it('forward mode: serves the same identity keys on every row', async () => {
+    const { res } = await runDated({}, {
+      contests_effective: { data: DAY_ROWS, error: null, count: DAY_ROWS.length },
+      speculations: { data: [], error: null },
+    });
+    expect(res.statusCode).toBe(200);
+    const items = (res.body as { contests: DatedItem[] }).contests;
+    const byId = new Map(items.map((i) => [i.contestId, i]));
+    expect(byId.get('42')!.gameId).toBe('jo-cubs-reds');
+    expect(byId.get('42')!.jsonoddsId).toBe('jo-cubs-reds');
+    expect(byId.get('45')!.gameId).toBe('jo-cards-brewers');
+    expect(byId.get('45')!.jsonoddsId).toBe('jo-cards-brewers');
+  });
+
+  it('a contest without a linkage serves BOTH keys as null — present, never omitted (both modes)', async () => {
+    for (const query of [{ date: '2026-08-14' }, {}]) {
+      const { res } = await runDated(query, {
+        contests_effective: { data: DAY_ROWS, error: null, count: DAY_ROWS.length },
+        speculations: { data: [], error: null },
+        games: { data: GAMES_ROWS, error: null },
+      });
+      expect(res.statusCode).toBe(200);
+      const items = (res.body as { contests: DatedItem[] }).contests;
+      const noLinkage = items.find((i) => i.contestId === '44')!;
+      expect('gameId' in noLinkage).toBe(true);
+      expect('jsonoddsId' in noLinkage).toBe(true);
+      expect(noLinkage.gameId).toBeNull();
+      expect(noLinkage.jsonoddsId).toBeNull();
+    }
+  });
+
+  it('identity is the contest row\'s own binding, NOT gated on a games row existing', async () => {
+    // A linked contest whose games mirror row is absent: dated finality
+    // degrades to '' but the identity keys still serve the linkage. A
+    // join-confirmed implementation (identity only when the games read
+    // finds the row) would serve null here and go red.
+    const { res } = await runDated({ date: '2026-08-14' }, {
+      contests_effective: {
+        data: [dayRow({ contest_id: 47, jsonodds_id: 'jo-orphaned-linkage' })],
+        error: null,
+        count: 1,
+      },
+      speculations: { data: [], error: null },
+      games: { data: [], error: null },
+    });
+    expect(res.statusCode).toBe(200);
+    const item = (res.body as { contests: DatedItem[] }).contests[0]!;
+    expect(item.gameId).toBe('jo-orphaned-linkage');
+    expect(item.jsonoddsId).toBe('jo-orphaned-linkage');
+    expect(item.gameFinalType).toBe('');
+  });
+});
+
 // ── the default listing is unchanged ────────────────────────────────────
 
-describe('GET /v1/contests without date — unchanged by dated discovery', () => {
-  it('issues no games query, keeps the forward gte/lte window, and selects no jsonodds_id', async () => {
+describe('GET /v1/contests without date — keeps its own query shape', () => {
+  it('issues no games query and keeps the forward gte/lte window', async () => {
     const { res, calls } = await runDated({}, {
       contests_effective: { data: [dayRow({})], error: null, count: 1 },
       speculations: { data: [], error: null },
@@ -433,10 +517,14 @@ describe('GET /v1/contests without date — unchanged by dated discovery', () =>
     expect(callsOn(calls, 'contests_effective', 'order').map((c) => c.args[0])).toEqual([
       'effective_start_time',
     ]);
+    // DELIBERATE INVERSION of the pre-identity pin ("forward selects no
+    // jsonodds_id"): both modes now share one select string, because every
+    // list row serves the identity keys. The projecting mock makes the
+    // served-value tests below the real enforcement; this is the shape pin.
     const cols = selectArg(calls, 'contests_effective')
       .split(',')
       .map((s) => s.trim());
-    expect(cols).not.toContain('jsonodds_id');
+    expect(cols).toContain('jsonodds_id');
   });
 
   it('serves no gameFinalType key at all (absent, not "")', async () => {
