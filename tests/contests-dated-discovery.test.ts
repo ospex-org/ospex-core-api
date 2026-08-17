@@ -474,6 +474,42 @@ describe('game identity (gameId / jsonoddsId) on every list row', () => {
     }
   });
 
+  it('an empty-string linkage is normalized to null on BOTH keys (identity is compared for equality)', async () => {
+    // '' is in-domain for contests.jsonodds_id (nullable text, no CHECK)
+    // and other wire boundaries normalize it (odds.ts) or classify it as
+    // no-linkage (the finality join's own filter). Served verbatim, ''
+    // would let two linkage-less rows compare EQUAL on an identity key —
+    // the exact false-match class the identity keys exist to prevent.
+    for (const query of [{ date: '2026-08-14' }, {}]) {
+      const { res } = await runDated(query, {
+        contests_effective: {
+          data: [dayRow({ contest_id: 48, jsonodds_id: '' })],
+          error: null,
+          count: 1,
+        },
+        speculations: { data: [], error: null },
+        games: { data: [], error: null },
+      });
+      expect(res.statusCode).toBe(200);
+      const item = (res.body as { contests: DatedItem[] }).contests[0]!;
+      expect('gameId' in item).toBe(true);
+      expect(item.gameId).toBeNull();
+      expect(item.jsonoddsId).toBeNull();
+    }
+  });
+
+  it('MOCK ARMED-NESS: the projecting mock is live on the contests select string', async () => {
+    // The identity pins above have teeth only while parseSelectedColumns
+    // can parse the handler's REAL select string into a column set — it
+    // returns null (projection disarmed, projectRow = identity) for any
+    // select containing '(' or '*'. If the handler ever adopts an
+    // embedded-resource select, this goes red instead of every
+    // select-string pin silently going vacuous.
+    const { calls } = await runDated({ date: '2026-08-14' });
+    expect(parseSelectedColumns(selectArg(calls, 'contests_effective'))).not.toBeNull();
+    expect(parseSelectedColumns(selectArg(calls, 'games'))).not.toBeNull();
+  });
+
   it('identity is the contest row\'s own binding, NOT gated on a games row existing', async () => {
     // A linked contest whose games mirror row is absent: dated finality
     // degrades to '' but the identity keys still serve the linkage. A
