@@ -90,7 +90,11 @@ const COLUMN_MISSING_CODES = new Set(['42703']);
  * `contest_id` proves the relation; the six time columns are the
  * migration-managed projections every contest-shaped surface selects (the
  * `CONTEST_*_COLUMNS` lists in v1/contests.ts and the speculation context
- * list). A column added to those lists belongs here too.
+ * list). A MIGRATION-MANAGED column added to those lists belongs here too.
+ * Plain base-table columns those lists select (e.g. `jsonodds_id`, part of
+ * every view version's projection — 067 projects `c.*`) are deliberately
+ * not probed: they cannot be missing from a stale view, so probing them
+ * adds no drift protection.
  */
 export const READINESS_VIEW_COLUMNS =
   'contest_id, start_time, effective_start_time, game_match_time, ' +

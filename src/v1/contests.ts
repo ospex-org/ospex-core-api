@@ -40,6 +40,42 @@
  * contest's own scored state is already served as `status`
  * (`scored` / `scored_manually`).
  *
+ * ## Game identity on list rows
+ *
+ * Every list row — BOTH the default forward window and `?date=` — carries
+ * the linked game's canonical identity as two deliberately redundant keys:
+ *
+ *   - `gameId`     — the contest's JSONOdds linkage
+ *                    (`contests.jsonodds_id`), under the name the games
+ *                    surface uses: `/v1/games` serves the SAME string as
+ *                    its `gameId`. The games table has no surrogate UUID —
+ *                    `(network, jsonodds_id)` is its primary key — so this
+ *                    IS the canonical game identity, and it gives
+ *                    consumers an exact-equality join key between contest
+ *                    rows and the games surface. Teams + start-time
+ *                    matching demotes to defense-in-depth.
+ *   - `jsonoddsId` — the same value under the contest-detail naming
+ *                    convention (the detail endpoint has always served
+ *                    it). Mirrors the intentional `gameId` /
+ *                    `externalIds.jsonodds` redundancy documented in
+ *                    `games.ts`.
+ *
+ * Both keys are always present and serve `null` when the contest has no
+ * JSONOdds linkage. `null` means NO identity, not a joinable value:
+ * consumers must reject or skip the row before any identity comparison —
+ * only non-null ids participate in equality joins, since comparing the
+ * nulls themselves would still match (`null === null` is true in JS). An
+ * empty-string linkage is normalized to null so a missing identity has
+ * exactly one sentinel; served verbatim, `''` is value-shaped and would
+ * slip past a `=== null` missing-check into an equality join.
+ * The value is otherwise the contest row's OWN
+ * binding, chosen at creation — deliberately not gated on a `games` row
+ * existing, so identity stays servable even when the games mirror row is
+ * absent (dated `gameFinalType` is then `''`). Detail, `?since=`
+ * recovery, and the SSE stream are unchanged by this addition (the detail
+ * body already carries `jsonoddsId`; extending identity to the
+ * recovery/stream bodies is a separate decision).
+ *
  * `/v1/contests` was previously mounted at `/v1/markets`. The handlers
  * keep using `scorerToType(scorer, scorers)` for the scorer→market_type
  * mapping (back-compat — preserves the exact wire output the prior
@@ -202,6 +238,22 @@ interface ContestBody {
 }
 
 interface ContestListItem extends ContestBody {
+  /** Canonical identity of the linked game, served on BOTH list modes: the
+   *  contest's JSONOdds linkage (`contests.jsonodds_id`), the same string
+   *  `/v1/games` serves as its `gameId` — the games table has no surrogate
+   *  UUID; `(network, jsonodds_id)` is its primary key. `null` when the
+   *  contest has no linkage — null means NO identity: consumers skip or
+   *  reject the row before joining and compare only non-null ids (an
+   *  empty-string linkage is normalized to null too, so missing identity
+   *  has one sentinel instead of a value-shaped `''` that would slip past
+   *  a null guard into an equality join); the key is always present.
+   *  Deliberately NOT gated on a `games` row existing — this is the
+   *  contest row's own binding. See the file header. */
+  gameId: string | null;
+  /** The same value under the contest-detail naming convention —
+   *  deliberately redundant with `gameId`, mirroring the documented
+   *  `gameId` / `externalIds.jsonodds` pair on `/v1/games`. */
+  jsonoddsId: string | null;
   /** The linked game's upstream result status (`games.final_type`), served
    *  VERBATIM — free upstream text, e.g. `'Finished'`, `'Postponed'`,
    *  `'Canceled'` (upstream spelling). `''` when no games row is linked or
@@ -238,8 +290,9 @@ interface ContestDetail extends ContestBody {
   /**
    * Upstream JSONOdds ID for this contest, used by the SDK to open
    * Realtime channels on `current_odds`. Null when the contest was
-   * created without a JSONOdds linkage. Surfaced on the detail
-   * endpoint only — list responses stay minimal.
+   * created without a JSONOdds linkage. Also served on every list row
+   * (beside its `gameId` twin) — see the file header's game identity
+   * section.
    */
   jsonoddsId: string | null;
   /** Contest fields surfaced on the detail endpoint only. */
@@ -259,10 +312,11 @@ interface ContestDetail extends ContestBody {
 /** Explicit row shape for the list query (see the cast in getContestsHandler). */
 interface ContestListRow {
   contest_id: string | number;
-  /** Selected only in dated (`?date=`) mode — see CONTEST_DATED_LIST_COLUMNS.
-   *  Used server-side for the `(network, jsonodds_id)` games finality join;
-   *  never served on list rows (it stays a detail-only response field). */
-  jsonodds_id?: string | null;
+  /** The contest's JSONOdds linkage, selected in BOTH list modes: served on
+   *  every list row as `gameId` / `jsonoddsId` (see the file header's game
+   *  identity section), and additionally consumed server-side in dated mode
+   *  as the `(network, jsonodds_id)` games finality join key. */
+  jsonodds_id: string | null;
   away_team: string | null;
   home_team: string | null;
   sport_slug: string | null;
@@ -405,16 +459,15 @@ export interface ContestRecoveryBody {
 // contest-shaped list is named so the query shape is assertable in tests; keep
 // all six time columns in each.
 
-/** `GET /v1/contests` (list). */
+/** `GET /v1/contests` (list) — one shared column set for BOTH the forward
+ *  window and `?date=` dated discovery. `jsonodds_id` is served on every
+ *  list row (`gameId` / `jsonoddsId` — the game identity keys) and doubles
+ *  as the `(network, jsonodds_id)` join key for the dated-mode games
+ *  finality read that supplies `gameFinalType`. */
 const CONTEST_LIST_COLUMNS =
-  'contest_id, away_team, home_team, sport_slug, jsonodds_sport_id, start_time, ' +
+  'contest_id, jsonodds_id, away_team, home_team, sport_slug, jsonodds_sport_id, start_time, ' +
   'effective_start_time, game_match_time, game_earliest_match_time, ' +
   'game_rundown_match_time, game_sportspage_match_time, contest_status';
-
-/** `GET /v1/contests?date=` (dated discovery). Extends the list columns with
- *  `jsonodds_id`, consumed server-side by the `(network, jsonodds_id)` games
- *  finality join that supplies `gameFinalType` — not served on list rows. */
-const CONTEST_DATED_LIST_COLUMNS = CONTEST_LIST_COLUMNS + ', jsonodds_id';
 
 /** `GET /v1/contests/:contestId` (detail). */
 const CONTEST_DETAIL_COLUMNS =
@@ -641,7 +694,7 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
   // `timestamptz` precision; nothing here parses a served timestamp.
   let q = sb
     .from(CONTESTS_VIEW)
-    .select(datedDay === null ? CONTEST_LIST_COLUMNS : CONTEST_DATED_LIST_COLUMNS, { count: 'exact' })
+    .select(CONTEST_LIST_COLUMNS, { count: 'exact' })
     .eq('network', config.network)
     .not('start_time', 'is', null);
   q =
@@ -746,6 +799,17 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
   const contestsList: ContestListItem[] = contests.map((c) => {
     const item: ContestListItem = {
       contestId: String(c.contest_id),
+      // Game identity, both modes, always-present keys (see the file
+      // header): the same string under the games-surface name and the
+      // contest-detail name. `||` (not `??`) is deliberate: an
+      // empty-string linkage is served as null too, so a missing identity
+      // always surfaces as the one documented sentinel — `''` is
+      // value-shaped and would slip past a consumer's `=== null`
+      // missing-check into an equality join. (null itself marks MISSING,
+      // not a joinable value — consumers skip it before comparing.) Same
+      // classification the dated finality join below applies to ''.
+      gameId: c.jsonodds_id || null,
+      jsonoddsId: c.jsonodds_id || null,
       awayTeam: c.away_team ?? '',
       homeTeam: c.home_team ?? '',
       sport: c.sport_slug ?? '',
@@ -759,9 +823,9 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
       status: c.contest_status ?? '',
       speculations: specsByContest.get(String(c.contest_id)) ?? [],
     };
-    // The key is ADDED only in dated mode — the default listing's rows
-    // carry no new key (pinned by the dated-discovery suite's absence
-    // test), and its query shape is unchanged.
+    // `gameFinalType` is ADDED only in dated mode — the default listing's
+    // rows never carry the key (pinned by the dated-discovery suite's
+    // absence test).
     if (finalTypeByJsonoddsId !== null) {
       item.gameFinalType =
         c.jsonodds_id != null ? (finalTypeByJsonoddsId.get(c.jsonodds_id) ?? '') : '';

@@ -121,6 +121,7 @@ describe('GET /v1/contests', () => {
           data: [
             {
               contest_id: 42,
+              jsonodds_id: 'a783e37e-4ce1-4f42-9dd6-615568f73044',
               away_team: 'Lakers',
               home_team: 'Celtics',
               sport_slug: 'nba',
@@ -165,12 +166,19 @@ describe('GET /v1/contests', () => {
     const body = res.body as {
       contests: Array<{
         contestId: string;
+        gameId: string | null;
+        jsonoddsId: string | null;
         gameEarliestMatchTime: string;
         speculations: Array<{ type: string; awayLine?: number }>;
       }>;
     };
     expect(body.contests).toHaveLength(1);
     expect(body.contests[0]!.contestId).toBe('42');
+    // Game identity on the forward list row — the same string /v1/games
+    // serves as gameId, under both naming conventions (the query-shape and
+    // null-linkage pins live in contests-dated-discovery.test.ts).
+    expect(body.contests[0]!.gameId).toBe('a783e37e-4ce1-4f42-9dd6-615568f73044');
+    expect(body.contests[0]!.jsonoddsId).toBe('a783e37e-4ce1-4f42-9dd6-615568f73044');
     // The retained safety floor is served on list rows (the full cross-surface
     // matrix lives in contests-effective-start-time.test.ts).
     expect(body.contests[0]!.gameEarliestMatchTime).toBe('2026-05-04T01:00:00Z');
@@ -267,6 +275,11 @@ describe('GET /v1/contests/:contestId', () => {
     };
     expect(body.contestId).toBe('42');
     expect(body.jsonoddsId).toBe('a783e37e-4ce1-4f42-9dd6-615568f73044');
+    // Scope pin: the list-row `gameId` alias deliberately does NOT extend
+    // to the detail body — detail consumers already have `jsonoddsId`.
+    // If detail ever gains `gameId`, make that a conscious decision, not
+    // drift.
+    expect('gameId' in (res.body as Record<string, unknown>)).toBe(false);
     // The retained safety floor is served on the detail body too.
     expect(body.gameEarliestMatchTime).toBe('2026-05-04T01:00:00Z');
     // No games row mocked → team_ids degrade to null. The team-id fields
