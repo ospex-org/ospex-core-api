@@ -155,6 +155,13 @@ const DECISIONS = [
   ),
 ];
 
+const SCORERS = {
+  moneyline: '0x59555106d4b5f1a797f3552f60ac418eb6b6f6bd',
+  spread: '0xb4b1e2a2a75c34e9e4c5d3bb8a432aff973dada0',
+  total: '0x2222222222222222222222222222222222222222',
+};
+const CORE = '0x40047bafcded16c938058b7b67186299a2893561';
+
 const STATS_ROW = {
   network: 'polygon',
   sport: 'all',
@@ -226,6 +233,7 @@ async function call(
       benchmarkStandingsWindowDays: 60,
       benchmarkStatsMaxAgeSeconds: 172_800,
       benchmarkHeadlineBasis: 'marginAdjusted.gameLevel',
+      scorers: SCORERS,
       ...config,
     }),
   }));
@@ -508,26 +516,54 @@ describe('picks — the pick card fields', () => {
           log_index: 0,
         },
       ],
-      speculations: [
+      chain_events: [
         {
+          id: 1,
           network: 'polygon',
-          speculation_id: 88,
-          contest_id: 41,
-          market_type: 'moneyline',
-          line_ticks: null,
-          speculation_status: 'closed',
-          win_side: 'away',
-          source_block: 90,
+          event_name: 'COMMITMENT_MATCHED',
+          entity_type: 'fill',
+          entity_id: 88,
+          emitter_address: CORE,
+          block_number: 100,
+          tx_hash: '0xtx1',
+          log_index: 0,
+          payload: { speculationId: '88', contestId: '41', taker: '0xabc', commitmentHash: '0xaa' },
         },
-      ],
-      contests: [
         {
+          id: 2,
           network: 'polygon',
-          contest_id: 41,
-          jsonodds_id: GAME_A,
-          contest_status: 'scored',
-          away_score: 5,
-          home_score: 3,
+          event_name: 'SPECULATION_CREATED',
+          entity_type: 'speculation',
+          entity_id: 88,
+          emitter_address: CORE,
+          block_number: 90,
+          tx_hash: '0xcreate',
+          log_index: 0,
+          payload: { speculationId: '88', contestId: '41', scorer: SCORERS.moneyline, lineTicks: '0' },
+        },
+        {
+          id: 3,
+          network: 'polygon',
+          event_name: 'SPECULATION_SETTLED',
+          entity_type: 'speculation',
+          entity_id: 88,
+          emitter_address: CORE,
+          block_number: 200,
+          tx_hash: '0xsettle',
+          log_index: 0,
+          payload: { speculationId: '88', winSideValue: '1', scorer: SCORERS.moneyline },
+        },
+        {
+          id: 4,
+          network: 'polygon',
+          event_name: 'CONTEST_CREATED',
+          entity_type: 'contest',
+          entity_id: 41,
+          emitter_address: CORE,
+          block_number: 80,
+          tx_hash: '0xcontest',
+          log_index: 0,
+          payload: { contestId: '41', jsonoddsId: GAME_A },
         },
       ],
     });

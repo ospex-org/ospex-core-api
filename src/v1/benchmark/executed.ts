@@ -4,7 +4,10 @@
  * Pure — callers pass already-fetched rows. The chain-side outcome of a
  * benchmark pick is NOT on `benchmark_execution_fills`; the fill row carries
  * the identity (`speculation_id`, `taker_address`, `tx_hash`, `stake_usdc`) and
- * the verdict has to be read off the protocol's own tables.
+ * the verdict has to be read off the chain's own history — `executedFetch.ts`
+ * reads it from the indexer's raw log under the deployment that emitted the
+ * fill, and hands this module the speculation and contest as that history
+ * states them.
  *
  * ## Why this is not `derivePositionStatus`
  *

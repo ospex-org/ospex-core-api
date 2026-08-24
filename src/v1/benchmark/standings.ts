@@ -477,7 +477,7 @@ export async function getBenchmarkStandingsHandler(req: Request, res: Response):
 
   let executed: ReadonlyMap<string, ExecutedSummary>;
   try {
-    const fills = await collectExecuted(sb, config.network, cohortIds, inScopeGames);
+    const fills = await collectExecuted(sb, config.network, cohortIds, config.scorers, inScopeGames);
     if ('error' in fills) {
       respondToQueryError(res, fills.error, fills.context);
       return;

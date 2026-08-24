@@ -129,6 +129,42 @@ const COHORT_PARTICIPANTS = PARTICIPANTS.map((p) => ({
   participant_id: p.participant_id,
 }));
 
+/** The configured scorer contracts — what names the market of a chain speculation. */
+const SCORERS = {
+  moneyline: '0x59555106d4b5f1a797f3552f60ac418eb6b6f6bd',
+  spread: '0xb4b1e2a2a75c34e9e4c5d3bb8a432aff973dada0',
+  total: '0x2222222222222222222222222222222222222222',
+};
+const CORE = '0x40047bafcded16c938058b7b67186299a2893561';
+
+/**
+ * The raw-log history one settled, won moneyline fill needs: its own
+ * COMMITMENT_MATCHED row (the deployment mark), the speculation's creation and
+ * settlement, and the contest's creation (for the game spine) and scores.
+ */
+function chainHistory(o: { gameId: string; txHash: string; block: number; taker: string }): Record<string, unknown>[] {
+  const row = (id: number, event_name: string, entity_type: string, entity_id: number, payload: Record<string, string>, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id,
+    network: 'polygon',
+    event_name,
+    entity_type,
+    entity_id,
+    emitter_address: CORE,
+    block_number: o.block,
+    tx_hash: o.txHash,
+    log_index: 0,
+    payload: { raw: '0x', ...payload },
+    ...extra,
+  });
+  return [
+    row(1, 'COMMITMENT_MATCHED', 'fill', 88, { speculationId: '88', contestId: '41', taker: o.taker, commitmentHash: '0xaa', scorer: SCORERS.moneyline }),
+    row(2, 'SPECULATION_CREATED', 'speculation', 88, { speculationId: '88', contestId: '41', scorer: SCORERS.moneyline, lineTicks: '0' }, { block_number: 90, tx_hash: '0xcreate' }),
+    row(3, 'SPECULATION_SETTLED', 'speculation', 88, { speculationId: '88', winSideValue: '1', scorer: SCORERS.moneyline }, { block_number: 200, tx_hash: '0xsettle' }),
+    row(4, 'CONTEST_CREATED', 'contest', 41, { contestId: '41', jsonoddsId: o.gameId }, { block_number: 80, tx_hash: '0xcontest' }),
+    row(5, 'CONTEST_SCORES_SET', 'contest', 41, { contestId: '41', awayScore: '5', homeScore: '3' }, { block_number: 190, tx_hash: '0xscore' }),
+  ];
+}
+
 /** The three real score rows behind the acceptance number. */
 function scoreRow(
   id: number,
@@ -249,6 +285,7 @@ async function run(
       benchmarkStandingsWindowDays: 60,
       benchmarkStatsMaxAgeSeconds: 172_800,
       benchmarkHeadlineBasis: 'marginAdjusted.gameLevel',
+      scorers: SCORERS,
       ...config,
     }),
     HEADLINE_BASES: [
@@ -663,28 +700,7 @@ describe('the sport scope', () => {
           log_index: 0,
         },
       ],
-      speculations: [
-        {
-          network: 'polygon',
-          speculation_id: 88,
-          contest_id: 41,
-          market_type: 'moneyline',
-          line_ticks: null,
-          speculation_status: 'closed',
-          win_side: 'away',
-          source_block: 90,
-        },
-      ],
-      contests: [
-        {
-          network: 'polygon',
-          contest_id: 41,
-          jsonodds_id: NBA_GAME,
-          contest_status: 'scored',
-          away_score: 5,
-          home_score: 3,
-        },
-      ],
+      chain_events: chainHistory({ gameId: NBA_GAME, txHash: '0xtx1', block: 100, taker: '0xabc' }),
     };
     const scoped = await run(withFills, { sport: 'mlb' });
     expect(armFor(scoped.body, FABLE).executed.fills).toBe(0);

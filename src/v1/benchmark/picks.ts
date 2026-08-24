@@ -343,7 +343,7 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
 
   let executed;
   try {
-    executed = await collectExecuted(sb, config.network, [cohort.cohortId]);
+    executed = await collectExecuted(sb, config.network, [cohort.cohortId], config.scorers);
   } catch (err) {
     if (respondProjectionFault(res, err)) return;
     throw err;

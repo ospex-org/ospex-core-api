@@ -1,6 +1,7 @@
 /**
  * The executed record's I/O: benchmark fill receipts → the immutable on-chain
- * fill EVENT → chain outcome → per-arm summary.
+ * fill EVENT → that fill's own deployment history → chain outcome → per-arm
+ * summary.
  *
  * Separate from `executed.ts`, which is the pure derivation, for the same
  * reason `standingsProject.ts` is separate from `standings.ts`.
@@ -22,66 +23,80 @@
  *    `(speculation, wallet)` pairs hold both sides — all of them MAKERS today,
  *    so it was latent rather than live, which is exactly the kind of "0 today"
  *    this repo's rules say not to build on.
- *  - **`speculation_id` is a per-deployment-round counter** (073 records the
- *    same hazard for `contest_id`, and the counter reset at R5). `speculations`
- *    carries no round column, so a `(network, speculation_id)` join cannot tell
- *    an R5 fill from an R6 speculation that reused the id.
+ *  - **`speculation_id` is a per-deployment counter** (073 records the same
+ *    hazard for `contest_id`, and the counter reset at R5).
  *  - The unfiltered `.limit(1000)` on a chunk of 100 speculations could
  *    silently drop the wallet's row: 178 speculations already carry 694
  *    position rows.
  *
  * Joining `position_fills` on `(network, tx_hash)` answers all four at once. A
- * transaction hash is globally unique and immutable, so it cannot be confused
- * across deployment rounds; the event row carries `taker_position_type` (the
- * side, stated rather than inferred), `taker_risk_amount` (THIS fill's stake)
- * and `maker_risk_amount` (this fill's profit if it wins). `positions` is not
- * read at all any more.
+ * transaction hash is globally unique and immutable; the event row carries
+ * `taker_position_type` (the side, stated rather than inferred),
+ * `taker_risk_amount` (THIS fill's stake) and `maker_risk_amount` (this fill's
+ * profit if it wins). `positions` is not read at all.
  *
- * ## The OUTCOME row must be bound to the event too — by durable identity
+ * ## The OUTCOME is read from the fill's own deployment, never by counter
  *
  * A transaction hash proves which fill happened. It does not prove that the
- * `speculations` row the service reads today is the speculation that fill was
- * on: `speculation_id` and `contest_id` are counters that restart on every
- * redeploy, and the protocol tables carry no round column, so after a redeploy
- * the current row for id 88 can be a different speculation on a different
- * contest. Review reproduced exactly that — an old event priced against a
- * reused id as one valid fill instead of one unresolved one.
+ * `speculations` row the service could read today is the speculation that
+ * fill was on: `speculation_id` and `contest_id` restart on every redeploy,
+ * and the projected tables carry no deployment column, so after a redeploy the
+ * current row for id 88 can be a different speculation on a different
+ * contest. Review reproduced that twice — first against a reused id created
+ * after the fill, then, once creation-block ordering was added, against a
+ * reused id created in the SAME block as the old fill, which no block rule can
+ * separate from a legitimate create-and-fill-in-one-block.
  *
- * Migration 079 records `contest_id` PAIRED with `deployment_round` for this
- * reason and names the durable spine in as many words: "NEVER a join key on
- * its own (073); the durable spine is (network, game_id)". The counter pair
- * cannot be resolved against tables that have no round, so every receipt is
- * bound along the identity that survives a redeploy, and a link that does not
- * hold REFUSES the receipt:
+ * So the outcome path does not read `speculations` or `contests` at all. The
+ * indexer keeps every event it ever ingested in `chain_events` — the raw
+ * immutable log, the canonical source its own rebuild reads from — and each
+ * row carries the `emitter_address` that emitted it. That address is the
+ * deployment: the ContestModule and SpeculationModule counters live in the
+ * contracts a Core delegates to, so a counter that restarted did so under a
+ * new Core (a new emitter), or under the same Core with a second
+ * `SPECULATION_CREATED` for the same id — and this module refuses both.
  *
- *  1. receipt → event: same `tx_hash`, and every event in that transaction
- *     names the receipt's taker, speculation, contest AND commitment hash;
- *  2. event → speculation row: the row cites the receipt's contest and market,
- *     and its `source_block` is at or before the receipt's `block_number` —
- *     a speculation cannot be filled before it exists, so a row minted by a
- *     later deployment under a reused id fails this on its own, whatever else
- *     it happens to agree on;
- *  3. speculation → contest row: the contest's `jsonodds_id` IS the receipt's
- *     `game_id` — the spine 079 names — so a reused contest id on a different
- *     game cannot be priced as this one.
+ * Every receipt therefore has to pass four links, and a link that does not
+ * hold REFUSES it into `unresolvedFills`:
+ *
+ *  1. receipt → fill event: same `tx_hash`, and every event in the
+ *     transaction names the receipt's taker, speculation, contest and
+ *     commitment hash, on one side;
+ *  2. fill event → its own `COMMITMENT_MATCHED` log row, at the same
+ *     `tx_hash` and `log_index`, with the same taker, speculation, contest,
+ *     commitment hash and block — that row's `emitter_address` is the
+ *     deployment `E` the fill happened under;
+ *  3. the speculation's history UNDER `E`: exactly one `SPECULATION_CREATED`
+ *     for the id, citing the receipt's contest and a scorer that maps to the
+ *     receipt's market; at most one `SPECULATION_SETTLED`;
+ *  4. the contest's history UNDER `E`: exactly one `CONTEST_CREATED` whose
+ *     `jsonoddsId` IS the receipt's `game_id` — the durable spine migration
+ *     079 names — at most one `CONTEST_SCORES_SET`, at most one
+ *     `CONTEST_VOIDED`.
+ *
+ * The verdict then comes from those events: settled → the protocol's side;
+ * voided → void; scored → the scorer replayed on the created line; else
+ * pending. A later deployment that reuses every id on the same game in the
+ * same block emits under a different `E` and is never consulted; a counter
+ * reset under one `E` shows as a second creation and is refused. Measured on
+ * production 2026-08-24: 6,131 log rows, one emitter, every `SPECULATION_*`,
+ * `CONTEST_*` and `COMMITMENT_MATCHED` row classified by entity (0 nulls), 0
+ * duplicate `(emitter, speculationId)` creations among 492.
  *
  * `deployment_round` and `run_id` are selected and carried on every fill so a
- * consumer can see which round's counters a receipt cites. They are not used
- * as a join key, for the same reason the counters are not.
+ * consumer can see which round's counters a receipt cites. They are
+ * provenance, not a join key, for the same reason the counters are not.
  *
- * Measured over the 462 live fills on benchmark speculations: one fill row per
- * `(speculation, taker)`, one row per `tx_hash`, `(tx_hash, log_index)` unique
- * 462/462, and the aggregate `risk_amount` equals the summed event risk
- * 462/462 — so the two agreed today and would have gone on agreeing until they
- * did not.
+ * The scorer addresses in config are what name the market of the chain's
+ * scorer contract, so the executed record needs them: with `SCORER_*` unset,
+ * every receipt is reported unresolved rather than priced on the receipt's
+ * own word.
  *
  * ## Anything ambiguous is REFUSED, not guessed
  *
- * A receipt whose transaction carries fill events for another taker, another
- * speculation, or both position sides — or whose outcome rows fail any link
- * above — is counted in `unresolvedFills` and contributes nothing. A record is
- * a public claim about money; a fill this service cannot identify exactly is
- * one it must not price.
+ * A record is a public claim about money; a fill this service cannot identify
+ * exactly is one it must not price. An amount it cannot read is refused, never
+ * read as zero.
  *
  * ## Paging is by KEYSET, and duplicates are a fault
  *
@@ -98,25 +113,20 @@
  *
  * `benchmark_execution_fills` is empty until Hermes's `publish_serving.py`
  * (work-order Part 3) runs. The downstream reads are skipped entirely when
- * there are no receipts, so the empty case costs one query rather than four,
+ * there are no receipts, so the empty case costs one query rather than five,
  * and every arm's `executed` block serves nulls rather than zeroes.
  */
 
 import type { PostgrestError, SupabaseClient } from '@supabase/supabase-js';
-import {
-  BENCHMARK,
-  POSTGREST_PAGE,
-  ProjectionIntegrityError,
-  chunkIds,
-  readAllByKeyset,
-} from './source.js';
+import { BENCHMARK, ProjectionIntegrityError, chunkIds, readAllByKeyset } from './source.js';
 import {
   summarizeExecuted,
   type ExecutedContest,
   type ExecutedFill,
+  type ExecutedSpeculation,
   type ExecutedSummary,
 } from './executed.js';
-import type { MarketType, WinSide } from '../../lib/speculation.js';
+import { scorerToType, type ScorerAddresses, type WinSide } from '../../lib/speculation.js';
 
 interface ReceiptRow {
   cohort_id: string;
@@ -149,25 +159,40 @@ interface FillEventRow {
   log_index: number;
 }
 
-interface SpecRow {
-  speculation_id: number | string;
-  contest_id: number | string | null;
-  market_type: MarketType | null;
-  line_ticks: number | null;
-  speculation_status: 'open' | 'closed';
-  win_side: WinSide;
-  /** INSERT-time block of the SpeculationCreated event. Nullable in the DDL. */
-  source_block: number | string | null;
+/** A `chain_events` row — the indexer's raw immutable log. Payload values are strings. */
+interface ChainEventRow {
+  id: number;
+  event_name: string;
+  emitter_address: string;
+  entity_id: number | string | null;
+  block_number: number | string;
+  tx_hash: string;
+  log_index: number;
+  payload: Record<string, string | undefined>;
 }
 
-interface ContestRow {
-  contest_id: number | string;
-  /** The durable spine — `games.jsonodds_id`, which is the benchmark's `game_id`. */
-  jsonodds_id: string | null;
-  contest_status: 'unverified' | 'verified' | 'scored' | 'voided';
-  away_score: number | null;
-  home_score: number | null;
-}
+/** Event names and entity classes, as the indexer writes them. */
+const CHAIN_EVENTS = 'chain_events';
+const EVENT = {
+  matched: 'COMMITMENT_MATCHED',
+  speculationCreated: 'SPECULATION_CREATED',
+  speculationSettled: 'SPECULATION_SETTLED',
+  contestCreated: 'CONTEST_CREATED',
+  scoresSet: 'CONTEST_SCORES_SET',
+  contestVoided: 'CONTEST_VOIDED',
+} as const;
+const ENTITY = { fill: 'fill', speculation: 'speculation', contest: 'contest' } as const;
+
+/** On-chain `WinSide` enum value → name; the indexer's `WIN_SIDE_MAP`. */
+const WIN_SIDE_BY_VALUE: Readonly<Record<string, WinSide>> = {
+  '0': 'tbd',
+  '1': 'away',
+  '2': 'home',
+  '3': 'over',
+  '4': 'under',
+  '5': 'push',
+  '6': 'void',
+};
 
 /** One benchmark fill receipt, joined and ready to render on a pick card. */
 export interface BenchmarkFill {
@@ -206,18 +231,13 @@ export interface ExecutedCollection {
 }
 
 /**
- * A read bound on the fill-event join. One receipt is one transaction and a
- * transaction carries a handful of events, so this sits far above any real
- * slate and exists so a runaway relation raises rather than walking forever.
+ * Read bounds. Each raises rather than truncates — see `readAllByKeyset`.
+ * One receipt is one transaction with a handful of events; one speculation
+ * has a handful of log rows; these sit far above any real slate.
  */
 const EVENT_READ_CAP = 100_000;
-
-/**
- * Receipt read bound. One row per executed pick: ~30 per arm-day, four arms,
- * a 400-day window is ~48k. Raises rather than truncates, like every bound
- * here.
- */
 const RECEIPT_READ_CAP = 200_000;
+const LOG_READ_CAP = 200_000;
 
 const WEI6 = 1_000_000;
 
@@ -238,26 +258,77 @@ function toBig(v: string | number | null): bigint | null {
   }
 }
 
-/** Hex is stored lowercase (079 CHECKs it); compare case-insensitively anyway. */
-const sameAddress = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
+/** A decimal integer string (a payload value) as a safe integer, or null. */
+function toInt(v: string | number | null | undefined): number | null {
+  if (v === null || v === undefined) return null;
+  const n = typeof v === 'number' ? v : /^-?\d+$/.test(v) ? Number(v) : NaN;
+  return Number.isSafeInteger(n) ? n : null;
+}
 
-/** Two ids that may arrive as `number` or as a `bigint`-as-string. */
-const sameId = (a: number | string | null, b: number | string | null): boolean =>
-  a !== null && b !== null && String(a) === String(b);
+/** Hex is stored lowercase (079 CHECKs it); payload addresses are checksummed. */
+const sameHex = (a: string | null | undefined, b: string | null | undefined): boolean =>
+  a !== null && a !== undefined && b !== null && b !== undefined && a.toLowerCase() === b.toLowerCase();
 
-/** A block number as a comparable integer, or null when absent/unparseable. */
-function blockOf(v: number | string | null): bigint | null {
-  if (v === null) return null;
-  try {
-    return BigInt(typeof v === 'number' ? Math.trunc(v) : v);
-  } catch {
-    return null;
+/** Two ids that may arrive as `number` or as a decimal string. */
+const sameId = (a: number | string | null | undefined, b: number | string | null | undefined): boolean =>
+  a !== null && a !== undefined && b !== null && b !== undefined && String(a) === String(b);
+
+/**
+ * Every `chain_events` row for a set of entities, by keyset on `id`. The
+ * `(network, entity_type, entity_id)` index is what makes this cheap.
+ */
+async function readChainEvents(
+  sb: SupabaseClient,
+  network: string,
+  entityType: string,
+  entityIds: readonly string[],
+): Promise<{ rows: ChainEventRow[]; error: PostgrestError | null }> {
+  const rows: ChainEventRow[] = [];
+  for (const chunk of chunkIds(entityIds, 100)) {
+    const page = await readAllByKeyset<ChainEventRow, number>(
+      CHAIN_EVENTS,
+      LOG_READ_CAP,
+      (r) => r.id,
+      (after, limit) => {
+        let q = sb
+          .from(CHAIN_EVENTS)
+          .select('id, event_name, emitter_address, entity_id, block_number, tx_hash, log_index, payload')
+          .eq('network', network)
+          .eq('entity_type', entityType)
+          .in('entity_id', chunk)
+          .order('id', { ascending: true })
+          .limit(limit);
+        if (after !== null) q = q.gt('id', after);
+        return q as unknown as PromiseLike<{
+          data: ChainEventRow[] | null;
+          error: PostgrestError | null;
+        }>;
+      },
+    );
+    if (page.error) return { rows, error: page.error };
+    rows.push(...page.rows);
   }
+  return { rows, error: null };
+}
+
+/** Group log rows by their entity id. */
+function byEntity(rows: readonly ChainEventRow[]): Map<string, ChainEventRow[]> {
+  const out = new Map<string, ChainEventRow[]>();
+  for (const row of rows) {
+    if (row.entity_id === null) continue;
+    const key = String(row.entity_id);
+    const list = out.get(key);
+    if (list === undefined) out.set(key, [row]);
+    else list.push(row);
+  }
+  return out;
 }
 
 /**
  * Read the fill receipts for a set of cohorts and roll them up per participant.
  *
+ * @param scorers the configured scorer contracts — what names the market of a
+ *   chain speculation. Absent ⇒ every receipt is unresolved (see the header).
  * @param inScopeGames when supplied, only receipts on these games count — the
  *   sport scope, which the cohort filter alone does not apply.
  */
@@ -265,6 +336,7 @@ export async function collectExecuted(
   sb: SupabaseClient,
   network: string,
   cohortIds: readonly string[],
+  scorers: ScorerAddresses | undefined,
   inScopeGames?: ReadonlySet<string>,
 ): Promise<ExecutedCollection | { error: PostgrestError; context: string }> {
   const receiptRows: ReceiptRow[] = [];
@@ -315,6 +387,48 @@ export async function collectExecuted(
 
   if (scoped.length === 0) return { fills: [], byParticipant: new Map() };
 
+  const byArm = new Map<string, ExecutedFill[]>();
+  const unresolvedByArm = new Map<string, number>();
+  const resolvedTx = new Set<string>();
+  const refuse = (participantId: string): void => {
+    unresolvedByArm.set(participantId, (unresolvedByArm.get(participantId) ?? 0) + 1);
+  };
+  const finish = (): ExecutedCollection => {
+    const byParticipant = new Map<string, ExecutedSummary>();
+    for (const participantId of new Set([...byArm.keys(), ...unresolvedByArm.keys()])) {
+      byParticipant.set(
+        participantId,
+        summarizeExecuted(byArm.get(participantId) ?? [], unresolvedByArm.get(participantId) ?? 0),
+      );
+    }
+    const fills: BenchmarkFill[] = scoped.map((f) => ({
+      cohortId: f.cohort_id,
+      participantId: f.participant_id,
+      gameId: f.game_id,
+      market: f.market,
+      resolved: resolvedTx.has(f.tx_hash),
+      runId: f.run_id,
+      deploymentRound: f.deployment_round,
+      contestId: String(f.contest_id),
+      speculationId: String(f.speculation_id),
+      takerAddress: f.taker_address,
+      txHash: f.tx_hash,
+      blockNumber: String(f.block_number),
+      filledAt: f.filled_at,
+      stakeUsdc: Number(f.stake_usdc),
+      wouldAbstain: f.would_abstain,
+    }));
+    return { fills, byParticipant };
+  };
+
+  // Without the scorer addresses no chain speculation can be assigned a
+  // market, so nothing can be priced. Refused, not priced on the receipt's
+  // own word — and without reading anything the refusal would be about.
+  if (scorers === undefined) {
+    for (const receipt of scoped) refuse(receipt.participant_id);
+    return finish();
+  }
+
   // ── the immutable fill events, by transaction ────────────────────────────
   const txHashes = [...new Set(scoped.map((r) => r.tx_hash))];
   const eventsByTx = new Map<string, FillEventRow[]>();
@@ -349,55 +463,24 @@ export async function collectExecuted(
     }
   }
 
-  // ── the outcome, keyed off the EVENT's speculation ───────────────────────
+  // ── the fill's own deployment history, from the raw log ──────────────────
   const specIds = [
     ...new Set([...eventsByTx.values()].flat().map((e) => String(e.speculation_id))),
   ];
-  const specs = new Map<string, SpecRow>();
-  for (const chunk of chunkIds(specIds, 100)) {
-    const res = await sb
-      .from('speculations')
-      .select(
-        'speculation_id, contest_id, market_type, line_ticks, speculation_status, win_side, source_block',
-      )
-      .eq('network', network)
-      .in('speculation_id', chunk)
-      .limit(POSTGREST_PAGE);
-    if (res.error) return { error: res.error, context: 'speculations' };
-    for (const row of (res.data ?? []) as unknown as SpecRow[]) {
-      specs.set(String(row.speculation_id), row);
-    }
-  }
+  const matched = await readChainEvents(sb, network, ENTITY.fill, specIds);
+  if (matched.error) return { error: matched.error, context: CHAIN_EVENTS };
+  const matchedBySpec = byEntity(matched.rows);
 
-  const contestIds = [
-    ...new Set(
-      [...specs.values()]
-        .map((s) => (s.contest_id === null ? null : String(s.contest_id)))
-        .filter((v): v is string => v !== null),
-    ),
-  ];
-  const contests = new Map<string, ContestRow>();
-  for (const chunk of chunkIds(contestIds, 100)) {
-    const res = await sb
-      .from('contests')
-      .select('contest_id, jsonodds_id, contest_status, away_score, home_score')
-      .eq('network', network)
-      .in('contest_id', chunk)
-      .limit(POSTGREST_PAGE);
-    if (res.error) return { error: res.error, context: 'contests' };
-    for (const row of (res.data ?? []) as unknown as ContestRow[]) {
-      contests.set(String(row.contest_id), row);
-    }
-  }
+  const specLog = await readChainEvents(sb, network, ENTITY.speculation, specIds);
+  if (specLog.error) return { error: specLog.error, context: CHAIN_EVENTS };
+  const specLogById = byEntity(specLog.rows);
+
+  const contestIds = [...new Set(scoped.map((r) => String(r.contest_id)))];
+  const contestLog = await readChainEvents(sb, network, ENTITY.contest, contestIds);
+  if (contestLog.error) return { error: contestLog.error, context: CHAIN_EVENTS };
+  const contestLogById = byEntity(contestLog.rows);
 
   // ── resolve each receipt to exactly one priced position, or refuse it ────
-  const byArm = new Map<string, ExecutedFill[]>();
-  const unresolvedByArm = new Map<string, number>();
-  const resolvedTx = new Set<string>();
-  const refuse = (participantId: string): void => {
-    unresolvedByArm.set(participantId, (unresolvedByArm.get(participantId) ?? 0) + 1);
-  };
-
   for (const receipt of scoped) {
     const events = eventsByTx.get(receipt.tx_hash) ?? [];
     // Every guard below refuses rather than guesses. A receipt the indexer has
@@ -413,11 +496,10 @@ export async function collectExecuted(
     // price this arm's record with money that is not its own.
     const mine = events.filter(
       (e) =>
-        sameAddress(e.taker_address, receipt.taker_address) &&
+        sameHex(e.taker_address, receipt.taker_address) &&
         sameId(e.speculation_id, receipt.speculation_id) &&
         sameId(e.contest_id, receipt.contest_id) &&
-        e.commitment_hash !== null &&
-        e.commitment_hash.toLowerCase() === receipt.commitment_hash.toLowerCase(),
+        sameHex(e.commitment_hash, receipt.commitment_hash),
     );
     if (mine.length === 0 || mine.length !== events.length) {
       refuse(receipt.participant_id);
@@ -428,31 +510,86 @@ export async function collectExecuted(
       refuse(receipt.participant_id);
       continue;
     }
-    // Link 2: the speculation row the service reads today is the one the fill
-    // was on. The counter alone cannot say so after a redeploy; the contest,
-    // the market and the creation block together can.
-    const spec = specs.get(String(mine[0]?.speculation_id));
-    if (spec === undefined || spec.market_type === null) {
+    const specId = String(mine[0]?.speculation_id);
+
+    // Link 2: each projected fill event has its own COMMITMENT_MATCHED log row
+    // at the same tx and log index, agreeing on every identity field and on
+    // the block — and the rows share ONE emitter. That emitter is the
+    // deployment the fill happened under.
+    const logRows = (matchedBySpec.get(specId) ?? []).filter(
+      (r) => r.event_name === EVENT.matched && sameHex(r.tx_hash, receipt.tx_hash),
+    );
+    const logFor = (e: FillEventRow): ChainEventRow | undefined =>
+      logRows.find((r) => r.log_index === e.log_index);
+    const consistent =
+      logRows.length === mine.length &&
+      mine.every((e) => {
+        const r = logFor(e);
+        return (
+          r !== undefined &&
+          sameId(r.payload.speculationId, specId) &&
+          sameId(r.payload.contestId, receipt.contest_id) &&
+          sameHex(r.payload.taker, receipt.taker_address) &&
+          sameHex(r.payload.commitmentHash, receipt.commitment_hash) &&
+          sameId(r.block_number, receipt.block_number)
+        );
+      });
+    const emitters = new Set(logRows.map((r) => r.emitter_address.toLowerCase()));
+    if (!consistent || emitters.size !== 1) {
       refuse(receipt.participant_id);
       continue;
     }
-    const specBlock = blockOf(spec.source_block);
-    const fillBlock = blockOf(receipt.block_number);
+    const emitter = [...emitters][0] as string;
+    const underEmitter = (rows: readonly ChainEventRow[] | undefined, name: string): ChainEventRow[] =>
+      (rows ?? []).filter((r) => r.event_name === name && sameHex(r.emitter_address, emitter));
+
+    // Link 3: the speculation's history under that deployment. Exactly one
+    // creation — a second one is a counter that restarted — citing the
+    // receipt's contest, with a scorer that names the receipt's market.
+    const created = underEmitter(specLogById.get(specId), EVENT.speculationCreated);
+    const settled = underEmitter(specLogById.get(specId), EVENT.speculationSettled);
+    if (created.length !== 1 || settled.length > 1) {
+      refuse(receipt.participant_id);
+      continue;
+    }
+    const creation = (created[0] as ChainEventRow).payload;
+    const market = creation.scorer === undefined ? null : scorerToType(creation.scorer, scorers);
+    const lineTicks = toInt(creation.lineTicks);
     if (
-      !sameId(spec.contest_id, receipt.contest_id) ||
-      spec.market_type !== receipt.market ||
-      specBlock === null ||
-      fillBlock === null ||
-      specBlock > fillBlock
+      !sameId(creation.contestId, receipt.contest_id) ||
+      market === null ||
+      market !== receipt.market ||
+      lineTicks === null
     ) {
       refuse(receipt.participant_id);
       continue;
     }
-    // Link 3: the contest is the receipt's GAME — the durable spine. A null
-    // `jsonodds_id` fails the same comparison (the receipt's game is never
-    // null), so it needs no clause of its own.
-    const contestRow = contests.get(String(spec.contest_id));
-    if (contestRow === undefined || contestRow.jsonodds_id !== receipt.game_id) {
+    const settledSide =
+      settled.length === 1 ? WIN_SIDE_BY_VALUE[(settled[0] as ChainEventRow).payload.winSideValue ?? ''] : undefined;
+    if (settled.length === 1 && settledSide === undefined) {
+      refuse(receipt.participant_id);
+      continue;
+    }
+
+    // Link 4: the contest's history under that deployment — created exactly
+    // once, for the receipt's GAME (the spine), scored at most once, voided at
+    // most once.
+    const contestId = String(receipt.contest_id);
+    const contestCreated = underEmitter(contestLogById.get(contestId), EVENT.contestCreated);
+    const scores = underEmitter(contestLogById.get(contestId), EVENT.scoresSet);
+    const voided = underEmitter(contestLogById.get(contestId), EVENT.contestVoided);
+    if (
+      contestCreated.length !== 1 ||
+      (contestCreated[0] as ChainEventRow).payload.jsonoddsId !== receipt.game_id ||
+      scores.length > 1 ||
+      voided.length > 1
+    ) {
+      refuse(receipt.participant_id);
+      continue;
+    }
+    const awayScore = scores.length === 1 ? toInt((scores[0] as ChainEventRow).payload.awayScore) : null;
+    const homeScore = scores.length === 1 ? toInt((scores[0] as ChainEventRow).payload.homeScore) : null;
+    if (scores.length === 1 && (awayScore === null || homeScore === null)) {
       refuse(receipt.participant_id);
       continue;
     }
@@ -471,10 +608,17 @@ export async function collectExecuted(
     }
     const riskWei6 = risks.reduce<bigint>((n, r) => n + (r as bigint), 0n);
     const profitWei6 = profits.reduce<bigint>((n, p) => n + (p as bigint), 0n);
+
+    const speculation: ExecutedSpeculation = {
+      speculationStatus: settled.length === 1 ? 'closed' : 'open',
+      winSide: settledSide ?? 'tbd',
+      marketType: market,
+      lineTicks,
+    };
     const contest: ExecutedContest = {
-      contestStatus: contestRow.contest_status,
-      awayScore: contestRow.away_score,
-      homeScore: contestRow.home_score,
+      contestStatus: voided.length === 1 ? 'voided' : scores.length === 1 ? 'scored' : 'unverified',
+      awayScore,
+      homeScore,
     };
 
     const entry: ExecutedFill = {
@@ -488,12 +632,7 @@ export async function collectExecuted(
         // `numeric(18,6)` decimal USDC on the receipt; wei6 on the chain side.
         receiptStakeWei6: BigInt(Math.round(receiptStake * WEI6)),
       },
-      speculation: {
-        speculationStatus: spec.speculation_status,
-        winSide: spec.win_side,
-        marketType: spec.market_type,
-        lineTicks: spec.line_ticks,
-      },
+      speculation,
       contest,
     };
     const list = byArm.get(receipt.participant_id);
@@ -502,31 +641,5 @@ export async function collectExecuted(
     resolvedTx.add(receipt.tx_hash);
   }
 
-  const byParticipant = new Map<string, ExecutedSummary>();
-  for (const participantId of new Set([...byArm.keys(), ...unresolvedByArm.keys()])) {
-    byParticipant.set(
-      participantId,
-      summarizeExecuted(byArm.get(participantId) ?? [], unresolvedByArm.get(participantId) ?? 0),
-    );
-  }
-
-  const fills: BenchmarkFill[] = scoped.map((f) => ({
-    cohortId: f.cohort_id,
-    participantId: f.participant_id,
-    gameId: f.game_id,
-    market: f.market,
-    resolved: resolvedTx.has(f.tx_hash),
-    runId: f.run_id,
-    deploymentRound: f.deployment_round,
-    contestId: String(f.contest_id),
-    speculationId: String(f.speculation_id),
-    takerAddress: f.taker_address,
-    txHash: f.tx_hash,
-    blockNumber: String(f.block_number),
-    filledAt: f.filled_at,
-    stakeUsdc: Number(f.stake_usdc),
-    wouldAbstain: f.would_abstain,
-  }));
-
-  return { fills, byParticipant };
+  return finish();
 }

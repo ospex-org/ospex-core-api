@@ -1,6 +1,7 @@
 /**
  * `collectExecuted` — the join from a benchmark fill receipt to the immutable
- * on-chain fill event, and from the event to the outcome rows it is bound to.
+ * on-chain fill event, and from the event to the outcome as the fill's OWN
+ * deployment recorded it.
  *
  * These exist because the first cut reconstructed each fill from the MUTABLE
  * aggregate `positions` row, and review reproduced two concrete money defects
@@ -10,14 +11,15 @@
  * asserted in the form that matters — the side comes from the event's
  * `taker_position_type`, so there is no row order to depend on.
  *
- * The second review round added two more, both reproduced and both pinned:
- * a reused speculation id after a redeploy was priced against the WRONG
- * outcome row (the "durable identity" block), and an offset walk over the
- * receipts double-counted when a row landed between two pages (the "paging"
- * block).
+ * Review then twice reproduced a fill priced against the WRONG outcome row: a
+ * reused speculation id after a redeploy, and — once creation-block ordering
+ * was added — a reused id created in the same block as the old fill. The
+ * "deployment identity" block below pins the design that closed both: the
+ * outcome is read from `chain_events` under the emitter that emitted the
+ * fill, never from the counter-keyed projections.
  *
  * Driven through the real Supabase client against a fake PostgREST, so the
- * queries are the ones the handler actually issues — including the one this
+ * queries are the ones the handler actually issues — including the ones this
  * module must NOT issue any more.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -37,14 +39,18 @@ const TAKER = '0x16dc5d67d080a5521ef2c79680dbfc2abf724d30';
 const OTHER = '0x8ff8fc180a1d4aa352bc23e73bf24d98cf94fad5';
 const GAME = 'game-a';
 
-const USDC = 1_000_000;
+/** The R5 Core, the emitter of every production log row measured 2026-08-24. */
+const CORE = '0x40047bafcded16c938058b7b67186299a2893561';
+/** A later deployment's Core — the reviewer's reused-counter scenario. */
+const OTHER_CORE = '0x1111111111111111111111111111111111111111';
 
-/**
- * The speculation was created at block 90 and filled at block 100 — the fill
- * strictly AFTER creation, so a fixture that moves creation past the fill is
- * measuring the block-ordering link and nothing else.
- */
-const SPEC_BLOCK = 90;
+const SCORERS = {
+  moneyline: '0x59555106d4b5f1a797f3552f60ac418eb6b6f6bd',
+  spread: '0xb4b1e2a2a75c34e9e4c5d3bb8a432aff973dada0',
+  total: '0x2222222222222222222222222222222222222222',
+};
+
+const USDC = 1_000_000;
 const FILL_BLOCK = 100;
 
 function receipt(over: Record<string, unknown> = {}): Record<string, unknown> {
@@ -86,31 +92,84 @@ function event(over: Record<string, unknown> = {}): Record<string, unknown> {
   };
 }
 
-function spec(over: Record<string, unknown> = {}): Record<string, unknown> {
+let logId = 1000;
+/** A `chain_events` row. Payload values are strings, addresses checksummed, as the indexer writes them. */
+function log(
+  eventName: string,
+  entityType: string,
+  entityId: number,
+  payload: Record<string, string>,
+  over: Record<string, unknown> = {},
+): Record<string, unknown> {
+  logId += 1;
   return {
+    id: logId,
     network: 'polygon',
-    speculation_id: 88,
-    contest_id: 41,
-    market_type: 'moneyline',
-    line_ticks: null,
-    speculation_status: 'closed',
-    win_side: 'away', // upper wins
-    source_block: SPEC_BLOCK,
+    event_name: eventName,
+    entity_type: entityType,
+    entity_id: entityId,
+    emitter_address: CORE,
+    block_number: FILL_BLOCK,
+    tx_hash: '0xtx1',
+    log_index: 0,
+    payload: { raw: '0x', ...payload },
     ...over,
   };
 }
 
-function contest(over: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
-    network: 'polygon',
-    contest_id: 41,
-    jsonodds_id: GAME,
-    contest_status: 'scored',
-    away_score: 5,
-    home_score: 3,
-    ...over,
-  };
-}
+/** The fill's own COMMITMENT_MATCHED log row — the deployment mark. */
+const matched = (over: Record<string, unknown> = {}, payload: Record<string, string> = {}): Record<string, unknown> =>
+  log(
+    'COMMITMENT_MATCHED',
+    'fill',
+    88,
+    {
+      speculationId: '88',
+      contestId: '41',
+      taker: '0x16Dc5D67D080a5521ef2c79680dBfC2aBf724D30',
+      commitmentHash: '0xAA',
+      scorer: SCORERS.moneyline,
+      ...payload,
+    },
+    over,
+  );
+const created = (over: Record<string, unknown> = {}, payload: Record<string, string> = {}): Record<string, unknown> =>
+  log(
+    'SPECULATION_CREATED',
+    'speculation',
+    88,
+    { speculationId: '88', contestId: '41', scorer: SCORERS.moneyline, lineTicks: '0', ...payload },
+    { block_number: 90, tx_hash: '0xcreate', ...over },
+  );
+const settled = (winSideValue = '1', over: Record<string, unknown> = {}): Record<string, unknown> =>
+  log(
+    'SPECULATION_SETTLED',
+    'speculation',
+    88,
+    { speculationId: '88', winSideValue, scorer: SCORERS.moneyline },
+    { block_number: 200, tx_hash: '0xsettle', ...over },
+  );
+const contestCreated = (over: Record<string, unknown> = {}, payload: Record<string, string> = {}): Record<string, unknown> =>
+  log(
+    'CONTEST_CREATED',
+    'contest',
+    41,
+    { contestId: '41', jsonoddsId: GAME, ...payload },
+    { block_number: 80, tx_hash: '0xcontest', ...over },
+  );
+const scoresSet = (away = '5', home = '3', over: Record<string, unknown> = {}): Record<string, unknown> =>
+  log(
+    'CONTEST_SCORES_SET',
+    'contest',
+    41,
+    { contestId: '41', awayScore: away, homeScore: home },
+    { block_number: 190, tx_hash: '0xscore', ...over },
+  );
+const voided = (over: Record<string, unknown> = {}): Record<string, unknown> =>
+  log('CONTEST_VOIDED', 'contest', 41, { contestId: '41' }, { block_number: 190, tx_hash: '0xvoid', ...over });
+
+/** The default history: created, matched, contest created and scored, speculation settled `away` (upper wins). */
+const HISTORY = (): Record<string, unknown>[] => [matched(), created(), settled('1'), contestCreated(), scoresSet()];
 
 interface Tables {
   [table: string]: unknown[];
@@ -135,7 +194,12 @@ function pageLike(rows: readonly unknown[], req: CapturedRequest): unknown[] {
   const order = req.params.get('order');
   if (order !== null) {
     const [col] = order.split('.') as [string];
-    filtered.sort((a, b) => String(a[col]).localeCompare(String(b[col])));
+    filtered.sort((a, b) => {
+      const x = a[col];
+      const y = b[col];
+      if (typeof x === 'number' && typeof y === 'number') return x - y;
+      return String(x).localeCompare(String(y));
+    });
   }
   const offset = Number(req.params.get('offset') ?? '0');
   const limit = req.params.has('limit') ? Number(req.params.get('limit')) : filtered.length;
@@ -146,6 +210,11 @@ async function collect(
   tables: Tables,
   inScope?: Set<string>,
   override?: (req: CapturedRequest, index: number) => FakeReply | undefined,
+  // `null`, NOT `undefined`, means "scorers not configured": a default
+  // parameter is applied when the argument is `undefined`, so passing
+  // `undefined` here would silently run the case WITH scorers — the
+  // `??`-collapses-the-null-case trap, one type over. It happened.
+  scorers: typeof SCORERS | null = SCORERS,
 ): Promise<{
   fake: FakePostgrest;
   result: Awaited<ReturnType<typeof import('../src/v1/benchmark/executedFetch.js').collectExecuted>>;
@@ -153,8 +222,7 @@ async function collect(
   const data: Tables = {
     benchmark_execution_fills: [],
     position_fills: [],
-    speculations: [spec()],
-    contests: [contest()],
+    chain_events: HISTORY(),
     ...tables,
   };
   const fake = await startFakePostgrest((req: CapturedRequest, index: number) => {
@@ -171,7 +239,13 @@ async function collect(
   }));
   const { getSupabase } = await import('../src/lib/supabase.js');
   const { collectExecuted } = await import('../src/v1/benchmark/executedFetch.js');
-  const result = await collectExecuted(getSupabase(), 'polygon', [COHORT], inScope);
+  const result = await collectExecuted(
+    getSupabase(),
+    'polygon',
+    [COHORT],
+    scorers === null ? undefined : scorers,
+    inScope,
+  );
   return { fake, result };
 }
 
@@ -203,6 +277,7 @@ describe('the join is the fill EVENT', () => {
     expect(s.record).toEqual({ won: 1, lost: 0, push: 0, void: 0, pending: 0 });
     // won ⇒ net is the counterparty's stake.
     expect(s.netWei6).toBe(BigInt(7 * USDC));
+    expect(s.verdictSource).toEqual({ settled: 1, predicted: 0, undecided: 0 });
   });
 
   /**
@@ -213,13 +288,14 @@ describe('the join is the fill EVENT', () => {
   it('does not double-count two receipts that share a speculation', async () => {
     const { result } = await collect({
       benchmark_execution_fills: [
-        receipt({ market: 'moneyline', tx_hash: '0xtx1', stake_usdc: 1 }),
-        receipt({ market: 'moneyline', tx_hash: '0xtx2', stake_usdc: 2 }),
+        receipt({ tx_hash: '0xtx1', stake_usdc: 1 }),
+        receipt({ tx_hash: '0xtx2', stake_usdc: 2, block_number: 101 }),
       ],
       position_fills: [
         event({ id: 1, tx_hash: '0xtx1', taker_risk_amount: String(1 * USDC), maker_risk_amount: '0' }),
         event({ id: 2, tx_hash: '0xtx2', taker_risk_amount: String(2 * USDC), maker_risk_amount: '0' }),
       ],
+      chain_events: [...HISTORY(), matched({ tx_hash: '0xtx2', block_number: 101 })],
     });
     const s = summaryOf(result);
     expect(s.fills).toBe(2);
@@ -257,6 +333,7 @@ describe('the join is the fill EVENT', () => {
         event({ id: 1, log_index: 0, taker_risk_amount: String(6 * USDC), maker_risk_amount: String(4 * USDC) }),
         event({ id: 2, log_index: 1, taker_risk_amount: String(4 * USDC), maker_risk_amount: String(3 * USDC) }),
       ],
+      chain_events: [...HISTORY(), matched({ log_index: 1 })],
     });
     const s = summaryOf(result);
     expect(s.fills).toBe(1);
@@ -265,14 +342,17 @@ describe('the join is the fill EVENT', () => {
     expect(s.stakeDisagreements).toBe(0);
   });
 
-  /** `positions` is the table this module must no longer touch. */
-  it('never queries the aggregate positions table', async () => {
+  /** The counter-keyed projections are the tables this module must not consult. */
+  it('never queries positions, speculations or contests', async () => {
     const { fake } = await collect({
       benchmark_execution_fills: [receipt()],
       position_fills: [event()],
     });
     expect(fake.tables()).not.toContain('positions');
+    expect(fake.tables()).not.toContain('speculations');
+    expect(fake.tables()).not.toContain('contests');
     expect(fake.tables()).toContain('position_fills');
+    expect(fake.tables()).toContain('chain_events');
   });
 
   /** The round and run the receipt cites travel with the fill, as provenance. */
@@ -320,6 +400,7 @@ describe('anything ambiguous is refused, not guessed', () => {
         event({ id: 1, taker_position_type: 'upper' }),
         event({ id: 2, log_index: 1, taker_position_type: 'lower' }),
       ],
+      chain_events: [...HISTORY(), matched({ log_index: 1 })],
     });
     expect(summaryOf(result).unresolvedFills).toBe(1);
   });
@@ -328,112 +409,6 @@ describe('anything ambiguous is refused, not guessed', () => {
     const { result } = await collect({
       benchmark_execution_fills: [receipt()],
       position_fills: [event({ speculation_id: 999 })],
-    });
-    expect(summaryOf(result).unresolvedFills).toBe(1);
-  });
-
-  /**
-   * Negative control for the four refusals above: the same fixture minus the
-   * ambiguity must RESOLVE. Without it, a collector that refused everything
-   * would pass all four.
-   */
-  it('resolves the unambiguous case', async () => {
-    const { result } = await collect({
-      benchmark_execution_fills: [receipt()],
-      position_fills: [event()],
-    });
-    const s = summaryOf(result);
-    expect(s.unresolvedFills).toBe(0);
-    expect(s.fills).toBe(1);
-  });
-});
-
-/**
- * REVIEW ROUND 2, B3. A transaction hash proves which fill happened; it does
- * not prove the `speculations` row read today is the speculation the fill was
- * on, because `speculation_id` and `contest_id` restart on every redeploy and
- * the protocol tables carry no round. Each case below breaks ONE link of the
- * identity chain and leaves every other link intact, so a build that skipped
- * that link — and only that link — would price the fill.
- */
-describe('the outcome row is bound by durable identity, not by the counter', () => {
-  /**
-   * The reviewer's probe: the current row for id 88 was minted by a LATER
-   * deployment — created after the fill it is being asked to price. Everything
-   * else about it agrees, which is exactly why the counter alone was fooled.
-   */
-  it('refuses a speculation row created after the fill (a reused id from a later deployment)', async () => {
-    const { result } = await collect({
-      benchmark_execution_fills: [receipt()],
-      position_fills: [event()],
-      speculations: [spec({ source_block: FILL_BLOCK + 1 })],
-    });
-    const s = summaryOf(result);
-    expect(s.fills).toBe(0);
-    expect(s.unresolvedFills).toBe(1);
-  });
-
-  /** Creation IN the fill's block is legitimate: R5 mints a speculation in its first fill. */
-  it('accepts a speculation created in the same block as the fill', async () => {
-    const { result } = await collect({
-      benchmark_execution_fills: [receipt()],
-      position_fills: [event()],
-      speculations: [spec({ source_block: FILL_BLOCK })],
-    });
-    expect(summaryOf(result).fills).toBe(1);
-  });
-
-  it('refuses a speculation row with no creation block at all', async () => {
-    const { result } = await collect({
-      benchmark_execution_fills: [receipt()],
-      position_fills: [event()],
-      speculations: [spec({ source_block: null })],
-    });
-    expect(summaryOf(result).unresolvedFills).toBe(1);
-  });
-
-  it('refuses a speculation row on a different contest than the receipt cites', async () => {
-    const { result } = await collect({
-      benchmark_execution_fills: [receipt()],
-      position_fills: [event()],
-      speculations: [spec({ contest_id: 42 })],
-      contests: [contest({ contest_id: 42 })],
-    });
-    expect(summaryOf(result).unresolvedFills).toBe(1);
-  });
-
-  it('refuses a speculation row on a different market than the receipt cites', async () => {
-    const { result } = await collect({
-      benchmark_execution_fills: [receipt({ market: 'total' })],
-      position_fills: [event()],
-    });
-    expect(summaryOf(result).unresolvedFills).toBe(1);
-  });
-
-  /** The spine 079 names: the contest must be the receipt's GAME. */
-  it('refuses a contest row whose jsonodds_id is not the receipt game', async () => {
-    const { result } = await collect({
-      benchmark_execution_fills: [receipt()],
-      position_fills: [event()],
-      contests: [contest({ jsonodds_id: 'some-other-game' })],
-    });
-    expect(summaryOf(result).unresolvedFills).toBe(1);
-  });
-
-  it('refuses a contest row with no jsonodds_id', async () => {
-    const { result } = await collect({
-      benchmark_execution_fills: [receipt()],
-      position_fills: [event()],
-      contests: [contest({ jsonodds_id: null })],
-    });
-    expect(summaryOf(result).unresolvedFills).toBe(1);
-  });
-
-  it('refuses when the contest row is missing entirely', async () => {
-    const { result } = await collect({
-      benchmark_execution_fills: [receipt()],
-      position_fills: [event()],
-      contests: [],
     });
     expect(summaryOf(result).unresolvedFills).toBe(1);
   });
@@ -455,42 +430,321 @@ describe('the outcome row is bound by durable identity, not by the counter', () 
   });
 
   /**
-   * Negative control for the nine refusals above, with every link deliberately
-   * at its BOUNDARY value rather than a comfortable one: creation in the fill's
-   * own block, and the commitment hash differing only in case (079 stores hex
-   * lowercase; the comparison is case-insensitive anyway).
+   * Negative control for the refusals above: the same fixture minus the
+   * ambiguity must RESOLVE. Without it, a collector that refused everything
+   * would pass all of them.
+   */
+  it('resolves the unambiguous case', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+    });
+    const s = summaryOf(result);
+    expect(s.unresolvedFills).toBe(0);
+    expect(s.fills).toBe(1);
+  });
+});
+
+/**
+ * REVIEW ROUND 2, B3 — twice. A transaction hash proves which fill happened;
+ * it does not prove that a counter-keyed row read today is the speculation the
+ * fill was on. The outcome is therefore read from the raw log under the
+ * emitter that emitted the fill, and each case below breaks ONE link of that
+ * chain while leaving every other link intact, so a build that skipped that
+ * link — and only that link — would price the fill.
+ */
+describe('the outcome is read from the fill deployment, never by counter', () => {
+  /**
+   * The reviewer's second probe, verbatim in shape: a later deployment reuses
+   * the same speculation id, contest id, game and market IN THE SAME BLOCK as
+   * the old fill, and settles to the opposite side. Its log rows carry the
+   * later Core as emitter. They are not consulted: the fill's own deployment
+   * says `away`, and `away` is what gets priced.
+   */
+  it('ignores a later deployment that reused every id in the same block', async () => {
+    const reused = {
+      emitter_address: OTHER_CORE,
+      block_number: FILL_BLOCK,
+      tx_hash: '0xtx-r6',
+    };
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [
+        ...HISTORY(),
+        created(reused),
+        settled('2', reused), // the OTHER side wins under the later deployment
+        contestCreated(reused),
+        scoresSet('3', '5', reused),
+      ],
+    });
+    const s = summaryOf(result);
+    expect(s.fills).toBe(1);
+    expect(s.record).toEqual({ won: 1, lost: 0, push: 0, void: 0, pending: 0 });
+  });
+
+  /**
+   * The same probe with the OLD deployment's history gone (a reset-and-reindex
+   * redeploy): the fill's own COMMITMENT_MATCHED row is absent, so there is no
+   * emitter to read under, and the receipt is unresolved — never priced on the
+   * later deployment's rows.
+   */
+  it('refuses the old receipt when only the later deployment history remains', async () => {
+    const reused = { emitter_address: OTHER_CORE, block_number: FILL_BLOCK, tx_hash: '0xtx-r6' };
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [created(reused), settled('2', reused), contestCreated(reused), scoresSet('3', '5', reused)],
+    });
+    const s = summaryOf(result);
+    expect(s.fills).toBe(0);
+    expect(s.unresolvedFills).toBe(1);
+  });
+
+  /** A counter that restarted UNDER the same Core shows as a second creation. */
+  it('refuses a speculation id created twice under the fill emitter', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [...HISTORY(), created({ tx_hash: '0xcreate-again', block_number: FILL_BLOCK })],
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  it('refuses a fill with no COMMITMENT_MATCHED log row of its own', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: HISTORY().filter((r) => r.event_name !== 'COMMITMENT_MATCHED'),
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  it('refuses when the log row for the fill sits in a different block than the receipt', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [...HISTORY().filter((r) => r.event_name !== 'COMMITMENT_MATCHED'), matched({ block_number: FILL_BLOCK + 1 })],
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  it('refuses when the log row for the fill names a different commitment', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [...HISTORY().filter((r) => r.event_name !== 'COMMITMENT_MATCHED'), matched({}, { commitmentHash: '0xbb' })],
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  /**
+   * The log holds TWO fill rows for the transaction but the projection holds
+   * one: the stake would be summed over one event while the chain says two.
+   * A missing log row is refused by the per-event lookup; this is the other
+   * direction, which only the count can see.
+   */
+  it('refuses when the log carries a fill row the projection lacks', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event({ id: 1, log_index: 0 })],
+      chain_events: [...HISTORY(), matched({ log_index: 1 })],
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  it('refuses a transaction whose fill log rows disagree on the emitter', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event({ id: 1, log_index: 0 }), event({ id: 2, log_index: 1 })],
+      chain_events: [...HISTORY(), matched({ log_index: 1, emitter_address: OTHER_CORE })],
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  it('refuses a creation that cites a different contest than the receipt', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [...HISTORY().filter((r) => r.event_name !== 'SPECULATION_CREATED'), created({}, { contestId: '42' })],
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  it('refuses a creation whose scorer names a different market than the receipt', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt({ market: 'total' })],
+      position_fills: [event()],
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  it('refuses a creation whose scorer is not one of the configured scorers', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [
+        ...HISTORY().filter((r) => r.event_name !== 'SPECULATION_CREATED'),
+        created({}, { scorer: '0x3333333333333333333333333333333333333333' }),
+      ],
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  /** The spine 079 names: the contest, as its own deployment created it, must be the receipt's GAME. */
+  it('refuses a contest created for a different game', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [...HISTORY().filter((r) => r.event_name !== 'CONTEST_CREATED'), contestCreated({}, { jsonoddsId: 'some-other-game' })],
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  it('refuses when the contest has no creation under the fill emitter', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: HISTORY().filter((r) => r.event_name !== 'CONTEST_CREATED'),
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  it('refuses a speculation settled twice, and a contest scored twice', async () => {
+    const twiceSettled = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [...HISTORY(), settled('2', { tx_hash: '0xsettle-again' })],
+    });
+    const twiceScored = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [...HISTORY(), scoresSet('9', '9', { tx_hash: '0xscore-again' })],
+    });
+    expect(summaryOf(twiceSettled.result).unresolvedFills).toBe(1);
+    expect(summaryOf(twiceScored.result).unresolvedFills).toBe(1);
+  });
+
+  it('refuses a settlement whose win side is not one the protocol defines', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [...HISTORY().filter((r) => r.event_name !== 'SPECULATION_SETTLED'), settled('9')],
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  /**
+   * The scorer addresses are what name a chain speculation's market. Without
+   * them nothing can be priced, and nothing is — on the receipt's own word or
+   * otherwise.
+   */
+  it('refuses every receipt when the scorer addresses are not configured', async () => {
+    const { result, fake } = await collect(
+      { benchmark_execution_fills: [receipt()], position_fills: [event()] },
+      undefined,
+      undefined,
+      null,
+    );
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+    expect(summaryOf(result).fills).toBe(0);
+    // And issues no chain read the refusal would be about.
+    expect(fake.tables()).not.toContain('chain_events');
+    // The harness really ran without scorers: with them, the same fixture prices.
+    const control = await collect({ benchmark_execution_fills: [receipt()], position_fills: [event()] });
+    expect(summaryOf(control.result).fills).toBe(1);
+  });
+
+  /**
+   * Negative control for every refusal above, with the links at their
+   * BOUNDARY values: the commitment hash and taker differing only in case
+   * (payloads are checksummed; 079 stores lowercase), the creation in the
+   * fill's own block, and the fill's log row carrying the exact block.
    */
   it('prices the fill when every link holds', async () => {
     const { result } = await collect({
       benchmark_execution_fills: [receipt({ commitment_hash: '0xAA' })],
       position_fills: [event()],
-      speculations: [spec({ source_block: FILL_BLOCK })],
+      chain_events: [...HISTORY().filter((r) => r.event_name !== 'SPECULATION_CREATED'), created({ block_number: FILL_BLOCK })],
     });
     const s = summaryOf(result);
     expect(s.unresolvedFills).toBe(0);
     expect(s.fills).toBe(1);
     expect(s.record.won).toBe(1);
   });
+});
+
+describe('the verdict comes from the deployment history', () => {
+  it('replays the scorer on the created line when the contest is scored but the speculation is open', async () => {
+    // Spread, away −1.5 (lineTicks −15 in the 10x domain), away 5 home 3 ⇒ away covers.
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt({ market: 'spread' })],
+      position_fills: [event()],
+      chain_events: [
+        matched({}, { scorer: SCORERS.spread }),
+        created({}, { scorer: SCORERS.spread, lineTicks: '-15' }),
+        contestCreated(),
+        scoresSet('5', '3'),
+      ],
+    });
+    const s = summaryOf(result);
+    expect(s.record).toEqual({ won: 1, lost: 0, push: 0, void: 0, pending: 0 });
+    expect(s.verdictSource).toEqual({ settled: 0, predicted: 1, undecided: 0 });
+  });
+
+  /** Same fixture, line pushed out to −2.5: the replay is reading the created line. */
+  it('and the line it replays is the one the deployment created', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt({ market: 'spread' })],
+      position_fills: [event()],
+      chain_events: [
+        matched({}, { scorer: SCORERS.spread }),
+        created({}, { scorer: SCORERS.spread, lineTicks: '-25' }),
+        contestCreated(),
+        scoresSet('5', '3'),
+      ],
+    });
+    expect(summaryOf(result).record).toEqual({ won: 0, lost: 1, push: 0, void: 0, pending: 0 });
+  });
 
   /**
-   * The other half of B3. A voided contest can never be scored (`setScores`
-   * reverts on any status but Verified) and the only settlement left to an
-   * open speculation on it is `WinSide.Void`, so the verdict is decided — only
-   * its claim block is not. Pending would hold the stake on a bet already
-   * refunded in principle.
+   * A voided contest can never be scored and the only settlement left to an
+   * open speculation on it is `WinSide.Void`, so the verdict is decided.
    */
   it('prices an open speculation on a voided contest as a void, stake returned', async () => {
     const { result } = await collect({
       benchmark_execution_fills: [receipt()],
       position_fills: [event()],
-      speculations: [spec({ speculation_status: 'open', win_side: 'tbd' })],
-      contests: [contest({ contest_status: 'voided', away_score: null, home_score: null })],
+      chain_events: [matched(), created(), contestCreated(), voided()],
     });
     const s = summaryOf(result);
     expect(s.record).toEqual({ won: 0, lost: 0, push: 0, void: 1, pending: 0 });
     expect(s.netWei6).toBe(0n);
     expect(s.pendingStakeWei6).toBe(0n);
     expect(s.verdictSource).toEqual({ settled: 0, predicted: 1, undecided: 0 });
+  });
+
+  it('is pending while the contest is neither scored nor voided', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [matched(), created(), contestCreated()],
+    });
+    const s = summaryOf(result);
+    expect(s.record.pending).toBe(1);
+    expect(s.pendingStakeWei6).toBe(BigInt(10 * USDC));
+  });
+
+  it('prefers the protocol settlement over the replay when both exist', async () => {
+    // Scores say away; the protocol settled home. The protocol wins.
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [matched(), created(), settled('2'), contestCreated(), scoresSet('5', '3')],
+    });
+    const s = summaryOf(result);
+    expect(s.record.lost).toBe(1);
+    expect(s.verdictSource.settled).toBe(1);
   });
 });
 
@@ -539,6 +793,15 @@ describe('an amount the service cannot read refuses the receipt', () => {
     const { result } = await collect({
       benchmark_execution_fills: [receipt({ stake_usdc: 'ten' })],
       position_fills: [event()],
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  it('refuses a created line that is not an integer', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [...HISTORY().filter((r) => r.event_name !== 'SPECULATION_CREATED'), created({}, { lineTicks: '1.5' })],
     });
     expect(summaryOf(result).unresolvedFills).toBe(1);
   });
@@ -668,14 +931,6 @@ describe('paging over the receipts', () => {
   });
 
   /**
-   * The contradiction check behind the keyset. A relation that is UNIQUE on
-   * `tx_hash` cannot return the same hash twice to a walk that only ever asks
-   * for hashes above its cursor; if it does, the read cannot be trusted and
-   * nothing is served from it. The cursor here still advances (the page's last
-   * row is new), so this is the duplicate check firing and not the
-   * cursor-did-not-advance guard in `readAllByKeyset`.
-   */
-  /**
    * A server that ignores the cursor and repeats a FULL page trips the
    * cursor-advance guard in `readAllByKeyset`. That is the same class of fault
    * as a duplicate — the server answered outside its contract — and is typed
@@ -690,6 +945,14 @@ describe('paging over the receipts', () => {
     ).rejects.toMatchObject({ name: 'ProjectionIntegrityError', relation: 'benchmark_execution_fills' });
   });
 
+  /**
+   * The contradiction check behind the keyset. A relation that is UNIQUE on
+   * `tx_hash` cannot return the same hash twice to a walk that only ever asks
+   * for hashes above its cursor; if it does, the read cannot be trusted and
+   * nothing is served from it. The cursor here still advances (the page's last
+   * row is new), so this is the duplicate check firing and not the
+   * cursor-did-not-advance guard in `readAllByKeyset`.
+   */
   it('refuses the whole read when a receipt comes back twice', async () => {
     const first = manyReceipts(1000);
     let served = 0;
