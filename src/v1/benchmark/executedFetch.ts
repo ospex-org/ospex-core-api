@@ -104,8 +104,11 @@
  * and AFTER the last, and if an incomplete row exists at either point, or the
  * latest row changed in between — a recovery started and completed during the
  * read — the whole read is refused as {@link ProjectionUnstableError}, a 503.
- * A failed or hung recovery therefore blocks this record exactly as it blocks
- * the indexer, until an operator clears it.
+ * Each snapshot is itself two statements (the incomplete rows, then the
+ * latest row) and a recovery can start between them, so the latest row's own
+ * status is an incomplete witness too — see `readRecoveryState`. A failed or
+ * hung recovery therefore blocks this record exactly as it blocks the
+ * indexer, until an operator clears it.
  *
  * `deployment_round` and `run_id` are selected and carried on every fill so a
  * consumer can see which round's counters a receipt cites. They are
@@ -385,9 +388,18 @@ async function readRecoveryState(
   if (latest.error) return { state: { incomplete: null, latest: null }, error: latest.error };
   const inc = ((incomplete.data ?? []) as unknown as RecoveryRunRow[])[0];
   const lat = ((latest.data ?? []) as unknown as RecoveryRunRow[])[0];
+  // The two statements are not one snapshot. A recovery that starts BETWEEN
+  // them is missed by the filtered query and seen by the unfiltered one — so
+  // the latest row is an incomplete witness in its own right whenever its
+  // status says so. Review reproduced the gap: opening filtered query empty,
+  // recovery starts, opening latest row in_progress, chain rows then read
+  // mid-rewrite, closing latest row the same id — accepted, and an orphaned
+  // fill priced from the replacement fork. Either witness refuses now.
+  const witness =
+    inc ?? (lat !== undefined && INCOMPLETE_RECOVERY.includes(lat.status) ? lat : undefined);
   return {
     state: {
-      incomplete: inc === undefined ? null : { id: String(inc.id), status: inc.status },
+      incomplete: witness === undefined ? null : { id: String(witness.id), status: witness.status },
       latest: lat === undefined ? null : { id: String(lat.id), status: lat.status },
     },
     error: null,
@@ -395,14 +407,11 @@ async function readRecoveryState(
 }
 
 /**
- * The same latest ledger row both times, or none both times.
- *
- * Only the id is compared, deliberately. A row's status moves from
- * `in_progress` and nowhere else, and an `in_progress` (or `failed`) row
- * present BEFORE the read is refused before any chain read happens — so the
- * only change the closing snapshot can observe is a row that did not exist
- * when the read opened, which is a recovery that started after it. Comparing
- * status or timestamps as well would be clauses no input can reach.
+ * The same latest ledger row both times, or none both times — by id. A row
+ * that was not there when the read opened is a recovery that started after
+ * it. Status is checked separately at both boundaries via `incomplete`, so a
+ * row whose status changed under the read is refused by that check rather
+ * than by this one.
  */
 function sameRecoveryState(a: RecoveryState, b: RecoveryState): boolean {
   return (a.latest?.id ?? null) === (b.latest?.id ?? null);
@@ -587,12 +596,18 @@ export async function collectExecuted(
   const contestLogById = byEntity(contestLog.rows);
 
   // ── the recovery bracket closes: the last chain read is behind us ────────
-  // A recovery that started during the reads — whether it has completed or
-  // is still running — is a ledger row that was not there when the read
-  // opened. The rows above may then span two canonical histories, and none
-  // of them is served.
+  // Incomplete state is checked at BOTH boundaries, then the generation: a
+  // recovery still running, or marked failed under the read, is refused by
+  // the first; one that started and completed during the reads is a ledger
+  // row that was not there when the read opened, refused by the second. The
+  // rows above may then span two canonical histories, and none is served.
   const after = await readRecoveryState(sb, network);
   if (after.error) return { error: after.error, context: RECOVERY_RUNS };
+  if (after.state.incomplete !== null) {
+    throw new ProjectionUnstableError(
+      `recovery ${after.state.incomplete.id} is ${after.state.incomplete.status}`,
+    );
+  }
   if (!sameRecoveryState(before.state, after.state)) {
     const latest = after.state.latest;
     throw new ProjectionUnstableError(

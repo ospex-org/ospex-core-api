@@ -848,6 +848,71 @@ describe('the chain read is bracketed by the indexer recovery ledger', () => {
     ).rejects.toMatchObject({ name: 'ProjectionUnstableError' });
   });
 
+  /**
+   * REVIEW ROUND 2d — the exact regression. Each snapshot is two statements,
+   * and a recovery can start BETWEEN them: the opening filtered query sees no
+   * incomplete row, recovery 8 starts, the opening latest-row query returns 8
+   * as in_progress, the chain is then read mid-rewrite (the fill from the
+   * prior fork, the outcome from the replacement fork with reused counters
+   * and the opposite settlement), and both closing queries return the same
+   * row 8. Comparing ids alone accepted that, and priced the old fill as a
+   * loss. The latest row's own status is an incomplete witness now, at both
+   * boundaries, and no chain read is issued at all.
+   */
+  it('fails closed when a recovery starts between the two opening ledger statements', async () => {
+    const inProgress = run({ id: 8, status: 'in_progress', completed_at: null });
+    let ledgerReads = 0;
+    const seen: string[] = [];
+    await expect(
+      collect(
+        {
+          benchmark_execution_fills: [receipt()],
+          position_fills: [event()],
+          // The replacement fork: same emitter, same counters, opposite outcome.
+          chain_events: [matched(), created(), settled('2'), contestCreated(), scoresSet('3', '5')],
+        },
+        undefined,
+        (req) => {
+          seen.push(req.path);
+          if (req.path !== '/rest/v1/recovery_runs') return undefined;
+          ledgerReads += 1;
+          // The opening filtered query, before the recovery starts: nothing.
+          if (ledgerReads === 1) return { body: [] };
+          // Every later statement — opening latest, both closing — sees row 8.
+          return { body: pageLike([inProgress], req) };
+        },
+      ),
+    ).rejects.toMatchObject({ name: 'ProjectionUnstableError' });
+    expect(ledgerReads).toBe(2);
+    expect(seen).not.toContain('/rest/v1/position_fills');
+    expect(seen).not.toContain('/rest/v1/chain_events');
+  });
+
+  /**
+   * The closing incomplete check on its own: the latest row was complete when
+   * the read opened and is marked failed under the read (an operator
+   * triaging). Its id has not changed, so only the status witness at the
+   * closing boundary can refuse it.
+   */
+  it('fails closed when the latest row is marked failed during the read', async () => {
+    let chainReads = 0;
+    const ledger: Record<string, unknown>[] = [run({ id: 7 })];
+    await expect(
+      collect(
+        { benchmark_execution_fills: [receipt()], position_fills: [event()] },
+        undefined,
+        (req) => {
+          if (req.path === '/rest/v1/chain_events') {
+            chainReads += 1;
+            if (chainReads === 3) ledger[0] = run({ id: 7, status: 'failed', completed_at: null });
+          }
+          if (req.path === '/rest/v1/recovery_runs') return { body: pageLike(ledger, req) };
+          return undefined;
+        },
+      ),
+    ).rejects.toMatchObject({ name: 'ProjectionUnstableError' });
+  });
+
   /** Negative control: a completed recovery that predates the read and does not change is not a fault. */
   it('serves when the ledger is complete and unchanged across the read', async () => {
     const { result, fake } = await collect({
