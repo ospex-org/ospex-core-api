@@ -288,7 +288,7 @@ export async function resolveWindow(
   const cohortIds = windowed.map((c) => c.cohortId);
   const attempts: AttemptGameRow[] = [];
   for (const chunk of chunkIds(cohortIds, 50)) {
-     
+
     const page = await readAllByKeyset<AttemptGameRow, number>(
       BENCHMARK.armAttempts,
       RUN_READ_CAP,
@@ -323,7 +323,7 @@ export async function resolveWindow(
   const allGameIds = [...new Set(attempts.map((a) => a.game_id))];
   const games = new Map<string, BenchmarkGame>();
   for (const chunk of chunkIds(allGameIds, 100)) {
-     
+
     const res = await sb
       .from('games')
       .select(

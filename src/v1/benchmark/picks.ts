@@ -184,7 +184,7 @@ async function resolveTeams(
   const ids = [...new Set(games.flatMap((g) => [g.homeTeamId, g.awayTeamId]))];
   const teams = new Map<string, { name: string; abbreviation: string }>();
   for (const chunk of chunkIds(ids, 100)) {
-     
+
     const res = await sb.from('teams').select('id, name, abbrev').in('id', chunk).limit(POSTGREST_PAGE);
     if (res.error) return { error: res.error };
     for (const t of (res.data ?? []) as unknown as TeamRow[]) {
@@ -263,7 +263,7 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
   const decisions: DecisionRow[] = [];
   for (const chunk of chunkIds(cohort.gameIds, 60)) {
     for (let offset = 0; ; offset += POSTGREST_PAGE) {
-       
+
       const result = await sb
         .from(BENCHMARK.decisions)
         .select(DECISION_SELECT)

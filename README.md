@@ -489,7 +489,13 @@ Failure modes, for all three: a missing relation (`PGRST205` / `42P01`), a relat
 
 Publication is a **config var rather than a database row** for a measured reason: core-api holds `service_role`, which migration 074 reduced to `SELECT` on every `benchmark_*` relation, so this service has no way to un-publish anything. `heroku config:unset BENCHMARK_PUBLIC_MIN_SLATE_DATE` is the only instant OFF switch that never needed a write. It is also the reason a cohort's own `label` is not used as the gate — every scored row on production carries `SMOKE_V0_NOT_A_COHORT`, and `ospex-benchmark` types that field as a literal (`z.literal`), so a label filter would be a permanent wall rather than a gate that opens when real data arrives. Eligibility is the slate date; the label is echoed in the payload.
 
-Ranking withheld means the front end prints **no rank column**. The metrics, a server-computed ordering and a named leader are all still served — work-order ruling 4 says the projection "serves metrics with ranking withheld", and migration 073's column comment constrains only sorting ("a UI must not sort participants when it is false"). The front end must never sort a leaderboard itself; `ranking.order` and `featured` exist so it does not have to.
+Ranking withheld means **the order and the leader are withheld too**, not just a rendered `#` column. `arms[]` comes back in a neutral order, `ranking.orderedBy` says `neutral`, and `featured` is all nulls. Once the operator opens the gate the array is ordered by the headline beat rate, `orderedBy` says `headline`, and `featured` names a leader and a runner-up.
+
+That is the reading both governing documents require together: work-order ruling 4 says the projection "serves metrics with ranking withheld", and migration 073's column comment says "a UI must not sort participants when it is false". An array served in performance order is a sort the front end merely has to leave alone, and `featured.leaderParticipantId` is naming a winner — serving both and asking the front end not to render a rank withholds nothing. The metrics all still ship; what is withheld is the ordering.
+
+The neutral order is `sha256(participantId + activeCohortId)` ascending — deterministic for a cohort-day, rotating as cohorts advance, carrying no meaning, and re-derivable by any reader from fields the payload already contains. Alphabetical would have seated the same lab first on every request forever, on a public comparison of four labs.
+
+Either way the front end must never sort a leaderboard itself: the served order is the whole contract.
 
 #### `GET /v1/benchmark/standings?sport=&date=&scoringPolicyVersion=`
 
@@ -514,6 +520,10 @@ observedPct  = 100 · (1 − (1 + econ) / (1 + ma))   (solve for v)
 
 Which figure is the headline is `BENCHMARK_HEADLINE_BASIS`, default `marginAdjusted.gameLevel`. **All four are always served** regardless — publishing one CLV variant alone is forbidden by the scorer's own methodology. `gameLevel` is the scorer's primary clustering (equal weight per game, so a game that drew four picks does not outvote three single-pick games); `perPick` is secondary. Each summary carries its own `n`.
 
+**The executed record.** Each published fill receipt is joined to its immutable on-chain fill event on `(network, tx_hash)`, and the side, stake and profit come from that event — `taker_position_type`, `taker_risk_amount`, `maker_risk_amount`. The aggregate `positions` table is deliberately not read: its `risk_amount` is the wallet's TOTAL risk on a speculation rather than this fill's, its `(speculation_id, user_address)` is not a unique key (the real one includes the side), and `speculation_id` is a per-deployment-round counter that a transaction hash is immune to. `claimed` is never consulted — claiming happens after the outcome and 174 of 462 live taker positions are claimed, precisely the winners.
+
+A receipt this service cannot resolve to exactly one priced fill — the indexer has not caught up, or the transaction also carries another wallet's fill, or its events straddle both sides — is REFUSED and counted in `executed.unresolvedFills` rather than guessed at. `executed.stakeDisagreements` counts fills where the operator's receipt and the chain event disagree on the stake; it is reported and never reconciled, because the two have different producers.
+
 **Denominators.** `sample.eligible` is the OPPORTUNITY count — supplied markets summed over dispatched arm-games, from `benchmark_arm_attempts` at `attempt_ordinal = 0` — not the arm's own pick count. Pooled across the live cohorts the four arms answered 294 / 291 / 288 / 273 of an identical 294 supplied markets each, so a pick-count denominator would compute a beat rate over a self-selected subset and reward an arm for declining to answer. `armOutcomes` is the histogram over the same rows (ordinal 0 only — the outcome is copied onto both legs of a repaired attempt).
 
 **Arms come from the roster, not the scores.** An arm that failed every call has attempt rows and no decisions and no scores; it is served with `scoreable: 0` and null summaries rather than vanishing. That is the failure mode the benchmark exists to measure.
@@ -521,6 +531,10 @@ Which figure is the headline is `BENCHMARK_HEADLINE_BASIS`, default `marginAdjus
 **Markets are pooled.** The scorer clusters on the game alone, so all three of a participant's markets on one game collapse into one game bucket. Ruling 2's run-line exclusion scopes the pick COUNT on `/v1/benchmark/picks` and nothing else — the acceptance figure is the mean of a moneyline and a spread pick. `byMarket` carries the split alongside, because 073 names publishing a pooled figure without it a read-path bug.
 
 **The series.** One point per cohort-day in the window, oldest first. `cumulative` is a full re-aggregation over every pick up to and including that day, never a running average of daily means — the two differ by 11% on live data, and the hero chart sits directly under the headline. The last point equals the arm's top-level aggregate by construction.
+
+**Caching and the request budget.** These three are the only endpoints here that fan out across several relations and then project over every score row in the window, so they carry two bounds rather than the usual one: a single-flight, 15-second memo (`v1/benchmark/cache.ts`) and a tighter `120/min` per-IP limiter instead of the general `600/min`. Single-flight is the half that matters — a TTL alone does nothing against a hundred simultaneous first requests, which is the shape of a cold-cache burst. Only a `200` is ever stored; a `503` from an unapplied migration is not a value and caching one would extend a transient outage to everyone for the whole window. The key carries every input that can change the answer, including the publication date and the headline basis.
+
+The projection itself is linear in the served rows: the per-day cumulative series accumulates rather than re-aggregating each prefix. Measured on a synthetic slate three times denser than production, 400 cohort-days / 216,000 score rows project in ~1.2s and the 60-day default in ~137ms.
 
 **Window.** `BENCHMARK_STANDINGS_WINDOW_DAYS` (default 60) bounds the aggregate to the most recent N published cohort-days. A window is a nameable population, echoed in `publication`; a row cap would serve a mean over an arbitrary prefix, which is not that participant's mean. Exceeding the backstop read bound answers `503` rather than truncating.
 
@@ -541,6 +555,8 @@ Writeups (`benchmark_decision_rationales`) are **not read at all** — operator-
 #### `GET /v1/benchmark/stats?sport=`
 
 The latest `benchmark_site_stats` snapshot for a sport. `sport` accepts `all` (the default, and a real stored value) plus the six slugs.
+
+Like the other two, this endpoint serves nothing and issues no query at all while `BENCHMARK_PUBLIC_MIN_SLATE_DATE` is unset. `benchmark_site_stats` is site-wide rather than cohort-scoped, so the gate here is presence of the config var rather than a slate-date comparison — the question it answers is whether the benchmark surface is public at all, and these are the most money-adjacent numbers the projection serves.
 
 Past `BENCHMARK_STATS_MAX_AGE_SECONDS` (default 48h) the three counters go **null** and `stale` goes true, with `asOf` and `ageSeconds` still populated. The front-end labels are fixed verbatim as `filled · last 24h` and `matched · last 24h`; a publisher that died on a Friday would otherwise render a three-day-old count under that label all weekend — a false public statement about money with nothing looking wrong. An absent row answers `200` with nulls, never `404`: the publisher not having run is an ordinary state and a 404 reads as a broken route.
 

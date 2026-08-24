@@ -182,7 +182,7 @@ export async function readAllByKeyset<Row, Key extends string | number>(
   const rows: Row[] = [];
   let after: Key | null = null;
   for (;;) {
-     
+
     const { data, error } = await page(after, POSTGREST_PAGE);
     if (error) return { rows, error };
     const batch = data ?? [];

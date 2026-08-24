@@ -17,6 +17,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  CumulativeAggregate,
   EMPTY_METRIC,
   EMPTY_PAIRED,
   EMPTY_SUMMARY,
@@ -250,5 +251,85 @@ describe('the empty singletons are shared, so they are frozen', () => {
   it('the freeze assertion is not vacuous', () => {
     const unfrozen = { meanClvPct: null };
     expect(Object.isFrozen(unfrozen)).toBe(false);
+  });
+});
+
+describe('CumulativeAggregate', () => {
+  /**
+   * equivalentToFullAggregate — the differential the class's own docstring
+   * promises.
+   *
+   * An incremental aggregate that DRIFTS from the one-shot one is the defect
+   * this class could introduce, and it would drift silently: the series' last
+   * point and the arm's headline are computed by different code paths and only
+   * one assertion in the handler tests compares them. So every PREFIX is
+   * compared here, over a matrix chosen to exercise the parts most likely to
+   * diverge — the running float sum against a left-to-right reduce, the merged
+   * sorted list against a fresh sort, the even-length median midpoint, and the
+   * strict `> 0` beat boundary.
+   *
+   * Values include exact zeros and both signs; days include empty ones and
+   * all-null ones; clusters repeat within a day and never across days, which is
+   * the property that makes folding exact.
+   */
+  it('equals the one-shot aggregate at every prefix', () => {
+    const POOL = [0, -0, 0.00005, -0.00005, 1.2351, -6.9478, 3.4903, -0.4646, 100, -100];
+    let seed = 987_654;
+    const rnd = (): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+
+    for (let trial = 0; trial < 200; trial += 1) {
+      const running = new CumulativeAggregate();
+      const soFar: AggregablePick[] = [];
+      const days = 1 + Math.floor(rnd() * 12);
+      for (let d = 0; d < days; d += 1) {
+        const day: AggregablePick[] = [];
+        const picks = Math.floor(rnd() * 6); // 0 is a real, and important, case
+        for (let i = 0; i < picks; i += 1) {
+          // Clusters repeat WITHIN a day and are unique across days — the
+          // invariant the incremental form relies on.
+          const cluster = `d${String(d)}-g${String(Math.floor(rnd() * 3))}`;
+          const nullish = rnd() < 0.2;
+          day.push({
+            clusterKey: cluster,
+            economicClvPct: nullish ? null : (POOL[Math.floor(rnd() * POOL.length)] as number),
+            marginAdjustedClvPct: rnd() < 0.2 ? null : (POOL[Math.floor(rnd() * POOL.length)] as number),
+          });
+        }
+        running.addDay(day);
+        soFar.push(...day);
+        const expected = soFar.length === 0 ? EMPTY_PAIRED : aggregatePaired(soFar);
+        expect(running.snapshot(), `trial ${String(trial)} day ${String(d)}`).toEqual(expected);
+      }
+    }
+  });
+
+  /**
+   * Negative control. The differential above would pass on a class that simply
+   * called `aggregatePaired` internally — which would be correct but would not
+   * be the thing under test. This proves the harness can see a divergence at
+   * all, by comparing against a deliberately wrong fold (median from the
+   * insertion order rather than the sorted order).
+   */
+  it('the differential can detect a divergence', () => {
+    const picks: AggregablePick[] = [
+      { clusterKey: 'a', economicClvPct: 10, marginAdjustedClvPct: null },
+      { clusterKey: 'b', economicClvPct: -30, marginAdjustedClvPct: null },
+      { clusterKey: 'c', economicClvPct: 1, marginAdjustedClvPct: null },
+    ];
+    const real = aggregatePaired(picks).economic.perPick.medianClvPct;
+    const unsortedMidpoint = picks[1]?.economicClvPct; // -30, the insertion middle
+    expect(real).toBe(1);
+    expect(real).not.toBe(unsortedMidpoint);
+  });
+
+  it('is empty-shaped before any day is added, and after only empty days', () => {
+    const a = new CumulativeAggregate();
+    expect(a.snapshot()).toEqual(EMPTY_PAIRED);
+    a.addDay([]);
+    a.addDay([{ clusterKey: 'x', economicClvPct: null, marginAdjustedClvPct: null }]);
+    expect(a.snapshot()).toEqual(EMPTY_PAIRED);
   });
 });

@@ -190,6 +190,20 @@ interface Harness {
   status: number;
 }
 
+/** A published scoring run with the ranking brake OPEN. */
+const OPEN_RUN = {
+  cohort_id: COHORT,
+  scoring_policy_version: V1,
+  eligible: 3,
+  scored: 2,
+  refused: 1,
+  schedule_held_out: 0,
+  refusal_reasons: { line_moved: 1 },
+  ranking_allowed: true,
+  ranking_reason: 'operator published',
+  cost_per_pick_comparable: null,
+};
+
 const open: FakePostgrest[] = [];
 afterEach(async () => {
   await Promise.all(open.splice(0).map((f) => f.close()));
@@ -501,6 +515,187 @@ describe('the primary stratum', () => {
 
 // ── the arm list ───────────────────────────────────────────────────────────
 
+describe('the sport scope', () => {
+  /**
+   * A cohort can hold games from more than one sport. `resolveWindow` filters
+   * each cohort's GAME list, but the score and fill reads are scoped by COHORT
+   * — so before this was fixed, requesting one sport still pulled every other
+   * sport's rows into the policy-version choice, the means, the counts and the
+   * ordering. Every production cohort is 100% MLB, so nothing leaked in
+   * practice and no production-shaped fixture could have caught it. Found in
+   * review.
+   *
+   * The NBA row's value is chosen so it cannot hide: including it moves Fable's
+   * per-pick economic mean from the acceptance figure -0.4646 to +33.0236 — the same figure the review probe reported.
+   */
+  const NBA_GAME = 'nba-game-1';
+  const MIXED: Tables = {
+    benchmark_arm_attempts: [
+      ...ATTEMPTS,
+      { ...ATTEMPTS[0], id: 3, game_id: NBA_GAME },
+    ],
+    games: [
+      ...GAMES,
+      { ...GAMES[0], jsonodds_id: NBA_GAME, sport: 'nba', slug: 'nba-1' },
+    ],
+    benchmark_scores: [
+      ...ACCEPTANCE_SCORES,
+      {
+        ...scoreRow(70, FABLE, 'moneyline', 100, 100),
+        benchmark_decisions: {
+          cohort_id: COHORT,
+          participant_id: FABLE,
+          game_id: NBA_GAME,
+          market: 'moneyline',
+        },
+      },
+    ],
+  };
+
+  it('excludes another sport from the means when one sport is requested', async () => {
+    const { body } = await run(MIXED, { sport: 'mlb' });
+    const fable = armFor(body, FABLE);
+    expect(fable.metrics.economic.perPick.meanClvPct).toBe(-0.4646);
+    expect(fable.sample.scoreable).toBe(2);
+  });
+
+  /**
+   * Negative control: the same fixture unscoped MUST include it, or the
+   * assertion above passes on a handler that drops the row for some unrelated
+   * reason (a bad game id, a failed join) rather than because of the filter.
+   */
+  it('includes it when no sport is requested', async () => {
+    const { body } = await run(MIXED);
+    const fable = armFor(body, FABLE);
+    expect(fable.sample.scoreable).toBe(3);
+    expect(fable.metrics.economic.perPick.meanClvPct).toBe(33.0236);
+  });
+
+  it('scopes the opportunity denominator the same way', async () => {
+    const scoped = await run(MIXED, { sport: 'mlb' });
+    const all = await run(MIXED);
+    expect(armFor(scoped.body, FABLE).sample.eligible).toBe(3);
+    expect(armFor(all.body, FABLE).sample.eligible).toBe(6);
+  });
+
+  /**
+   * N03. The out-of-scope rows must not choose the POLICY VERSION either. Here
+   * the NBA rows are scored under v0.6.2 with a later `scored_at`; unscoped,
+   * the two versions tie on cohort coverage and recency breaks it toward
+   * v0.6.2, which then excludes every MLB row and empties the table. Scoped,
+   * v0.6.2 is not in the population at all.
+   *
+   * The earlier sport cases could not catch this: their extra row shared the
+   * in-scope version, so the choice was the same either way.
+   */
+  it('excludes another sport from the policy-version choice', async () => {
+    const nbaAtV2 = {
+      ...MIXED,
+      benchmark_scores: [
+        ...ACCEPTANCE_SCORES,
+        {
+          ...scoreRow(80, FABLE, 'moneyline', 100, 100, {}, V2),
+          scored_at: '2026-09-01T00:00:00+00:00',
+          benchmark_decisions: {
+            cohort_id: COHORT,
+            participant_id: FABLE,
+            game_id: NBA_GAME,
+            market: 'moneyline',
+          },
+        },
+      ],
+    };
+    const scoped = await run(nbaAtV2, { sport: 'mlb' });
+    expect(scoped.body.scoringPolicyVersion).toBe(V1);
+    expect(armFor(scoped.body, FABLE).metrics.economic.perPick.meanClvPct).toBe(-0.4646);
+
+    // Negative control: unscoped, the NBA version really does win, so the
+    // assertion above is about the scope rather than about the fixture.
+    const all = await run(nbaAtV2);
+    expect(all.body.scoringPolicyVersion).toBe(V2);
+  });
+
+  /**
+   * N04. The scope has to reach the EXECUTION FILLS too — they are read by
+   * cohort like the scores were, and a fill on another sport's game would put
+   * another sport's money into this arm's record.
+   */
+  it('excludes another sport from the executed record', async () => {
+    const withFills = {
+      ...MIXED,
+      benchmark_execution_fills: [
+        {
+          cohort_id: COHORT,
+          participant_id: FABLE,
+          network: 'polygon',
+          game_id: NBA_GAME,
+          market: 'moneyline',
+          contest_id: 41,
+          speculation_id: 88,
+          commitment_hash: '0xaa',
+          taker_address: '0xabc',
+          tx_hash: '0xtx1',
+          block_number: 1,
+          filled_at: '2026-08-15T20:00:00+00:00',
+          stake_usdc: 10,
+          would_abstain: false,
+        },
+      ],
+      position_fills: [
+        {
+          id: 1,
+          network: 'polygon',
+          speculation_id: 88,
+          contest_id: 41,
+          commitment_hash: '0xaa',
+          taker_address: '0xabc',
+          taker_position_type: 'upper',
+          taker_risk_amount: '10000000',
+          maker_risk_amount: '7000000',
+          tx_hash: '0xtx1',
+          log_index: 0,
+        },
+      ],
+      speculations: [
+        {
+          network: 'polygon',
+          speculation_id: 88,
+          contest_id: 41,
+          market_type: 'moneyline',
+          line_ticks: null,
+          speculation_status: 'closed',
+          win_side: 'away',
+        },
+      ],
+      contests: [
+        {
+          network: 'polygon',
+          contest_id: 41,
+          contest_status: 'scored',
+          away_score: 5,
+          home_score: 3,
+        },
+      ],
+    };
+    const scoped = await run(withFills, { sport: 'mlb' });
+    expect(armFor(scoped.body, FABLE).executed.fills).toBe(0);
+    expect(armFor(scoped.body, FABLE).executed.netUsdc).toBeNull();
+
+    // Negative control: unscoped it IS counted, so the scope is what excluded
+    // it rather than a broken join.
+    const all = await run(withFills);
+    expect(armFor(all.body, FABLE).executed.fills).toBe(1);
+    expect(armFor(all.body, FABLE).executed.netUsdc).toBe(7);
+  });
+
+  it('reports only the sports actually in scope', async () => {
+    const scoped = await run(MIXED, { sport: 'mlb' });
+    const all = await run(MIXED);
+    expect(scoped.body.availableSports).toEqual(['mlb']);
+    expect(all.body.availableSports).toEqual(['mlb', 'nba']);
+  });
+});
+
 describe('the game-level cluster key', () => {
   /**
    * Two cohort/game pairs whose plain concatenation is identical:
@@ -615,19 +810,22 @@ describe('the arm list', () => {
     ).toEqual({ invalid_schema: 1 });
   });
 
-  it('serves baselines separately and never as the leader', async () => {
-    const { body } = await run();
+  it('serves baselines separately, and never lets one be the leader', async () => {
+    const { body } = await run({ benchmark_scoring_runs: [OPEN_RUN] });
     expect(armsOf(body).map((a) => a.participantId)).not.toContain('baseline-favorite-ml');
     const baselines = body.baselines as Array<{ participantId: string; markets: string[] }>;
     expect(baselines.map((b) => b.participantId)).toEqual(['baseline-favorite-ml']);
     expect(baselines[0]?.markets).toEqual(['moneyline']);
+    // `featuredOf` only ever looks at `arms`, so a baseline cannot be named
+    // however it performs.
     const featured = body.featured as { leaderParticipantId: string | null };
     expect(featured.leaderParticipantId).toBe(FABLE);
   });
 
   /** An arm with no rate sorts last, never first on a null. */
-  it('orders by headline beat rate, nulls last', async () => {
-    const { body } = await run();
+  it('orders by headline beat rate with nulls last, once the gate is open', async () => {
+    const { body } = await run({ benchmark_scoring_runs: [OPEN_RUN] });
+    expect((body.ranking as { orderedBy: string }).orderedBy).toBe('headline');
     expect(armsOf(body).map((a) => a.participantId)).toEqual([FABLE, GEMINI]);
   });
 });
@@ -707,22 +905,7 @@ describe('the ranking gate', () => {
   });
 
   it('allows ranking when every contributing cohort published it open', async () => {
-    const { body } = await run({
-      benchmark_scoring_runs: [
-        {
-          cohort_id: COHORT,
-          scoring_policy_version: V1,
-          eligible: 3,
-          scored: 2,
-          refused: 1,
-          schedule_held_out: 0,
-          refusal_reasons: { line_moved: 1 },
-          ranking_allowed: true,
-          ranking_reason: 'operator published',
-          cost_per_pick_comparable: null,
-        },
-      ],
-    });
+    const { body } = await run({ benchmark_scoring_runs: [OPEN_RUN] });
     expect((body.ranking as { allowed: boolean }).allowed).toBe(true);
   });
 
@@ -747,12 +930,48 @@ describe('the ranking gate', () => {
     expect((body.ranking as { allowed: boolean }).allowed).toBe(false);
   });
 
-  /** Withheld gates the RANK, never the numbers. Ruling 4. */
-  it('still serves the metrics and an order while withheld', async () => {
+  /**
+   * Withheld gates the ORDER and the leader, never the numbers.
+   *
+   * Ruling 4 says the projection "serves metrics with ranking withheld", and
+   * migration 073 says "a UI must not sort participants when it is false" — so
+   * an array served in performance order plus a named leader withholds nothing,
+   * which is what the first cut shipped. Both halves are asserted here: the
+   * numbers survive, the ranking does not.
+   */
+  it('serves the metrics but withholds the order and the leader', async () => {
     const { body } = await run();
-    expect((body.ranking as { allowed: boolean }).allowed).toBe(false);
+    const ranking = body.ranking as { allowed: boolean; orderedBy: string };
+    expect(ranking.allowed).toBe(false);
+    expect(ranking.orderedBy).toBe('neutral');
     expect(armFor(body, FABLE).metrics.marginAdjusted.perPick.meanClvPct).toBe(3.4903);
-    expect((body.featured as { leaderParticipantId: string }).leaderParticipantId).toBe(FABLE);
+    expect(body.featured).toEqual({
+      leaderParticipantId: null,
+      runnerUpParticipantId: null,
+    });
+  });
+
+  /**
+   * The neutral order must not BE the performance order by accident, or the
+   * assertion above is decoration. Fable has a beat rate and Gemini has none,
+   * so performance order is deterministic ([FABLE, GEMINI]); the hash order for
+   * this seed differs, which is what makes the two distinguishable at all.
+   */
+  it('the withheld order is not the performance order', async () => {
+    const withheld = await run();
+    const opened = await run({ benchmark_scoring_runs: [OPEN_RUN] });
+    expect(armsOf(withheld.body).map((a) => a.participantId)).not.toEqual(
+      armsOf(opened.body).map((a) => a.participantId),
+    );
+  });
+
+  /** Deterministic: the same request twice gives the same neutral order. */
+  it('the withheld order is stable across requests', async () => {
+    const a = await run();
+    const b = await run();
+    expect(armsOf(a.body).map((x) => x.participantId)).toEqual(
+      armsOf(b.body).map((x) => x.participantId),
+    );
   });
 });
 

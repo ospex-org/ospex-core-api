@@ -58,8 +58,10 @@
  * over a self-selected subset and rewards an arm for declining to answer.
  */
 
+import { createHash } from 'node:crypto';
 import type { HeadlineBasis } from '../../lib/env.js';
 import {
+  CumulativeAggregate,
   EMPTY_PAIRED,
   aggregatePaired,
   type AggregablePick,
@@ -289,8 +291,10 @@ export interface WireExecuted {
   record: { won: number; lost: number; push: number; void: number; pending: number } | null;
   /** How many verdicts the protocol settled vs how many were replayed from scores. */
   verdictSource: { settled: number; predicted: number; undecided: number } | null;
-  /** Claimed fills whose on-chain payout disagreed with the derivation. Operator signal. */
-  claimedAmountDisagreements: number;
+  /** Fills where the receipt and the chain event disagree on the stake. */
+  stakeDisagreements: number;
+  /** Published receipts this service could not identify a unique fill for. */
+  unresolvedFills: number;
 }
 
 export const EMPTY_WIRE_EXECUTED: WireExecuted = Object.freeze({
@@ -300,7 +304,8 @@ export const EMPTY_WIRE_EXECUTED: WireExecuted = Object.freeze({
   pendingStakeUsdc: null,
   record: null,
   verdictSource: null,
-  claimedAmountDisagreements: 0,
+  stakeDisagreements: 0,
+  unresolvedFills: 0,
 });
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -448,7 +453,14 @@ export interface ProjectStandingsInput {
 const WEI6 = 1_000_000;
 
 function wireExecuted(summary: ExecutedSummary | undefined): WireExecuted {
-  if (summary === undefined || summary.fills === 0) return EMPTY_WIRE_EXECUTED;
+  if (summary === undefined) return EMPTY_WIRE_EXECUTED;
+  if (summary.fills === 0) {
+    // No PRICED fill, but there may still be receipts this service refused to
+    // identify. Those must survive into the payload: an arm whose whole record
+    // was unresolvable would otherwise be indistinguishable from one that never
+    // traded.
+    return { ...EMPTY_WIRE_EXECUTED, unresolvedFills: summary.unresolvedFills };
+  }
   return {
     fills: summary.fills,
     stakedUsdc: Number(summary.stakedWei6) / WEI6,
@@ -456,7 +468,8 @@ function wireExecuted(summary: ExecutedSummary | undefined): WireExecuted {
     pendingStakeUsdc: Number(summary.pendingStakeWei6) / WEI6,
     record: summary.record,
     verdictSource: summary.verdictSource,
-    claimedAmountDisagreements: summary.claimedAmountDisagreements,
+    stakeDisagreements: summary.stakeDisagreements,
+    unresolvedFills: summary.unresolvedFills,
   };
 }
 
@@ -537,18 +550,37 @@ export function projectArms(input: ProjectStandingsInput): WireArm[] {
     // The series: one point per cohort in the window, in time order. A day the
     // arm sat out still appears, with nulls — a gap the front end can draw as a
     // gap rather than as a straight line through it.
+    //
+    // The cumulative figure ACCUMULATES rather than re-aggregating the prefix.
+    // The obvious version was quadratic in days and allocated a fresh object
+    // per pick per day: measured in review at ~441ms for a 60-day window and
+    // ~19.3 SECONDS for the 400-day maximum, on an endpoint one IP may call
+    // hundreds of times a minute. `CumulativeAggregate` documents why folding
+    // is exact here rather than merely close.
+    //
+    // Grouping by cohort once, outside the loop, removes the other quadratic
+    // term — the old `mine.filter(...)` per day.
+    const byDay = new Map<string, ScoredPickRow[]>();
+    for (const s of mine) {
+      const list = byDay.get(s.cohortId);
+      if (list === undefined) byDay.set(s.cohortId, [s]);
+      else list.push(s);
+    }
+
     const series: WireSeriesPoint[] = [];
-    const upto: ScoredPickRow[] = [];
+    const running = new CumulativeAggregate();
+    let seenAny = false;
     for (const cohortId of cohortOrder) {
-      const day = mine.filter((s) => s.cohortId === cohortId);
-      upto.push(...day);
-      const dailyAgg = day.length === 0 ? EMPTY_PAIRED : aggregatePaired(toAggregable(day));
-      const cumAgg = upto.length === 0 ? EMPTY_PAIRED : aggregatePaired(toAggregable(upto));
+      const day = byDay.get(cohortId) ?? [];
+      const dayAggregable = toAggregable(day);
+      running.addDay(dayAggregable);
+      if (dayAggregable.length > 0) seenAny = true;
+      const dailyAgg = day.length === 0 ? EMPTY_PAIRED : aggregatePaired(dayAggregable);
       series.push({
         slateDate: slateDateByCohort.get(cohortId) ?? cohortId,
         cohortId,
         daily: day.length === 0 ? EMPTY_WIRE_PAIRED : toWirePaired(dailyAgg),
-        cumulative: upto.length === 0 ? EMPTY_WIRE_PAIRED : toWirePaired(cumAgg),
+        cumulative: seenAny ? toWirePaired(running.snapshot()) : EMPTY_WIRE_PAIRED,
       });
     }
 
@@ -585,32 +617,58 @@ export function projectArms(input: ProjectStandingsInput): WireArm[] {
   return arms;
 }
 
+/** How `arms[]` is ordered — a named contract, because order IS a ranking. */
+export type ArmOrdering = 'headline' | 'neutral';
+
 /**
- * Order the arms, and name the leader.
+ * Order the arms.
  *
- * Always computed, and computed HERE — the front end must never sort a
- * leaderboard itself. Three of the nine landing-page components identify their
- * subject by position ("leader by CLV beat rate", "the leader's top pick",
- * "second-place model's top pick"), and the handoff's non-goals forbid
- * client-side metric math, so an unordered payload leaves the front end
- * choosing between rendering nothing and inventing a sort over one of eight
- * numbers.
+ * ## The order is itself gated, and that is the correction
  *
- * Ordering is separate from PERMISSION to print a rank: `ranking.allowed` gates
- * the `#` column, not the existence of an order. Migration 073's own column
- * comment says exactly that much and no more — "a UI must not sort participants
- * when it is false" — and work-order ruling 4 says the metrics are still served.
+ * The first cut always performance-sorted and always named a leader, on the
+ * reading that `ranking_allowed` gates only a rendered `#` column. That reading
+ * does not survive migration 073's own words — *"a UI must not sort
+ * participants when it is false"* — because an array served in performance
+ * order IS a sort the UI merely has to not disturb, and
+ * `featured.leaderParticipantId` IS naming a winner. Handing the front end both
+ * and asking it not to render a rank withholds nothing. Caught in review.
  *
- * Descending headline beat rate; an arm with no beat rate sorts last regardless
- * (it has no measured performance, and floating it to the top on a null would
- * be the worst possible default); ties break on the headline mean, then on
- * `participantId` so the order is stable across requests.
+ * So `allowed === false` serves a NEUTRAL order and no leader. The metrics all
+ * still ship — work-order ruling 4 says the projection "serves metrics with
+ * ranking withheld", and this is what withheld means. What the operator gives
+ * up until they open the gate is the ordering, not the data.
+ *
+ * ## Why neutral is a hash and not alphabetical
+ *
+ * The four participant ids sort `anthropic-…`, `google-…`, `openai-…`,
+ * `xai-…`, so ascending order seats the Anthropic arm first on every request,
+ * forever, on a public comparison of four labs published through infrastructure
+ * Anthropic tooling helped write. A hash of `(participantId, seed)` is
+ * deterministic for a given seed, rotates as cohorts advance, carries no
+ * meaning, and any reader can recompute it from fields the payload already
+ * contains.
+ *
+ * @param allowed whether the operator has opened the ranking gate
+ * @param seed    stable within a cohort-day; the active cohort id
  */
-export function orderArms(arms: readonly WireArm[]): WireArm[] {
-  return [...arms].sort((a, b) => {
+export function orderArms(
+  arms: readonly WireArm[],
+  allowed: boolean,
+  seed: string,
+): { arms: WireArm[]; orderedBy: ArmOrdering } {
+  if (!allowed) {
+    const keyed = arms.map((a) => ({
+      arm: a,
+      key: createHash('sha256').update(`${a.participantId}|${seed}`).digest('hex'),
+    }));
+    keyed.sort((x, y) => x.key.localeCompare(y.key));
+    return { arms: keyed.map((k) => k.arm), orderedBy: 'neutral' };
+  }
+  const sorted = [...arms].sort((a, b) => {
     const ab = a.headline.beatClosePct;
     const bb = b.headline.beatClosePct;
     if (ab === null && bb === null) return a.participantId.localeCompare(b.participantId);
+    // An arm with no measured performance sorts LAST, never first on a null.
     if (ab === null) return 1;
     if (bb === null) return -1;
     if (ab !== bb) return bb - ab;
@@ -619,13 +677,23 @@ export function orderArms(arms: readonly WireArm[]): WireArm[] {
     if (am !== bm) return bm - am;
     return a.participantId.localeCompare(b.participantId);
   });
+  return { arms: sorted, orderedBy: 'headline' };
 }
 
-/** Leader and runner-up, or nulls when fewer than that many arms have a rate. */
-export function featuredOf(ordered: readonly WireArm[]): {
-  leaderParticipantId: string | null;
-  runnerUpParticipantId: string | null;
-} {
+/**
+ * Leader and runner-up — only when the gate is open.
+ *
+ * Naming a leader is publishing a ranking of one, so it is gated by the same
+ * flag as the ordering. With the gate shut both are null and the front end's
+ * hero and runner-up slots render nothing, which is its own empty-state
+ * doctrine and is the honest state until the operator says the sample supports
+ * a ranking.
+ */
+export function featuredOf(
+  ordered: readonly WireArm[],
+  allowed: boolean,
+): { leaderParticipantId: string | null; runnerUpParticipantId: string | null } {
+  if (!allowed) return { leaderParticipantId: null, runnerUpParticipantId: null };
   const ranked = ordered.filter((a) => a.headline.beatClosePct !== null);
   return {
     leaderParticipantId: ranked[0]?.participantId ?? null,

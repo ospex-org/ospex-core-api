@@ -70,6 +70,28 @@ export function ageSeconds(asOf: string, now: Date): number | null {
   return Number((nowMicros - then) / 1_000_000n);
 }
 
+/**
+ * The no-numbers body, shared by the gate-closed and no-row paths.
+ *
+ * Identical on purpose: a caller cannot distinguish "the operator has not
+ * published" from "the publisher has not run", and does not need to — both mean
+ * there is no counter to render, and the front end's empty-state doctrine
+ * renders nothing for either.
+ */
+function unavailable(network: string, sport: string, maxAgeSeconds: number): Record<string, unknown> {
+  return {
+    network,
+    sport,
+    asOf: null,
+    ageSeconds: null,
+    stale: true,
+    maxAgeSeconds,
+    availableCommitments: null,
+    fillsLast24h: null,
+    matchedUsdcLast24h: null,
+  };
+}
+
 export async function getBenchmarkStatsHandler(req: Request, res: Response): Promise<void> {
   const parsed = parseSportParam(req.query.sport);
   if (parsed === 'invalid') {
@@ -85,6 +107,24 @@ export async function getBenchmarkStatsHandler(req: Request, res: Response): Pro
   const sport = parsed ?? 'all';
 
   const config = loadConfig();
+
+  // THE PUBLICATION GATE. Absent, this endpoint answers like the other two:
+  // 200 with nulls, and NO query.
+  //
+  // It was missing here in the first cut, and the README's "unset means nothing
+  // is served and no benchmark read happens" was therefore false of one of the
+  // three endpoints — an untruth in prose that no test enforced, which is the
+  // failure this repo's verification rules name first. Caught in review.
+  //
+  // `benchmark_site_stats` is site-wide rather than cohort-scoped, so the gate
+  // here is presence of the config var rather than a slate-date comparison:
+  // the question it answers is "is the benchmark surface public at all", and
+  // the counters are the most money-adjacent numbers this projection serves.
+  if (config.benchmarkPublicMinSlateDate === undefined) {
+    res.status(200).json(unavailable(config.network, sport, config.benchmarkStatsMaxAgeSeconds));
+    return;
+  }
+
   const sb = getSupabase();
 
   const result = await sb
@@ -104,17 +144,7 @@ export async function getBenchmarkStatsHandler(req: Request, res: Response): Pro
   const maxAge = config.benchmarkStatsMaxAgeSeconds;
 
   if (result.data === null) {
-    res.status(200).json({
-      network: config.network,
-      sport,
-      asOf: null,
-      ageSeconds: null,
-      stale: true,
-      maxAgeSeconds: maxAge,
-      availableCommitments: null,
-      fillsLast24h: null,
-      matchedUsdcLast24h: null,
-    });
+    res.status(200).json(unavailable(config.network, sport, maxAge));
     return;
   }
 

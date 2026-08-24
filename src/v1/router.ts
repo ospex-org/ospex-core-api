@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { eip712Auth, type AuthenticatedRequest } from '../middleware/eip712Auth.js';
-import { commitmentsRateLimit, readRateLimit } from '../middleware/rateLimit.js';
+import { benchmarkRateLimit, commitmentsRateLimit, readRateLimit } from '../middleware/rateLimit.js';
 import {
   deleteCommitmentHandler,
   getCommitmentByHashHandler,
@@ -45,6 +45,8 @@ import { getScheduleHandler } from './schedule.js';
 import { getBenchmarkStandingsHandler } from './benchmark/standings.js';
 import { getBenchmarkPicksHandler } from './benchmark/picks.js';
 import { getBenchmarkStatsHandler } from './benchmark/stats.js';
+import { benchmarkCacheKey, serveCachedBenchmark } from './benchmark/cache.js';
+import { loadConfig } from '../lib/env.js';
 
 /**
  * Versioned public API. Endpoints migrate here in batches from
@@ -172,9 +174,48 @@ v1Router.get('/leaderboard', readRateLimit, asyncHandler(getLeaderboardHandler))
 // publication gate is a config var rather than a database row, because
 // `service_role` holds SELECT only and this service has no way to un-publish
 // one. See `src/lib/env.ts`.
-v1Router.get('/benchmark/standings', readRateLimit, asyncHandler(getBenchmarkStandingsHandler));
-v1Router.get('/benchmark/picks', readRateLimit, asyncHandler(getBenchmarkPicksHandler));
-v1Router.get('/benchmark/stats', readRateLimit, asyncHandler(getBenchmarkStatsHandler));
+//
+// All three go through a single-flight, short-TTL memo and a tighter rate
+// budget than the other reads: they are the only endpoints here that fan out
+// across several relations and then project over every score row in the
+// window. See `benchmark/cache.ts` for why single-flight is the half that
+// matters and why nothing but a 200 is ever stored.
+v1Router.get(
+  '/benchmark/standings',
+  benchmarkRateLimit,
+  asyncHandler((req, res) =>
+    serveCachedBenchmark(
+      benchmarkCacheKey('standings', req, loadConfig()),
+      req,
+      res,
+      getBenchmarkStandingsHandler,
+    ),
+  ),
+);
+v1Router.get(
+  '/benchmark/picks',
+  benchmarkRateLimit,
+  asyncHandler((req, res) =>
+    serveCachedBenchmark(
+      benchmarkCacheKey('picks', req, loadConfig()),
+      req,
+      res,
+      getBenchmarkPicksHandler,
+    ),
+  ),
+);
+v1Router.get(
+  '/benchmark/stats',
+  benchmarkRateLimit,
+  asyncHandler((req, res) =>
+    serveCachedBenchmark(
+      benchmarkCacheKey('stats', req, loadConfig()),
+      req,
+      res,
+      getBenchmarkStatsHandler,
+    ),
+  ),
+);
 
 v1Router.get('/schedule', readRateLimit, asyncHandler(getScheduleHandler));
 

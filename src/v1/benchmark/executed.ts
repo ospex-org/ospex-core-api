@@ -43,13 +43,12 @@
  *
  * ## The cross-check is a second WITNESS, not a second formula
  *
- * `positions.claimed_amount` is the on-chain `PositionClaimed.payout`, written
- * by a different indexer handler from `risk_amount` / `profit_amount` (which
- * come from `PositionMatchedPair`). Comparing the derived payout against it on
- * claimed rows is therefore an independent check rather than the same number
- * computed twice — measured, 0 disagreements over all 174 claimed rows. It is
- * reported as a count, never used to correct the derivation: a discrepancy is
- * something an operator must see, not something a read path should paper over.
+ * The stake arrives twice from two producers — the operator's executor writes
+ * it onto the benchmark receipt, and the indexer projects it from the chain
+ * event — so comparing them is independent evidence rather than the same number
+ * read twice. It is reported as `stakeDisagreements` and never used to correct
+ * the derivation: a discrepancy is something an operator must see, not
+ * something a read path should paper over.
  */
 
 import { didWin, predictWinSide, type MarketType, type WinSide } from '../../lib/speculation.js';
@@ -76,17 +75,33 @@ export interface ExecutedContest {
   homeScore: number | null;
 }
 
-/** Projection of the taker's `positions` row. */
+/**
+ * The taker's side of ONE fill, read off the immutable `position_fills` event
+ * rather than the mutable aggregate `positions` row.
+ *
+ * There is deliberately no `claimed` field. Claiming happens after the outcome
+ * and cannot change it, so a record has no use for it — and its absence here
+ * makes "a claim cannot erase the verdict" structural rather than a rule this
+ * module has to remember. See the file header for why that matters: 174 of 462
+ * live taker positions are claimed, and they are precisely the winners.
+ */
 export interface ExecutedPosition {
-  /** 0 = upper, 1 = lower. */
+  /** 0 = upper, 1 = lower. From the event's `taker_position_type`, not inferred. */
   positionType: 0 | 1;
-  /** wei6. */
+  /** wei6 — THIS fill's taker risk, summed over the transaction's events. */
   riskWei6: bigint;
-  /** wei6 — the counterparty's stake. Non-zero on pushes too. */
+  /** wei6 — the counterparty's stake on this fill. Non-zero on pushes too. */
   profitWei6: bigint;
-  claimed: boolean;
-  /** wei6, or null when unclaimed. The independent witness. */
-  claimedAmountWei6: bigint | null;
+  /**
+   * wei6 — the same stake as the operator's executor recorded it, or null when
+   * no receipt figure is available.
+   *
+   * A genuine second witness: the receipt comes from the executor on the
+   * operator's box and `riskWei6` from the indexer's projection of the chain
+   * event, so agreement is evidence and disagreement is an operator signal. It
+   * is never used to CORRECT the derivation — see `stakeDisagreements`.
+   */
+  receiptStakeWei6: bigint | null;
 }
 
 export interface ExecutedVerdict {
@@ -193,11 +208,21 @@ export interface ExecutedSummary {
   /** How many verdicts the protocol itself supplied vs how many we replayed. */
   verdictSource: { settled: number; predicted: number; undecided: number };
   /**
-   * Claimed fills whose on-chain `claimed_amount` disagreed with the derived
-   * payout. Zero on production today (0 of 174). Non-zero is an operator
-   * signal, never a correction — see the file header.
+   * Fills where the operator's receipt and the chain event disagree on the
+   * stake. Reported, never reconciled: the two have different producers, so a
+   * gap is a fact about the pipeline rather than a number to average away.
    */
-  claimedAmountDisagreements: number;
+  stakeDisagreements: number;
+  /**
+   * Receipts this service could NOT identify a unique priced fill for — the
+   * indexer has not caught up, or the transaction carries another wallet's
+   * fill, or both position sides. They contribute nothing to any figure.
+   *
+   * Surfaced rather than swallowed: a record quietly computed over fewer fills
+   * than the operator published is a wrong number that looks like a right one,
+   * and this is the count that makes the difference visible.
+   */
+  unresolvedFills: number;
 }
 
 export const EMPTY_EXECUTED: ExecutedSummary = Object.freeze({
@@ -207,7 +232,8 @@ export const EMPTY_EXECUTED: ExecutedSummary = Object.freeze({
   netWei6: 0n,
   pendingStakeWei6: 0n,
   verdictSource: Object.freeze({ settled: 0, predicted: 0, undecided: 0 }),
-  claimedAmountDisagreements: 0,
+  stakeDisagreements: 0,
+  unresolvedFills: 0,
 });
 
 export interface ExecutedFill {
@@ -216,27 +242,39 @@ export interface ExecutedFill {
   contest: ExecutedContest | null;
 }
 
-/** Roll a participant's fills into one record. */
-export function summarizeExecuted(fills: readonly ExecutedFill[]): ExecutedSummary {
+/**
+ * Roll a participant's fills into one record.
+ *
+ * @param unresolvedFills receipts the caller could not identify a unique priced
+ *   fill for. Carried through rather than dropped so the payload can say how
+ *   much of the published record it is actually pricing.
+ */
+export function summarizeExecuted(
+  fills: readonly ExecutedFill[],
+  unresolvedFills = 0,
+): ExecutedSummary {
   const record: ExecutedRecord = { won: 0, lost: 0, push: 0, void: 0, pending: 0 };
   const verdictSource = { settled: 0, predicted: 0, undecided: 0 };
   let stakedWei6 = 0n;
   let netWei6 = 0n;
   let pendingStakeWei6 = 0n;
-  let claimedAmountDisagreements = 0;
+  let stakeDisagreements = 0;
 
   for (const fill of fills) {
     const verdict = deriveExecutedVerdict(fill.position, fill.speculation, fill.contest);
     record[verdict.result] += 1;
     verdictSource[verdict.source] += 1;
     stakedWei6 += fill.position.riskWei6;
+    if (
+      fill.position.receiptStakeWei6 !== null &&
+      fill.position.receiptStakeWei6 !== fill.position.riskWei6
+    ) {
+      stakeDisagreements += 1;
+    }
     if (verdict.payoutWei6 === null) {
       pendingStakeWei6 += fill.position.riskWei6;
     } else {
       netWei6 += verdict.payoutWei6 - fill.position.riskWei6;
-      if (fill.position.claimed && fill.position.claimedAmountWei6 !== verdict.payoutWei6) {
-        claimedAmountDisagreements += 1;
-      }
     }
   }
 
@@ -247,6 +285,7 @@ export function summarizeExecuted(fills: readonly ExecutedFill[]): ExecutedSumma
     netWei6,
     pendingStakeWei6,
     verdictSource,
-    claimedAmountDisagreements,
+    stakeDisagreements,
+    unresolvedFills,
   };
 }

@@ -8,13 +8,13 @@
  *
  *   - 174 of 462 positions are `claimed`, so a derivation that short-circuits
  *     on `claimed` (as `derivePositionStatus` deliberately does) reports 38% of
- *     the record as verdict-less;
+ *     the record as verdict-less. This module now has no `claimed` field at
+ *     all, which is the structural version of the same guarantee;
  *   - 11 positions pushed while carrying 8.6444 USDC of `profit_amount`
  *     between them, so a push fixture with `profitWei6: 0n` cannot tell a
  *     stake-only payout from a stake-plus-profit one.
  *
- * Every push fixture below therefore carries a non-zero profit, and several
- * carry `claimed: true`.
+ * Every push fixture below therefore carries a non-zero profit.
  */
 import { describe, expect, it } from 'vitest';
 import {
@@ -37,8 +37,9 @@ function position(over: Partial<ExecutedPosition> = {}): ExecutedPosition {
     positionType: 0,
     riskWei6: RISK,
     profitWei6: PROFIT,
-    claimed: false,
-    claimedAmountWei6: null,
+    // Agrees with the chain by default, so a test that cares about the
+    // disagreement counter has to set it deliberately.
+    receiptStakeWei6: RISK,
     ...over,
   };
 }
@@ -147,21 +148,31 @@ describe('deriveExecutedVerdict — where the verdict comes from', () => {
   });
 });
 
-describe('deriveExecutedVerdict — a claim must not erase the verdict', () => {
+describe('deriveExecutedVerdict — a claim cannot erase the verdict', () => {
   /**
    * The single most consequential difference from `derivePositionStatus`,
    * measured: 174 of 462 production positions are claimed, and claiming is
    * what a WINNER does. A record that forgets them reports won:0.
+   *
+   * This is now STRUCTURAL rather than behavioural — `ExecutedPosition` has no
+   * `claimed` field at all, so there is nothing for a future edit to start
+   * consulting. The assertion is on the type surface, which is the thing that
+   * would have to change for the defect to come back.
    */
-  it('returns the same verdict claimed or not', () => {
-    for (const winSide of ['away', 'home', 'push', 'void'] as const) {
-      const unclaimed = deriveExecutedVerdict(position({ claimed: false }), spec({ winSide }), null);
-      const claimed = deriveExecutedVerdict(
-        position({ claimed: true, claimedAmountWei6: 1n }),
-        spec({ winSide }),
-        null,
-      );
-      expect(claimed).toEqual(unclaimed);
+  it('has no claim field to consult', () => {
+    const keys = Object.keys(position()).sort();
+    expect(keys).toEqual(['positionType', 'profitWei6', 'receiptStakeWei6', 'riskWei6']);
+    expect(keys).not.toContain('claimed');
+  });
+
+  it('prices every settled outcome without one', () => {
+    for (const [winSide, result] of [
+      ['away', 'won'],
+      ['home', 'lost'],
+      ['push', 'push'],
+      ['void', 'void'],
+    ] as const) {
+      expect(deriveExecutedVerdict(position(), spec({ winSide }), null).result).toBe(result);
     }
   });
 });
@@ -220,23 +231,44 @@ describe('summarizeExecuted', () => {
     expect(got.netWei6).not.toBe(2n * PROFIT - RISK);
   });
 
-  it('counts a claimed_amount disagreement without correcting the derivation', () => {
+  /**
+   * The receipt and the chain event are two producers of one quantity — the
+   * operator's executor and the indexer's projection. A gap is reported and
+   * never reconciled: the derivation keeps using the CHAIN figure, because
+   * that is what the payout arithmetic has to agree with.
+   */
+  it('counts a receipt/chain stake disagreement without correcting the derivation', () => {
     const got = summarizeExecuted([
-      // agrees: a win claimed for exactly stake + profit
-      fill({ position: { claimed: true, claimedAmountWei6: RISK + PROFIT }, speculation: { winSide: 'away' } }),
-      // disagrees: claimed for one unit less than the derivation says
-      fill({ position: { claimed: true, claimedAmountWei6: RISK + PROFIT - 1n }, speculation: { winSide: 'away' } }),
+      fill({ position: { receiptStakeWei6: RISK }, speculation: { winSide: 'away' } }),
+      fill({ position: { receiptStakeWei6: RISK - 1n }, speculation: { winSide: 'away' } }),
     ]);
-    expect(got.claimedAmountDisagreements).toBe(1);
-    // The net still uses the DERIVED payout for both, not the claimed amount.
+    expect(got.stakeDisagreements).toBe(1);
+    // Both are still priced off the chain risk, so the net is unmoved.
+    expect(got.stakedWei6).toBe(2n * RISK);
     expect(got.netWei6).toBe(2n * PROFIT);
   });
 
-  it('does not count an unclaimed row as a disagreement', () => {
+  it('does not count a fill with no receipt figure as a disagreement', () => {
     const got = summarizeExecuted([
-      fill({ position: { claimed: false, claimedAmountWei6: null }, speculation: { winSide: 'away' } }),
+      fill({ position: { receiptStakeWei6: null }, speculation: { winSide: 'away' } }),
     ]);
-    expect(got.claimedAmountDisagreements).toBe(0);
+    expect(got.stakeDisagreements).toBe(0);
+  });
+
+  /**
+   * A receipt the caller could not identify a unique priced fill for must stay
+   * VISIBLE. An arm whose entire published record was unresolvable would
+   * otherwise be indistinguishable from one that never traded — a silently
+   * short record that looks like a complete one.
+   */
+  it('carries unresolved receipts through, even with nothing priced', () => {
+    const none = summarizeExecuted([], 3);
+    expect(none.fills).toBe(0);
+    expect(none.unresolvedFills).toBe(3);
+
+    const some = summarizeExecuted([fill({ speculation: { winSide: 'away' } })], 2);
+    expect(some.fills).toBe(1);
+    expect(some.unresolvedFills).toBe(2);
   });
 
   it('separates predicted verdicts from settled ones', () => {
@@ -267,7 +299,7 @@ describe('differential vs derivePositionStatus', () => {
     for (const winSide of WIN_SIDES) {
       for (const marketType of MARKETS) {
         for (const positionType of [0, 1] as const) {
-          const p = position({ positionType, claimed: false });
+          const p = position({ positionType });
           const s = spec({ speculationStatus: 'closed', winSide, marketType, lineTicks: 0 });
           const mine = deriveExecutedVerdict(p, s, null);
           const theirs = derivePositionStatus(
@@ -302,7 +334,7 @@ describe('differential vs derivePositionStatus', () => {
    * for their own question.
    */
   it('diverges on a zero-risk push, and that is the intended difference', () => {
-    const p = position({ riskWei6: 0n, claimed: false });
+    const p = position({ riskWei6: 0n, receiptStakeWei6: 0n });
     const mine = deriveExecutedVerdict(p, spec({ winSide: 'push' }), null);
     const theirs = derivePositionStatus(
       { speculationId: '1', address: '0xabc', positionType: 0, riskAmount: '0', profitAmount: PROFIT.toString(), claimed: false },
@@ -320,7 +352,7 @@ describe('differential vs derivePositionStatus', () => {
    * claimed; 174 of 462 production positions are in that state.
    */
   it('diverges on a claimed position, and that is the reason this module exists', () => {
-    const p = position({ claimed: true, claimedAmountWei6: RISK + PROFIT });
+    const p = position();
     const mine = deriveExecutedVerdict(p, spec({ winSide: 'away' }), null);
     const theirs = derivePositionStatus(
       { speculationId: '1', address: '0xabc', positionType: 0, riskAmount: RISK.toString(), profitAmount: PROFIT.toString(), claimed: true },

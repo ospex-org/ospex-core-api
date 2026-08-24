@@ -485,4 +485,46 @@ describe('stats', () => {
     const { status } = await call('stats', {}, { sport: 'quidditch' });
     expect(status).toBe(400);
   });
+
+  /**
+   * THE PUBLICATION GATE, which this endpoint did not honour in the first cut.
+   *
+   * The README claimed all three endpoints serve nothing and issue no query
+   * with the gate unset; `stats` queried and published anyway. A prose claim no
+   * test enforced — and these counters are the most money-adjacent numbers the
+   * projection serves. Found in review.
+   *
+   * `fake.requests` is the assertion that matters: an empty body alone would
+   * also pass on a handler that read the row and then discarded it, which is a
+   * materially weaker guarantee.
+   */
+  it('serves nothing and issues no query when the gate is unset', async () => {
+    const { body, status, fake } = await call(
+      'stats',
+      {},
+      {},
+      { benchmarkPublicMinSlateDate: undefined },
+    );
+    expect(status).toBe(200);
+    expect(fake.requests).toHaveLength(0);
+    expect(body).toMatchObject({
+      asOf: null,
+      ageSeconds: null,
+      stale: true,
+      availableCommitments: null,
+      fillsLast24h: null,
+      matchedUsdcLast24h: null,
+    });
+  });
+
+  /**
+   * Negative control for the gate: with it SET, the very same fixture is read
+   * and served. Without this the test above passes on a handler that never
+   * queries anything.
+   */
+  it('does query once the gate is set', async () => {
+    const { body, fake } = await call('stats', {}, {}, {}, new Date('2026-08-24T06:00:00Z'));
+    expect(fake.requests.length).toBeGreaterThan(0);
+    expect(body.availableCommitments).toBe(12);
+  });
 });

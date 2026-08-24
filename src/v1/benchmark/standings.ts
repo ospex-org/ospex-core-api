@@ -170,7 +170,7 @@ async function fetchScores(
 ): Promise<{ rows: ScoreDbRow[]; error: PostgrestError | null }> {
   const rows: ScoreDbRow[] = [];
   for (const chunk of chunkIds(cohortIds, 50)) {
-     
+
     const page = await readAllByKeyset<ScoreDbRow, number>(
       BENCHMARK.scores,
       SCORE_READ_CAP,
@@ -435,10 +435,29 @@ export async function getBenchmarkStandingsHandler(req: Request, res: Response):
     return;
   }
 
-  const { version: defaultVersion, available } = resolvePolicyVersion(collected.data.scores);
+  // SPORT SCOPE, applied before anything reads the rows.
+  //
+  // `resolveWindow` filters each cohort's game list by sport, but the score and
+  // fill reads are scoped by COHORT — so on a mixed-sport cohort every
+  // out-of-scope row came back too, and fed the policy-version choice, the
+  // means, the counts, the ordering and the executed totals. Every cohort on
+  // production is 100% MLB today, so nothing leaked in practice and no
+  // production-shaped fixture could have caught it; the benchmark adding a
+  // second sport is what would have made it real. Caught in review.
+  //
+  // Filtering here rather than in the query keeps it in ONE place for both
+  // streams: `cohort.gameIds` is already the sport-scoped set, and the
+  // alternative — pushing a game-id list into every read — would be a second
+  // definition of the same scope that could drift from the first.
+  const inScopeGames = new Set(win.cohorts.flatMap((c) => c.gameIds));
+  const scopedScoreRows = collected.data.scores.filter((r) =>
+    inScopeGames.has(r.benchmark_decisions.game_id),
+  );
+
+  const { version: defaultVersion, available } = resolvePolicyVersion(scopedScoreRows);
   const version = requestedVersion ?? defaultVersion;
 
-  const atVersion = collected.data.scores.filter((r) => r.scoring_policy_version === version);
+  const atVersion = scopedScoreRows.filter((r) => r.scoring_policy_version === version);
   const scores: ScoredPickRow[] = atVersion.map((r) => ({
     cohortId: r.benchmark_decisions.cohort_id,
     participantId: r.benchmark_decisions.participant_id,
@@ -455,7 +474,7 @@ export async function getBenchmarkStandingsHandler(req: Request, res: Response):
 
   let executed: ReadonlyMap<string, ExecutedSummary>;
   try {
-    const fills = await collectExecuted(sb, config.network, cohortIds);
+    const fills = await collectExecuted(sb, config.network, cohortIds, inScopeGames);
     if ('error' in fills) {
       respondToQueryError(res, fills.error, fills.context);
       return;
@@ -474,18 +493,16 @@ export async function getBenchmarkStandingsHandler(req: Request, res: Response):
   const modelIds = new Set(models.map((r) => r.participantId));
   const baselineIds = new Set(baselineRoster.map((r) => r.participantId));
 
-  const arms = orderArms(
-    projectArms({
-      roster: models,
-      scores: scores.filter((s) => modelIds.has(s.participantId)),
-      attempts: win.attempts,
-      wallets: collected.data.wallets,
-      executed,
-      cohortOrder: cohortIds,
-      slateDateByCohort,
-      headlineBasis: config.benchmarkHeadlineBasis,
-    }),
-  );
+  const projected = projectArms({
+    roster: models,
+    scores: scores.filter((s) => modelIds.has(s.participantId)),
+    attempts: win.attempts,
+    wallets: collected.data.wallets,
+    executed,
+    cohortOrder: cohortIds,
+    slateDateByCohort,
+    headlineBasis: config.benchmarkHeadlineBasis,
+  });
   const baselines: WireBaseline[] = projectBaselines(
     baselineRoster,
     scores.filter((s) => baselineIds.has(s.participantId)),
@@ -509,6 +526,11 @@ export async function getBenchmarkStandingsHandler(req: Request, res: Response):
     }));
   const rankingAllowed = contributing.length > 0 && withheldBy.length === 0;
 
+  // Ordering is gated on the same flag, because an order IS a ranking — see
+  // `orderArms`. The seed keeps the neutral order stable within a cohort-day.
+  const ordered = orderArms(projected, rankingAllowed, win.activeCohortId ?? win.standingsThrough ?? '');
+  const arms = ordered.arms;
+
   res.status(200).json({
     sport: sport ?? null,
     network: config.network,
@@ -527,9 +549,15 @@ export async function getBenchmarkStandingsHandler(req: Request, res: Response):
     availableVersions: available,
     ranking: {
       allowed: rankingAllowed,
+      /**
+       * `headline` only when the gate is open; `neutral` is a deterministic
+       * hash carrying no meaning. A consumer must not re-sort either way — the
+       * served order is the whole contract.
+       */
+      orderedBy: ordered.orderedBy,
       withheldBy,
     },
-    featured: featuredOf(arms),
+    featured: featuredOf(arms, rankingAllowed),
     methodology: METHODOLOGY,
     cohorts: win.cohorts.map((c) => {
       const run = runByCohort.get(c.cohortId);
@@ -601,7 +629,7 @@ function emptyBody(
     availableSports: [],
     scoringPolicyVersion: requestedVersion,
     availableVersions: [],
-    ranking: { allowed: false, withheldBy: [] },
+    ranking: { allowed: false, orderedBy: 'neutral', withheldBy: [] },
     featured: { leaderParticipantId: null, runnerUpParticipantId: null },
     methodology: METHODOLOGY,
     cohorts: [],
