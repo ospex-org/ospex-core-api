@@ -6,6 +6,24 @@ export type Network = 'polygon' | 'amoy';
 export type ChainId = 137 | 80002;
 
 /**
+ * The four published CLV figures, as selector strings. `<metric>.<clustering>`:
+ * the metric is economic (vig-in entry vs no-vig close) or margin-adjusted
+ * (de-vigged entry vs the same close), and the clustering is per-pick or the
+ * scorer's primary equal-weight-per-game aggregate.
+ */
+export const HEADLINE_BASES = [
+  'marginAdjusted.gameLevel',
+  'marginAdjusted.perPick',
+  'economic.gameLevel',
+  'economic.perPick',
+] as const;
+export type HeadlineBasis = (typeof HEADLINE_BASES)[number];
+
+export function isHeadlineBasis(value: string): value is HeadlineBasis {
+  return (HEADLINE_BASES as readonly string[]).includes(value);
+}
+
+/**
  * Required vars are validated at boot and always present on Config.
  *
  * Optional vars are reserved for endpoints that haven't migrated yet.
@@ -82,6 +100,92 @@ export interface Config {
    * real commit on the public repo. `herokuReleaseVersion` /
    * `herokuReleaseCreatedAt` come from `runtime-dyno-metadata` (not deprecated).
    */
+  /**
+   * Benchmark read projection - the PUBLICATION gate.
+   *
+   * `BENCHMARK_PUBLIC_MIN_SLATE_DATE` (`YYYY-MM-DD`). A benchmark cohort is
+   * served publicly only when its `slate_date` is on or after this date.
+   * **Absent means NOTHING is served** - the three `/v1/benchmark/*` endpoints
+   * answer 200 with empty collections rather than 404, so the front end's
+   * empty-state doctrine renders nothing and no CLV reaches a public page by
+   * default.
+   *
+   * This is the operator's single publication lever, and it lives here rather
+   * than in the database for two measured reasons. Every scored row on
+   * production today carries `label = SMOKE_V0_NOT_A_COHORT`, and the scorer
+   * that wrote them prints "this data must never appear on a leaderboard" -
+   * so a default-open endpoint publishes exactly the data the artifact
+   * forbids. And core-api holds `service_role`, which migration 074 reduced to
+   * SELECT on every `benchmark_*` relation: there is no un-publish available
+   * to this service, so the only instant OFF switch is one that never needed a
+   * write. `heroku config:unset BENCHMARK_PUBLIC_MIN_SLATE_DATE` is that
+   * switch.
+   *
+   * It is a publication gate on public evidence, not convenience tooling, so
+   * `.claude/rules/advisory-tooling.md` does not argue against it blocking -
+   * that rule's allowed-to-block list is exactly authorization and
+   * target-freeze checks.
+   *
+   * Distinct from the RANKING gate, which stays in the database
+   * (`benchmark_scoring_runs.ranking_allowed`, absent or false => the payload
+   * says ranking is withheld and the front end prints no rank column). Two
+   * different questions: may this cohort be shown at all, and may it be
+   * ordered.
+   */
+  benchmarkPublicMinSlateDate?: string;
+  /**
+   * How many eligible cohort-days the standings aggregate spans, most recent
+   * first. Default 60. Boot-fatal outside [1, 400].
+   *
+   * A bound rather than a cap on rows: a window is a NAMEABLE population ("the
+   * last 60 cohort-days", echoed in the payload) while a row cap would serve a
+   * mean over an arbitrary prefix, which is not that participant's mean and
+   * bites unevenly across arms. Measured 2026-08-24: a scored cohort-day is
+   * ~216 score rows (~300 on a full 15-game slate) and PostgREST caps a
+   * response at 1000, so 60 days is ~13k rows / ~14 requests / ~20 MiB of
+   * heap on the single Basic web dyno.
+   */
+  /**
+   * Which of the four published CLV figures the standings payload names as its
+   * `headline`. One of `marginAdjusted.gameLevel` (default),
+   * `marginAdjusted.perPick`, `economic.gameLevel`, `economic.perPick`.
+   * Boot-fatal on anything else.
+   *
+   * ALL FOUR are always served - `project_benchmark.md` forbids publishing one
+   * CLV variant alone, and this setting does not change that. It names which
+   * one the front end renders large, so the choice is an operator config
+   * change rather than a deploy.
+   *
+   * The default is margin-adjusted for a measured reason. Economic CLV prices
+   * the vig-in entry against the no-vig close, so it is negative for every arm
+   * by construction: over the nine cohorts on production 2026-08-24 the four
+   * model arms read -1.63 / -1.92 / -2.39 / -3.29 with beat rates 19-33%.
+   * Margin-adjusted prices the DE-VIGGED entry against the same close - "how
+   * would this forecast have done with no vig" - and reads +1.99 / +1.68 /
+   * +1.20 / +0.27 with beat rates 48-72%. The ordering is identical under both,
+   * so this removes a constant rather than flattering anyone. Two independent
+   * checks that 50% is the break-even line for the margin-adjusted beat rate:
+   * the two coin-flip baselines (`baseline-away-ml`, `baseline-home-ml`) sit at
+   * exactly 50.0000%, and the front-end mockup draws its dashed baseline there.
+   *
+   * `gameLevel` rather than `perPick` because that is the scorer's own primary
+   * clustering (equal weight per game, so a game that drew four picks does not
+   * outvote three single-pick games).
+   */
+  benchmarkHeadlineBasis: HeadlineBasis;
+  benchmarkStandingsWindowDays: number;
+  /**
+   * Age past which `GET /v1/benchmark/stats` stops serving its counters.
+   * Default 172800 (48h). Boot-fatal outside [3600, 2592000].
+   *
+   * `benchmark_site_stats` is append-only snapshots written by a publisher on
+   * another box, and the front end labels the numbers `filled - last 24h` and
+   * `matched - last 24h` verbatim. A publisher that dies over a weekend would
+   * otherwise render a three-day-old row under a "last 24h" label: a false
+   * public statement about money, with nothing looking wrong. Past the bound
+   * the counters are null and `stale` is true.
+   */
+  benchmarkStatsMaxAgeSeconds: number;
   herokuBuildCommit?: string;
   herokuSlugCommit?: string;
   herokuReleaseVersion?: string;
@@ -325,6 +429,61 @@ export function loadConfig(): Config {
     'env: stream-auth',
   );
 
+  // Benchmark read projection. The publication gate is a DATE, deliberately:
+  // an allowlist of cohort ids would need editing every night, while the
+  // operator's real intent ("everything from the day I froze the prompt
+  // onward") is a threshold. Validated for shape AND for being a real
+  // calendar date - `2026-02-30` matches the shape and would silently admit or
+  // exclude a day nobody meant.
+  const benchmarkPublicMinSlateDate = optionalEnv('BENCHMARK_PUBLIC_MIN_SLATE_DATE');
+  if (benchmarkPublicMinSlateDate !== undefined) {
+    const asUtc = new Date(`${benchmarkPublicMinSlateDate}T00:00:00Z`);
+    const roundTrips =
+      /^\d{4}-\d{2}-\d{2}$/.test(benchmarkPublicMinSlateDate) &&
+      !Number.isNaN(asUtc.getTime()) &&
+      asUtc.toISOString().slice(0, 10) === benchmarkPublicMinSlateDate;
+    if (!roundTrips) {
+      logger.fatal(
+        { var: 'BENCHMARK_PUBLIC_MIN_SLATE_DATE', value: benchmarkPublicMinSlateDate },
+        'BENCHMARK_PUBLIC_MIN_SLATE_DATE must be a real calendar date in YYYY-MM-DD form',
+      );
+      process.exit(1);
+    }
+  }
+  logger.info(
+    { benchmarkPublicMinSlateDate: benchmarkPublicMinSlateDate ?? 'unset (nothing published)' },
+    'env: benchmark publication gate',
+  );
+
+  const headlineRaw = optionalEnv('BENCHMARK_HEADLINE_BASIS');
+  if (headlineRaw !== undefined && !isHeadlineBasis(headlineRaw)) {
+    logger.fatal(
+      { var: 'BENCHMARK_HEADLINE_BASIS', value: headlineRaw, allowed: HEADLINE_BASES },
+      `BENCHMARK_HEADLINE_BASIS must be one of: ${HEADLINE_BASES.join(', ')}`,
+    );
+    process.exit(1);
+  }
+  const benchmarkHeadlineBasis: HeadlineBasis = headlineRaw ?? 'marginAdjusted.gameLevel';
+
+  const benchmarkStandingsWindowDays =
+    optionalPositiveIntEnv('BENCHMARK_STANDINGS_WINDOW_DAYS') ?? 60;
+  if (benchmarkStandingsWindowDays > 400) {
+    logger.fatal(
+      { value: benchmarkStandingsWindowDays },
+      'BENCHMARK_STANDINGS_WINDOW_DAYS must be between 1 and 400',
+    );
+    process.exit(1);
+  }
+  const benchmarkStatsMaxAgeSeconds =
+    optionalPositiveIntEnv('BENCHMARK_STATS_MAX_AGE_SECONDS') ?? 172_800;
+  if (benchmarkStatsMaxAgeSeconds < 3600 || benchmarkStatsMaxAgeSeconds > 2_592_000) {
+    logger.fatal(
+      { value: benchmarkStatsMaxAgeSeconds },
+      'BENCHMARK_STATS_MAX_AGE_SECONDS must be between 3600 (1h) and 2592000 (30d)',
+    );
+    process.exit(1);
+  }
+
   cached = {
     port,
     nodeEnv,
@@ -336,7 +495,11 @@ export function loadConfig(): Config {
     streamChallengeTtlSec,
     streamTokenTtlSec,
     ownStateSnapshotMaxCommitments,
+    benchmarkHeadlineBasis,
+    benchmarkStandingsWindowDays,
+    benchmarkStatsMaxAgeSeconds,
     ...(supabaseAnonKey !== undefined ? { supabaseAnonKey } : {}),
+    ...(benchmarkPublicMinSlateDate !== undefined ? { benchmarkPublicMinSlateDate } : {}),
     ...(alchemyRpcUrl !== undefined ? { alchemyRpcUrl } : {}),
     ...(matchingModuleAddress !== undefined ? { matchingModuleAddress } : {}),
     ...(positionModuleAddress !== undefined ? { positionModuleAddress } : {}),

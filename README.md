@@ -472,6 +472,84 @@ Current active leaderboard (the soonest-ending one whose start has passed) with 
 
 Query params: `limit` (max 500), `offset`.
 
+### LLM benchmark read projection
+
+Three signer-free public reads over the `benchmark_*` serving tables that migrations 073–079 create in the protocol indexer's schema. No authentication: the acceptance for this surface is that an auditor holding only the Supabase anon key can reproduce the published numbers, and the anon key cannot read a single `benchmark_*` row (073 revokes it from `anon` and `authenticated`). The `service_role` key that CAN read them never leaves this process — the browser consumes this projection instead of the tables, so no metric math and no credential goes near the front end.
+
+> ⚠ **Nothing is served until `BENCHMARK_PUBLIC_MIN_SLATE_DATE` is set.** With it unset the three endpoints answer `200` with empty collections and issue **no database query at all**. See **The two gates** below.
+
+Failure modes, for all three: a missing relation (`PGRST205` / `42P01`), a relation older than this service expects (`42703`), or a foreign key an embed names being absent or ambiguous (`PGRST200` / `PGRST201`) each answer `503 NOT_READY` naming the migration — **for that endpoint only**. Benchmark relations are deliberately NOT probed by `/readyz`: this is a secondary surface and an unapplied benchmark migration must not mark the whole API unready. Anything else is `500 INTERNAL_ERROR`; an invalid parameter is `400 INVALID_PARAM`.
+
+#### The two gates, which answer different questions
+
+| Question | Lever | Default |
+|---|---|---|
+| May this cohort be shown at all? | `BENCHMARK_PUBLIC_MIN_SLATE_DATE` (config var) | unset ⇒ nothing |
+| May it be ordered? | `benchmark_scoring_runs.ranking_allowed` (database, per cohort + policy version) | absent or false ⇒ withheld |
+
+Publication is a **config var rather than a database row** for a measured reason: core-api holds `service_role`, which migration 074 reduced to `SELECT` on every `benchmark_*` relation, so this service has no way to un-publish anything. `heroku config:unset BENCHMARK_PUBLIC_MIN_SLATE_DATE` is the only instant OFF switch that never needed a write. It is also the reason a cohort's own `label` is not used as the gate — every scored row on production carries `SMOKE_V0_NOT_A_COHORT`, and `ospex-benchmark` types that field as a literal (`z.literal`), so a label filter would be a permanent wall rather than a gate that opens when real data arrives. Eligibility is the slate date; the label is echoed in the payload.
+
+Ranking withheld means the front end prints **no rank column**. The metrics, a server-computed ordering and a named leader are all still served — work-order ruling 4 says the projection "serves metrics with ranking withheld", and migration 073's column comment constrains only sorting ("a UI must not sort participants when it is false"). The front end must never sort a leaderboard itself; `ranking.order` and `featured` exist so it does not have to.
+
+#### `GET /v1/benchmark/standings?sport=&date=&scoringPolicyVersion=`
+
+Per model arm: identity, per-cohort wallet bindings, coverage counters, both CLV metrics at both clusterings, the two vig figures, a per-day series, and the executed on-chain record. Baselines ship in a separate `baselines[]` block. A `methodology` block ships the definitions **with** the numbers.
+
+| Param | What it does |
+|---|---|
+| `sport` | `all` (default) or one of `mlb`/`nba`/`ncaab`/`ncaaf`/`nfl`/`nhl`. Resolved through `games.sport` BEFORE aggregation — applying a sport filter afterwards would change every mean. |
+| `date` | Restrict to one cohort's `slate_date` (`YYYY-MM-DD`). This is what makes a single-cohort audit expressible. |
+| `scoringPolicyVersion` | Pin the methodology version. Default: the version covering the most cohorts in the window, ties to the latest `scored_at`. |
+
+**The two headline numbers.** `headline.beatClosePct` is how often the arm beat the closing line **on a number with no vig**, and `headline.vig.breakEvenPct` is the vig at which that stops being profitable. Beside them, `vig.observedPct` is what the board actually charged. A maker quoting under the break-even number is a bet worth taking; the board, measured across the nine live cohorts, is not.
+
+Both vig figures are closed-form from the two published means, not new estimates. Writing the entry price as a hold `v` on the fair price, `economic = (1 − v)(1 + marginAdjusted) − 1`, which rearranges to
+
+```
+breakEvenPct = 100 · ma / (1 + ma)                 (economic = 0)
+observedPct  = 100 · (1 − (1 + econ) / (1 + ma))   (solve for v)
+```
+
+`v` is the **hold** — `margin / (1 + margin)`, the fraction of stake the margin costs — which is the convention a market maker's quoted spread converts to. It is a uniform vig solved from the means; the real per-pick margin varies, and both inputs sit beside it so a reader can re-derive. A negative `breakEvenPct` is meaningful: the strategy loses even at zero vig.
+
+Which figure is the headline is `BENCHMARK_HEADLINE_BASIS`, default `marginAdjusted.gameLevel`. **All four are always served** regardless — publishing one CLV variant alone is forbidden by the scorer's own methodology. `gameLevel` is the scorer's primary clustering (equal weight per game, so a game that drew four picks does not outvote three single-pick games); `perPick` is secondary. Each summary carries its own `n`.
+
+**Denominators.** `sample.eligible` is the OPPORTUNITY count — supplied markets summed over dispatched arm-games, from `benchmark_arm_attempts` at `attempt_ordinal = 0` — not the arm's own pick count. Pooled across the live cohorts the four arms answered 294 / 291 / 288 / 273 of an identical 294 supplied markets each, so a pick-count denominator would compute a beat rate over a self-selected subset and reward an arm for declining to answer. `armOutcomes` is the histogram over the same rows (ordinal 0 only — the outcome is copied onto both legs of a repaired attempt).
+
+**Arms come from the roster, not the scores.** An arm that failed every call has attempt rows and no decisions and no scores; it is served with `scoreable: 0` and null summaries rather than vanishing. That is the failure mode the benchmark exists to measure.
+
+**Markets are pooled.** The scorer clusters on the game alone, so all three of a participant's markets on one game collapse into one game bucket. Ruling 2's run-line exclusion scopes the pick COUNT on `/v1/benchmark/picks` and nothing else — the acceptance figure is the mean of a moneyline and a spread pick. `byMarket` carries the split alongside, because 073 names publishing a pooled figure without it a read-path bug.
+
+**The series.** One point per cohort-day in the window, oldest first. `cumulative` is a full re-aggregation over every pick up to and including that day, never a running average of daily means — the two differ by 11% on live data, and the hero chart sits directly under the headline. The last point equals the arm's top-level aggregate by construction.
+
+**Window.** `BENCHMARK_STANDINGS_WINDOW_DAYS` (default 60) bounds the aggregate to the most recent N published cohort-days. A window is a nameable population, echoed in `publication`; a row cap would serve a mean over an arbitrary prefix, which is not that participant's mean. Exceeding the backstop read bound answers `503` rather than truncating.
+
+#### `GET /v1/benchmark/picks?sport=&date=`
+
+One cohort's whole slate — every game, including games with zero picks — with the model arms' revealed picks on it. `date` selects by `slate_date`; absent, the active cohort.
+
+**This is also the schedule source, deliberately.** `/v1/games` is not changed: it is the SDK and market-maker hot path for contest creation and a benchmark outage must not degrade it. It also cannot serve this section, measured — it is future-only (`.gte('match_time', now)`, so an evening pageview loses the afternoon's games) and its `availableOnly` default excludes games that already have a contest, which is ~94% of exactly the games that have picks.
+
+`pickCount` is the revealed executed-market picks: model arms × (moneyline + total), max 8 per game per ruling 2. Run-line picks are recorded and scored but never counted here.
+
+`featuredPick` and `topPickByParticipant` are designated server-side by `featuredRule` (highest confidence, ties to the lowest decision id) — a model puts up ~30 executed picks a day and the mockup renders one, so any client-side rule would be metric math on the most prominent number on the page. A caller holding the standings leader looks it up in `topPickByParticipant`.
+
+`axes` are the raw stored integers with `axisScale: {min: 1, max: 5}` beside them. They are NOT 0–100: passing the raw value into an 0–100 radar collapses every polygon to ~2px from the centre, and inferring the ceiling from observed values gives softness (live max 4) a different scale from the other four. `axes` and `primaryAxis` are both nullable. `matchTime` is the same bounded minimum `/v1/games` serves, not the raw column. `priceAmerican` is converted once, server-side, matching every other odds field in this service.
+
+Writeups (`benchmark_decision_rationales`) are **not read at all** — operator-gated, and the way to not publish something is to not query it.
+
+#### `GET /v1/benchmark/stats?sport=`
+
+The latest `benchmark_site_stats` snapshot for a sport. `sport` accepts `all` (the default, and a real stored value) plus the six slugs.
+
+Past `BENCHMARK_STATS_MAX_AGE_SECONDS` (default 48h) the three counters go **null** and `stale` goes true, with `asOf` and `ageSeconds` still populated. The front-end labels are fixed verbatim as `filled · last 24h` and `matched · last 24h`; a publisher that died on a Friday would otherwise render a three-day-old count under that label all weekend — a false public statement about money with nothing looking wrong. An absent row answers `200` with nulls, never `404`: the publisher not having run is an ordinary state and a 404 reads as a broken route.
+
+#### What this projection cannot reproduce
+
+`benchmark_scores` does not carry every field the published scorecard does, and the gap is stated rather than approximated. **Not available at any price:** the shin-v1 de-vig sensitivity block (no shin columns exist; `devig_method` is `proportional-v1` on every row), the TOTALS_V1 ladder aggregates (the ladder CLV values are not persisted, and the ladder scores picks the exact-line metric refuses — a different population, not a small delta), and `conditionalOnly`. **Do not fill a surface labelled with either of those from `economic_clv_pct`.**
+
+And a bound worth stating plainly: a scored artifact is per RUN and a run covers one game, so every published scorecard has `gamesScoreable ∈ {0, 1}`. A multi-day pooled table is an **extension** of the scorer's definition, not a reproduction of any artifact. What is field-for-field comparable to a scorecard is a single-cohort-day slice — which is what `?date=` is for.
+
 ### `GET /v1/schedule?sport=`
 
 > ⚠ **Dormant — this endpoint returns an empty list for every sport.** It reads `current_schedules`, an ESPN-sourced table that stopped being refreshed: on production 2026-07-31 it holds 6,580 rows whose newest `game_date` is 2026-04-19 and whose newest `fetched_at` is 2026-04-15, and no writer in the project populates it. The window below is forward-only, so nothing falls inside it. Verified against the deployed service: `GET /v1/schedule?sport=nba` and `?sport=mlb` both return `{"games":[], "pagination":{"total":0,...}}`.
@@ -661,6 +739,10 @@ See `.env.example`. Required values are validated at boot — missing vars exit 
 | `SCORER_TOTAL_ADDRESS` | for `POST /v1/commitments` | |
 | `MAX_STREAM_CONNECTIONS_TOTAL` | no | Max concurrent SSE streams process-wide. Positive integer; defaults to 200. Surfaced on `/v1/metrics`. |
 | `MAX_STREAM_CONNECTIONS_PER_IP` | no | Max concurrent SSE streams per client IP. Positive integer; defaults to 16. Surfaced on `/v1/metrics`. |
+| `BENCHMARK_PUBLIC_MIN_SLATE_DATE` | no | **Unset = the three `/v1/benchmark/*` endpoints serve nothing and issue no query.** `YYYY-MM-DD`; a benchmark cohort is public only from this slate date on. Boot-fatal if set to anything that is not a real calendar date. The only instant un-publish this service has — `service_role` is SELECT-only on every `benchmark_*` relation. |
+| `BENCHMARK_HEADLINE_BASIS` | no | Which of the four published CLV figures the standings payload names as its `headline`. One of `marginAdjusted.gameLevel` (default), `marginAdjusted.perPick`, `economic.gameLevel`, `economic.perPick`; boot-fatal otherwise. All four are always served — this names the one the front end renders large. |
+| `BENCHMARK_STANDINGS_WINDOW_DAYS` | no | Cohort-days the standings aggregate spans, most recent first. Default 60; boot-fatal outside [1, 400]. |
+| `BENCHMARK_STATS_MAX_AGE_SECONDS` | no | Age past which `/v1/benchmark/stats` nulls its counters and sets `stale`. Default 172800 (48h); boot-fatal outside [3600, 2592000]. |
 | `RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER` | no | Of the per-IP budget, slots reserved for the owner-auth own-state stream — anonymous streams may use at most `(PER_IP - this)`; own-state may use the full `PER_IP`. **Non-negative integer (`0` is allowed** = no reserve / original single shared pool, anon + own-state share the full `PER_IP`); defaults to 3. Surfaced on `/v1/metrics`. |
 
 ## Deployment
@@ -694,6 +776,10 @@ Set via `heroku config:set <var>=<value> --app ospex-core-api`. Mirrors `.env.ex
 - `STREAM_AUTH_AUDIENCE` — optional but required by both stream-auth POST endpoints (same `503 NOT_READY` rule). The canonical host string bound into both the challenge typed-data and the issued token (e.g. `https://api.ospex.org`); SDK clients derive the same string from their `baseUrl`, so a token minted for one deployment cannot be replayed against another
 - `STREAM_CHALLENGE_TTL_SECONDS` — optional, default `180` (3 min). Lifetime of a single-use challenge; **boot-fatal outside [120, 300]** (2–5 min)
 - `STREAM_TOKEN_TTL_SECONDS` — optional, default `900` (15 min). Lifetime of an issued bearer token; **boot-fatal outside [60, 1800]**
+- `BENCHMARK_PUBLIC_MIN_SLATE_DATE` — optional, **unset by default and unset means nothing is published**. The publication gate for the three `/v1/benchmark/*` endpoints: a cohort is served only when its `slate_date` is on or after this `YYYY-MM-DD` date. Boot-fatal if it is not a real calendar date. This is the operator's single publication lever and the only instant OFF switch available, because migration 074 left `service_role` — the key this service holds — with `SELECT` only on every `benchmark_*` relation, so a mistaken publish could not otherwise be withdrawn without a `postgres`-owner `DELETE` against production
+- `BENCHMARK_HEADLINE_BASIS` — optional, default `marginAdjusted.gameLevel`. Which CLV figure the standings payload names as its headline; one of `marginAdjusted.gameLevel` / `marginAdjusted.perPick` / `economic.gameLevel` / `economic.perPick`, boot-fatal otherwise. All four ship regardless
+- `BENCHMARK_STANDINGS_WINDOW_DAYS` — optional, default `60`; **boot-fatal outside [1, 400]**
+- `BENCHMARK_STATS_MAX_AGE_SECONDS` — optional, default `172800` (48h); **boot-fatal outside [3600, 2592000]**
 - `OWN_STATE_SNAPSHOT_MAX_COMMITMENTS` — optional, default `5000`. Per-page commitments cap for `GET /v1/own-state/snapshot`; **boot-fatal outside [100, 50000]**. SDK pages with `?cursor=` until the response carries `truncated: false`
 
 The stream-auth challenge store is **in-memory, per-process**. A challenge minted on one dyno cannot be consumed on another — fine for the current single-dyno Heroku deployment, but horizontal scale-out requires moving challenges to Redis/Postgres or running with sticky routing first. The endpoint-level `503 NOT_READY` checks are deliberately separate from `/readyz` (next section) — `/readyz` keeps the meaning "the always-required dependencies are reachable", and stream-auth is opt-in at the operator level.

@@ -42,6 +42,9 @@ import { getStreamHandler } from './stream/handler.js';
 import { getOddsStreamHandler } from './stream/oddsHandler.js';
 import { getLeaderboardHandler } from './leaderboard.js';
 import { getScheduleHandler } from './schedule.js';
+import { getBenchmarkStandingsHandler } from './benchmark/standings.js';
+import { getBenchmarkPicksHandler } from './benchmark/picks.js';
+import { getBenchmarkStatsHandler } from './benchmark/stats.js';
 
 /**
  * Versioned public API. Endpoints migrate here in batches from
@@ -158,6 +161,20 @@ v1Router.get('/stream/own-state', verifyStreamToken, (req, res) =>
 v1Router.get('/stream/:resource', (req, res) => getStreamHandler(req, res));
 
 v1Router.get('/leaderboard', readRateLimit, asyncHandler(getLeaderboardHandler));
+
+// ── LLM benchmark read projection ────────────────────────────────────
+// Signer-free public reads over the `benchmark_*` serving tables, which the
+// anon key cannot touch (migration 073 revokes it) — the browser consumes this
+// projection instead of the raw tables, so no metric math and no credential
+// goes anywhere near the front end.
+//
+// Nothing is served until BENCHMARK_PUBLIC_MIN_SLATE_DATE is set: the
+// publication gate is a config var rather than a database row, because
+// `service_role` holds SELECT only and this service has no way to un-publish
+// one. See `src/lib/env.ts`.
+v1Router.get('/benchmark/standings', readRateLimit, asyncHandler(getBenchmarkStandingsHandler));
+v1Router.get('/benchmark/picks', readRateLimit, asyncHandler(getBenchmarkPicksHandler));
+v1Router.get('/benchmark/stats', readRateLimit, asyncHandler(getBenchmarkStatsHandler));
 
 v1Router.get('/schedule', readRateLimit, asyncHandler(getScheduleHandler));
 

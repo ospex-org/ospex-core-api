@@ -40,15 +40,21 @@
  * Callers compute the max once and pass it in here; this module just
  * propagates it.
  *
- * Same scorer logic as `positionFetch.ts` so the SSE-derived status
- * agrees with the snapshot's categorization. The duplication is
- * intentional: the snapshot helper returns BUCKETED rows (already
- * filtered to active/pendingSettle/claimable) while this returns the
- * canonical enum INCLUDING terminal losers, which the snapshot
- * intentionally drops. Sharing the predicate function avoids
- * scorer-logic drift.
+ * Same scorer logic as `positionFetch.ts` so the SSE-derived status agrees
+ * with the snapshot's categorization — and now literally the same code:
+ * `predictWinSide` and `didWin` live in `lib/speculation.ts` and both modules
+ * import them. Until 2026-08-24 each carried its own private copy (identical to
+ * the byte, verified before they were collapsed) under a comment asserting they
+ * "must match", which is a rule prose cannot enforce; a third consumer made
+ * that the moment to have one.
+ *
+ * What is NOT shared, and should not be: the snapshot helper returns BUCKETED
+ * rows already filtered to active/pendingSettle/claimable, while this returns
+ * the canonical enum INCLUDING terminal losers, which the snapshot
+ * intentionally drops.
  */
 
+import { didWin, predictWinSide } from '../../lib/speculation.js';
 import type { MarketType, WinSide } from '../../lib/speculation.js';
 
 /** Canonical `positionStatus` enum. */
@@ -115,44 +121,6 @@ export interface ContestInput {
   contestStatus: 'unverified' | 'verified' | 'scored' | 'voided';
   awayScore: number | null;
   homeScore: number | null;
-}
-
-/**
- * Replays the on-chain scorer logic — must match `positionFetch.ts:predictWinSide`
- * exactly so the SSE stream and the snapshot agree on transitions. See
- * `positionFetch.ts` comment for the lineTicks domain notes.
- */
-function predictWinSide(
-  market: MarketType,
-  awayScore: number,
-  homeScore: number,
-  lineTicks: number | null,
-): 'away' | 'home' | 'over' | 'under' | 'push' | null {
-  if (market === 'moneyline') {
-    if (awayScore > homeScore) return 'away';
-    if (homeScore > awayScore) return 'home';
-    return 'push';
-  }
-  if (market === 'spread') {
-    if (lineTicks == null) return null;
-    const scaledAway = awayScore * 10;
-    const scaledHome = homeScore * 10;
-    const adjustedAway = scaledAway + lineTicks;
-    if (adjustedAway > scaledHome) return 'away';
-    if (adjustedAway < scaledHome) return 'home';
-    return 'push';
-  }
-  // total
-  if (lineTicks == null) return null;
-  const scaledTotal = (awayScore + homeScore) * 10;
-  if (scaledTotal > lineTicks) return 'over';
-  if (scaledTotal < lineTicks) return 'under';
-  return 'push';
-}
-
-function didWin(positionType: 0 | 1, winSide: SpeculationInput['winSide']): boolean {
-  if (positionType === 0) return winSide === 'away' || winSide === 'over';
-  return winSide === 'home' || winSide === 'under';
 }
 
 function toBig(v: string | bigint | null | undefined): bigint {
