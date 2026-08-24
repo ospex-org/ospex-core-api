@@ -129,6 +129,7 @@ const matched = (over: Record<string, unknown> = {}, payload: Record<string, str
       taker: '0x16Dc5D67D080a5521ef2c79680dBfC2aBf724D30',
       commitmentHash: '0xAA',
       scorer: SCORERS.moneyline,
+      lineTicks: '0',
       ...payload,
     },
     over,
@@ -193,13 +194,14 @@ function pageLike(rows: readonly unknown[], req: CapturedRequest): unknown[] {
   const filtered = applyFilters(rows, req.params) as Array<Record<string, unknown>>;
   const order = req.params.get('order');
   if (order !== null) {
-    const [col] = order.split('.') as [string];
+    const [col, dir] = order.split('.') as [string, string | undefined];
     filtered.sort((a, b) => {
       const x = a[col];
       const y = b[col];
       if (typeof x === 'number' && typeof y === 'number') return x - y;
       return String(x).localeCompare(String(y));
     });
+    if (dir === 'desc') filtered.reverse();
   }
   const offset = Number(req.params.get('offset') ?? '0');
   const limit = req.params.has('limit') ? Number(req.params.get('limit')) : filtered.length;
@@ -223,6 +225,7 @@ async function collect(
     benchmark_execution_fills: [],
     position_fills: [],
     chain_events: HISTORY(),
+    recovery_runs: [],
     ...tables,
   };
   const fake = await startFakePostgrest((req: CapturedRequest, index: number) => {
@@ -625,6 +628,69 @@ describe('the outcome is read from the fill deployment, never by counter', () =>
     expect(summaryOf(twiceScored.result).unresolvedFills).toBe(1);
   });
 
+  /**
+   * REVIEW ROUND 2c, item 2. The fill's own log row and the settlement each
+   * name a scorer, and the fill's log row names a line; all three witnesses
+   * must agree with the creation. Two immutable events that disagree about
+   * which contract scored a speculation are not describing one speculation.
+   */
+  it('refuses when the fill log row names a different scorer than the creation', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [...HISTORY().filter((r) => r.event_name !== 'COMMITMENT_MATCHED'), matched({}, { scorer: SCORERS.spread })],
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  it('refuses when the fill log row names a different line than the creation', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [...HISTORY().filter((r) => r.event_name !== 'COMMITMENT_MATCHED'), matched({}, { lineTicks: '5' })],
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  it('refuses when the settlement names a different scorer than the creation', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      chain_events: [
+        ...HISTORY().filter((r) => r.event_name !== 'SPECULATION_SETTLED'),
+        log('SPECULATION_SETTLED', 'speculation', 88, { speculationId: '88', winSideValue: '1', scorer: SCORERS.spread }, { block_number: 200, tx_hash: '0xsettle' }),
+      ],
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  /**
+   * REVIEW ROUND 2c, item 3 — the NARROWED contract, pinned. Scorer modules
+   * are Core-bound; after a Core rotation the configured scorers are the new
+   * deployment's, and this service holds no map for the old one. A fill whose
+   * history was retained is then reported unresolved rather than priced by a
+   * map the service does not have. (The indexer's supported redeploy resets and
+   * reindexes, which leaves such fills without an event at all.)
+   */
+  it('reports a previous deployment fill unresolved once the configured scorers rotate', async () => {
+    const rotated = {
+      moneyline: '0x4444444444444444444444444444444444444444',
+      spread: '0x5555555555555555555555555555555555555555',
+      total: '0x6666666666666666666666666666666666666666',
+    };
+    const { result } = await collect(
+      { benchmark_execution_fills: [receipt()], position_fills: [event()] },
+      undefined,
+      undefined,
+      rotated,
+    );
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+    expect(summaryOf(result).fills).toBe(0);
+    // Negative control: the same history under the deployment's own scorers prices.
+    const own = await collect({ benchmark_execution_fills: [receipt()], position_fills: [event()] });
+    expect(summaryOf(own.result).fills).toBe(1);
+  });
+
   it('refuses a settlement whose win side is not one the protocol defines', async () => {
     const { result } = await collect({
       benchmark_execution_fills: [receipt()],
@@ -674,6 +740,139 @@ describe('the outcome is read from the fill deployment, never by counter', () =>
   });
 });
 
+/**
+ * REVIEW ROUND 2c, item 1. The chain reads are separate statements and the
+ * indexer's recovery replaces a block range across several of its own, so a
+ * read can pair a fill from one canonical history with an outcome from
+ * another. Every recovery runs inside a `recovery_runs` row (`in_progress` →
+ * `complete` | `failed`); the reader snapshots that ledger before its first
+ * chain read and after its last, and refuses the whole read if anything is
+ * incomplete at either point or the latest row changed in between.
+ */
+describe('the chain read is bracketed by the indexer recovery ledger', () => {
+  const run = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id: 7,
+    network: 'polygon',
+    kind: 'reorg',
+    phase: 'validating',
+    status: 'complete',
+    started_at: '2026-08-24T00:00:00+00:00',
+    completed_at: '2026-08-24T00:05:00+00:00',
+    ...over,
+  });
+
+  /**
+   * What the opening snapshot guards is that NO chain read is issued while a
+   * recovery is mutating state — the refusal itself would also come from the
+   * closing snapshot, but only after reading rows mid-rewrite. So the case
+   * asserts on the requests, not only on the rejection.
+   */
+  it('fails closed when a recovery is in progress before the read, without reading the chain', async () => {
+    const seen: string[] = [];
+    await expect(
+      collect(
+        {
+          benchmark_execution_fills: [receipt()],
+          position_fills: [event()],
+          recovery_runs: [run({ status: 'in_progress', completed_at: null })],
+        },
+        undefined,
+        (req) => {
+          seen.push(req.path);
+          return undefined;
+        },
+      ),
+    ).rejects.toMatchObject({ name: 'ProjectionUnstableError' });
+    expect(seen).not.toContain('/rest/v1/position_fills');
+    expect(seen).not.toContain('/rest/v1/chain_events');
+    expect(seen).toContain('/rest/v1/recovery_runs');
+  });
+
+  /** A failed recovery blocks the indexer's own ingest until triaged; it blocks this reader the same way. */
+  it('fails closed on a failed recovery, however old', async () => {
+    await expect(
+      collect({
+        benchmark_execution_fills: [receipt()],
+        position_fills: [event()],
+        recovery_runs: [
+          run({ id: 3, status: 'failed', completed_at: null, started_at: '2026-07-01T00:00:00+00:00' }),
+          run({ id: 9 }),
+        ],
+      }),
+    ).rejects.toMatchObject({ name: 'ProjectionUnstableError' });
+  });
+
+  /**
+   * The reviewer's sequence: the fill and its log row are read, a recovery
+   * then replaces the fork, and the outcome history is read from the
+   * replacement. The recovery leaves a newer `complete` row than the one seen
+   * before the read; the after-snapshot sees it and the read is refused.
+   */
+  it('fails closed when a recovery completes between the fill read and the outcome read', async () => {
+    const ledger: Record<string, unknown>[] = [run({ id: 7 })];
+    let chainReads = 0;
+    await expect(
+      collect(
+        { benchmark_execution_fills: [receipt()], position_fills: [event()] },
+        undefined,
+        (req) => {
+          if (req.path === '/rest/v1/chain_events') {
+            chainReads += 1;
+            // After the first chain read (the fill's own log rows), a
+            // recovery starts and completes.
+            if (chainReads === 1) ledger.push(run({ id: 8, kind: 'reorg' }));
+          }
+          if (req.path === '/rest/v1/recovery_runs') return { body: pageLike(ledger, req) };
+          return undefined;
+        },
+      ),
+    ).rejects.toMatchObject({ name: 'ProjectionUnstableError' });
+  });
+
+  it('fails closed when a recovery is in progress after the read', async () => {
+    const ledger: Record<string, unknown>[] = [];
+    let chainReads = 0;
+    await expect(
+      collect(
+        { benchmark_execution_fills: [receipt()], position_fills: [event()] },
+        undefined,
+        (req) => {
+          if (req.path === '/rest/v1/chain_events') {
+            chainReads += 1;
+            if (chainReads === 3) ledger.push(run({ id: 8, status: 'in_progress', completed_at: null }));
+          }
+          if (req.path === '/rest/v1/recovery_runs') return { body: pageLike(ledger, req) };
+          return undefined;
+        },
+      ),
+    ).rejects.toMatchObject({ name: 'ProjectionUnstableError' });
+  });
+
+  /** Negative control: a completed recovery that predates the read and does not change is not a fault. */
+  it('serves when the ledger is complete and unchanged across the read', async () => {
+    const { result, fake } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+      recovery_runs: [run({ id: 7 })],
+    });
+    expect(summaryOf(result).fills).toBe(1);
+    // The bracket really surrounds the chain reads: the ledger is the first
+    // thing read after the receipts and the last thing read at all.
+    const tables = fake.tables();
+    const firstChain = tables.findIndex((t) => t === 'position_fills' || t === 'chain_events');
+    const lastChain = tables.length - 1 - [...tables].reverse().findIndex((t) => t === 'position_fills' || t === 'chain_events');
+    expect(tables.slice(0, firstChain)).toContain('recovery_runs');
+    expect(tables.slice(lastChain + 1)).toContain('recovery_runs');
+    expect(tables[tables.length - 1]).toBe('recovery_runs');
+  });
+
+  /** With no receipts nothing chain-derived is read, so the ledger is not consulted either. */
+  it('does not consult the ledger when there is nothing to read', async () => {
+    const { fake } = await collect({ recovery_runs: [run({ status: 'in_progress', completed_at: null })] });
+    expect(fake.tables()).not.toContain('recovery_runs');
+  });
+});
+
 describe('the verdict comes from the deployment history', () => {
   it('replays the scorer on the created line when the contest is scored but the speculation is open', async () => {
     // Spread, away −1.5 (lineTicks −15 in the 10x domain), away 5 home 3 ⇒ away covers.
@@ -681,7 +880,7 @@ describe('the verdict comes from the deployment history', () => {
       benchmark_execution_fills: [receipt({ market: 'spread' })],
       position_fills: [event()],
       chain_events: [
-        matched({}, { scorer: SCORERS.spread }),
+        matched({}, { scorer: SCORERS.spread, lineTicks: '-15' }),
         created({}, { scorer: SCORERS.spread, lineTicks: '-15' }),
         contestCreated(),
         scoresSet('5', '3'),
@@ -698,7 +897,7 @@ describe('the verdict comes from the deployment history', () => {
       benchmark_execution_fills: [receipt({ market: 'spread' })],
       position_fills: [event()],
       chain_events: [
-        matched({}, { scorer: SCORERS.spread }),
+        matched({}, { scorer: SCORERS.spread, lineTicks: '-25' }),
         created({}, { scorer: SCORERS.spread, lineTicks: '-25' }),
         contestCreated(),
         scoresSet('5', '3'),
@@ -1003,6 +1202,14 @@ describe('respondProjectionFault', () => {
   it('answers a size fault with 503 NOT_READY', async () => {
     const { ProjectionTooLargeError } = await import('../src/v1/benchmark/source.js');
     const r = await respondTo(new ProjectionTooLargeError('benchmark_scores', 200_000));
+    expect(r.handled).toBe(true);
+    expect(r.status).toBe(503);
+    expect(r.body).toMatchObject({ code: 'NOT_READY' });
+  });
+
+  it('answers an unstable read (indexer recovery) with 503 NOT_READY', async () => {
+    const { ProjectionUnstableError } = await import('../src/v1/benchmark/source.js');
+    const r = await respondTo(new ProjectionUnstableError('recovery 8 is in_progress'));
     expect(r.handled).toBe(true);
     expect(r.status).toBe(503);
     expect(r.body).toMatchObject({ code: 'NOT_READY' });

@@ -157,7 +157,7 @@ function chainHistory(o: { gameId: string; txHash: string; block: number; taker:
     ...extra,
   });
   return [
-    row(1, 'COMMITMENT_MATCHED', 'fill', 88, { speculationId: '88', contestId: '41', taker: o.taker, commitmentHash: '0xaa', scorer: SCORERS.moneyline }),
+    row(1, 'COMMITMENT_MATCHED', 'fill', 88, { speculationId: '88', contestId: '41', taker: o.taker, commitmentHash: '0xaa', scorer: SCORERS.moneyline, lineTicks: '0' }),
     row(2, 'SPECULATION_CREATED', 'speculation', 88, { speculationId: '88', contestId: '41', scorer: SCORERS.moneyline, lineTicks: '0' }, { block_number: 90, tx_hash: '0xcreate' }),
     row(3, 'SPECULATION_SETTLED', 'speculation', 88, { speculationId: '88', winSideValue: '1', scorer: SCORERS.moneyline }, { block_number: 200, tx_hash: '0xsettle' }),
     row(4, 'CONTEST_CREATED', 'contest', 41, { contestId: '41', jsonoddsId: o.gameId }, { block_number: 80, tx_hash: '0xcontest' }),
@@ -1153,6 +1153,42 @@ describe('the executed record', () => {
     expect(status).toBe(503);
     expect(body.code).toBe('NOT_READY');
     expect(body.arms).toBeUndefined();
+  });
+
+  /**
+   * An indexer recovery in progress means the chain reads behind the record
+   * may straddle two histories; the endpoint answers 503 rather than serving
+   * a record from either. Driven through the handler so the wiring is what is
+   * exercised. Fills are needed for the ledger to be consulted at all.
+   */
+  it('answers 503 NOT_READY while the indexer is recovering', async () => {
+    const { status, body } = await run({
+      benchmark_execution_fills: [
+        {
+          cohort_id: COHORT,
+          participant_id: FABLE,
+          network: 'polygon',
+          game_id: GAME,
+          market: 'moneyline',
+          run_id: RUN,
+          deployment_round: 'R5',
+          contest_id: 41,
+          speculation_id: 88,
+          commitment_hash: '0xaa',
+          taker_address: '0xabc',
+          tx_hash: '0xtx1',
+          block_number: 100,
+          filled_at: '2026-08-15T20:00:00+00:00',
+          stake_usdc: 10,
+          would_abstain: false,
+        },
+      ],
+      recovery_runs: [
+        { id: 8, network: 'polygon', kind: 'reorg', phase: 'pre_swap', status: 'in_progress', started_at: '2026-08-24T00:00:00+00:00', completed_at: null },
+      ],
+    });
+    expect(status).toBe(503);
+    expect(body.code).toBe('NOT_READY');
   });
 });
 

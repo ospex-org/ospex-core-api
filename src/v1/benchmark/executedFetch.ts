@@ -74,6 +74,11 @@
  *     079 names — at most one `CONTEST_SCORES_SET`, at most one
  *     `CONTEST_VOIDED`.
  *
+ * The three immutable witnesses have to AGREE with each other too: every
+ * `COMMITMENT_MATCHED` row for the fill names the creation's scorer and line,
+ * and the settlement names the creation's scorer. Two events that disagree
+ * about which contract scored a speculation are not one speculation.
+ *
  * The verdict then comes from those events: settled → the protocol's side;
  * voided → void; scored → the scorer replayed on the created line; else
  * pending. A later deployment that reuses every id on the same game in the
@@ -83,14 +88,41 @@
  * `CONTEST_*` and `COMMITMENT_MATCHED` row classified by entity (0 nulls), 0
  * duplicate `(emitter, speculationId)` creations among 492.
  *
+ * ## The whole chain read is bracketed by the indexer's recovery state
+ *
+ * The reads above are separate PostgREST statements, and the indexer's
+ * recovery — a reorg or a backfill — replaces a block range across several
+ * statements of its own. A read that starts before a recovery and finishes
+ * after it can pair a fill from one canonical history with a settlement from
+ * another. Review reproduced exactly that: an orphaned fill priced from the
+ * replacement fork's outcome.
+ *
+ * Every recovery runs inside a `recovery_runs` lifecycle (`in_progress` →
+ * `complete` | `failed`), and the indexer's own ingest and retry loops refuse
+ * to touch state while a row is `in_progress` or `failed`. This reader gates
+ * on the same signal: the recovery state is read BEFORE the first chain read
+ * and AFTER the last, and if an incomplete row exists at either point, or the
+ * latest row changed in between — a recovery started and completed during the
+ * read — the whole read is refused as {@link ProjectionUnstableError}, a 503.
+ * A failed or hung recovery therefore blocks this record exactly as it blocks
+ * the indexer, until an operator clears it.
+ *
  * `deployment_round` and `run_id` are selected and carried on every fill so a
  * consumer can see which round's counters a receipt cites. They are
  * provenance, not a join key, for the same reason the counters are not.
  *
+ * ## The scorer map is the CONFIGURED deployment's — stated as the bound
+ *
  * The scorer addresses in config are what name the market of the chain's
  * scorer contract, so the executed record needs them: with `SCORER_*` unset,
  * every receipt is reported unresolved rather than priced on the receipt's
- * own word.
+ * own word. Scorer modules are Core-bound, so after a Core rotation the
+ * previous deployment's scorers are no longer in config and its fills — if
+ * their history was retained at all — are reported unresolved rather than
+ * priced by a map this service does not hold. The indexer's supported
+ * redeploy resets and reindexes from the new deployment, which leaves those
+ * fills without an event to resolve against in any case; the narrowing is
+ * stated rather than hidden, and pinned by a test.
  *
  * ## Anything ambiguous is REFUSED, not guessed
  *
@@ -118,7 +150,13 @@
  */
 
 import type { PostgrestError, SupabaseClient } from '@supabase/supabase-js';
-import { BENCHMARK, ProjectionIntegrityError, chunkIds, readAllByKeyset } from './source.js';
+import {
+  BENCHMARK,
+  ProjectionIntegrityError,
+  ProjectionUnstableError,
+  chunkIds,
+  readAllByKeyset,
+} from './source.js';
 import {
   summarizeExecuted,
   type ExecutedContest,
@@ -311,6 +349,65 @@ async function readChainEvents(
   return { rows, error: null };
 }
 
+/** The indexer's recovery ledger — see the file header. */
+const RECOVERY_RUNS = 'recovery_runs';
+const INCOMPLETE_RECOVERY = ['in_progress', 'failed'];
+
+interface RecoveryRunRow {
+  id: number | string;
+  status: string;
+}
+
+/** A snapshot of the recovery ledger: is anything incomplete, and what is the latest row. */
+interface RecoveryState {
+  incomplete: { id: string; status: string } | null;
+  latest: { id: string; status: string } | null;
+}
+
+async function readRecoveryState(
+  sb: SupabaseClient,
+  network: string,
+): Promise<{ state: RecoveryState; error: PostgrestError | null }> {
+  const incomplete = await sb
+    .from(RECOVERY_RUNS)
+    .select('id, status')
+    .eq('network', network)
+    .in('status', INCOMPLETE_RECOVERY)
+    .order('id', { ascending: false })
+    .limit(1);
+  if (incomplete.error) return { state: { incomplete: null, latest: null }, error: incomplete.error };
+  const latest = await sb
+    .from(RECOVERY_RUNS)
+    .select('id, status')
+    .eq('network', network)
+    .order('id', { ascending: false })
+    .limit(1);
+  if (latest.error) return { state: { incomplete: null, latest: null }, error: latest.error };
+  const inc = ((incomplete.data ?? []) as unknown as RecoveryRunRow[])[0];
+  const lat = ((latest.data ?? []) as unknown as RecoveryRunRow[])[0];
+  return {
+    state: {
+      incomplete: inc === undefined ? null : { id: String(inc.id), status: inc.status },
+      latest: lat === undefined ? null : { id: String(lat.id), status: lat.status },
+    },
+    error: null,
+  };
+}
+
+/**
+ * The same latest ledger row both times, or none both times.
+ *
+ * Only the id is compared, deliberately. A row's status moves from
+ * `in_progress` and nowhere else, and an `in_progress` (or `failed`) row
+ * present BEFORE the read is refused before any chain read happens — so the
+ * only change the closing snapshot can observe is a row that did not exist
+ * when the read opened, which is a recovery that started after it. Comparing
+ * status or timestamps as well would be clauses no input can reach.
+ */
+function sameRecoveryState(a: RecoveryState, b: RecoveryState): boolean {
+  return (a.latest?.id ?? null) === (b.latest?.id ?? null);
+}
+
 /** Group log rows by their entity id. */
 function byEntity(rows: readonly ChainEventRow[]): Map<string, ChainEventRow[]> {
   const out = new Map<string, ChainEventRow[]>();
@@ -429,6 +526,15 @@ export async function collectExecuted(
     return finish();
   }
 
+  // ── the recovery bracket opens: nothing chain-derived is read before this ─
+  const before = await readRecoveryState(sb, network);
+  if (before.error) return { error: before.error, context: RECOVERY_RUNS };
+  if (before.state.incomplete !== null) {
+    throw new ProjectionUnstableError(
+      `recovery ${before.state.incomplete.id} is ${before.state.incomplete.status}`,
+    );
+  }
+
   // ── the immutable fill events, by transaction ────────────────────────────
   const txHashes = [...new Set(scoped.map((r) => r.tx_hash))];
   const eventsByTx = new Map<string, FillEventRow[]>();
@@ -479,6 +585,20 @@ export async function collectExecuted(
   const contestLog = await readChainEvents(sb, network, ENTITY.contest, contestIds);
   if (contestLog.error) return { error: contestLog.error, context: CHAIN_EVENTS };
   const contestLogById = byEntity(contestLog.rows);
+
+  // ── the recovery bracket closes: the last chain read is behind us ────────
+  // A recovery that started during the reads — whether it has completed or
+  // is still running — is a ledger row that was not there when the read
+  // opened. The rows above may then span two canonical histories, and none
+  // of them is served.
+  const after = await readRecoveryState(sb, network);
+  if (after.error) return { error: after.error, context: RECOVERY_RUNS };
+  if (!sameRecoveryState(before.state, after.state)) {
+    const latest = after.state.latest;
+    throw new ProjectionUnstableError(
+      `recovery ${latest?.id ?? '?'} (${latest?.status ?? '?'}) started while the record was being read`,
+    );
+  }
 
   // ── resolve each receipt to exactly one priced position, or refuse it ────
   for (const receipt of scoped) {
@@ -561,6 +681,20 @@ export async function collectExecuted(
       market !== receipt.market ||
       lineTicks === null
     ) {
+      refuse(receipt.participant_id);
+      continue;
+    }
+    // Link 3b: the witnesses agree with the creation. Every fill log row
+    // names the same scorer and line the speculation was created with, and
+    // the settlement names the same scorer. Two immutable events that
+    // disagree about which contract scored a speculation are not describing
+    // one speculation, whatever ids they share.
+    const witnessesAgree =
+      logRows.every(
+        (r) => sameHex(r.payload.scorer, creation.scorer) && sameId(r.payload.lineTicks, creation.lineTicks),
+      ) &&
+      settled.every((r) => sameHex(r.payload.scorer, creation.scorer));
+    if (!witnessesAgree) {
       refuse(receipt.participant_id);
       continue;
     }

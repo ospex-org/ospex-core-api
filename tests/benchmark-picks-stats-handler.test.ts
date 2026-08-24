@@ -527,7 +527,7 @@ describe('picks — the pick card fields', () => {
           block_number: 100,
           tx_hash: '0xtx1',
           log_index: 0,
-          payload: { speculationId: '88', contestId: '41', taker: '0xabc', commitmentHash: '0xaa' },
+          payload: { speculationId: '88', contestId: '41', taker: '0xabc', commitmentHash: '0xaa', scorer: SCORERS.moneyline, lineTicks: '0' },
         },
         {
           id: 2,

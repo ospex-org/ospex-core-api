@@ -163,6 +163,19 @@ export class ProjectionIntegrityError extends Error {
 }
 
 /**
+ * Thrown when the indexer was recovering — a reorg or a backfill — before or
+ * while a chain read ran, so the rows read may come from two different
+ * canonical histories. Transient: the next request after the recovery
+ * completes reads one history and serves. Nothing is served meanwhile.
+ */
+export class ProjectionUnstableError extends Error {
+  constructor(readonly detail: string) {
+    super(`indexer recovery: ${detail}`);
+    this.name = 'ProjectionUnstableError';
+  }
+}
+
+/**
  * Answer a projection fault the handlers throw past their query-error paths.
  *
  * Returns `true` when `err` was one of this module's typed faults and a 503
@@ -189,6 +202,16 @@ export function respondProjectionFault(res: Response, err: unknown): boolean {
       error:
         `A benchmark read returned rows its schema rules out (${err.relation}: ${err.detail}). ` +
         'Nothing is served from it until the relation is inspected.',
+      code: 'NOT_READY',
+    } satisfies ApiError);
+    return true;
+  }
+  if (err instanceof ProjectionUnstableError) {
+    logger.warn({ detail: err.detail }, 'benchmark: indexer recovery during a chain read');
+    res.status(503).json({
+      error:
+        `The indexer was recovering while the executed record was being read (${err.detail}). ` +
+        'A read that may straddle two chain histories is not served; retry once the recovery completes.',
       code: 'NOT_READY',
     } satisfies ApiError);
     return true;
