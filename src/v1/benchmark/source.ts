@@ -142,6 +142,60 @@ export class ProjectionTooLargeError extends Error {
   }
 }
 
+/**
+ * Thrown when a read returns something its own schema says it cannot — the
+ * same row twice from a keyset walk over a UNIQUE key, for instance.
+ *
+ * Distinct from {@link ProjectionTooLargeError} because the operator action is
+ * different: a bound is narrowed, an integrity fault is investigated. Both are
+ * refused rather than served, for the same reason: a figure computed over a
+ * population the service cannot vouch for is a wrong number wearing a right
+ * number's clothes.
+ */
+export class ProjectionIntegrityError extends Error {
+  constructor(
+    readonly relation: string,
+    readonly detail: string,
+  ) {
+    super(`${relation}: ${detail}`);
+    this.name = 'ProjectionIntegrityError';
+  }
+}
+
+/**
+ * Answer a projection fault the handlers throw past their query-error paths.
+ *
+ * Returns `true` when `err` was one of this module's typed faults and a 503
+ * has been written; the caller re-throws anything else so a genuine bug still
+ * reaches the error handler as a 500. One place, because the two handlers
+ * that read fills both have to answer both faults identically.
+ */
+export function respondProjectionFault(res: Response, err: unknown): boolean {
+  if (err instanceof ProjectionTooLargeError) {
+    logger.error({ relation: err.relation, cap: err.cap }, 'benchmark: read exceeded its bound');
+    res.status(503).json({
+      error:
+        `The benchmark projection outgrew this endpoint's read bound on ${err.relation} ` +
+        `(${String(err.cap)} rows). Narrow BENCHMARK_STANDINGS_WINDOW_DAYS. ` +
+        'A partial aggregate is not served, because a mean over part of the sample ' +
+        'is indistinguishable from the real one.',
+      code: 'NOT_READY',
+    } satisfies ApiError);
+    return true;
+  }
+  if (err instanceof ProjectionIntegrityError) {
+    logger.error({ relation: err.relation, detail: err.detail }, 'benchmark: read integrity fault');
+    res.status(503).json({
+      error:
+        `A benchmark read returned rows its schema rules out (${err.relation}: ${err.detail}). ` +
+        'Nothing is served from it until the relation is inspected.',
+      code: 'NOT_READY',
+    } satisfies ApiError);
+    return true;
+  }
+  return false;
+}
+
 export interface KeysetPage<Row> {
   data: Row[] | null;
   error: PostgrestError | null;

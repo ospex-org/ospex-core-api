@@ -172,8 +172,29 @@ describe('the key', () => {
     );
   });
 
-  it('is case-insensitive on values, because the handlers lowercase them', () => {
-    expect(benchmarkCacheKey('standings', req({ sport: 'MLB' }), config)).toBe(
+  /**
+   * REVIEW ROUND 2. The key must not normalise a value the handler does not.
+   * `scoringPolicyVersion` is compared byte for byte against the stored
+   * string, so `Scoring-V0.6.2` and `scoring-v0.6.2` are two different
+   * requests — the first cut lower-cased the key and served one request's
+   * answer under the other's label for the whole window.
+   */
+  it('keys scoringPolicyVersion on its exact spelling', () => {
+    expect(benchmarkCacheKey('standings', req({ scoringPolicyVersion: 'Scoring-V0.6.2' }), config)).not.toBe(
+      benchmarkCacheKey('standings', req({ scoringPolicyVersion: 'scoring-v0.6.2' }), config),
+    );
+  });
+
+  /**
+   * `sport` IS case-folded by its parser, so `MLB` and `mlb` behave
+   * identically and keying them apart costs one extra fan-out. That is the
+   * acceptable direction: a key that fragments on a casing the handler treats
+   * as the same is a cache miss; a key that merges two inputs the handler
+   * treats as different is a wrong answer. The rule is one rule — no
+   * normalisation in the key — rather than a per-parameter exception.
+   */
+  it('keys sport on its exact spelling too, accepting the extra miss', () => {
+    expect(benchmarkCacheKey('standings', req({ sport: 'MLB' }), config)).not.toBe(
       benchmarkCacheKey('standings', req({ sport: 'mlb' }), config),
     );
   });

@@ -170,6 +170,18 @@ export async function serveCachedBenchmark(
  * a key that ignored them would be wrong in exactly the way that is hardest
  * to notice). Unknown query params are ignored rather than keyed, so a
  * cache-busting suffix cannot be used to force a fan-out per request.
+ *
+ * ## Values are keyed EXACTLY as the handlers read them
+ *
+ * No normalisation here that the handler does not also perform. The first cut
+ * lower-cased every value on the reasoning that `sport` is case-folded by its
+ * parser — true — and the same fold silently aliased `scoringPolicyVersion`,
+ * which the standings handler compares to the stored string byte for byte.
+ * Review showed `Scoring-V0.6.2` and `scoring-v0.6.2` sharing a key: the
+ * second request served the first request's answer under the other label for
+ * the whole window. A key that fragments on a casing the handler treats as
+ * identical costs one extra fan-out; a key that merges two inputs the handler
+ * treats as different serves a wrong answer. Only one of those is acceptable.
  */
 export function benchmarkCacheKey(
   endpoint: 'standings' | 'picks' | 'stats',
@@ -183,7 +195,7 @@ export function benchmarkCacheKey(
   },
 ): string {
   const q = (name: string): string =>
-    req.query[name] === undefined ? '' : String(req.query[name]).toLowerCase();
+    req.query[name] === undefined ? '' : String(req.query[name]);
   return [
     endpoint,
     config.network,
@@ -193,8 +205,6 @@ export function benchmarkCacheKey(
     config.benchmarkHeadlineBasis,
     q('sport'),
     q('date'),
-    // The exact spelling the handlers read. Keying on a different casing would
-    // fragment the cache for requests that behave identically.
     q('scoringPolicyVersion'),
   ].join('\u0001');
 }

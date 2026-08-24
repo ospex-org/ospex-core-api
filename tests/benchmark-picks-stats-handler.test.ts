@@ -279,6 +279,20 @@ describe('picks — the reveal embed', () => {
     // would publish a sealed-but-unrevealed decision with a null body.
     expect(select).not.toMatch(/[^!]benchmark_decision_reveals\(/);
   });
+
+  /**
+   * REVIEW ROUND 2, B5, at its second site. `benchmark_decisions` is
+   * append-only under a publisher that can insert between two pages, so the
+   * walk is keyed on `id` rather than offset: ordered by the cursor column,
+   * bounded by `limit`, and never carrying an `offset`.
+   */
+  it('reads decisions by keyset, not by offset', async () => {
+    const { fake } = await call('picks');
+    const req = requestTo(fake, 'benchmark_decisions');
+    expect(req?.params.get('order')).toBe('id.asc');
+    expect(req?.params.has('limit')).toBe(true);
+    expect(req?.params.has('offset')).toBe(false);
+  });
 });
 
 describe('picks — the slate', () => {
@@ -383,6 +397,48 @@ describe('picks — the pick card fields', () => {
     });
     const pick = gamesOf(body).flatMap((g) => g.picks)[0];
     expect(pick?.axes).toBeNull();
+  });
+
+  /**
+   * The fill on a pick card carries its provenance: which deployment round's
+   * counters the contest and speculation ids belong to, and the run the
+   * receipt cites. Both are read off the receipt; neither is a join key.
+   */
+  it('carries the published fill with its deployment round and run id', async () => {
+    const { body } = await call('picks', {
+      benchmark_execution_fills: [
+        {
+          cohort_id: COHORT,
+          participant_id: FABLE,
+          network: 'polygon',
+          game_id: GAME_A,
+          market: 'moneyline',
+          run_id: 'run-1',
+          deployment_round: 'R5',
+          contest_id: 41,
+          speculation_id: 88,
+          commitment_hash: '0xaa',
+          taker_address: '0xabc',
+          tx_hash: '0xtx1',
+          block_number: 100,
+          filled_at: '2026-08-15T20:00:00+00:00',
+          stake_usdc: 10,
+          would_abstain: false,
+        },
+      ],
+    });
+    const ml = gamesOf(body)
+      .find((g) => g.gameId === GAME_A)
+      ?.picks.find((p) => p.market === 'moneyline');
+    expect(ml?.fill).toMatchObject({
+      txHash: '0xtx1',
+      blockNumber: '100',
+      deploymentRound: 'R5',
+      runId: 'run-1',
+      contestId: '41',
+      speculationId: '88',
+      stakeUsdc: 10,
+    });
   });
 
   it('carries no fill when none is published', async () => {

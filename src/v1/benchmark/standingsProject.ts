@@ -56,6 +56,26 @@
  * cohorts the four arms answered 294 / 291 / 288 / 273 of an identical 294
  * supplied markets each, so using picks as the denominator computes a beat rate
  * over a self-selected subset and rewards an arm for declining to answer.
+ *
+ * ## There is ONE summation order, and every figure uses it
+ *
+ * `mean()` sums in array order and float addition is not associative, so the
+ * order picks are fed in is part of the number. The published order is: cohorts
+ * oldest slate first, and within a cohort the order the scored artifact was
+ * written in (`benchmark_scores.id` ascending). That is the order the per-day
+ * series accumulates in, and it is now the order the top-level aggregate and
+ * the per-market split sum in too — {@link orderByCohort} applies it once,
+ * before anything reads the rows.
+ *
+ * It was not always one order. The rows arrive in id order across the whole
+ * window, and an EARLIER cohort re-scored or backfilled later carries HIGHER
+ * ids than a later cohort's — so the headline summed "later cohort, then
+ * earlier" while the series summed "earlier, then later", and the two rounded
+ * differently in the fourth decimal (review measured −9.4200 against −9.4201).
+ * Sorting by cohort restores the README's contract — the last series point IS
+ * the headline — by construction rather than by luck, and leaves a single
+ * cohort-day slice (`?date=`) in exactly the artifact's own order, which is
+ * the one slice that is field-for-field comparable to the scorer.
  */
 
 import { createHash } from 'node:crypto';
@@ -221,7 +241,8 @@ export interface WireSeriesPoint {
    * another fifteen. The hero area chart sits directly under the headline
    * number, so a running average visibly disagrees with the figure above it.
    * The last point of this series equals the arm's top-level aggregate by
-   * construction, and a test asserts it.
+   * construction — both sum the same rows in the same order (see the file
+   * header) — and a test with a backfilled earlier cohort asserts it.
    */
   cumulative: WirePaired;
 }
@@ -400,6 +421,31 @@ function toAggregable(rows: readonly ScoredPickRow[]): AggregablePick[] {
   }));
 }
 
+/**
+ * The one summation order — see the file header.
+ *
+ * A STABLE sort by the cohort's position in `cohortOrder`, so rows keep their
+ * fetched (id-ascending) order within a cohort. A row whose cohort is not in
+ * the order — which the handler cannot produce, since the rows are fetched by
+ * these very cohort ids — sorts after every known cohort rather than being
+ * dropped, so a caller that did produce one would see it in the numbers and
+ * not lose it silently.
+ */
+export function orderByCohort(
+  rows: readonly ScoredPickRow[],
+  cohortOrder: readonly string[],
+): ScoredPickRow[] {
+  const rank = new Map<string, number>();
+  cohortOrder.forEach((cohortId, i) => {
+    if (!rank.has(cohortId)) rank.set(cohortId, i);
+  });
+  const unknown = cohortOrder.length;
+  return rows
+    .map((row, index) => ({ row, index, rank: rank.get(row.cohortId) ?? unknown }))
+    .sort((a, b) => a.rank - b.rank || a.index - b.index)
+    .map((r) => r.row);
+}
+
 function readHeadline(paired: WirePaired, basis: HeadlineBasis): WireArm['headline'] {
   const [metric, clustering] = basis.split('.') as [
     'economic' | 'marginAdjusted',
@@ -497,8 +543,10 @@ export function projectArms(input: ProjectStandingsInput): WireArm[] {
   const identity = new Map<string, RosterEntry>();
   for (const r of roster) if (!identity.has(r.participantId)) identity.set(r.participantId, r);
 
+  // The one order, applied before ANY aggregate reads a row — the headline,
+  // the per-market split and the series all sum the same sequence.
   const scoresByArm = new Map<string, ScoredPickRow[]>();
-  for (const s of scores) {
+  for (const s of orderByCohort(scores, cohortOrder)) {
     const list = scoresByArm.get(s.participantId);
     if (list === undefined) scoresByArm.set(s.participantId, [s]);
     else list.push(s);
@@ -747,13 +795,16 @@ export function projectBaselines(
   roster: readonly RosterEntry[],
   scores: readonly ScoredPickRow[],
   headlineBasis: HeadlineBasis,
+  /** Same order as the arms — a baseline's mean must not sum differently. */
+  cohortOrder: readonly string[],
 ): WireBaseline[] {
   const identity = new Map<string, RosterEntry>();
   for (const r of roster) if (!identity.has(r.participantId)) identity.set(r.participantId, r);
 
+  const ordered = orderByCohort(scores, cohortOrder);
   const out: WireBaseline[] = [];
   for (const [participantId, id] of identity) {
-    const mine = scores.filter((s) => s.participantId === participantId);
+    const mine = ordered.filter((s) => s.participantId === participantId);
     const paired = mine.length === 0 ? EMPTY_PAIRED : aggregatePaired(toAggregable(mine));
     const metrics = mine.length === 0 ? EMPTY_WIRE_PAIRED : toWirePaired(paired);
     let refused = 0;

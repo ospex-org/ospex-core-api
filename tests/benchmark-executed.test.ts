@@ -117,6 +117,37 @@ describe('deriveExecutedVerdict — where the verdict comes from', () => {
   });
 
   /**
+   * REVIEW ROUND 2. `ContestStatus.Voided` is terminal on-chain: `setScores`
+   * reverts on any status but Verified, so the contest can never be scored,
+   * and the one settlement `settleSpeculation` can still perform on it writes
+   * `WinSide.Void`. The verdict is therefore decided the moment the contest
+   * voids; only the block at which the stake becomes claimable is not. Pending
+   * would carry the stake in `pendingStakeUsdc` on a bet the protocol has
+   * already refunded in principle.
+   */
+  it('is a void, stake returned, when the speculation is open on a voided contest', () => {
+    const v = deriveExecutedVerdict(
+      position(),
+      spec({ speculationStatus: 'open', winSide: 'tbd' }),
+      { contestStatus: 'voided', awayScore: null, homeScore: null },
+    );
+    expect(v).toEqual({ result: 'void', source: 'predicted', payoutWei6: RISK });
+    expect(v.payoutWei6).not.toBe(RISK + PROFIT);
+  });
+
+  /** The settled void and the predicted void agree on the money. */
+  it('pays a predicted void exactly what a settled void pays', () => {
+    const settled = deriveExecutedVerdict(position(), spec({ winSide: 'void' }), null);
+    const predicted = deriveExecutedVerdict(
+      position(),
+      spec({ speculationStatus: 'open', winSide: 'tbd' }),
+      { contestStatus: 'voided', awayScore: null, homeScore: null },
+    );
+    expect(predicted.payoutWei6).toBe(settled.payoutWei6);
+    expect(predicted.result).toBe(settled.result);
+  });
+
+  /**
    * A scored contest with a spread speculation and no line has no derivable
    * winner — `predictWinSide` returns null and this must stay pending rather
    * than falling through to a loss.
@@ -278,6 +309,20 @@ describe('summarizeExecuted', () => {
     ]);
     expect(got.verdictSource).toEqual({ settled: 1, predicted: 1, undecided: 0 });
     expect(got.record.won).toBe(2);
+  });
+
+  /** A void on a voided contest holds no stake pending and nets nothing. */
+  it('does not carry a voided-contest stake as pending', () => {
+    const got = summarizeExecuted([
+      fill({
+        speculation: { speculationStatus: 'open', winSide: 'tbd' },
+        contest: { contestStatus: 'voided', awayScore: null, homeScore: null },
+      }),
+    ]);
+    expect(got.record).toEqual({ won: 0, lost: 0, push: 0, void: 1, pending: 0 });
+    expect(got.pendingStakeWei6).toBe(0n);
+    expect(got.netWei6).toBe(0n);
+    expect(got.verdictSource).toEqual({ settled: 0, predicted: 1, undecided: 0 });
   });
 });
 

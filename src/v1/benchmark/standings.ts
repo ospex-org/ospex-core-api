@@ -37,16 +37,15 @@
 import type { Request, Response } from 'express';
 import type { PostgrestError, SupabaseClient } from '@supabase/supabase-js';
 import { loadConfig } from '../../lib/env.js';
-import { logger } from '../../lib/logger.js';
 import { getSupabase } from '../../lib/supabase.js';
 import { SPORTS as VALID_SPORTS } from '../../lib/sports.js';
 import type { ApiError } from '../../middleware/errorHandler.js';
 import {
   BENCHMARK,
   POSTGREST_PAGE,
-  ProjectionTooLargeError,
   chunkIds,
   readAllByKeyset,
+  respondProjectionFault,
   respondToQueryError,
 } from './source.js';
 import { parseSportParam, resolveWindow, type ResolvedWindow } from './window.js';
@@ -402,10 +401,7 @@ export async function getBenchmarkStandingsHandler(req: Request, res: Response):
       ...(slateDate !== undefined ? { slateDate } : {}),
     });
   } catch (err) {
-    if (err instanceof ProjectionTooLargeError) {
-      respondTooLarge(res, err);
-      return;
-    }
+    if (respondProjectionFault(res, err)) return;
     throw err;
   }
   if (!windowRes.ok) {
@@ -424,10 +420,7 @@ export async function getBenchmarkStandingsHandler(req: Request, res: Response):
   try {
     collected = await collect(sb, config.network, cohortIds);
   } catch (err) {
-    if (err instanceof ProjectionTooLargeError) {
-      respondTooLarge(res, err);
-      return;
-    }
+    if (respondProjectionFault(res, err)) return;
     throw err;
   }
   if ('error' in collected) {
@@ -481,10 +474,7 @@ export async function getBenchmarkStandingsHandler(req: Request, res: Response):
     }
     executed = fills.byParticipant;
   } catch (err) {
-    if (err instanceof ProjectionTooLargeError) {
-      respondTooLarge(res, err);
-      return;
-    }
+    if (respondProjectionFault(res, err)) return;
     throw err;
   }
 
@@ -507,6 +497,7 @@ export async function getBenchmarkStandingsHandler(req: Request, res: Response):
     baselineRoster,
     scores.filter((s) => baselineIds.has(s.participantId)),
     config.benchmarkHeadlineBasis,
+    cohortIds,
   );
 
   // Ranking is unanimous or it is withheld. One cohort whose operator has not
@@ -590,21 +581,6 @@ export async function getBenchmarkStandingsHandler(req: Request, res: Response):
     arms,
     baselines,
   });
-}
-
-function respondTooLarge(res: Response, err: ProjectionTooLargeError): void {
-  logger.error(
-    { relation: err.relation, cap: err.cap },
-    'benchmark: standings read exceeded its bound',
-  );
-  res.status(503).json({
-    error:
-      `The benchmark projection outgrew this endpoint's read bound on ${err.relation} ` +
-      `(${String(err.cap)} rows). Narrow BENCHMARK_STANDINGS_WINDOW_DAYS. ` +
-      'A partial aggregate is not served, because a mean over part of the sample ' +
-      'is indistinguishable from the real one.',
-    code: 'NOT_READY',
-  } satisfies ApiError);
 }
 
 function emptyBody(

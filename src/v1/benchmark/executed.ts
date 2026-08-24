@@ -119,7 +119,19 @@ export interface ExecutedVerdict {
  *
  * `closed` is authoritative — the protocol has spoken. Otherwise a `scored`
  * contest with both scores present is enough to replay the scorer, which is the
- * path a third of this population takes. Anything else is genuinely undecided.
+ * path a third of this population takes; and a `voided` contest is enough to
+ * know the answer is `void`. Anything else is genuinely undecided.
+ *
+ * ## Why an open speculation on a voided contest is NOT pending
+ *
+ * `ContestStatus.Voided` is terminal: `setScores` reverts on any status other
+ * than `Verified`, so a voided contest can never be scored, and the only
+ * branch `settleSpeculation` can still take on it writes `WinSide.Void`
+ * (`SpeculationModule.sol`, the cooldown path). The verdict is decided the
+ * moment the contest voids; only the block at which the stake becomes
+ * claimable is not. Reporting it as pending would hold the stake in
+ * `pendingStakeUsdc` on a bet the protocol has already refunded in principle —
+ * caught in review.
  */
 function resolveWinSide(
   speculation: ExecutedSpeculation,
@@ -132,6 +144,9 @@ function resolveWinSide(
     // fabricated loss into a published record.
     if (speculation.winSide === 'tbd') return { winSide: null, source: 'undecided' };
     return { winSide: speculation.winSide, source: 'settled' };
+  }
+  if (contest !== null && contest.contestStatus === 'voided') {
+    return { winSide: 'void', source: 'predicted' };
   }
   if (
     contest !== null &&

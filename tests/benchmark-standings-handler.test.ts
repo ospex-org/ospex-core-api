@@ -23,6 +23,7 @@ import {
   startFakePostgrest,
   type CapturedRequest,
   type FakePostgrest,
+  type FakeReply,
 } from './helpers/fakePostgrest.js';
 
 // ── fixtures, from production 2026-08-24 ───────────────────────────────────
@@ -214,10 +215,14 @@ async function run(
   tables: Tables = {},
   query: Record<string, string> = {},
   config: Record<string, unknown> = {},
+  /** Answer a request yourself; return undefined to fall through to the fixture. */
+  override?: (req: CapturedRequest, index: number) => FakeReply | undefined,
 ): Promise<Harness> {
   const data: Tables = { ...DEFAULT_TABLES, ...tables };
   const seen = new Map<string, number>();
-  const fake = await startFakePostgrest((req: CapturedRequest) => {
+  const fake = await startFakePostgrest((req: CapturedRequest, index: number) => {
+    const forced = override?.(req, index);
+    if (forced !== undefined) return forced;
     const table = /^\/rest\/v1\/([^/?]+)/.exec(req.path)?.[1] ?? '';
     // A keyset page walk asks again after a full page. These fixtures are far
     // under the 1000-row page size, so the first answer terminates the walk;
@@ -630,12 +635,14 @@ describe('the sport scope', () => {
           network: 'polygon',
           game_id: NBA_GAME,
           market: 'moneyline',
+          run_id: RUN,
+          deployment_round: 'R5',
           contest_id: 41,
           speculation_id: 88,
           commitment_hash: '0xaa',
           taker_address: '0xabc',
           tx_hash: '0xtx1',
-          block_number: 1,
+          block_number: 100,
           filled_at: '2026-08-15T20:00:00+00:00',
           stake_usdc: 10,
           would_abstain: false,
@@ -665,12 +672,14 @@ describe('the sport scope', () => {
           line_ticks: null,
           speculation_status: 'closed',
           win_side: 'away',
+          source_block: 90,
         },
       ],
       contests: [
         {
           network: 'polygon',
           contest_id: 41,
+          jsonodds_id: NBA_GAME,
           contest_status: 'scored',
           away_score: 5,
           home_score: 3,
@@ -886,6 +895,69 @@ describe('the per-day series', () => {
     expect(last).not.toBe(-2.5);
   });
 
+  /**
+   * REVIEW ROUND 2, B7. The case above cannot fail on summation ORDER, because
+   * its score ids run in slate order. Here the EARLIER cohort was re-scored
+   * later and so carries the HIGHER ids — the rows arrive "later cohort, then
+   * earlier" — while the series walks the cohorts oldest first. Float addition
+   * is not associative, and these four values were chosen so the two orders
+   * round to different fourth decimals: slate order gives −8.1877, id order
+   * −8.1876 (the same shape as the review's −9.4200 / −9.4201). One order is
+   * now applied to everything before any aggregate reads a row, so the last
+   * series point and the headline are the same figure by construction.
+   */
+  it('ends on the top-level aggregate even when an earlier cohort was backfilled later', async () => {
+    const twoDays = [
+      { run_id: 'r1', network: 'polygon', cohort_id: 'c-a', slate_date: '2026-08-15', benchmark_commit: 'a' },
+      { run_id: 'r2', network: 'polygon', cohort_id: 'c-b', slate_date: '2026-08-16', benchmark_commit: 'a' },
+    ];
+    const attempts = [
+      { ...ATTEMPTS[0], id: 1, cohort_id: 'c-a', game_id: 'g1' },
+      { ...ATTEMPTS[0], id: 2, cohort_id: 'c-b', game_id: 'g2' },
+      { ...ATTEMPTS[0], id: 3, cohort_id: 'c-b', game_id: 'g3' },
+      { ...ATTEMPTS[0], id: 4, cohort_id: 'c-b', game_id: 'g4' },
+    ];
+    const at = (id: number, cohort: string, gameId: string, v: number): Record<string, unknown> => ({
+      ...scoreRow(id, FABLE, 'moneyline', v, v),
+      benchmark_decisions: { cohort_id: cohort, participant_id: FABLE, game_id: gameId, market: 'moneyline' },
+    });
+    const { body } = await run({
+      benchmark_runs: twoDays,
+      benchmark_arm_attempts: attempts,
+      games: ['g1', 'g2', 'g3', 'g4'].map((id) => ({ ...GAMES[0], jsonodds_id: id })),
+      benchmark_cohort_participants: [
+        { cohort_id: 'c-a', network: 'polygon', participant_id: FABLE },
+        { cohort_id: 'c-b', network: 'polygon', participant_id: FABLE },
+      ],
+      // In ID order, as PostgREST returns them: the later cohort's three rows
+      // first, then the earlier cohort's single backfilled row at id 10.
+      benchmark_scores: [
+        at(1, 'c-b', 'g2', -17.8727),
+        at(2, 'c-b', 'g3', -8.8573),
+        at(3, 'c-b', 'g4', 9.5023),
+        at(10, 'c-a', 'g1', -15.5229),
+      ],
+    });
+    const fable = armFor(body, FABLE);
+    const series = (fable as unknown as {
+      series: Array<{ cohortId: string; cumulative: { marginAdjusted: { gameLevel: { meanClvPct: number | null }; perPick: { meanClvPct: number | null } } } }>;
+    }).series;
+    expect(series.map((p) => p.cohortId)).toEqual(['c-a', 'c-b']);
+    const last = series[1]?.cumulative.marginAdjusted;
+    expect(last?.gameLevel.meanClvPct).toBe(fable.metrics.marginAdjusted.gameLevel.meanClvPct);
+    expect(last?.perPick.meanClvPct).toBe(fable.metrics.marginAdjusted.perPick.meanClvPct);
+    // The slate-order figure, and NOT the id-order one.
+    expect(fable.metrics.marginAdjusted.gameLevel.meanClvPct).toBe(-8.1877);
+    expect(fable.metrics.marginAdjusted.gameLevel.meanClvPct).not.toBe(-8.1876);
+    // The fixture discriminates: summing in id order really does round the
+    // other way, so the assertion above is about the order and not the values.
+    const round4 = (v: number): number => Math.round(v * 1e4) / 1e4;
+    const idOrder = [-17.8727, -8.8573, 9.5023, -15.5229];
+    const slateOrder = [-15.5229, -17.8727, -8.8573, 9.5023];
+    expect(round4(idOrder.reduce((a, b) => a + b, 0) / 4)).toBe(-8.1876);
+    expect(round4(slateOrder.reduce((a, b) => a + b, 0) / 4)).toBe(-8.1877);
+  });
+
   it('carries one point per cohort in the window, oldest first', async () => {
     const { body } = await run();
     const series = (armFor(body, FABLE) as unknown as {
@@ -1023,6 +1095,48 @@ describe('the executed record', () => {
     expect(executed.fills).toBe(0);
     expect(executed.netUsdc).toBeNull();
     expect(executed.record).toBeNull();
+  });
+
+  /**
+   * The receipts walk is keyed on `tx_hash`, and a hash coming back twice is
+   * a contradiction the schema rules out. Driven through the HANDLER so the
+   * wiring from the throw to the 503 is what is exercised, not just the
+   * responder: page one is 1,000 receipts, page two repeats one of them beside
+   * a genuinely later one (so the cursor still advances and it is the
+   * duplicate check, not the cursor guard, that fires).
+   */
+  it('answers 503 NOT_READY rather than serving a record over a duplicated receipt', async () => {
+    const hash = (i: number): string => `0x${i.toString(16).padStart(6, '0')}`;
+    const receipt = (i: number): Record<string, unknown> => ({
+      cohort_id: COHORT,
+      participant_id: FABLE,
+      network: 'polygon',
+      game_id: GAME,
+      market: 'moneyline',
+      run_id: RUN,
+      deployment_round: 'R5',
+      contest_id: 41,
+      speculation_id: 88,
+      commitment_hash: '0xaa',
+      taker_address: '0xabc',
+      tx_hash: hash(i),
+      block_number: 100,
+      filled_at: '2026-08-15T20:00:00+00:00',
+      stake_usdc: 1,
+      would_abstain: false,
+    });
+    const first = Array.from({ length: 1000 }, (_, i) => receipt(i + 1));
+    let served = 0;
+    const { status, body } = await run({}, {}, {}, (req) => {
+      if (req.path !== '/rest/v1/benchmark_execution_fills') return undefined;
+      served += 1;
+      if (served === 1) return { body: first };
+      return { body: [receipt(500), receipt(5000)] };
+    });
+    expect(served).toBe(2);
+    expect(status).toBe(503);
+    expect(body.code).toBe('NOT_READY');
+    expect(body.arms).toBeUndefined();
   });
 });
 

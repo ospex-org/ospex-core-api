@@ -39,7 +39,15 @@ import { loadConfig } from '../../lib/env.js';
 import { getSupabase } from '../../lib/supabase.js';
 import { SPORTS as VALID_SPORTS } from '../../lib/sports.js';
 import type { ApiError } from '../../middleware/errorHandler.js';
-import { BENCHMARK, POSTGREST_PAGE, REVEAL_EMBED, chunkIds, respondToQueryError } from './source.js';
+import {
+  BENCHMARK,
+  POSTGREST_PAGE,
+  REVEAL_EMBED,
+  chunkIds,
+  readAllByKeyset,
+  respondProjectionFault,
+  respondToQueryError,
+} from './source.js';
 import { parseSportParam, resolveWindow, type BenchmarkGame } from './window.js';
 import { collectExecuted, type BenchmarkFill } from './executedFetch.js';
 
@@ -79,6 +87,13 @@ const AXIS_SCALE = Object.freeze({ min: 1, max: 5 });
  * without a special case for degeneracy.
  */
 const FEATURED_RULE = 'highest confidence among revealed executed-market picks, ties to the lowest decision id';
+
+/**
+ * Decision read bound for one cohort. Four arms × three markets × a 15-game
+ * slate is 180 rows; this is a backstop against a runaway relation, and it
+ * raises rather than truncates like every bound in `source.ts`.
+ */
+const DECISION_READ_CAP = 50_000;
 
 interface DecisionRow {
   id: number;
@@ -260,26 +275,42 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
     return;
   }
 
+  // Keyset on `id`, not offset: `benchmark_decisions` is append-only under a
+  // publisher that can insert between two pages, and an offset walk over it
+  // re-reads a row when one lands before page two — the same double-count
+  // review reproduced on the fill receipts. `readAllByKeyset` explains why.
   const decisions: DecisionRow[] = [];
-  for (const chunk of chunkIds(cohort.gameIds, 60)) {
-    for (let offset = 0; ; offset += POSTGREST_PAGE) {
-
-      const result = await sb
-        .from(BENCHMARK.decisions)
-        .select(DECISION_SELECT)
-        .eq('network', config.network)
-        .eq('cohort_id', cohort.cohortId)
-        .in('game_id', chunk)
-        .order('id', { ascending: true })
-        .range(offset, offset + POSTGREST_PAGE - 1);
-      if (result.error) {
-        respondToQueryError(res, result.error, BENCHMARK.decisions);
+  try {
+    for (const chunk of chunkIds(cohort.gameIds, 60)) {
+      const page = await readAllByKeyset<DecisionRow, number>(
+        BENCHMARK.decisions,
+        DECISION_READ_CAP,
+        (r) => r.id,
+        (after, limit) => {
+          let q = sb
+            .from(BENCHMARK.decisions)
+            .select(DECISION_SELECT)
+            .eq('network', config.network)
+            .eq('cohort_id', cohort.cohortId)
+            .in('game_id', chunk)
+            .order('id', { ascending: true })
+            .limit(limit);
+          if (after !== null) q = q.gt('id', after);
+          return q as unknown as PromiseLike<{
+            data: DecisionRow[] | null;
+            error: PostgrestError | null;
+          }>;
+        },
+      );
+      if (page.error) {
+        respondToQueryError(res, page.error, BENCHMARK.decisions);
         return;
       }
-      const batch = (result.data ?? []) as unknown as DecisionRow[];
-      decisions.push(...batch);
-      if (batch.length < POSTGREST_PAGE) break;
+      decisions.push(...page.rows);
     }
+  } catch (err) {
+    if (respondProjectionFault(res, err)) return;
+    throw err;
   }
 
   const identityRes = await sb
@@ -302,7 +333,13 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
     ).map((p) => [p.participant_id, p]),
   );
 
-  const executed = await collectExecuted(sb, config.network, [cohort.cohortId]);
+  let executed;
+  try {
+    executed = await collectExecuted(sb, config.network, [cohort.cohortId]);
+  } catch (err) {
+    if (respondProjectionFault(res, err)) return;
+    throw err;
+  }
   if ('error' in executed) {
     respondToQueryError(res, executed.error, executed.context);
     return;
@@ -348,6 +385,9 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
       blockNumber: string;
       filledAt: string;
       stakeUsdc: number;
+      /** Which deployment's counters `contestId` / `speculationId` are — provenance, not a key. */
+      deploymentRound: string;
+      runId: string;
       contestId: string;
       speculationId: string;
       takerAddress: string;
@@ -407,6 +447,8 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
               blockNumber: fill.blockNumber,
               filledAt: fill.filledAt,
               stakeUsdc: fill.stakeUsdc,
+              deploymentRound: fill.deploymentRound,
+              runId: fill.runId,
               contestId: fill.contestId,
               speculationId: fill.speculationId,
               takerAddress: fill.takerAddress,
