@@ -47,6 +47,7 @@
 
 import { getSupabase } from '../../lib/supabase.js';
 import { wei6ToUSDC } from '../../lib/sanitize.js';
+import { didWin, predictWinSide } from '../../lib/speculation.js';
 import type { MarketType, WinSide } from '../../lib/speculation.js';
 import { loadConfig } from '../../lib/env.js';
 import {
@@ -201,60 +202,6 @@ function impliedOddsDecimal(risk: bigint, profit: bigint | null): number | null 
   // decimal odds = 1 + profit/risk. Convert via Number — fine for USDC-scale values
   // (uint256 here is bounded by USDC supply, well under 2^53).
   return 1 + Number(profit) / Number(risk);
-}
-
-/**
- * Did this position win? Maps win_side string to position_type.
- *   upper (0) wins on win_side ∈ {away, over}
- *   lower (1) wins on win_side ∈ {home, under}
- */
-function didWin(positionType: 0 | 1, winSide: SpeculationRow['win_side']): boolean {
-  if (positionType === 0) return winSide === 'away' || winSide === 'over';
-  return winSide === 'home' || winSide === 'under';
-}
-
-/**
- * Replays the on-chain scorer logic in TS for pending-settle prediction.
- * Mirrors `MoneylineScorerModule._scoreMoneyline`,
- * `SpreadScorerModule._scoreSpread`, and `TotalScorerModule._scoreTotal`.
- *
- * `lineTicks` semantics (from the speculation, not the contest's stored
- * default odds):
- *   - moneyline: ignored
- *   - spread:    int32 in 10× domain (away-side adjustment); push if
- *                `awayScore*10 + lineTicks == homeScore*10`
- *   - total:     int32 in 10× domain; push if `(away+home)*10 == lineTicks`
- *
- * Returns `null` if the inputs are inconsistent (e.g., scores missing
- * even though contest_status='scored'). Caller skips the row in that
- * case rather than emitting a misleading prediction.
- */
-function predictWinSide(
-  market: MarketType,
-  awayScore: number,
-  homeScore: number,
-  lineTicks: number | null,
-): 'away' | 'home' | 'over' | 'under' | 'push' | null {
-  if (market === 'moneyline') {
-    if (awayScore > homeScore) return 'away';
-    if (homeScore > awayScore) return 'home';
-    return 'push';
-  }
-  if (market === 'spread') {
-    if (lineTicks == null) return null;
-    const scaledAway = awayScore * 10;
-    const scaledHome = homeScore * 10;
-    const adjustedAway = scaledAway + lineTicks;
-    if (adjustedAway > scaledHome) return 'away';
-    if (adjustedAway < scaledHome) return 'home';
-    return 'push';
-  }
-  // total
-  if (lineTicks == null) return null;
-  const scaledTotal = (awayScore + homeScore) * 10;
-  if (scaledTotal > lineTicks) return 'over';
-  if (scaledTotal < lineTicks) return 'under';
-  return 'push';
 }
 
 export async function fetchCategorizedPositions(
