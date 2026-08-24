@@ -18,6 +18,7 @@ import {
   startFakePostgrest,
   type CapturedRequest,
   type FakePostgrest,
+  type FakeReply,
 } from './helpers/fakePostgrest.js';
 
 const COHORT = 'watch-v0-2026-08-15';
@@ -193,10 +194,14 @@ async function call(
   query: Record<string, string> = {},
   config: Record<string, unknown> = {},
   now = new Date('2026-08-15T18:00:00Z'),
+  /** Answer a request yourself; return undefined to fall through to the fixture. */
+  override?: (req: CapturedRequest, index: number) => FakeReply | undefined,
 ): Promise<{ fake: FakePostgrest; body: Record<string, unknown>; status: number }> {
   const data: Tables = { ...DEFAULT_TABLES, ...tables };
   const seen = new Map<string, number>();
-  const fake = await startFakePostgrest((req: CapturedRequest) => {
+  const fake = await startFakePostgrest((req: CapturedRequest, index: number) => {
+    const forced = override?.(req, index);
+    if (forced !== undefined) return forced;
     const table = /^\/rest\/v1\/([^/?]+)/.exec(req.path)?.[1] ?? '';
     const n = seen.get(table) ?? 0;
     seen.set(table, n + 1);
@@ -292,6 +297,27 @@ describe('picks — the reveal embed', () => {
     expect(req?.params.get('order')).toBe('id.asc');
     expect(req?.params.has('limit')).toBe(true);
     expect(req?.params.has('offset')).toBe(false);
+  });
+
+  /**
+   * A projection fault inside the window's own walks answers 503 here as it
+   * does on standings — the first cut let it escape as a bare 500. The fault
+   * is provoked by a server that ignores the run cursor and repeats a full
+   * page, which trips the keyset guard.
+   */
+  it('answers 503 NOT_READY when the runs walk faults, like standings does', async () => {
+    const runs = Array.from({ length: 1000 }, (_, i) => ({
+      run_id: `run-${String(i).padStart(6, '0')}`,
+      network: 'polygon',
+      cohort_id: COHORT,
+      slate_date: '2026-08-15',
+      benchmark_commit: 'a',
+    }));
+    const { status, body } = await call('picks', {}, {}, {}, undefined, (req) =>
+      req.path === '/rest/v1/benchmark_runs' ? { body: runs } : undefined,
+    );
+    expect(status).toBe(503);
+    expect(body.code).toBe('NOT_READY');
   });
 });
 
@@ -438,7 +464,77 @@ describe('picks — the pick card fields', () => {
       contestId: '41',
       speculationId: '88',
       stakeUsdc: 10,
+      // No event, speculation or contest in this fixture: the receipt is
+      // served, and it says it did not resolve.
+      resolved: false,
     });
+  });
+
+  /** With the whole chain present the same receipt says it resolved. */
+  it('marks the fill resolved when the identity chain binds it', async () => {
+    const { body } = await call('picks', {
+      benchmark_execution_fills: [
+        {
+          cohort_id: COHORT,
+          participant_id: FABLE,
+          network: 'polygon',
+          game_id: GAME_A,
+          market: 'moneyline',
+          run_id: 'run-1',
+          deployment_round: 'R5',
+          contest_id: 41,
+          speculation_id: 88,
+          commitment_hash: '0xaa',
+          taker_address: '0xabc',
+          tx_hash: '0xtx1',
+          block_number: 100,
+          filled_at: '2026-08-15T20:00:00+00:00',
+          stake_usdc: 10,
+          would_abstain: false,
+        },
+      ],
+      position_fills: [
+        {
+          id: 1,
+          network: 'polygon',
+          speculation_id: 88,
+          contest_id: 41,
+          commitment_hash: '0xaa',
+          taker_address: '0xabc',
+          taker_position_type: 'upper',
+          taker_risk_amount: '10000000',
+          maker_risk_amount: '7000000',
+          tx_hash: '0xtx1',
+          log_index: 0,
+        },
+      ],
+      speculations: [
+        {
+          network: 'polygon',
+          speculation_id: 88,
+          contest_id: 41,
+          market_type: 'moneyline',
+          line_ticks: null,
+          speculation_status: 'closed',
+          win_side: 'away',
+          source_block: 90,
+        },
+      ],
+      contests: [
+        {
+          network: 'polygon',
+          contest_id: 41,
+          jsonodds_id: GAME_A,
+          contest_status: 'scored',
+          away_score: 5,
+          home_score: 3,
+        },
+      ],
+    });
+    const ml = gamesOf(body)
+      .find((g) => g.gameId === GAME_A)
+      ?.picks.find((p) => p.market === 'moneyline');
+    expect((ml?.fill as { resolved: boolean }).resolved).toBe(true);
   });
 
   it('carries no fill when none is published', async () => {

@@ -237,13 +237,21 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
   const config = loadConfig();
   const sb = getSupabase();
 
-  const windowRes = await resolveWindow(sb, {
-    network: config.network,
-    minSlateDate: config.benchmarkPublicMinSlateDate,
-    windowDays: config.benchmarkStandingsWindowDays,
-    ...(sport !== undefined && sport !== 'all' ? { sport } : {}),
-    ...(slateDate !== undefined ? { slateDate } : {}),
-  });
+  let windowRes;
+  try {
+    windowRes = await resolveWindow(sb, {
+      network: config.network,
+      minSlateDate: config.benchmarkPublicMinSlateDate,
+      windowDays: config.benchmarkStandingsWindowDays,
+      ...(sport !== undefined && sport !== 'all' ? { sport } : {}),
+      ...(slateDate !== undefined ? { slateDate } : {}),
+    });
+  } catch (err) {
+    // The same two typed faults standings answers as 503 — a bound or an
+    // integrity fault inside the window's own keyset walks.
+    if (respondProjectionFault(res, err)) return;
+    throw err;
+  }
   if (!windowRes.ok) {
     respondToQueryError(res, windowRes.error, windowRes.context);
     return;
@@ -391,6 +399,14 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
       contestId: string;
       speculationId: string;
       takerAddress: string;
+      /**
+       * Whether the identity chain in `executedFetch.ts` bound this receipt to
+       * exactly one on-chain fill and outcome. The receipt itself is served
+       * either way — it is the operator's published statement that the
+       * placement happened — but the standings record only PRICES fills that
+       * resolved, and a reader of the pick card is entitled to the same fact.
+       */
+      resolved: boolean;
     } | null;
   }
 
@@ -452,6 +468,7 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
               contestId: fill.contestId,
               speculationId: fill.speculationId,
               takerAddress: fill.takerAddress,
+              resolved: fill.resolved,
             },
     };
     const list = picksByGame.get(d.game_id);

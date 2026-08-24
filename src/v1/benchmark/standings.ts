@@ -387,6 +387,16 @@ export async function getBenchmarkStandingsHandler(req: Request, res: Response):
     req.query.scoringPolicyVersion === undefined
       ? undefined
       : String(req.query.scoringPolicyVersion);
+  // `?scoringPolicyVersion=` is malformed, not "the default": the other two
+  // params already refuse their empty spelling, and an empty literal would
+  // otherwise serve an empty table labelled ''.
+  if (requestedVersion !== undefined && requestedVersion.trim() === '') {
+    res.status(400).json({
+      error: 'scoringPolicyVersion must be a non-empty version string.',
+      code: 'INVALID_PARAM',
+    } satisfies ApiError);
+    return;
+  }
 
   const config = loadConfig();
   const sb = getSupabase();

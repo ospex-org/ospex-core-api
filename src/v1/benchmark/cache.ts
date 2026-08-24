@@ -182,6 +182,14 @@ export async function serveCachedBenchmark(
  * the whole window. A key that fragments on a casing the handler treats as
  * identical costs one extra fan-out; a key that merges two inputs the handler
  * treats as different serves a wrong answer. Only one of those is acceptable.
+ *
+ * The same rule, one input over: an ABSENT param and an EMPTY one are two
+ * different inputs to the handler (`undefined` selects the default version;
+ * `''` is a literal), so the key encodes presence — `null` for absent — and
+ * is JSON rather than a joined string, because a joined string lets a value
+ * that happens to contain the separator (Express passes `%01` through) move a
+ * character from one field to the next and collide. Found by an adversarial
+ * pass on the first fix.
  */
 export function benchmarkCacheKey(
   endpoint: 'standings' | 'picks' | 'stats',
@@ -194,17 +202,19 @@ export function benchmarkCacheKey(
     benchmarkHeadlineBasis: string;
   },
 ): string {
-  const q = (name: string): string =>
-    req.query[name] === undefined ? '' : String(req.query[name]);
-  return [
+  // `String(...)` is exactly the read every handler performs on a present
+  // value; `null` marks absence, which `String` cannot.
+  const q = (name: string): string | null =>
+    req.query[name] === undefined ? null : String(req.query[name]);
+  return JSON.stringify([
     endpoint,
     config.network,
-    config.benchmarkPublicMinSlateDate ?? '-',
-    String(config.benchmarkStandingsWindowDays),
-    String(config.benchmarkStatsMaxAgeSeconds),
+    config.benchmarkPublicMinSlateDate ?? null,
+    config.benchmarkStandingsWindowDays,
+    config.benchmarkStatsMaxAgeSeconds,
     config.benchmarkHeadlineBasis,
     q('sport'),
     q('date'),
     q('scoringPolicyVersion'),
-  ].join('\u0001');
+  ]);
 }

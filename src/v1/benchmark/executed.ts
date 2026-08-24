@@ -137,16 +137,21 @@ function resolveWinSide(
   speculation: ExecutedSpeculation,
   contest: ExecutedContest | null,
 ): { winSide: WinSide | null; source: VerdictSource } {
+  if (speculation.speculationStatus === 'closed' && speculation.winSide !== 'tbd') {
+    return { winSide: speculation.winSide, source: 'settled' };
+  }
+  // The contest's terminal void decides, whatever the speculation row says —
+  // including a closed row still reading `tbd`, which the contract cannot
+  // produce but which must not read as pending if it ever did.
+  if (contest !== null && contest.contestStatus === 'voided') {
+    return { winSide: 'void', source: 'predicted' };
+  }
   if (speculation.speculationStatus === 'closed') {
     // `tbd` on a closed speculation is a shouldn't-happen. It is reported as
     // undecided rather than guessed at — the alternative, treating it as a
     // loss the way the own-state derivation defensively does, would put a
     // fabricated loss into a published record.
-    if (speculation.winSide === 'tbd') return { winSide: null, source: 'undecided' };
-    return { winSide: speculation.winSide, source: 'settled' };
-  }
-  if (contest !== null && contest.contestStatus === 'voided') {
-    return { winSide: 'void', source: 'predicted' };
+    return { winSide: null, source: 'undecided' };
   }
   if (
     contest !== null &&

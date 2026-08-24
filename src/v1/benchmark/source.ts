@@ -244,14 +244,21 @@ export async function readAllByKeyset<Row, Key extends string | number>(
     if (batch.length < POSTGREST_PAGE) return { rows, error: null };
     if (rows.length >= cap) throw new ProjectionTooLargeError(relation, cap);
     const last = batch[batch.length - 1];
-    if (last === undefined) throw new Error(`${relation}: full page with no last row`);
+    if (last === undefined) {
+      throw new ProjectionIntegrityError(relation, 'a full page arrived with no last row');
+    }
     const next = keyOf(last);
     // A full page whose cursor did not advance loops forever. It cannot happen
     // with a unique, strictly-increasing key and a matching `order` — which is
     // exactly why this helper requires both. The guard makes "cannot happen"
-    // enforced rather than assumed.
+    // enforced rather than assumed, and it is the same class of fault as a
+    // duplicate row (the server answered outside its own contract), so it is
+    // answered the same way: a typed fault, 503, nothing served.
     if (after !== null && next <= after) {
-      throw new Error(`${relation}: keyset cursor did not advance past ${String(after)}`);
+      throw new ProjectionIntegrityError(
+        relation,
+        `keyset cursor did not advance past ${String(after)}`,
+      );
     }
     after = next;
   }

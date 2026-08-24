@@ -175,6 +175,13 @@ export interface BenchmarkFill {
   participantId: string;
   gameId: string;
   market: string;
+  /**
+   * Whether the identity chain bound this receipt to exactly one priced fill.
+   * The receipt is carried either way — it is the operator's published
+   * statement that the placement happened — but only a resolved one is in
+   * the standings record, and a consumer rendering the receipt is told which.
+   */
+  resolved: boolean;
   /** The run the receipt cites — part of the decision's identity under 079. */
   runId: string;
   /**
@@ -214,12 +221,20 @@ const RECEIPT_READ_CAP = 200_000;
 
 const WEI6 = 1_000_000;
 
-function toBig(v: string | number | null): bigint {
-  if (v === null) return 0n;
+/**
+ * A chain amount (wei6, a whole number) as a bigint, or null when the value
+ * cannot be read as one. Null REFUSES the receipt downstream: an amount this
+ * service cannot read is not zero, and pricing it as zero would publish a
+ * fill with no stake and the full profit — the one place "refuse rather than
+ * guess" leaked in the first cut, found by an adversarial pass.
+ */
+function toBig(v: string | number | null): bigint | null {
+  if (v === null) return null;
+  if (typeof v === 'number') return Number.isSafeInteger(v) ? BigInt(v) : null;
   try {
-    return BigInt(typeof v === 'number' ? Math.trunc(v) : v);
+    return BigInt(v);
   } catch {
-    return 0n;
+    return null;
   }
 }
 
@@ -298,24 +313,7 @@ export async function collectExecuted(
   const scoped =
     inScopeGames === undefined ? receiptRows : receiptRows.filter((r) => inScopeGames.has(r.game_id));
 
-  const fills: BenchmarkFill[] = scoped.map((f) => ({
-    cohortId: f.cohort_id,
-    participantId: f.participant_id,
-    gameId: f.game_id,
-    market: f.market,
-    runId: f.run_id,
-    deploymentRound: f.deployment_round,
-    contestId: String(f.contest_id),
-    speculationId: String(f.speculation_id),
-    takerAddress: f.taker_address,
-    txHash: f.tx_hash,
-    blockNumber: String(f.block_number),
-    filledAt: f.filled_at,
-    stakeUsdc: Number(f.stake_usdc),
-    wouldAbstain: f.would_abstain,
-  }));
-
-  if (fills.length === 0) return { fills, byParticipant: new Map() };
+  if (scoped.length === 0) return { fills: [], byParticipant: new Map() };
 
   // ── the immutable fill events, by transaction ────────────────────────────
   const txHashes = [...new Set(scoped.map((r) => r.tx_hash))];
@@ -395,6 +393,7 @@ export async function collectExecuted(
   // ── resolve each receipt to exactly one priced position, or refuse it ────
   const byArm = new Map<string, ExecutedFill[]>();
   const unresolvedByArm = new Map<string, number>();
+  const resolvedTx = new Set<string>();
   const refuse = (participantId: string): void => {
     unresolvedByArm.set(participantId, (unresolvedByArm.get(participantId) ?? 0) + 1);
   };
@@ -458,8 +457,20 @@ export async function collectExecuted(
       continue;
     }
 
-    const riskWei6 = mine.reduce((n, e) => n + toBig(e.taker_risk_amount), 0n);
-    const profitWei6 = mine.reduce((n, e) => n + toBig(e.maker_risk_amount), 0n);
+    // Amounts the service cannot read are refused, never read as zero.
+    const risks = mine.map((e) => toBig(e.taker_risk_amount));
+    const profits = mine.map((e) => toBig(e.maker_risk_amount));
+    const receiptStake = Number(receipt.stake_usdc);
+    if (
+      risks.some((r) => r === null) ||
+      profits.some((p) => p === null) ||
+      !Number.isFinite(receiptStake)
+    ) {
+      refuse(receipt.participant_id);
+      continue;
+    }
+    const riskWei6 = risks.reduce<bigint>((n, r) => n + (r as bigint), 0n);
+    const profitWei6 = profits.reduce<bigint>((n, p) => n + (p as bigint), 0n);
     const contest: ExecutedContest = {
       contestStatus: contestRow.contest_status,
       awayScore: contestRow.away_score,
@@ -475,7 +486,7 @@ export async function collectExecuted(
         // indexer's projection of the same event. Two producers, one quantity —
         // a genuine second witness rather than the same number read twice.
         // `numeric(18,6)` decimal USDC on the receipt; wei6 on the chain side.
-        receiptStakeWei6: BigInt(Math.round(Number(receipt.stake_usdc) * WEI6)),
+        receiptStakeWei6: BigInt(Math.round(receiptStake * WEI6)),
       },
       speculation: {
         speculationStatus: spec.speculation_status,
@@ -488,6 +499,7 @@ export async function collectExecuted(
     const list = byArm.get(receipt.participant_id);
     if (list === undefined) byArm.set(receipt.participant_id, [entry]);
     else list.push(entry);
+    resolvedTx.add(receipt.tx_hash);
   }
 
   const byParticipant = new Map<string, ExecutedSummary>();
@@ -497,6 +509,24 @@ export async function collectExecuted(
       summarizeExecuted(byArm.get(participantId) ?? [], unresolvedByArm.get(participantId) ?? 0),
     );
   }
+
+  const fills: BenchmarkFill[] = scoped.map((f) => ({
+    cohortId: f.cohort_id,
+    participantId: f.participant_id,
+    gameId: f.game_id,
+    market: f.market,
+    resolved: resolvedTx.has(f.tx_hash),
+    runId: f.run_id,
+    deploymentRound: f.deployment_round,
+    contestId: String(f.contest_id),
+    speculationId: String(f.speculation_id),
+    takerAddress: f.taker_address,
+    txHash: f.tx_hash,
+    blockNumber: String(f.block_number),
+    filledAt: f.filled_at,
+    stakeUsdc: Number(f.stake_usdc),
+    wouldAbstain: f.would_abstain,
+  }));
 
   return { fills, byParticipant };
 }

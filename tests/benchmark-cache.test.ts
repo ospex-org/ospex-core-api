@@ -198,4 +198,35 @@ describe('the key', () => {
       benchmarkCacheKey('standings', req({ sport: 'mlb' }), config),
     );
   });
+
+  /**
+   * The same aliasing one input over, found by an adversarial pass on the
+   * first fix: `?scoringPolicyVersion=` reaches the handler as `''` and an
+   * absent param as `undefined`, and the handler treats them differently
+   * (the default version vs a literal). A key that reads both as '' serves
+   * one answer under the other for the whole window. Every param, because the
+   * rule is one rule.
+   */
+  it('distinguishes an absent param from an empty one, for every param', () => {
+    for (const name of ['sport', 'date', 'scoringPolicyVersion']) {
+      expect(benchmarkCacheKey('standings', req({ [name]: '' }), config)).not.toBe(
+        benchmarkCacheKey('standings', req(), config),
+      );
+    }
+  });
+
+  /**
+   * A joined-string key lets a value containing the separator move a
+   * character across a field boundary. Two requests that differ only in
+   * which field a boundary character sits in must not share a key.
+   */
+  it('does not let a value containing the separator cross a field boundary', () => {
+    const sep = String.fromCharCode(1);
+    const a = benchmarkCacheKey('standings', req({ date: `2026-08-15${sep}X`, scoringPolicyVersion: 'Y' }), config);
+    const b = benchmarkCacheKey('standings', req({ date: '2026-08-15', scoringPolicyVersion: `X${sep}Y` }), config);
+    expect(a).not.toBe(b);
+    const c = benchmarkCacheKey('standings', req({ date: '2026-08-15X', scoringPolicyVersion: 'Y' }), config);
+    const d = benchmarkCacheKey('standings', req({ date: '2026-08-15', scoringPolicyVersion: 'XY' }), config);
+    expect(c).not.toBe(d);
+  });
 });

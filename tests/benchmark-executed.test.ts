@@ -135,6 +135,20 @@ describe('deriveExecutedVerdict — where the verdict comes from', () => {
     expect(v.payoutWei6).not.toBe(RISK + PROFIT);
   });
 
+  /**
+   * The contest's terminal void decides even for a CLOSED row still reading
+   * `tbd` — a state the contract cannot write (every Closed write carries a
+   * concrete side), but one that must not read as pending if it ever did.
+   */
+  it('is a void for a closed-but-tbd speculation on a voided contest', () => {
+    const v = deriveExecutedVerdict(
+      position(),
+      spec({ speculationStatus: 'closed', winSide: 'tbd' }),
+      { contestStatus: 'voided', awayScore: null, homeScore: null },
+    );
+    expect(v).toEqual({ result: 'void', source: 'predicted', payoutWei6: RISK });
+  });
+
   /** The settled void and the predicted void agree on the money. */
   it('pays a predicted void exactly what a settled void pays', () => {
     const settled = deriveExecutedVerdict(position(), spec({ winSide: 'void' }), null);

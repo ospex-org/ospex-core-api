@@ -1170,4 +1170,19 @@ describe('parameter validation', () => {
     const { status } = await run({}, { date: '15-08-2026' });
     expect(status).toBe(400);
   });
+
+  /**
+   * `?scoringPolicyVersion=` is malformed, like the empty spelling of the
+   * other two params — not "the default". Served as a literal it would be an
+   * empty table labelled '', and a 200 that the cache could store.
+   */
+  it('rejects an empty scoringPolicyVersion', async () => {
+    const { status, body } = await run({}, { scoringPolicyVersion: '' });
+    expect(status).toBe(400);
+    expect(body.code).toBe('INVALID_PARAM');
+    // Negative control: absent still serves the default version.
+    const { status: ok, body: served } = await run();
+    expect(ok).toBe(200);
+    expect(served.scoringPolicyVersion).toBe(V1);
+  });
 });

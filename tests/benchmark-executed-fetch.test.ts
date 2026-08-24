@@ -494,6 +494,88 @@ describe('the outcome row is bound by durable identity, not by the counter', () 
   });
 });
 
+/**
+ * Found by an adversarial pass: the first cut read an unparseable chain
+ * amount as ZERO and still priced the fill — a record with no stake and the
+ * full profit. Every other fault in this module refuses; this one now does.
+ */
+describe('an amount the service cannot read refuses the receipt', () => {
+  it('refuses a fractional taker risk rather than pricing it as zero', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event({ taker_risk_amount: '10000000.5' })],
+    });
+    const s = summaryOf(result);
+    expect(s.fills).toBe(0);
+    expect(s.unresolvedFills).toBe(1);
+    expect(s.stakedWei6).toBe(0n);
+    expect(s.netWei6).toBe(0n);
+  });
+
+  /**
+   * The same value as a JSON NUMBER, which is how PostgREST serialises a
+   * `numeric` column. A string fixture alone cannot reach the number branch —
+   * a mutant truncating `10000000.5` to `10000000` survived until this case.
+   */
+  it('refuses a fractional taker risk that arrives as a number', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event({ taker_risk_amount: 10000000.5 })],
+    });
+    const s = summaryOf(result);
+    expect(s.unresolvedFills).toBe(1);
+    expect(s.fills).toBe(0);
+  });
+
+  it('refuses an unreadable maker risk', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event({ maker_risk_amount: 'seven' })],
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  it('refuses an unreadable receipt stake', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt({ stake_usdc: 'ten' })],
+      position_fills: [event()],
+    });
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+
+  /** Negative control: amounts as numbers and as bigint strings both price. */
+  it('prices whole amounts whether they arrive as numbers or strings', async () => {
+    const asNumbers = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event({ taker_risk_amount: 10 * USDC, maker_risk_amount: 7 * USDC })],
+    });
+    const asStrings = await collect({
+      benchmark_execution_fills: [receipt()],
+      position_fills: [event()],
+    });
+    expect(summaryOf(asNumbers.result).netWei6).toBe(BigInt(7 * USDC));
+    expect(summaryOf(asStrings.result).netWei6).toBe(BigInt(7 * USDC));
+  });
+});
+
+/** Each carried receipt says whether the identity chain resolved it. */
+describe('the resolved flag on a carried receipt', () => {
+  it('is true for a priced fill and false for a refused one', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt({ tx_hash: '0xtx1' }), receipt({ tx_hash: '0xtx2', market: 'total' })],
+      // Only the first has its event; the second is refused at link 1.
+      position_fills: [event({ tx_hash: '0xtx1' })],
+    });
+    const fills = (result as { fills: Array<{ txHash: string; resolved: boolean }> }).fills;
+    expect(fills.map((f) => [f.txHash, f.resolved])).toEqual([
+      ['0xtx1', true],
+      ['0xtx2', false],
+    ]);
+    expect(summaryOf(result).fills).toBe(1);
+    expect(summaryOf(result).unresolvedFills).toBe(1);
+  });
+});
+
 describe('the receipt is a second witness on the stake', () => {
   it('counts a receipt/chain disagreement and prices from the chain', async () => {
     const { result } = await collect({
@@ -593,6 +675,21 @@ describe('paging over the receipts', () => {
    * row is new), so this is the duplicate check firing and not the
    * cursor-did-not-advance guard in `readAllByKeyset`.
    */
+  /**
+   * A server that ignores the cursor and repeats a FULL page trips the
+   * cursor-advance guard in `readAllByKeyset`. That is the same class of fault
+   * as a duplicate — the server answered outside its contract — and is typed
+   * the same way, so both handlers answer 503 rather than a bare 500.
+   */
+  it('refuses the whole read when the cursor does not advance', async () => {
+    const first = manyReceipts(1000);
+    await expect(
+      collect({}, undefined, (req) =>
+        req.path === '/rest/v1/benchmark_execution_fills' ? { body: first } : undefined,
+      ),
+    ).rejects.toMatchObject({ name: 'ProjectionIntegrityError', relation: 'benchmark_execution_fills' });
+  });
+
   it('refuses the whole read when a receipt comes back twice', async () => {
     const first = manyReceipts(1000);
     let served = 0;

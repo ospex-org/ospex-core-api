@@ -618,7 +618,12 @@ export function projectArms(input: ProjectStandingsInput): WireArm[] {
     const series: WireSeriesPoint[] = [];
     const running = new CumulativeAggregate();
     let seenAny = false;
-    for (const cohortId of cohortOrder) {
+    // A cohort id repeated in the order would fold its day into the running
+    // aggregate twice. `resolveWindow` derives the order from a Map so it
+    // cannot repeat; the Set makes that a property of this function rather
+    // than of its caller, and matches `orderByCohort`, which already ranks a
+    // repeated id once.
+    for (const cohortId of new Set(cohortOrder)) {
       const day = byDay.get(cohortId) ?? [];
       const dayAggregable = toAggregable(day);
       running.addDay(dayAggregable);
