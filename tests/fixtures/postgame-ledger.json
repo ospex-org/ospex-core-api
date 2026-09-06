@@ -1,0 +1,67 @@
+{
+  "description": "Exact historical captured JSON rows (not DB rows, not a status response, not fresh live evidence). Tests deterministically map these immutable inputs to DB shape.",
+  "sources": {
+    "enriched-positions.json": {
+      "path": "/home/vince/.hermes/review/escrow-20260905/enriched-positions.json",
+      "sha256": "1914c723ddfc39a85ad45f522b5563f3b3cd8bf028e6b116dfa26fab748107c3",
+      "bytes": 3080398
+    },
+    "stage-maker-a.pages.json": {
+      "path": "/home/vince/.hermes/review/escrow-20260905/stage-maker-a.pages.json",
+      "sha256": "8af52172f0a61b3ee5f093d3ae1c52a6af5b15a47086baa12f2df9c531a778cc",
+      "bytes": 168395
+    },
+    "flow-a.pages.json": {
+      "path": "/home/vince/.hermes/review/escrow-20260905/flow-a.pages.json",
+      "sha256": "a9364dfb33668facfadc7bf5daa21a4d1835fd3aeb23f956ed256e1514049610",
+      "bytes": 148900
+    }
+  },
+  "entries": [
+    {
+      "label": "maker-won-unsettled",
+      "enriched": {
+        "source": "enriched-positions.json",
+        "rowIndex": 744,
+        "rawSha256": "ba0fabada417dbb37233ee51c12e1628aeb7b9fa8f2f451ead5855002f8f35d4",
+        "raw": "{\n    \"wallet\": \"stage-maker-a\",\n    \"address\": \"0x5316fa54c170d1927f30d1a497ac9e85e3826a9b\",\n    \"speculationId\": 277,\n    \"side\": 0,\n    \"risk\": 10000,\n    \"profit\": 10000,\n    \"claimed\": false,\n    \"firstFillTimestamp\": 1786669857,\n    \"contestId\": 118,\n    \"scorer\": \"0x59555106d4b5f1a797f3552f60ac418eb6b6f6bd\",\n    \"lineTicks\": 0,\n    \"specStatus\": 0,\n    \"winSide\": 0,\n    \"awayScore\": 7,\n    \"homeScore\": 6,\n    \"leagueId\": 3,\n    \"contestStatus\": 2,\n    \"rundownId\": \"399f1f54ba31a606140cd8399b2f46cf\",\n    \"sportspageId\": \"337815\",\n    \"jsonoddsId\": \"609cbc22-57f8-48ea-a55f-cdf806b4dddc\",\n    \"start\": 1786757880,\n    \"market\": \"moneyline\",\n    \"api\": {},\n    \"liability\": 10000,\n    \"datedAPI\": {\n      \"awayTeam\": \"Kansas City Royals\",\n      \"homeTeam\": \"Los Angeles Angels\",\n      \"matchTime\": \"2026-08-15T01:38:00+00:00\",\n      \"gameMatchTime\": \"2026-08-15T01:38:00+00:00\",\n      \"gameFinalType\": \"Finished\",\n      \"status\": \"scored\",\n      \"jsonoddsId\": \"609cbc22-57f8-48ea-a55f-cdf806b4dddc\"\n    },\n    \"listedSpeculationIds\": [\n      277,\n      278\n    ],\n    \"listedSpeculation\": true,\n    \"oracleLineTicks\": 0,\n    \"lineDiffersFromOracle\": false,\n    \"bucket\": \"c_scored_unsettled\"\n  }"
+      },
+      "history": {
+        "source": "stage-maker-a.pages.json",
+        "rowIndex": 591,
+        "rawSha256": "b1c3e4b41b33d7d35e06dc1dab04dd1de08746109e787400d12d27b71cbd2121",
+        "raw": "{\n      \"speculationId\": \"277\",\n      \"positionType\": 0,\n      \"riskAmountUSDC\": 0.01,\n      \"profitAmountUSDC\": 0.01,\n      \"claimed\": false,\n      \"positionCreatedAt\": \"2026-08-14T01:10:57+00:00\"\n    }"
+      }
+    },
+    {
+      "label": "controlled-loser-same-speculation",
+      "enriched": {
+        "source": "enriched-positions.json",
+        "rowIndex": 743,
+        "rawSha256": "a3589a730c32aaa971a5acaa08683eb324eed14c6471948d317faf8a696beb62",
+        "raw": "{\n    \"wallet\": \"flow-a\",\n    \"address\": \"0x16dc5d67d080a5521ef2c79680dbfc2abf724d30\",\n    \"speculationId\": 277,\n    \"side\": 1,\n    \"risk\": 10000,\n    \"profit\": 10000,\n    \"claimed\": false,\n    \"firstFillTimestamp\": 1786669857,\n    \"contestId\": 118,\n    \"scorer\": \"0x59555106d4b5f1a797f3552f60ac418eb6b6f6bd\",\n    \"lineTicks\": 0,\n    \"specStatus\": 0,\n    \"winSide\": 0,\n    \"awayScore\": 7,\n    \"homeScore\": 6,\n    \"leagueId\": 3,\n    \"contestStatus\": 2,\n    \"rundownId\": \"399f1f54ba31a606140cd8399b2f46cf\",\n    \"sportspageId\": \"337815\",\n    \"jsonoddsId\": \"609cbc22-57f8-48ea-a55f-cdf806b4dddc\",\n    \"start\": 1786757880,\n    \"market\": \"moneyline\",\n    \"api\": {},\n    \"liability\": 10000,\n    \"datedAPI\": {\n      \"awayTeam\": \"Kansas City Royals\",\n      \"homeTeam\": \"Los Angeles Angels\",\n      \"matchTime\": \"2026-08-15T01:38:00+00:00\",\n      \"gameMatchTime\": \"2026-08-15T01:38:00+00:00\",\n      \"gameFinalType\": \"Finished\",\n      \"status\": \"scored\",\n      \"jsonoddsId\": \"609cbc22-57f8-48ea-a55f-cdf806b4dddc\"\n    },\n    \"listedSpeculationIds\": [\n      277,\n      278\n    ],\n    \"listedSpeculation\": true,\n    \"oracleLineTicks\": 0,\n    \"lineDiffersFromOracle\": false,\n    \"bucket\": \"c_scored_unsettled\"\n  }"
+      },
+      "history": {
+        "source": "flow-a.pages.json",
+        "rowIndex": 431,
+        "rawSha256": "4f44634b2101f81760d66d5b8df7f6e17f68c06bcde6da27967b4744951657a2",
+        "raw": "{\n      \"speculationId\": \"277\",\n      \"positionType\": 1,\n      \"riskAmountUSDC\": 0.01,\n      \"profitAmountUSDC\": 0.01,\n      \"claimed\": false,\n      \"positionCreatedAt\": \"2026-08-14T01:10:57+00:00\"\n    }"
+      }
+    },
+    {
+      "label": "maker-won-claimable",
+      "enriched": {
+        "source": "enriched-positions.json",
+        "rowIndex": 1019,
+        "rawSha256": "b6baaf951d2c39c4acd67e7b6e8e6f2e16a36127b368466d866eef3a98255031",
+        "raw": "{\n    \"wallet\": \"stage-maker-a\",\n    \"address\": \"0x5316fa54c170d1927f30d1a497ac9e85e3826a9b\",\n    \"speculationId\": 407,\n    \"side\": 1,\n    \"risk\": 3797400,\n    \"profit\": 2999946,\n    \"claimed\": false,\n    \"firstFillTimestamp\": 1787151666,\n    \"contestId\": 185,\n    \"scorer\": \"0x59555106d4b5f1a797f3552f60ac418eb6b6f6bd\",\n    \"lineTicks\": 0,\n    \"specStatus\": 1,\n    \"winSide\": 2,\n    \"awayScore\": 1,\n    \"homeScore\": 4,\n    \"leagueId\": 3,\n    \"contestStatus\": 2,\n    \"rundownId\": \"718c84c28af56baacb1f8b6ec8ca69a2\",\n    \"sportspageId\": \"337893\",\n    \"jsonoddsId\": \"4ae7ae68-93ba-4a1d-992d-0e680fd9b398\",\n    \"start\": 1787177100,\n    \"market\": \"moneyline\",\n    \"api\": {},\n    \"liability\": 6797346,\n    \"datedAPI\": {\n      \"awayTeam\": \"Miami Marlins\",\n      \"homeTeam\": \"Philadelphia Phillies\",\n      \"matchTime\": \"2026-08-19T22:05:00+00:00\",\n      \"gameMatchTime\": \"2026-08-19T22:05:00+00:00\",\n      \"gameFinalType\": \"Finished\",\n      \"status\": \"scored\",\n      \"jsonoddsId\": \"4ae7ae68-93ba-4a1d-992d-0e680fd9b398\"\n    },\n    \"listedSpeculationIds\": [\n      407,\n      408\n    ],\n    \"listedSpeculation\": true,\n    \"oracleLineTicks\": 0,\n    \"lineDiffersFromOracle\": false,\n    \"bucket\": \"b_settled_claimable\"\n  }"
+      },
+      "history": {
+        "source": "stage-maker-a.pages.json",
+        "rowIndex": 436,
+        "rawSha256": "02af0db13fc9353bcb91bffdc838c13b41b3064aa7eb275cf725d9436f157b8e",
+        "raw": "{\n      \"speculationId\": \"407\",\n      \"positionType\": 1,\n      \"riskAmountUSDC\": 3.7974,\n      \"profitAmountUSDC\": 2.999946,\n      \"claimed\": false,\n      \"positionCreatedAt\": \"2026-08-19T15:01:06+00:00\"\n    }"
+      }
+    }
+  ]
+}

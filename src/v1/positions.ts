@@ -36,6 +36,7 @@ import type {
   ClaimablePosition,
   PendingSettlePosition,
   PositionBase,
+  PositionEnumeration,
 } from './utils/positionFetch.js';
 import { nextCursor, parseRecovery, recoveryKeysetExpr } from '../lib/recovery.js';
 import type { ApiError } from '../middleware/errorHandler.js';
@@ -294,6 +295,9 @@ interface StatusResponse {
   active: PositionBase[];
   pendingSettle: PendingSettlePosition[];
   claimable: ClaimablePosition[];
+  /** All scored/open controlled positions, including losers; not a payout bucket. */
+  settlementCandidates: PositionBase[];
+  enumeration: PositionEnumeration;
   totals: {
     activeCount: number;
     pendingSettleCount: number;
@@ -319,7 +323,7 @@ export async function getPositionStatusHandler(req: Request, res: Response): Pro
 
   let result;
   try {
-    result = await fetchCategorizedPositions(address);
+    result = await fetchCategorizedPositions(address, { complete: true });
   } catch (err) {
     logger.error({ err: formatError(err) }, 'positions: status fetch failed');
     res.status(500).json({ error: 'Failed to categorize positions.', code: 'INTERNAL_ERROR' } satisfies ApiError);
@@ -337,6 +341,8 @@ export async function getPositionStatusHandler(req: Request, res: Response): Pro
     active: result.active,
     pendingSettle: result.pendingSettle,
     claimable: result.claimable,
+    settlementCandidates: result.settlementCandidates,
+    enumeration: result.enumeration,
     totals: {
       activeCount: result.active.length,
       pendingSettleCount: result.pendingSettle.length,
@@ -438,7 +444,7 @@ export async function getClaimParamsHandler(req: Request, res: Response): Promis
 
   let result;
   try {
-    result = await fetchCategorizedPositions(address);
+    result = await fetchCategorizedPositions(address, { complete: true });
   } catch (err) {
     logger.error({ err: formatError(err) }, 'positions: claim-params fetch failed');
     res.status(500).json({ error: 'Failed to fetch claimable positions.', code: 'INTERNAL_ERROR' } satisfies ApiError);

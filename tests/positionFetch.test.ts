@@ -540,6 +540,7 @@ describe('fetchCategorizedPositions — mixed and edge cases', () => {
       claimable: [],
       hitCap: false,
       derivedStatuses: [],
+      settlementCandidates: [],
     });
   });
 
