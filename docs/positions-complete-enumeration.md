@@ -13,4 +13,15 @@ Public `GET /v1/positions/:address/status` and `claim-params` explicitly opt int
 
 Rollout is separately approved: deploy this producer before the MVE consumer. The companion consumer must require the new `settledLost` array as well as complete-enumeration metadata and exact raw/union reconciliation; older status bodies must not be interpreted as complete. No deployment, live settlement, claim, SDK pin/build change, or own-state cap removal is authorized by this PR.
 
+## Classification bound and deferred adjacent work
+
+The exclusion of closed/`tbd` relies on the registered moneyline, spread and total scorers returning only `{Away, Home, Over, Under, Push}` on successful scoring. Atomic indexer writes are not the guarantee: settlement does not enforce a non-TBD result, and the indexer's unknown-outcome fallback is `tbd`. If an inconsistent closed/`tbd` row exists, the strict raw/union mismatch blocks that wallet's entire consumer lane. Identity reconciliation detects omission and contradiction, not a producer misclassification whose fields are stamped by the same branch that chose its bucket.
+
+Within REST-visible positive-risk, unclaimed positions, the own-state advisory `settledLost` label is broader than this REST bucket: it also includes closed/`tbd` rows and open predicted losers. The REST bucket contains only authoritative closed losses. Do not substitute one for the other.
+
+Two pre-existing behaviors remain separate follow-ups, not fixes in #74:
+
+- **Own-state 200-row cap:** terminal losses remain unclaimed with positive historical risk and no payout/transfer clearing path, so they can permanently consume the default capped query's budget and keep `positionsTruncated`/the MM health hold asserted. A durable correction must exclude terminal rows before applying the actionable own-state cap (without falsifying raw complete-enumeration evidence), and prove with more than 200 terminal losses plus actionable rows that health recovers without hiding live exposure. Raising the cap only delays the problem. This source finding does not establish whether any live maker is currently latched.
+- **History/list totals:** `GET /v1/positions/:address` still reports page-scoped sums alongside full-set `totalCount`, and counts unclaimed settled losses in `activeCount`. A separate contract/documentation correction must make aggregation scope explicit and pin terminal-loss classification across multiple pages. This status correction leaves that endpoint unchanged.
+
 Tests use an in-memory query double and explicitly mapped historical ledger rows. The immutable fixture includes exact captured-row strings, source hashes and row indexes. Synthetic database IDs/timestamps are labeled; these are not live response or transaction evidence.

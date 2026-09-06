@@ -890,7 +890,7 @@ src/
     games.ts           # GET /v1/games, /:gameId
     teams.ts           # GET /v1/teams/aliases
     utils/
-      positionFetch.ts # categorize active/pendingSettle/claimable (Supabase-only)
+      positionFetch.ts # categorize active/pendingSettle/claimable/settlementCandidates/settledLost (Supabase-only)
       speculations.ts  # shared Speculation wire shape + row→Speculation converters
       odds.ts          # shared per-market odds shapes + row→shape mapper (REST + stream)
 ```

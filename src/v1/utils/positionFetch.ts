@@ -410,9 +410,9 @@ export async function fetchCategorizedPositions(
     const positionType = POSITION_TYPE_TO_INT[p.position_type];
     const market: MarketType = spec.market_type ?? 'moneyline';
 
-    // Compute derived state from the same join — pushed to
-    // derivedStatuses unconditionally, even when the row is dropped
-    // from the buckets below (e.g. settledLost predicted-losers).
+    // Compute advisory own-state status from the same join, independently
+    // of REST bucket membership. Its broader settledLost label also covers
+    // open predicted losers and unclassified closed/tbd rows.
     const sourceUpdatedAt = maxIsoTimestamptz(
       p.row_updated_at,
       spec.row_updated_at,
