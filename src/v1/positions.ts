@@ -7,7 +7,7 @@
  *                                            maker + taker).
  *   GET /v1/positions/claim-result/:txHash — parse PositionClaimed event.
  *   GET /v1/positions/:address/claim-params — txParams for claimable rows
- *   GET /v1/positions/:address/status      — categorized active|claimable
+ *   GET /v1/positions/:address/status      — categorized positions + terminal losses
  *   GET /v1/positions/:address             — paginated history (existing).
  *
  * Out of scope (no analog in the current protocol):
@@ -37,6 +37,7 @@ import type {
   PendingSettlePosition,
   PositionBase,
   PositionEnumeration,
+  SettledLostPosition,
 } from './utils/positionFetch.js';
 import { nextCursor, parseRecovery, recoveryKeysetExpr } from '../lib/recovery.js';
 import type { ApiError } from '../middleware/errorHandler.js';
@@ -287,7 +288,7 @@ export async function getPositionsRecoveryHandler(req: Request, res: Response): 
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// GET /v1/positions/:address/status   (categorized active | claimable)
+// GET /v1/positions/:address/status   (categorized positions + terminal losses)
 // ──────────────────────────────────────────────────────────────────────
 
 interface StatusResponse {
@@ -297,6 +298,8 @@ interface StatusResponse {
   claimable: ClaimablePosition[];
   /** All scored/open controlled positions, including losers; not a payout bucket. */
   settlementCandidates: PositionBase[];
+  /** Closed losing positions: historical identity, never exposure, work, or payout. */
+  settledLost: SettledLostPosition[];
   enumeration: PositionEnumeration;
   totals: {
     activeCount: number;
@@ -342,6 +345,7 @@ export async function getPositionStatusHandler(req: Request, res: Response): Pro
     pendingSettle: result.pendingSettle,
     claimable: result.claimable,
     settlementCandidates: result.settlementCandidates,
+    settledLost: result.settledLost,
     enumeration: result.enumeration,
     totals: {
       activeCount: result.active.length,

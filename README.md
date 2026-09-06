@@ -17,7 +17,7 @@ Live on Polygon mainnet. The API surface today:
 - `GET /v1/auth/domain` — EIP-712 self-discovery: the signing `domain`, every registered action's typed-field schema, and a per-endpoint map of which `action.type` each signed endpoint accepts. Copy `domain` + the action's fields straight into `wallet.signTypedData(...)`. Returns `503 NOT_READY` if `MATCHING_MODULE_ADDRESS` is unset
 - `GET /v1/config/public` — bootstrap config for public clients: `{supabaseUrl, supabaseAnonKey, network, chainId}`. The Supabase key served here is the **publishable** key and is public by design — it is gated by row-level security, and grants only the anonymous read access the protocol already exposes. Returns `503 NOT_READY` if `SUPABASE_ANON_KEY` is unset
 - `GET /v1/positions/:address` — wallet position history
-- `GET /v1/positions/:address/status` — categorized active / pendingSettle / claimable
+- `GET /v1/positions/:address/status` — active / pendingSettle / claimable, settlement candidates, and non-actionable settled losses
 - `GET /v1/positions/:address/claim-params` — ordered `txParams[]` action plan
   (one `claimPosition` step for settled rows; `settleSpeculation` then `claimPosition` for
   rows whose contest is scored but whose speculation is still open)
@@ -376,15 +376,19 @@ Query params: `limit` (max 200), `offset`.
 
 #### `GET /v1/positions/:address/status`
 
-Returns the wallet's unclaimed positions split into three buckets:
+Returns the wallet's positive-risk, unclaimed positions in these buckets (all arrays are present, including when empty):
 
 - **`active`** — speculation still open AND parent contest not yet `Scored`. Nothing the user can do yet.
 - **`pendingSettle`** — speculation still open but the parent contest's `contest_status = 'scored'` on-chain. Anyone can call `SpeculationModule.settleSpeculation(speculationId)` (permissionless) to finalize, after which the position becomes claimable. Predicted-loser rows are filtered out (settling them would just expose `NoPayout` on the subsequent `claimPosition`).
 - **`claimable`** — speculation closed (already settled), position has non-zero expected payout.
+- **`settlementCandidates`** — all controlled positions on scored contests with open speculations, including predicted losers and unavailable predictions. This is settlement work, **not** a payout bucket; deduplicate `speculationId` before settling. It overlaps `pendingSettle` and may overlap `active` when prediction inputs are missing.
+- **`settledLost`** — speculation closed with an authoritative losing `win_side`. These rows remain `claimed=false` with positive historical risk because `claimPosition` would revert with `NoPayout`. They are terminal identity only: **not active exposure, settlement/claim work, or money owed**. Open predicted losers are not settled losses; they remain `settlementCandidates`.
 
 Each entry has `positionId`, `speculationId`, `positionType`, `team`, `opponent`, `market`, `oddsDecimal`, `riskAmountUSDC`, `profitAmountUSDC`. **Claimable** entries also have `result` (`won`/`push`/`void`), `estimatedPayoutUSDC` (full precision, no rounding), and `estimatedPayoutWei6` (raw uint256-as-string). **PendingSettle** entries carry the same `result` / `estimatedPayoutUSDC` / `estimatedPayoutWei6` fields plus `predictedWinSide` (`away`/`home`/`over`/`under`/`push`) — derived off-chain by replaying the on-chain scorer logic against `contests.{away_score, home_score}` and `speculations.line_ticks`. Once `settleSpeculation` runs the on-chain `winSide` will match.
 
-Top-level `totals` mirrors all three buckets:
+All entries also carry `contestId`, `sport`, `awayTeam`, `homeTeam`, `riskAmountWei6`, `counterpartyRiskWei6`, and `updatedAtUnixSec`. A **settledLost** entry is this same structured position detail (`PositionBase`) plus `result: "lost"`, with no `estimatedPayout*`, `predictedWinSide`, or `txParams`. Identity is `positionId = "${speculationId}_${lowercaseAddress}_${positionType}"`; `speculationId` and `contestId` are strings, and `positionType` is numeric 0 (upper) or 1 (lower). Its risk/profit fields are historical only and must never be added to active exposure or payout totals.
+
+Top-level `totals` is unchanged; it excludes `settledLost` and `settlementCandidates`:
 
 | Field | What it sums |
 |---|---|
@@ -394,9 +398,9 @@ Top-level `totals` mirrors all three buckets:
 | `estimatedPayoutUSDC` / `estimatedPayoutWei6` | claimable-only payouts (ready to sweep right now) |
 | `pendingSettlePayoutUSDC` / `pendingSettlePayoutWei6` | pendingSettle-only predicted payouts (require an extra `settleSpeculation` call before they materialize) |
 
-Wei6 totals are aggregated in bigint to avoid float-rounding loss across many rows; the USDC float is the bigint sum divided by 1e6. Capped at 200 unclaimed positions per address.
+Wei6 totals are aggregated in bigint to avoid float-rounding loss across many rows; the USDC float is the bigint sum divided by 1e6. Public status and claim-params enumerate all raw positive-risk, unclaimed rows using strict immutable `id DESC` keyset pages and bounded joins of 199 rows. `enumeration = {complete:true,pageSize:199,pages,positionCount}` reports raw reads/rows **before categorization**, not a bucket sum. Completeness consumers must compare `positionCount` to the stable-identity **union** of all five buckets, not weaken the raw count or double-count candidates. Missing joins/read failures return errors rather than partial buckets. See [complete enumeration](docs/positions-complete-enumeration.md) for scan guarantees and consumer compatibility.
 
-Filtering matches the contract exactly: `claimPosition` reverts with `PositionModule__NoPayout` when `riskAmount == 0 || payout == 0`. The filter is done in wei6 (bigint), so sub-cent payouts that ARE claimable on-chain still appear in the response. Lost positions are excluded (the contract would revert with `NoPayout`); positions on still-open speculations whose parent contest is not yet scored go in `active`. There is no `withdrawable` bucket — see note below.
+Payable filtering matches the contract exactly: `claimPosition` reverts with `PositionModule__NoPayout` when `riskAmount == 0 || payout == 0`. The filter is done in wei6 (bigint), so sub-cent payouts that ARE claimable on-chain still appear in the response. Settled losses appear only in `settledLost`, never payable buckets; closed push (draw) and void refunds remain `claimable`. Positions on still-open speculations whose parent contest is not yet scored go in `active`. Open-void behavior is unchanged (still active, not settlement/claim work); addressing that separately accepted completion issue is out of scope. There is no `withdrawable` bucket — see note below.
 
 This endpoint reads `speculations.market_type` and `contests.{contest_status, away_score, home_score}` directly (all populated by the indexer) and does not depend on the `SCORER_*_ADDRESS` env vars — those are only required for `POST /v1/commitments`.
 
@@ -404,7 +408,7 @@ This endpoint reads `speculations.market_type` and `contests.{contest_status, aw
 
 Returns ready-to-sign tx params for every claimable AND pendingSettle position. `claimPosition` takes `(speculationId, positionType)` — positions are uniquely identified by `(speculationId, user, positionType)`.
 
-Same filter / market_type / scorer-replay semantics as `/status` above.
+Same payable filter / market_type / scorer-replay semantics as `/status` above. Neither `settledLost` nor predicted-loser `settlementCandidates` contributes claim plans; this response remains payable-only with no terminal-loss bucket.
 
 Response shape:
 
@@ -886,7 +890,7 @@ src/
     games.ts           # GET /v1/games, /:gameId
     teams.ts           # GET /v1/teams/aliases
     utils/
-      positionFetch.ts # categorize active/pendingSettle/claimable (Supabase-only)
+      positionFetch.ts # categorize active/pendingSettle/claimable/settlementCandidates/settledLost (Supabase-only)
       speculations.ts  # shared Speculation wire shape + row→Speculation converters
       odds.ts          # shared per-market odds shapes + row→shape mapper (REST + stream)
 ```

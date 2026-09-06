@@ -48,10 +48,11 @@
  * "must match", which is a rule prose cannot enforce; a third consumer made
  * that the moment to have one.
  *
- * What is NOT shared, and should not be: the snapshot helper returns BUCKETED
- * rows already filtered to active/pendingSettle/claimable, while this returns
- * the canonical enum INCLUDING terminal losers, which the snapshot
- * intentionally drops.
+ * What is NOT shared, and should not be: fetchCategorizedPositions returns
+ * REST buckets including settlementCandidates and settledLost, while
+ * loadOwnStateSnapshot selects active/pendingSettle/claimable for its rows.
+ * This derivation returns the broader advisory enum INCLUDING terminal losers,
+ * which that snapshot projection intentionally drops.
  */
 
 import { didWin, predictWinSide } from '../../lib/speculation.js';

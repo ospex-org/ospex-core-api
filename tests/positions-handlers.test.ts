@@ -71,9 +71,12 @@ describe('GET /v1/positions/:address/status', () => {
     expect(res.body).toMatchObject({ code: 'INVALID_PARAM' });
   });
 
-  it('returns three buckets with summed totals', async () => {
+  it('returns terminal losses without including historical risk in counts or money totals', async () => {
     fetchMock.fetchCategorizedPositions.mockResolvedValueOnce({
       active: [{ positionId: 'a', speculationId: '1' }],
+      settledLost: [{ positionId: 'lost', speculationId: '4', contestId: '42', positionType: 1, result: 'lost', riskAmountWei6: '999999999' }],
+      settlementCandidates: [{ positionId: 'p', speculationId: '2' }],
+      enumeration: { complete: true, pageSize: 199, pages: 1, positionCount: 4 },
       pendingSettle: [
         {
           positionId: 'p',
@@ -114,6 +117,8 @@ describe('GET /v1/positions/:address/status', () => {
     expect(res.statusCode).toBe(200);
     expect(res.body).toMatchObject({
       address: ADDR,
+      settledLost: [{ positionId: 'lost', speculationId: '4', contestId: '42', positionType: 1, result: 'lost', riskAmountWei6: '999999999' }],
+      enumeration: { complete: true, pageSize: 199, pages: 1, positionCount: 4 },
       totals: {
         activeCount: 1,
         pendingSettleCount: 1,

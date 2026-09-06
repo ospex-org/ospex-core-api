@@ -30,9 +30,9 @@ async function invoke(handler: typeof getPositionStatusHandler, address = ADDRES
 beforeEach(() => vi.clearAllMocks());
 
 describe('bounded complete positions enumeration', () => {
-  it('scans 450 raw rows through an entirely filtered first page, tied/null timestamps, and bounded joins', async () => {
+  it('scans 450 raw rows through a settledLost-only first page, tied/null timestamps, and bounded joins', async () => {
     const tables = scaleTables(450);
-    // Newest 199 are closed losers: no public bucket rows at all on page 1.
+    // Newest 199 are closed losers: terminal identity, never exposure or payout.
     for (const s of tables.speculations) {
       if (Number(s.speculation_id) >= 252) { s.speculation_status = 'closed'; s.win_side = 'home'; }
     }
@@ -61,9 +61,18 @@ describe('bounded complete positions enumeration', () => {
     expect(res.body.active).toHaveLength(198);
     expect(res.body.pendingSettle).toMatchObject([{ speculationId: '200', result: 'won' }]);
     expect(res.body.claimable).toMatchObject([{ speculationId: '1', result: 'won' }]);
+    const lost = res.body.settledLost as Array<{ speculationId: string; positionId: string; result: string }>;
+    expect(lost).toHaveLength(199);
+    expect(lost.map((p) => p.speculationId)).toEqual(Array.from({ length: 199 }, (_, i) => String(450 - i)));
+    expect(lost.every((p) => p.result === 'lost')).toBe(true);
+    const delivered = ['active', 'pendingSettle', 'claimable', 'settlementCandidates', 'settledLost']
+      .flatMap((bucket) => res.body[bucket] as Array<{ positionId: string }>);
+    // Candidates overlap pendingSettle: completeness is a union, NOT a sum.
+    expect(new Set(delivered.map((p) => p.positionId)).size).toBe(450);
     const candidates = res.body.settlementCandidates as Array<{ speculationId: string }>;
     expect(candidates.map((p) => p.speculationId)).toEqual(Array.from({ length: 52 }, (_, i) => String(251 - i)));
-    expect(res.body.totals).toMatchObject({ pendingSettleCount: 1, pendingSettlePayoutWei6: '25000', estimatedPayoutWei6: '25000' });
+    expect(res.body.totals).toEqual({ activeCount: 198, pendingSettleCount: 1, claimableCount: 1,
+      pendingSettlePayoutUSDC: 0.025, pendingSettlePayoutWei6: '25000', estimatedPayoutUSDC: 0.025, estimatedPayoutWei6: '25000' });
     const pages = sb.queries.filter((q) => q.table === 'positions');
     expect(pages.map((q) => q.lt)).toEqual([[], [['id', '252']], [['id', '53']]]);
     for (const q of pages) {
@@ -78,6 +87,18 @@ describe('bounded complete positions enumeration', () => {
       expect(joins.map((q) => q.joins[0]![1].length)).toEqual([199, 199, 52]);
       for (const q of joins) expect(q.eq).toEqual([['network', 'polygon']]);
     }
+    // Terminal historical risk never enters either kind of payable plan.
+    const params = await invoke(getClaimParamsHandler);
+    expect(params.statusCode).toBe(200);
+    expect(params.body.positions).toMatchObject([
+      { speculationId: '1', bucket: 'claimable', estimatedPayoutWei6: '25000', txParams: [
+        { method: 'claimPosition', target: 'PositionModule', args: { speculationId: '1', positionType: 0 } },
+      ] },
+      { speculationId: '200', bucket: 'pendingSettle', estimatedPayoutWei6: '25000', txParams: [
+        { method: 'settleSpeculation', target: 'SpeculationModule', args: { speculationId: '200' } },
+        { method: 'claimPosition', target: 'PositionModule', args: { speculationId: '200', positionType: 0 } },
+      ] },
+    ]);
   });
 
   it.each([0, 1, 199, 200, 398])('enumerates %i rows; pages counts successful reads including the terminal empty page', async (count) => {
