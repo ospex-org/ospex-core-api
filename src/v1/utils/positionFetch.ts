@@ -30,19 +30,22 @@
  *                     `settleSpeculation` followed by `claimPosition`.
  *                     Predicted result + payout are computed from the
  *                     contest scores by replaying the scorer logic.
- *                     Lost positions are filtered out (settling them
- *                     would be wasted gas — `claimPosition` reverts
- *                     with NoPayout, and nothing else gates the eventual
- *                     auto-void path either).
+ *                     Lost positions are filtered out of this payout
+ *                     bucket (`claimPosition` reverts with NoPayout).
+ *   - settlementCandidates — ALL positive-risk unclaimed positions on
+ *                     scored contests with open speculations, including
+ *                     predicted losers and rows with missing prediction
+ *                     inputs. Settlement can release counterparty funds
+ *                     even when the controlled position itself lost.
  *   - claimable     — speculation_status = 'closed', claimed = false,
  *                     estimated payout > 0 (won, push, or void; lost
  *                     positions have payout = 0 and are filtered out
  *                     because `claimPosition` reverts with NoPayout)
  *
- * Hard-coded query cap of 200 unclaimed positions per address. The
- * agent-server used the same cap; preserving the behavior keeps a
- * runaway wallet (or a maker-bot bug) from causing a multi-second
- * Supabase query.
+ * Default: one capped 200-row query, preserving the own-state snapshot
+ * budget and raw hitCap signal. Public status/claim-params explicitly
+ * opt into a complete scan using <=199-row immutable-id keyset pages.
+ * Complete scans fail closed; no partial buckets escape on any read error.
  */
 
 import { getSupabase } from '../../lib/supabase.js';
@@ -57,6 +60,7 @@ import {
 import { maxIsoTimestamptz } from '../ownState/timestamps.js';
 
 const POSITION_QUERY_LIMIT = 200;
+const COMPLETE_PAGE_SIZE = 199;
 
 const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower: 1 };
 const POSITION_TYPE_FROM_INT: Record<0 | 1, 'upper' | 'lower'> = { 0: 'upper', 1: 'lower' };
@@ -142,6 +146,10 @@ export interface PositionFetchResult {
   active: PositionBase[];
   pendingSettle: PendingSettlePosition[];
   claimable: ClaimablePosition[];
+  /** Settlement work, NOT a payout bucket. Deduplicate speculationId before settling. */
+  settlementCandidates: PositionBase[];
+  /** Present only for explicitly requested complete enumeration. */
+  enumeration?: PositionEnumeration;
   /**
    * `true` when the raw `positions` DB query returned exactly
    * `POSITION_QUERY_LIMIT` rows — the categorization happens AFTER that
@@ -164,7 +172,18 @@ export interface PositionFetchResult {
   derivedStatuses: DerivedPositionStatus[];
 }
 
+export interface PositionEnumeration {
+  complete: true;
+  pageSize: 199;
+  /** Successful raw-position reads, including a terminal empty read if needed. */
+  pages: number;
+  /** Raw positive-risk unclaimed rows, BEFORE categorization drops losers. */
+  positionCount: number;
+}
+
 interface PositionRow {
+  /** Immutable bigint identity, selected only for complete enumeration. */
+  id?: string | number;
   speculation_id: number;
   user_address: string;
   position_type: 'upper' | 'lower';
@@ -204,8 +223,29 @@ function impliedOddsDecimal(risk: bigint, profit: bigint | null): number | null 
   return 1 + Number(profit) / Number(risk);
 }
 
+function positionIdentity(row: PositionRow): bigint {
+  const id = row.id;
+  if (
+    (typeof id !== 'string' && typeof id !== 'number') ||
+    (typeof id === 'number' && !Number.isSafeInteger(id)) ||
+    !/^(0|[1-9]\d*)$/.test(String(id))
+  ) {
+    throw new Error('fetchCategorizedPositions positions: invalid or unsafe identity');
+  }
+  return BigInt(id);
+}
+
+export function fetchCategorizedPositions(
+  address: string,
+  options: { complete: true },
+): Promise<PositionFetchResult & { enumeration: PositionEnumeration }>;
+export function fetchCategorizedPositions(
+  address: string,
+  options?: { complete?: boolean },
+): Promise<PositionFetchResult>;
 export async function fetchCategorizedPositions(
   address: string,
+  options: { complete?: boolean } = {},
 ): Promise<PositionFetchResult> {
   const config = loadConfig();
   const sb = getSupabase();
@@ -224,24 +264,63 @@ export async function fetchCategorizedPositions(
   // (Closed-speculation zero-risk rows are already filtered later,
   // by the `riskWei6 === 0n || payoutWei6 === 0n` check that mirrors
   // the contract's `PositionModule__NoPayout` guard.)
-  const posRes = await sb
-    .from('positions')
-    .select('speculation_id, user_address, position_type, risk_amount, profit_amount, claimed, position_created_at, row_updated_at')
-    .eq('network', config.network)
-    .eq('user_address', lowerAddress)
-    .eq('claimed', false)
-    .gt('risk_amount', 0)
-    .order('position_created_at', { ascending: false, nullsFirst: false })
-    .limit(POSITION_QUERY_LIMIT);
-
-  if (posRes.error) throw new Error(`fetchCategorizedPositions positions: ${posRes.error.message}`);
-  const positions = (posRes.data ?? []) as unknown as PositionRow[];
+  const positions: PositionRow[] = [];
+  let pages = 0;
+  let beforeId: bigint | undefined;
+  const columns = 'speculation_id, user_address, position_type, risk_amount, profit_amount, claimed, position_created_at, row_updated_at';
+  do {
+    let query = sb.from('positions')
+      .select(options.complete ? `id, ${columns}` : columns)
+      .eq('network', config.network)
+      .eq('user_address', lowerAddress)
+      .eq('claimed', false)
+      .gt('risk_amount', 0);
+    if (options.complete) {
+      // Immutable id, not mutable row_updated_at or nullable/tied creation
+      // timestamps. DESC avoids chasing new inserts at the head. Strict <
+      // never skips the older tail when earlier rows become claimed; OFFSET
+      // on this shrinking set would. This is a scan, not an atomic snapshot.
+      if (beforeId !== undefined) query = query.lt('id', beforeId.toString());
+      query = query.order('id', { ascending: false }).limit(COMPLETE_PAGE_SIZE);
+    } else {
+      query = query.order('position_created_at', { ascending: false, nullsFirst: false })
+        .limit(POSITION_QUERY_LIMIT);
+    }
+    const posRes = await query;
+    if (posRes.error) throw new Error(`fetchCategorizedPositions positions: ${posRes.error.message}`);
+    if (options.complete && !Array.isArray(posRes.data)) {
+      throw new Error('fetchCategorizedPositions positions: missing page data');
+    }
+    const page = (posRes.data ?? []) as unknown as PositionRow[];
+    pages++;
+    if (options.complete) {
+      if (page.length > COMPLETE_PAGE_SIZE) {
+        throw new Error('fetchCategorizedPositions positions: oversized page');
+      }
+      // Validate EVERY raw row (including short pages and predicted losers),
+      // not just the last cursor. A repeated/overlapping/out-of-order page
+      // must fail instead of looping forever or advertising completeness.
+      for (const row of page) {
+        const id = positionIdentity(row);
+        if (beforeId !== undefined && id >= beforeId) {
+          throw new Error('fetchCategorizedPositions positions: non-advancing keyset page');
+        }
+        beforeId = id;
+      }
+    }
+    positions.push(...page);
+    if (!options.complete || page.length < COMPLETE_PAGE_SIZE) break;
+  } while (true);
+  const enumeration: PositionEnumeration | undefined = options.complete
+    ? { complete: true, pageSize: COMPLETE_PAGE_SIZE, pages, positionCount: positions.length }
+    : undefined;
   // Raw-cap signal — `>=` (not `===`) tolerates a future Supabase quirk where
   // PostgREST returns 201 on a `limit(200)`; the predicate here is "did we
   // saturate the cap budget?".
-  const hitCap = positions.length >= POSITION_QUERY_LIMIT;
+  const hitCap = !options.complete && positions.length >= POSITION_QUERY_LIMIT;
   if (positions.length === 0) {
-    return { active: [], pendingSettle: [], claimable: [], hitCap, derivedStatuses: [] };
+    return { active: [], pendingSettle: [], claimable: [], settlementCandidates: [], hitCap, derivedStatuses: [],
+      ...(enumeration ? { enumeration } : {}) };
   }
 
   // Step 2: batch-fetch related speculations.
@@ -250,12 +329,14 @@ export async function fetchCategorizedPositions(
   // doesn't depend on SCORER_*_ADDRESS env config.
   const specIds = [...new Set(positions.map((p) => p.speculation_id))];
   const specById = new Map<number, SpeculationRow>();
-  if (specIds.length > 0) {
-    const specRes = await sb
+  for (let start = 0, size = options.complete ? COMPLETE_PAGE_SIZE : specIds.length; start < specIds.length; start += size) {
+    let query = sb
       .from('speculations')
       .select('speculation_id, contest_id, market_type, line_ticks, speculation_status, win_side, row_updated_at')
       .eq('network', config.network)
-      .in('speculation_id', specIds);
+      .in('speculation_id', specIds.slice(start, start + size));
+    if (options.complete) query = query.limit(COMPLETE_PAGE_SIZE);
+    const specRes = await query;
     if (specRes.error) throw new Error(`fetchCategorizedPositions speculations: ${specRes.error.message}`);
     const specs = (specRes.data ?? []) as unknown as SpeculationRow[];
     for (const s of specs) specById.set(s.speculation_id, s);
@@ -275,12 +356,14 @@ export async function fetchCategorizedPositions(
     ),
   ];
   const contestById = new Map<number, ContestRow>();
-  if (contestIds.length > 0) {
-    const contestRes = await sb
+  for (let start = 0, size = options.complete ? COMPLETE_PAGE_SIZE : contestIds.length; start < contestIds.length; start += size) {
+    let query = sb
       .from('contests')
       .select('contest_id, away_team, home_team, sport_slug, contest_status, away_score, home_score, row_updated_at')
       .eq('network', config.network)
-      .in('contest_id', contestIds);
+      .in('contest_id', contestIds.slice(start, start + size));
+    if (options.complete) query = query.limit(COMPLETE_PAGE_SIZE);
+    const contestRes = await query;
     if (contestRes.error) throw new Error(`fetchCategorizedPositions contests: ${contestRes.error.message}`);
     const contests = (contestRes.data ?? []) as unknown as ContestRow[];
     for (const c of contests) contestById.set(c.contest_id, c);
@@ -298,13 +381,20 @@ export async function fetchCategorizedPositions(
   const active: PositionBase[] = [];
   const pendingSettle: PendingSettlePosition[] = [];
   const claimable: ClaimablePosition[] = [];
+  const settlementCandidates: PositionBase[] = [];
   const derivedStatuses: DerivedPositionStatus[] = [];
 
   for (const p of positions) {
     const spec = specById.get(p.speculation_id);
+    if (options.complete && !spec) {
+      throw new Error(`fetchCategorizedPositions speculations: missing join for ${p.speculation_id}`);
+    }
     if (!spec) continue; // shouldn't happen; skip orphans defensively
 
     const contest = spec.contest_id != null ? contestById.get(spec.contest_id) : undefined;
+    if (options.complete && !contest) {
+      throw new Error(`fetchCategorizedPositions contests: missing join for ${p.speculation_id}`);
+    }
     const positionType = POSITION_TYPE_TO_INT[p.position_type];
     const market: MarketType = spec.market_type ?? 'moneyline';
 
@@ -415,6 +505,12 @@ export async function fetchCategorizedPositions(
     }
 
     // speculation_status === 'open'
+    if (contest?.contest_status === 'scored' && !p.claimed && riskWei6 > 0n) {
+      // Independent of predicted winner OR availability of prediction
+      // inputs. A losing controlled side can still finalize the market
+      // for its winning counterparty. Do not add losers to payout buckets.
+      settlementCandidates.push(base);
+    }
     if (
       contest &&
       contest.contest_status === 'scored' &&
@@ -466,7 +562,8 @@ export async function fetchCategorizedPositions(
     active.push(base);
   }
 
-  return { active, pendingSettle, claimable, hitCap, derivedStatuses };
+  return { active, pendingSettle, claimable, settlementCandidates, hitCap, derivedStatuses,
+    ...(enumeration ? { enumeration } : {}) };
 }
 
 /** Convenience for callers needing the on-chain enum string back from the int. */
