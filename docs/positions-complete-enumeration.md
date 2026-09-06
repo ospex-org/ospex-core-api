@@ -1,6 +1,6 @@
 # Public positions status: bounded complete enumeration
 
-Public `GET /v1/positions/:address/status` and `claim-params` explicitly opt into complete enumeration. Existing SDK/CLI status JSON passes the additive fields through; no SDK/CLI upgrade is part of this change.
+Public `GET /v1/positions/:address/status` and `claim-params` explicitly opt into complete enumeration. The pinned SDK shapes status into `{active, pendingSettle, claimable, totals}`, so the CLI does **not** receive the additive fields. The separately reviewed MVE consumer must read status directly from this public endpoint over HTTPS, retaining the CLI for every write and every other read. No SDK/CLI upgrade is part of this change.
 
 - Raw positive-risk, unclaimed positions are scanned by immutable `id DESC` with strict `id < cursor`, 199 rows per read. Continue past categorized-empty/loser-only pages; only a short raw page terminates the scan. Related speculation/contest joins are chunked at 199.
 - `enumeration = {complete:true,pageSize:199,pages,positionCount}` counts successful raw reads (including terminal empty reads where applicable), and raw positions before payout filtering. An error, stalled cursor, missing identity, or missing join produces an error response, not partial-success metadata.
