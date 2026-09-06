@@ -117,7 +117,7 @@ describe('fetchCategorizedPositions — claimable bucket', () => {
     expect(c.positionId).toBe(`1_${ADDR}_0`);
   });
 
-  it('drops losing closed-speculation positions (would revert with NoPayout)', async () => {
+  it('retains losing closed-speculation identity outside payable buckets (NoPayout)', async () => {
     supabaseMock.getSupabase.mockReturnValue(
       makeSupabase({
         positions: [
@@ -158,6 +158,11 @@ describe('fetchCategorizedPositions — claimable bucket', () => {
     expect(result.claimable).toHaveLength(0);
     expect(result.pendingSettle).toHaveLength(0);
     expect(result.active).toHaveLength(0);
+    expect(result.settlementCandidates).toEqual([]);
+    expect(result.settledLost).toMatchObject([{
+      positionId: `1_${ADDR}_0`, speculationId: '1', contestId: '42', positionType: 0,
+      result: 'lost', riskAmountWei6: '100000000', counterpartyRiskWei6: '90000000',
+    }]);
   });
 
   it('returns push positions in the claimable bucket with payout = risk', async () => {
@@ -541,6 +546,7 @@ describe('fetchCategorizedPositions — mixed and edge cases', () => {
       hitCap: false,
       derivedStatuses: [],
       settlementCandidates: [],
+      settledLost: [],
     });
   });
 

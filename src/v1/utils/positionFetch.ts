@@ -41,6 +41,10 @@
  *                     estimated payout > 0 (won, push, or void; lost
  *                     positions have payout = 0 and are filtered out
  *                     because `claimPosition` reverts with NoPayout)
+ *   - settledLost   — speculation_status = 'closed', claimed = false,
+ *                     authoritative win_side is the opposing side.
+ *                     Terminal identity only, NOT exposure or a payout.
+ *                     Open predicted losers remain settlementCandidates.
  *
  * Default: one capped 200-row query, preserving the own-state snapshot
  * budget and raw hitCap signal. Public status/claim-params explicitly
@@ -89,6 +93,11 @@ export interface ClaimablePosition extends PositionBase {
   result: 'won' | 'push' | 'void';
   estimatedPayoutUSDC: number;
   estimatedPayoutWei6: string;
+}
+
+/** Terminal loss. Risk/profit fields are historical, never payable or active exposure. */
+export interface SettledLostPosition extends PositionBase {
+  result: 'lost';
 }
 
 /**
@@ -148,6 +157,8 @@ export interface PositionFetchResult {
   claimable: ClaimablePosition[];
   /** Settlement work, NOT a payout bucket. Deduplicate speculationId before settling. */
   settlementCandidates: PositionBase[];
+  /** Closed losing positions only; no settlement/claim work or money totals. */
+  settledLost: SettledLostPosition[];
   /** Present only for explicitly requested complete enumeration. */
   enumeration?: PositionEnumeration;
   /**
@@ -177,7 +188,7 @@ export interface PositionEnumeration {
   pageSize: 199;
   /** Successful raw-position reads, including a terminal empty read if needed. */
   pages: number;
-  /** Raw positive-risk unclaimed rows, BEFORE categorization drops losers. */
+  /** Raw positive-risk unclaimed rows, BEFORE categorization; never a bucket count. */
   positionCount: number;
 }
 
@@ -319,7 +330,7 @@ export async function fetchCategorizedPositions(
   // saturate the cap budget?".
   const hitCap = !options.complete && positions.length >= POSITION_QUERY_LIMIT;
   if (positions.length === 0) {
-    return { active: [], pendingSettle: [], claimable: [], settlementCandidates: [], hitCap, derivedStatuses: [],
+    return { active: [], pendingSettle: [], claimable: [], settlementCandidates: [], settledLost: [], hitCap, derivedStatuses: [],
       ...(enumeration ? { enumeration } : {}) };
   }
 
@@ -382,6 +393,7 @@ export async function fetchCategorizedPositions(
   const pendingSettle: PendingSettlePosition[] = [];
   const claimable: ClaimablePosition[] = [];
   const settlementCandidates: PositionBase[] = [];
+  const settledLost: SettledLostPosition[] = [];
   const derivedStatuses: DerivedPositionStatus[] = [];
 
   for (const p of positions) {
@@ -490,7 +502,9 @@ export async function fetchCategorizedPositions(
         // closed but win_side not yet set — shouldn't happen, treat as not claimable
         continue;
       } else {
-        // lost: contract reverts with NoPayout
+        // Closed loss: contract reverts with NoPayout, but retain terminal
+        // identity so raw enumeration can reconcile without inventing work.
+        settledLost.push({ ...base, result: 'lost' });
         continue;
       }
       // Match contract: reject only riskAmount==0 || payout==0.
@@ -562,7 +576,7 @@ export async function fetchCategorizedPositions(
     active.push(base);
   }
 
-  return { active, pendingSettle, claimable, settlementCandidates, hitCap, derivedStatuses,
+  return { active, pendingSettle, claimable, settlementCandidates, settledLost, hitCap, derivedStatuses,
     ...(enumeration ? { enumeration } : {}) };
 }
 
