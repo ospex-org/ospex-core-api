@@ -378,10 +378,10 @@ Query params: `limit` (max 200), `offset`.
 
 Returns the wallet's positive-risk, unclaimed positions in these buckets (all arrays are present, including when empty):
 
-- **`active`** — speculation still open AND parent contest not yet `Scored`. Nothing the user can do yet.
+- **`active`** — speculation still open and no payout bucket claimed the row. Usually the parent contest is `unverified`/`verified` and there is genuinely nothing to do yet, but absence of work is NOT what this bucket means: a `scored` contest with missing prediction inputs, and every `voided` contest, appear here AND in `settlementCandidates`. Read `settlementCandidates` for the work.
 - **`pendingSettle`** — speculation still open but the parent contest's `contest_status = 'scored'` on-chain. Anyone can call `SpeculationModule.settleSpeculation(speculationId)` (permissionless) to finalize, after which the position becomes claimable. Predicted-loser rows are filtered out (settling them would just expose `NoPayout` on the subsequent `claimPosition`).
 - **`claimable`** — speculation closed (already settled), position has non-zero expected payout.
-- **`settlementCandidates`** — all controlled positions on scored contests with open speculations, including predicted losers and unavailable predictions. This is settlement work, **not** a payout bucket; deduplicate `speculationId` before settling. It overlaps `pendingSettle` and may overlap `active` when prediction inputs are missing.
+- **`settlementCandidates`** — all controlled positions with open speculations whose contest is `scored` **or** `voided`, including predicted losers and unavailable predictions. This is settlement work, **not** a payout bucket; deduplicate `speculationId` before settling. It overlaps `pendingSettle` and overlaps `active` whenever prediction inputs are missing or the contest is voided. A voided contest refunds **both** sides their own risk once `settleSpeculation` assigns `void`; that refund amount is not served in any payout bucket yet — see `docs/positions-complete-enumeration.md` for the bound.
 - **`settledLost`** — speculation closed with an authoritative losing `win_side`. These rows remain `claimed=false` with positive historical risk because `claimPosition` would revert with `NoPayout`. They are terminal identity only: **not active exposure, settlement/claim work, or money owed**. Open predicted losers are not settled losses; they remain `settlementCandidates`.
 
 Each entry has `positionId`, `speculationId`, `positionType`, `team`, `opponent`, `market`, `oddsDecimal`, `riskAmountUSDC`, `profitAmountUSDC`. **Claimable** entries also have `result` (`won`/`push`/`void`), `estimatedPayoutUSDC` (full precision, no rounding), and `estimatedPayoutWei6` (raw uint256-as-string). **PendingSettle** entries carry the same `result` / `estimatedPayoutUSDC` / `estimatedPayoutWei6` fields plus `predictedWinSide` (`away`/`home`/`over`/`under`/`push`) — derived off-chain by replaying the on-chain scorer logic against `contests.{away_score, home_score}` and `speculations.line_ticks`. Once `settleSpeculation` runs the on-chain `winSide` will match.
@@ -408,7 +408,7 @@ This endpoint reads `speculations.market_type` and `contests.{contest_status, aw
 
 Returns ready-to-sign tx params for every claimable AND pendingSettle position. `claimPosition` takes `(speculationId, positionType)` — positions are uniquely identified by `(speculationId, user, positionType)`.
 
-Same payable filter / market_type / scorer-replay semantics as `/status` above. Neither `settledLost` nor predicted-loser `settlementCandidates` contributes claim plans; this response remains payable-only with no terminal-loss bucket.
+Same payable filter / market_type / scorer-replay semantics as `/status` above. Neither `settledLost` nor predicted-loser `settlementCandidates` contributes claim plans, and neither does an **open-void** `settlementCandidates` row; this response remains payable-only with no terminal-loss bucket.
 
 Response shape:
 

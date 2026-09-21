@@ -123,14 +123,26 @@ describe('public settledLost terminal identity, never exposure or payout', () =>
     expect(await invoke(getClaimParamsHandler)).toEqual({ address: ADDRESS, positions: [] });
   });
 
-  it('preserves open-void behavior (still active, no settlement/claim plan)', async () => {
+  it('reports an open void as settlement work, with no settled loss, no payout and no claim plan', async () => {
+    // This case used to assert that an open void produced NO settlement
+    // candidate, under a name saying that behaviour was preserved on purpose. It
+    // was the defect in ospex-core-api#77 wearing a passing test's clothes, and
+    // it is the reason no later sweep looked at it. The three properties it was
+    // genuinely protecting are kept below; the candidate expectation is flipped.
     const tables = scaleTables(1);
     tables.contests[0]!.contest_status = 'voided';
     db.getSupabase.mockReturnValue(positionTables(tables));
     const body = await invoke();
+    // Not a settled loss: the speculation is still open, and a void loses nobody.
     expect(body.settledLost).toEqual([]);
+    // Actionable work, which is the fix.
+    expect(body.settlementCandidates).toMatchObject([{ speculationId: '1', positionType: 0 }]);
+    // Still in `active`, so the row does not vanish from the own-state snapshot.
     expect(body.active).toMatchObject([{ speculationId: '1' }]);
-    for (const bucket of ['settlementCandidates', 'pendingSettle', 'claimable']) expect(body[bucket]).toEqual([]);
+    // And still not payable: no payout bucket, no money in totals, no claim plan.
+    // That bound is deliberate and documented — serving the refund amount needs a
+    // coordinated ospex-sdk release, see docs/positions-complete-enumeration.md.
+    for (const bucket of ['pendingSettle', 'claimable']) expect(body[bucket]).toEqual([]);
     expect(body.totals).toEqual({ ...ZERO_TOTALS, activeCount: 1 });
     expect(await invoke(getClaimParamsHandler)).toEqual({ address: ADDRESS, positions: [] });
   });

@@ -296,7 +296,12 @@ interface StatusResponse {
   active: PositionBase[];
   pendingSettle: PendingSettlePosition[];
   claimable: ClaimablePosition[];
-  /** All scored/open controlled positions, including losers; not a payout bucket. */
+  /**
+   * All open-speculation controlled positions whose contest is 'scored' OR
+   * 'voided', including losers; not a payout bucket. A voided contest refunds
+   * both sides, and that refund amount is deliberately not served here — see
+   * `docs/positions-complete-enumeration.md`.
+   */
   settlementCandidates: PositionBase[];
   /** Closed losing positions: historical identity, never exposure, work, or payout. */
   settledLost: SettledLostPosition[];
