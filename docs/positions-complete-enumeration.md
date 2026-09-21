@@ -19,6 +19,20 @@ The exclusion of closed/`tbd` relies on the registered moneyline, spread and tot
 
 Within REST-visible positive-risk, unclaimed positions, the own-state advisory `settledLost` label is broader than this REST bucket: it also includes closed/`tbd` rows and open predicted losers. The REST bucket contains only authoritative closed losses. Do not substitute one for the other.
 
+### The settleable set is bounded by what the row alone proves
+
+`settlementCandidates` admits an open speculation whose contest is `scored` or `voided`. On chain a
+third state is settleable: a `verified` contest past the void cooldown settles to `Void`, and doing so
+is what makes a contest read `voided` at all — `ContestStatus.Voided` has one write site, reachable
+only from inside that cooldown branch. So this bucket catches a stalled contest's sibling speculations
+and not the first one.
+
+That is a stated bound rather than an oversight. `scored` and `voided` are facts the indexer mirrors
+from events; `verified` + past-cooldown is a prediction from a stored timestamp plus the deployment's
+`voidCooldown` immutable, neither of which this endpoint reads, and a wrong constant would advertise
+work whose transaction reverts `ContestNotFinalized`. Tracked as ospex-core-api#79, which also records
+that the right timestamp is `contests.start_time` and not the effective-start view.
+
 ### Open-void refunds: settlement work is served, the refund amount is not
 
 An open speculation on a `voided` contest is reported as settlement work. Its refund is deliberately

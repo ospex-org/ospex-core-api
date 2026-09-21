@@ -135,6 +135,12 @@ export interface ExecutedVerdict {
  * claimable is not. Reporting it as pending would hold the stake in
  * `pendingStakeUsdc` on a bet the protocol has already refunded in principle —
  * caught in review.
+ *
+ * Not in tension with the positions surface, which reports that same row as
+ * settlement WORK (`utils/positionFetch.ts`, `SETTLEABLE_OPEN_CONTEST_STATUSES`).
+ * The two answer different questions: the verdict is decided, and the transaction
+ * that makes the refund claimable has not been sent. Undecided and unsettled are
+ * not the same state.
  */
 function resolveWinSide(
   speculation: ExecutedSpeculation,

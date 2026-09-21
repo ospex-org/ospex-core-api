@@ -238,20 +238,47 @@ interface ContestRow {
 }
 
 /**
- * The contest statuses that put settlement work in front of an OPEN speculation.
+ * The contest statuses that put settlement work in front of an OPEN speculation,
+ * as far as this endpoint can assert it from the row alone.
  *
- * `contest_status` has exactly four values (ospex-indexer writes them; see
- * `ContestRow` above), and only two of them carry an outcome a caller could act on:
+ * `contest_status` has exactly four values — guaranteed by the Postgres enum in
+ * `ospex-indexer/schema/live.sql`, not by the unvalidated `ContestRow` cast above:
  *
- *   - `scored` — the scorer published a result, so `settleSpeculation` can assign
- *     the winning side and release the counterparty's funds.
- *   - `voided` — the contest was voided, so `settleSpeculation` assigns `void` and
- *     BOTH positions become refundable for their own risk.
+ *   - `scored` — the scorer published a result, so `settleSpeculation` assigns the
+ *     winning side and releases the counterparty's funds. IN this set.
+ *   - `voided` — already voided, so `settleSpeculation` assigns `void` and BOTH
+ *     positions become refundable for their own risk. IN this set.
+ *   - `verified` — **settleable too, once the void cooldown has elapsed**, and NOT
+ *     in this set. See the bound below; tracked as #79.
+ *   - `unverified` — unreachable for an open speculation, because creating one
+ *     requires a Verified contest. Kept as a defensive negative control only.
  *
- * `unverified` and `verified` have no outcome on chain yet, so there is nothing to
- * settle. Enumerated as a set rather than written as `!== 'unverified'` on purpose:
- * membership here is what makes a row actionable, so a fifth status must be
- * classified deliberately instead of being admitted by a negation.
+ * ## The bound: `voided` is a CONSEQUENCE of settlement, not a precondition
+ *
+ * `SpeculationModule.settleSpeculation`'s post-scored branch fires on the clock
+ * alone, and voids a still-`Verified` contest itself on the way through:
+ *
+ *     if (block.timestamp >= contestStartTime + i_voidCooldown) {
+ *         if (contest.contestStatus == ContestStatus.Verified) {
+ *             contestModule.voidContest(s.contestId);
+ *         }
+ *         ... winSide = Void
+ *
+ * `ContestStatus.Voided` has exactly one write site, reachable only from that
+ * call — so a contest reads `voided` BECAUSE someone already settled the first
+ * speculation on it while it was `verified`. This set therefore catches the
+ * sibling speculations and not the first one, which is the settlement that starts
+ * a stalled contest's refund.
+ *
+ * That gap is deliberate rather than overlooked, and it is #79 rather than a line
+ * here, because `verified` + past-cooldown is a PREDICTION from a stored timestamp
+ * plus the deployment's `voidCooldown` immutable — neither of which this endpoint
+ * reads — where `scored` and `voided` are facts the indexer mirrors from events.
+ * Advertising work on a wrong constant reverts `ContestNotFinalized`.
+ *
+ * Enumerated as a set rather than written as a negation on purpose: membership is
+ * what makes a row actionable, so a status must be classified deliberately instead
+ * of being admitted by default.
  */
 const SETTLEABLE_OPEN_CONTEST_STATUSES: ReadonlySet<ContestRow['contest_status']> =
   new Set<ContestRow['contest_status']>(['scored', 'voided']);
@@ -618,7 +645,11 @@ export async function fetchCategorizedPositions(
       continue;
     }
 
-    // Open speculation, contest not yet scored. Plain active.
+    // Open speculation with no payout bucket. Three different rows land here and
+    // only the first is "nothing to do": a contest still awaiting an outcome; a
+    // `scored` one whose prediction inputs are missing; and every `voided` one.
+    // The latter two are also settlementCandidates above — `active` is the
+    // residual bucket, not a statement that no work exists.
     active.push(base);
   }
 

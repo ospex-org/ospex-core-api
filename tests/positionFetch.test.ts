@@ -771,6 +771,18 @@ describe('fetchCategorizedPositions — settlement work across the contest_statu
    *
    * Expectations are literals per row. Deriving them from the helper's own set
    * would make the table move with a broken helper instead of catching it.
+   *
+   * READ THIS BEFORE TRUSTING THE `verified` ROW. It pins what this endpoint
+   * currently serves, which is NOT the whole of what is settleable on chain: an
+   * open speculation on a `verified` contest past the void cooldown settles to
+   * `Void` too, and settling it is what makes a contest read `voided` in the first
+   * place. That row is a bound, not a contract — see #79 and the docblock on
+   * `SETTLEABLE_OPEN_CONTEST_STATUSES`. It is stated here rather than left implicit
+   * because a table asserting `verified` is not settlement work, with no note, is
+   * exactly the passing test that stops anyone looking at the gap again.
+   *
+   * The `unverified` row is a defensive control rather than a reachable state:
+   * creating a speculation requires a Verified contest.
    */
   const VOCABULARY: Array<{
     status: string;
@@ -778,6 +790,8 @@ describe('fetchCategorizedPositions — settlement work across the contest_statu
     expectedSecondBucket: 'active' | 'pendingSettle';
   }> = [
     { status: 'unverified', isSettlementCandidate: false, expectedSecondBucket: 'active' },
+    // Known-incomplete, see above and #79: false is today's behaviour, not the
+    // chain's answer. When #79 lands this row becomes cooldown-dependent.
     { status: 'verified', isSettlementCandidate: false, expectedSecondBucket: 'active' },
     { status: 'scored', isSettlementCandidate: true, expectedSecondBucket: 'pendingSettle' },
     { status: 'voided', isSettlementCandidate: true, expectedSecondBucket: 'active' },
