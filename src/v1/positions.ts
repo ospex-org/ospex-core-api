@@ -29,6 +29,7 @@ import { getSupabase } from '../lib/supabase.js';
 import { getProvider } from '../lib/rpc.js';
 import { wei6ToUSDC } from '../lib/sanitize.js';
 import {
+  enumerationLimitOf,
   fetchCategorizedPositions,
   positionTypeIntToString,
 } from './utils/positionFetch.js';
@@ -62,6 +63,29 @@ const POSITION_CLAIMED_ABI = [
 
 const positionFilledIface = new ethers.Interface(POSITION_FILLED_ABI);
 const positionClaimedIface = new ethers.Interface(POSITION_CLAIMED_ABI);
+
+/**
+ * Map a complete-traversal refusal onto the wire, or null when the failure is
+ * anything else.
+ *
+ * A 500 rather than a 503: the server is not degraded and this is not
+ * transient — the same wallet reproduces it until a bound moves. The distinct
+ * `code` is what lets an operator tell "this population outgrew a constant"
+ * from "a read failed", which the shared `INTERNAL_ERROR` could not.
+ */
+function enumerationLimitBody(err: unknown): ApiError | null {
+  const limit = enumerationLimitOf(err);
+  if (limit === null) return null;
+  return limit === 'pages'
+    ? {
+        error: 'Position enumeration exceeded its page budget for this address.',
+        code: 'ENUMERATION_BUDGET_EXCEEDED',
+      }
+    : {
+        error: 'Position enumeration exceeded its time budget for this address.',
+        code: 'ENUMERATION_DEADLINE_EXCEEDED',
+      };
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // GET /v1/positions/:address  (history list — pre-existing)
@@ -394,6 +418,12 @@ export async function getPositionStatusHandler(req: Request, res: Response): Pro
   try {
     result = await fetchCategorizedPositions(address, { complete: true });
   } catch (err) {
+    const bounded = enumerationLimitBody(err);
+    if (bounded !== null) {
+      logger.error({ err: formatError(err), code: bounded.code }, 'positions: status enumeration refused');
+      res.status(500).json(bounded);
+      return;
+    }
     logger.error({ err: formatError(err) }, 'positions: status fetch failed');
     res.status(500).json({ error: 'Failed to categorize positions.', code: 'INTERNAL_ERROR' } satisfies ApiError);
     return;
@@ -516,6 +546,12 @@ export async function getClaimParamsHandler(req: Request, res: Response): Promis
   try {
     result = await fetchCategorizedPositions(address, { complete: true });
   } catch (err) {
+    const bounded = enumerationLimitBody(err);
+    if (bounded !== null) {
+      logger.error({ err: formatError(err), code: bounded.code }, 'positions: claim-params enumeration refused');
+      res.status(500).json(bounded);
+      return;
+    }
     logger.error({ err: formatError(err) }, 'positions: claim-params fetch failed');
     res.status(500).json({ error: 'Failed to fetch claimable positions.', code: 'INTERNAL_ERROR' } satisfies ApiError);
     return;

@@ -77,6 +77,74 @@ import { maxIsoTimestamptz } from '../ownState/timestamps.js';
 const POSITION_QUERY_LIMIT = 200;
 const COMPLETE_PAGE_SIZE = 199;
 
+/**
+ * The resource budget on a COMPLETE traversal. Applies to `complete` only; the
+ * default capped path is a single read and is untouched.
+ *
+ * ## Why this is allowed to refuse, when a linter is not
+ *
+ * `.claude/rules/advisory-tooling.md` keeps the blocking list short and
+ * deliberate. This belongs on it: it is a fail-closed resource gate on a
+ * money-adjacent read, and the thing it refuses to do is return a number
+ * nobody bounded. It is not convenience tooling and it cannot fail while the
+ * system is fine — it fires only when a traversal genuinely exceeded a stated
+ * bound.
+ *
+ * ## The unit, which decides the off-by-one
+ *
+ * `COMPLETE_MAX_PAGES` counts DATABASE READS of the positions scan, the same
+ * thing `enumeration.pages` reports — terminal short read included. The loop
+ * stops on a short page, so a population that is an exact multiple of
+ * `COMPLETE_PAGE_SIZE` costs one extra read to discover it has ended. The
+ * largest population that completes is therefore
+ * `COMPLETE_MAX_PAGES * COMPLETE_PAGE_SIZE - 1` = 12,735 rows; 12,736 needs a
+ * 65th read and is refused. Stated because "at the limit" and "one over" are
+ * otherwise indistinguishable from an off-by-one.
+ *
+ * Rows need no separate budget: an oversized page is already refused below, so
+ * reads x page size bounds rows exactly. A third constant would only drift.
+ *
+ * ## Which of the two is the real guard
+ *
+ * The DEADLINE is. It covers the whole traversal — the scan and both joins —
+ * because that is what a request spends, and it is half of Heroku's 30s router
+ * timeout so the categorisation and the response still fit in the other half.
+ * `COMPLETE_MAX_PAGES` is the backstop for a loop that is pathological but
+ * FAST, where elapsed time would never notice. So the page budget is set
+ * generously on purpose: 12,735 rows is roughly 28x the largest population this
+ * repo has ever exercised, and a wallet legitimately past it should get the
+ * bound raised deliberately rather than be refused by a number nobody chose.
+ */
+const COMPLETE_MAX_PAGES = 64;
+const COMPLETE_DEADLINE_MS = 15_000;
+
+/** Which bound a complete traversal ran into. */
+export type EnumerationLimit = 'pages' | 'deadline';
+
+/**
+ * A complete traversal refused to continue.
+ *
+ * Typed, and distinct per bound, because the two call for different operator
+ * actions: `pages` means a population outgrew a constant and somebody decides
+ * whether to raise it; `deadline` means reads got slower and somebody looks at
+ * why. Flattening both into a bare `INTERNAL_ERROR` — which is what the
+ * handlers did with every throw on this path — makes them the same page in the
+ * logs as a dropped connection.
+ *
+ * Neither is transient. Retrying the same wallet reproduces it.
+ */
+export class PositionEnumerationLimitError extends Error {
+  constructor(readonly limit: EnumerationLimit, message: string) {
+    super(message);
+    this.name = 'PositionEnumerationLimitError';
+  }
+}
+
+/** The bound a thrown value ran into, or null when it is any other failure. */
+export function enumerationLimitOf(err: unknown): EnumerationLimit | null {
+  return err instanceof PositionEnumerationLimitError ? err.limit : null;
+}
+
 const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower: 1 };
 const POSITION_TYPE_FROM_INT: Record<0 | 1, 'upper' | 'lower'> = { 0: 'upper', 1: 'lower' };
 
@@ -335,8 +403,30 @@ export async function fetchCategorizedPositions(
   const positions: PositionRow[] = [];
   let pages = 0;
   let beforeId: bigint | undefined;
+  // One deadline for the WHOLE complete traversal, read once. The scan and both
+  // joins share it because a request spends the sum of all three, and bounding
+  // them separately would let three in-budget phases add up to an out-of-budget
+  // request.
+  const deadlineAt = Date.now() + COMPLETE_DEADLINE_MS;
+  const refuseIfLate = (phase: string): void => {
+    if (options.complete && Date.now() > deadlineAt) {
+      throw new PositionEnumerationLimitError(
+        'deadline',
+        `fetchCategorizedPositions ${phase}: exceeded the ${String(COMPLETE_DEADLINE_MS)}ms complete-traversal deadline`,
+      );
+    }
+  };
   const columns = 'speculation_id, user_address, position_type, risk_amount, profit_amount, claimed, position_created_at, row_updated_at';
   do {
+    // Checked BEFORE the read, so the budget bounds reads issued rather than
+    // reads completed — a refusal costs nothing.
+    if (options.complete && pages >= COMPLETE_MAX_PAGES) {
+      throw new PositionEnumerationLimitError(
+        'pages',
+        `fetchCategorizedPositions positions: exceeded ${String(COMPLETE_MAX_PAGES)} pages without reaching a short page`,
+      );
+    }
+    refuseIfLate('positions');
     let query = sb.from('positions')
       .select(options.complete ? `id, ${columns}` : columns)
       .eq('network', config.network)
@@ -398,6 +488,7 @@ export async function fetchCategorizedPositions(
   const specIds = [...new Set(positions.map((p) => p.speculation_id))];
   const specById = new Map<number, SpeculationRow>();
   for (let start = 0, size = options.complete ? COMPLETE_PAGE_SIZE : specIds.length; start < specIds.length; start += size) {
+    refuseIfLate('speculations');
     let query = sb
       .from('speculations')
       .select('speculation_id, contest_id, market_type, line_ticks, speculation_status, win_side, row_updated_at')
@@ -425,6 +516,7 @@ export async function fetchCategorizedPositions(
   ];
   const contestById = new Map<number, ContestRow>();
   for (let start = 0, size = options.complete ? COMPLETE_PAGE_SIZE : contestIds.length; start < contestIds.length; start += size) {
+    refuseIfLate('contests');
     let query = sb
       .from('contests')
       .select('contest_id, away_team, home_team, sport_slug, contest_status, away_score, home_score, row_updated_at')
