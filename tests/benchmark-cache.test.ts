@@ -165,6 +165,43 @@ describe('the key', () => {
     expect(new Set([base, ...variants]).size).toBe(variants.length + 1);
   });
 
+  /**
+   * PATH params, which `/benchmark/pick/:participantId/:gameId/:market` carries
+   * its whole identity in and which the key ignored until that endpoint existed.
+   *
+   * Without them every pick shares one entry and the memo serves one pick's body
+   * for another's request. A same-key assertion alone cannot catch that, so each
+   * case moves exactly ONE segment.
+   */
+  it('distinguishes picks that differ in a single path segment', () => {
+    const pick = (params: Record<string, string>): Request =>
+      ({ query: {}, params }) as unknown as Request;
+    const base = { participantId: 'a', gameId: 'g', market: 'moneyline' };
+    const key = (p: Record<string, string>): string => benchmarkCacheKey('pick', pick(p), config);
+
+    const baseKey = key(base);
+    const variants = [
+      key({ ...base, participantId: 'b' }),
+      key({ ...base, gameId: 'h' }),
+      key({ ...base, market: 'total' }),
+    ];
+    for (const v of variants) expect(v).not.toBe(baseKey);
+    expect(new Set([baseKey, ...variants]).size).toBe(variants.length + 1);
+    // Identical params still share an entry, or the memo would never hit.
+    expect(key({ ...base })).toBe(baseKey);
+  });
+
+  it('cannot be smuggled across fields by a value containing the encoding', () => {
+    // The hazard the JSON encoding exists for, arriving through route params:
+    // in a joined string these two would produce the same key, because a
+    // character moves from one field into the next.
+    const pick = (params: Record<string, string>): Request =>
+      ({ query: {}, params }) as unknown as Request;
+    const a = benchmarkCacheKey('pick', pick({ participantId: 'x","y', gameId: 'g', market: 'total' }), config);
+    const b = benchmarkCacheKey('pick', pick({ participantId: 'x', gameId: 'y","g', market: 'total' }), config);
+    expect(a).not.toBe(b);
+  });
+
   /** A param the handlers ignore must not fragment the cache. */
   it('ignores query params nothing reads', () => {
     expect(benchmarkCacheKey('standings', req({ cacheBust: '1' }), config)).toBe(

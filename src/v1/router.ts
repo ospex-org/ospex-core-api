@@ -44,6 +44,7 @@ import { getLeaderboardHandler } from './leaderboard.js';
 import { getScheduleHandler } from './schedule.js';
 import { getBenchmarkStandingsHandler } from './benchmark/standings.js';
 import { getBenchmarkPicksHandler } from './benchmark/picks.js';
+import { getBenchmarkPickHandler } from './benchmark/pick.js';
 import { getBenchmarkStatsHandler } from './benchmark/stats.js';
 import { benchmarkCacheKey, serveCachedBenchmark } from './benchmark/cache.js';
 import { loadConfig } from '../lib/env.js';
@@ -204,6 +205,22 @@ v1Router.get(
       req,
       res,
       getBenchmarkPicksHandler,
+    ),
+  ),
+);
+// One pick in full, keyed entirely by PATH params. Cached like its siblings —
+// the memo's key now encodes route params as well as query params, because this
+// is the first benchmark endpoint whose identity lives there and a key that
+// omitted it would serve one pick's body for another's request.
+v1Router.get(
+  '/benchmark/pick/:participantId/:gameId/:market',
+  benchmarkRateLimit,
+  asyncHandler((req, res) =>
+    serveCachedBenchmark(
+      benchmarkCacheKey('pick', req, loadConfig()),
+      req,
+      res,
+      getBenchmarkPickHandler,
     ),
   ),
 );

@@ -593,6 +593,28 @@ Both paragraphs describe a shape that **is not currently served**: run-line pick
 
 Writeups (`benchmark_decision_rationales`) are **not read by this endpoint**, so a pick card carries no prose. That is a choice about this surface, not a publication control: indexer migration 081's `benchmark_pick_writeups` view is anon-readable (measured 2026-09-21, 4,170 rows of prose), so the rationales are already public whatever this service queries. The view does withhold `evidence_refs`. Reason about publication from the grants, not from this endpoint's query list.
 
+#### `GET /v1/benchmark/pick/:participantId/:gameId/:market`
+
+One pick in full — the detail behind a card on `/v1/benchmark/picks`. `market` is `moneyline`, `spread` or `total`; anything else is a `400 INVALID_PARAM` before any read.
+
+**The key identifies at most one row**, and that is a property of the projection rather than logic here: indexer migration 086 ranks the ledger `row_number() OVER (PARTITION BY participant_id, game_id, market ORDER BY as_of DESC)` and keeps the latest. `asOf` is served as the stamp of WHICH snapshot the row is, not as a key a caller supplies.
+
+**Three states**, because that is what the public relations support:
+
+| `state` | meaning |
+|---|---|
+| `published` | the row was found; `pick` is populated, `conflict` is null |
+| `withheld_conflict` | the key is in `benchmark_pick_ledger_conflicts` — an affirmative, dated statement about a key that exists. `pick` is null, `conflict` carries `reason` / `asOf` / `sport` / `slateDate` |
+| `not_published` | everything else |
+
+All three answer `200`. `pick: null` rather than an object of nulls, so there is no field a consumer can misread as a zero.
+
+`not_published` **deliberately conflates causes** and it is worth knowing which. A sealed-but-unrevealed pick produces no reveal row, therefore no key row, therefore no conflicts row and no ledger row — byte-identical to "never existed" in every relation this endpoint reads. `benchmark_decisions` would distinguish it, and saying "this arm has a sealed pick on this game" before the reveal discloses which games an arm picked, which is what the seal withholds. A key resolving to a non-live cohort, and a slate before the publication gate, are also `not_published`. Claiming to tell these apart would be an invention, not a service.
+
+**Distinctions the body preserves**, each of which a normalisation would erase: `execution.netUsdc` is null only while `result` is `pending` — a push, void or no-fill carries a real `0`; `clv.pct` null WITH `clv.unscoredReason` set is the scorer refusing, null with both null is not-yet-scored; `clv.heldOutOfPrimary` stays tri-state and is never defaulted to `false`; `closing.ready` is its own boolean rather than an inferred null timestamp; the `marketOpen*` family is null on rows published before migration 084 and must be treated as optional for that reason rather than as missing data.
+
+Spread picks follow the same convention as everywhere else in this service: `awayLine` / `homeLine` with a null `line`. `digests.algorithm` names the hash so a verifier need not guess.
+
 #### `GET /v1/benchmark/stats?sport=`
 
 The latest `benchmark_site_stats` snapshot for a sport. `sport` accepts `all` (the default, and a real stored value) plus the six slugs.

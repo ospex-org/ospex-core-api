@@ -192,7 +192,7 @@ export async function serveCachedBenchmark(
  * pass on the first fix.
  */
 export function benchmarkCacheKey(
-  endpoint: 'standings' | 'picks' | 'stats',
+  endpoint: 'standings' | 'picks' | 'stats' | 'pick',
   req: Request,
   config: {
     network: string;
@@ -216,5 +216,14 @@ export function benchmarkCacheKey(
     q('sport'),
     q('date'),
     q('scoringPolicyVersion'),
+    // PATH params, sorted so the encoding is stable.
+    //
+    // `/benchmark/pick/:participantId/:gameId/:market` carries its whole
+    // identity here and NOTHING in `req.query`. Without this, every pick shares
+    // one entry and the memo serves one pick's body for another's request — the
+    // same class of collision the JSON encoding above was introduced to close,
+    // arriving through the other kind of parameter. The three query-only
+    // endpoints have no route params, so they key as `[]` and are unaffected.
+    Object.keys(req.params ?? {}).sort().map((k) => [k, String(req.params[k])]),
   ]);
 }
