@@ -37,11 +37,25 @@ const ADDR = '0xabcdefabcdef0123456789abcdef0123456789ab';
 /** Where the server goes quiet. Set per test. */
 let mode: 'headers' | 'body' = 'headers';
 let received = 0;
+/**
+ * Resolves when the server has actually accepted a request.
+ *
+ * Load-bearing, not tidiness. Advancing the fake clock before the read is
+ * dispatched aborts the signal first, so fetch rejects without ever connecting
+ * and the case measures nothing. That raced: it passed on Windows/Node 22 and
+ * the FIRST case failed on CI's Linux/Node 20.19, where dispatch is slower than
+ * the advance (the later cases won because undici already had a warm connection
+ * to the origin). Waiting on the far side of the request removes the race
+ * instead of hoping to win it.
+ */
+let arrived: () => void = () => undefined;
+let arrival: Promise<void> = Promise.resolve();
 const held: ServerResponse[] = [];
 const sockets: Socket[] = [];
 
 const server = createServer((_req, res) => {
   received += 1;
+  arrived();
   if (mode === 'body') {
     // Headers and an opening bracket, so the client blocks consuming a BODY
     // rather than waiting for a status line.
@@ -71,6 +85,7 @@ const { getPositionStatusHandler, getClaimParamsHandler } = await import('../src
 
 beforeEach(() => {
   received = 0;
+  arrival = new Promise<void>((resolve) => { arrived = resolve; });
   vi.useFakeTimers();
   vi.setSystemTime(new Date('2026-09-21T00:00:00Z'));
 });
@@ -101,6 +116,8 @@ describe('a complete traversal is cancelled, not merely checked (#75)', () => {
         { params: { address: ADDR } } as unknown as Request,
         res as unknown as Response,
       );
+      // Only advance once the read is genuinely in flight — see `arrival`.
+      await arrival;
       // Sixteen faked seconds. The socket is real and still open; only the abort
       // timer is virtual.
       await vi.advanceTimersByTimeAsync(16_000);
