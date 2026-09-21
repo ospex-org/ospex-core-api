@@ -370,9 +370,24 @@ This lets a reader of the public repo confirm which source is live — follow `c
 
 #### `GET /v1/positions/:address`
 
-Paginated position history for a wallet. Returns positions with `riskAmountUSDC`, `profitAmountUSDC`, `claimed`, `positionType` (0|1), and totals (`totalCount`, `totalRiskUSDC`, `totalProfitUSDC`, `activeCount`).
+Paginated position history for a wallet. Each row carries `riskAmountUSDC`, `profitAmountUSDC`, `claimed` and `positionType` (0|1).
 
 Query params: `limit` (max 200), `offset`.
+
+**Read the scope before the number.** `totals` mixes two of them and its names do not say which is which — it is kept exactly as shipped because installed clients read it:
+
+| field | scope |
+|---|---|
+| `totals.totalCount` | the whole **wallet** — an exact database count |
+| `totals.totalRiskUSDC` | this **page** only, despite the name |
+| `totals.totalProfitUSDC` | this **page** only, despite the name |
+| `totals.activeCount` | this **page** only, and it counts `claimed = false` rows |
+
+`page` carries the same three numbers under names that state their own scope, and is what a new consumer should read: `page.count`, `page.riskUSDC`, `page.profitUSDC`, `page.unclaimedCount`. They are one derivation assigned to both shapes, not two, so the pairs cannot drift apart. Everything under `page` moves when `limit` or `offset` moves; `totals.totalCount` does not.
+
+**`unclaimedCount` is not live exposure.** A settled LOSS stays `claimed = false` with positive historical risk forever, because `claimPosition` reverts `NoPayout` and nothing ever clears the row. This endpoint reads `positions` alone and cannot tell that from an open bet, so the field is named for what it counts. `GET /v1/positions/:address/status` is the surface that classifies, and reports those rows as `settledLost`.
+
+**There is no wallet-scoped money total, deliberately.** Producing one means walking every page of the wallet's history on each request — a per-request cost linear in that history — or a database aggregate, which is a migration rather than a read-path change. Never infer one from a page: the pages of a wallet do not sum to a figure this endpoint has ever checked.
 
 #### `GET /v1/positions/:address/status`
 

@@ -88,11 +88,55 @@ interface PositionRow {
 interface ListResponse {
   address: string;
   positions: PositionBody[];
+  /**
+   * MIXED SCOPE, and the names do not say which is which.
+   *
+   * `totalCount` is the whole wallet — an exact database count. The other three
+   * are summed from the RETURNED PAGE only, so they change with `limit` and
+   * `offset` while `totalCount` does not. Sitting together under one `totals`
+   * key reads as four wallet figures, which is the defect this shape is kept
+   * for rather than fixed: installed clients read these names.
+   *
+   * `page` below carries the same three numbers under names that state their
+   * own scope. Prefer it.
+   */
   totals: {
+    /** WALLET scope. Exact row count for this address, from the database. */
     totalCount: number;
+    /** PAGE scope despite the name. Identical to `page.riskUSDC`. */
     totalRiskUSDC: number;
+    /** PAGE scope despite the name. Identical to `page.profitUSDC`. */
     totalProfitUSDC: number;
+    /** PAGE scope, and it counts UNCLAIMED rows. Identical to `page.unclaimedCount`. */
     activeCount: number;
+  };
+  /**
+   * Scoped to the rows in `positions` and named so it cannot be read as a
+   * wallet figure. Every value here moves when `limit` or `offset` moves.
+   *
+   * There is deliberately no wallet-scoped money total anywhere in this
+   * response. Producing one means either walking every page of the wallet's
+   * history on each request — a per-request cost linear in that history, which
+   * `.claude/rules/production-cost-review.md` exists to refuse — or a database
+   * aggregate, which is a migration in ospex-indexer rather than a change to a
+   * read path. Omitted and said out loud, because the previous shape let a
+   * reader infer one from a single page.
+   */
+  page: {
+    /** Rows returned. Equal to `positions.length`; stated so the scope is legible. */
+    count: number;
+    riskUSDC: number;
+    profitUSDC: number;
+    /**
+     * Rows on this page with `claimed = false`. NOT live exposure, and named
+     * for what it counts rather than what a reader might want it to mean: a
+     * settled LOSS stays unclaimed forever with positive historical risk,
+     * because `claimPosition` reverts `NoPayout` and nothing ever clears the
+     * row. Classifying those needs the speculation and contest this endpoint
+     * does not join — `GET /v1/positions/:address/status` is the surface that
+     * does, and it reports them as `settledLost`.
+     */
+    unclaimedCount: number;
   };
   pagination: { limit: number; offset: number; total: number; hasMore: boolean };
 }
@@ -156,23 +200,40 @@ export async function getPositionsByAddressHandler(req: Request, res: Response):
 
   const positions = (data ?? []).map((r) => rowToBody(r as unknown as PositionRow));
   const total = count ?? 0;
-  let totalRiskUSDC = 0;
-  let totalProfitUSDC = 0;
-  let activeCount = 0;
+  // One derivation, assigned to both shapes. Computing `totals.totalRiskUSDC`
+  // and `page.riskUSDC` separately would be two witnesses to one number, which
+  // is how they come to disagree.
+  //
+  // Summed as numbers rather than as wei6 bigints the way `/status` does. That
+  // is safe HERE and only here, because the page is capped at MAX_LIMIT: at 200
+  // rows of USDC magnitudes the float64 error stays around ten orders of
+  // magnitude below the cent this rounds to. The cap is what bounds it, so a
+  // wallet-scoped sum could not reuse this method even if it were served.
+  let pageRiskUSDC = 0;
+  let pageProfitUSDC = 0;
+  let unclaimedCount = 0;
   for (const p of positions) {
-    totalRiskUSDC += p.riskAmountUSDC;
-    totalProfitUSDC += p.profitAmountUSDC;
-    if (!p.claimed) activeCount++;
+    pageRiskUSDC += p.riskAmountUSDC;
+    pageProfitUSDC += p.profitAmountUSDC;
+    if (!p.claimed) unclaimedCount++;
   }
+  const riskUSDC = Math.round(pageRiskUSDC * 100) / 100;
+  const profitUSDC = Math.round(pageProfitUSDC * 100) / 100;
 
   const body: ListResponse = {
     address,
     positions,
     totals: {
       totalCount: total,
-      totalRiskUSDC: Math.round(totalRiskUSDC * 100) / 100,
-      totalProfitUSDC: Math.round(totalProfitUSDC * 100) / 100,
-      activeCount,
+      totalRiskUSDC: riskUSDC,
+      totalProfitUSDC: profitUSDC,
+      activeCount: unclaimedCount,
+    },
+    page: {
+      count: positions.length,
+      riskUSDC,
+      profitUSDC,
+      unclaimedCount,
     },
     pagination: { limit: lo.limit, offset: lo.offset, total, hasMore: lo.offset + positions.length < total },
   };
