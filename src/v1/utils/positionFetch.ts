@@ -408,8 +408,34 @@ export async function fetchCategorizedPositions(
   // them separately would let three in-budget phases add up to an out-of-budget
   // request.
   const deadlineAt = Date.now() + COMPLETE_DEADLINE_MS;
+  // An ABORT is what makes the deadline real; a clock read between reads is only
+  // the cheap part of it. Checking the clock alone cannot interrupt a read that
+  // is already in flight, and cannot see a read that RETURNS late — both of
+  // which were reproduced on the check-only version of this: a stalled response
+  // body left the endpoint pending past the deadline, and a slow terminal read
+  // answered 200 with `enumeration.complete = true`. So one signal is attached
+  // to every read of the traversal, and it cancels the request and its body.
+  //
+  // Unref'd and deliberately never cleared (`windows-tooling.md`, the timer
+  // rule): nothing races it, so it must not hold the event loop open after a
+  // fast request, and aborting a controller nobody is listening to is a no-op.
+  const deadline = options.complete ? new AbortController() : undefined;
+  if (deadline !== undefined) {
+    setTimeout(() => { deadline.abort(); }, COMPLETE_DEADLINE_MS).unref();
+  }
+  // Two mechanisms, one job each, and deliberately not overlapping: the SIGNAL
+  // cancels, the CLOCK classifies. A cancelled read comes back as an ordinary
+  // error, and by then the clock is necessarily at or past the deadline, so
+  // checking `signal.aborted` here as well would be a second branch that no
+  // test could isolate from the first. `>=` rather than `>` because the timer
+  // is set for exactly this instant.
+  //
+  // A genuine read failure arriving at or after the deadline is reported as the
+  // deadline on purpose: both facts are true by then, and this is the
+  // actionable one.
   const refuseIfLate = (phase: string): void => {
-    if (options.complete && Date.now() > deadlineAt) {
+    if (!options.complete) return;
+    if (Date.now() >= deadlineAt) {
       throw new PositionEnumerationLimitError(
         'deadline',
         `fetchCategorizedPositions ${phase}: exceeded the ${String(COMPLETE_DEADLINE_MS)}ms complete-traversal deadline`,
@@ -419,7 +445,11 @@ export async function fetchCategorizedPositions(
   const columns = 'speculation_id, user_address, position_type, risk_amount, profit_amount, claimed, position_created_at, row_updated_at';
   do {
     // Checked BEFORE the read, so the budget bounds reads issued rather than
-    // reads completed — a refusal costs nothing.
+    // reads completed — a refusal costs nothing. Only the scan keeps a pre-read
+    // deadline check: the joins are entered immediately after a post-read check,
+    // with nothing but synchronous dedup in between, so a pre-check there could
+    // never see a clock the previous one did not. Their post-read checks are the
+    // live ones.
     if (options.complete && pages >= COMPLETE_MAX_PAGES) {
       throw new PositionEnumerationLimitError(
         'pages',
@@ -444,7 +474,12 @@ export async function fetchCategorizedPositions(
       query = query.order('position_created_at', { ascending: false, nullsFirst: false })
         .limit(POSITION_QUERY_LIMIT);
     }
+    if (deadline !== undefined) query = query.abortSignal(deadline.signal);
     const posRes = await query;
+    // Before the error is generalised: an aborted read arrives here as an
+    // ordinary `error`, so this is where it becomes the typed refusal instead
+    // of an INTERNAL_ERROR. Also catches a read that simply RETURNED late.
+    refuseIfLate('positions');
     if (posRes.error) throw new Error(`fetchCategorizedPositions positions: ${posRes.error.message}`);
     if (options.complete && !Array.isArray(posRes.data)) {
       throw new Error('fetchCategorizedPositions positions: missing page data');
@@ -477,6 +512,9 @@ export async function fetchCategorizedPositions(
   // saturate the cap budget?".
   const hitCap = !options.complete && positions.length >= POSITION_QUERY_LIMIT;
   if (positions.length === 0) {
+    // A wallet with nothing in it is still a traversal, and a single read that
+    // came back after the deadline must not answer an authoritative empty.
+    refuseIfLate('result');
     return { active: [], pendingSettle: [], claimable: [], settlementCandidates: [], settledLost: [], hitCap, derivedStatuses: [],
       ...(enumeration ? { enumeration } : {}) };
   }
@@ -488,14 +526,15 @@ export async function fetchCategorizedPositions(
   const specIds = [...new Set(positions.map((p) => p.speculation_id))];
   const specById = new Map<number, SpeculationRow>();
   for (let start = 0, size = options.complete ? COMPLETE_PAGE_SIZE : specIds.length; start < specIds.length; start += size) {
-    refuseIfLate('speculations');
     let query = sb
       .from('speculations')
       .select('speculation_id, contest_id, market_type, line_ticks, speculation_status, win_side, row_updated_at')
       .eq('network', config.network)
       .in('speculation_id', specIds.slice(start, start + size));
     if (options.complete) query = query.limit(COMPLETE_PAGE_SIZE);
+    if (deadline !== undefined) query = query.abortSignal(deadline.signal);
     const specRes = await query;
+    refuseIfLate('speculations');
     if (specRes.error) throw new Error(`fetchCategorizedPositions speculations: ${specRes.error.message}`);
     const specs = (specRes.data ?? []) as unknown as SpeculationRow[];
     for (const s of specs) specById.set(s.speculation_id, s);
@@ -516,14 +555,15 @@ export async function fetchCategorizedPositions(
   ];
   const contestById = new Map<number, ContestRow>();
   for (let start = 0, size = options.complete ? COMPLETE_PAGE_SIZE : contestIds.length; start < contestIds.length; start += size) {
-    refuseIfLate('contests');
     let query = sb
       .from('contests')
       .select('contest_id, away_team, home_team, sport_slug, contest_status, away_score, home_score, row_updated_at')
       .eq('network', config.network)
       .in('contest_id', contestIds.slice(start, start + size));
     if (options.complete) query = query.limit(COMPLETE_PAGE_SIZE);
+    if (deadline !== undefined) query = query.abortSignal(deadline.signal);
     const contestRes = await query;
+    refuseIfLate('contests');
     if (contestRes.error) throw new Error(`fetchCategorizedPositions contests: ${contestRes.error.message}`);
     const contests = (contestRes.data ?? []) as unknown as ContestRow[];
     for (const c of contests) contestById.set(c.contest_id, c);
@@ -745,6 +785,11 @@ export async function fetchCategorizedPositions(
     active.push(base);
   }
 
+  // No late result is ever presented as complete. With the signal attached this
+  // is a backstop rather than the mechanism — a read cannot overrun the deadline
+  // any more — but it is what makes the bound true of the WHOLE traversal
+  // including categorisation, rather than only of its reads.
+  refuseIfLate('result');
   return { active, pendingSettle, claimable, settlementCandidates, settledLost, hitCap, derivedStatuses,
     ...(enumeration ? { enumeration } : {}) };
 }

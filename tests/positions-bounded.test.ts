@@ -522,15 +522,22 @@ describe('complete enumeration refuses past its budget (#75)', () => {
 
   it.each([
     ['the scan', 100_000, { positions: 8_000 }, 'positions'],
-    ['the speculations join', 199, { positions: 8_000 }, 'speculations'],
-    ['the contests join', 199, { speculations: 20_000 }, 'contests'],
+    ['a terminal short read that returns late', 5, { positions: 20_000 }, 'positions'],
+    ['an empty wallet whose only read returns late', 0, { positions: 20_000 }, 'positions'],
+    ['the speculations join', 199, { speculations: 20_000 }, 'speculations'],
+    ['the contests join', 199, { contests: 20_000 }, 'contests'],
   ] as Array<[string, number, Partial<Record<Table, number>>, string]>)(
     'refuses on the deadline during %s, far inside the page budget',
     async (_where, rows, advance, phase) => {
-      // The deadline covers the whole traversal, so it is checked at three
-      // sites. One case each, and the message names the phase — otherwise a
-      // build that kept only the scan check would pass on the scan case alone
-      // and ship two guards nothing executes.
+      // The deadline covers the whole traversal, so it is checked after EVERY
+      // read. One case per site, each asserting the phase the message names —
+      // otherwise a build that kept only the scan check would pass on the scan
+      // case alone and ship two guards nothing executes.
+      //
+      // Two of these are the holes a check-only deadline left open, and they are
+      // the reason the post-read check exists at all: a terminal SHORT read and
+      // an EMPTY wallet both end the loop, so nothing ran afterwards to notice
+      // the clock and both answered an authoritative success late.
       //
       // Every case stays at a handful of reads, far under 64, so a refusal here
       // can only be the clock and never the page budget.
@@ -543,6 +550,65 @@ describe('complete enumeration refuses past its budget (#75)', () => {
       });
     },
   );
+
+  it.each([
+    ['exactly at the deadline', 15_000],
+    ['past it', 20_000],
+  ])('refuses on the clock alone when time moves without the abort timer running (%s)', async (_why, jump) => {
+    // `setSystemTime` moves `Date.now()` WITHOUT running pending timers, so the
+    // abort never fires and the clock is the only thing that can refuse. That is
+    // what isolates the two mechanisms: the stalled-socket file proves the signal
+    // CANCELS, and this proves the clock CLASSIFIES, neither standing in for the
+    // other.
+    //
+    // It is also the production case the signal cannot cover: a busy event loop
+    // where the deadline has passed but its timer has not been run yet.
+    //
+    // The 15,000 row is the boundary. The check is `>=` because the timer is set
+    // for exactly that instant, and a `>` build lets that instant through.
+    freezeClock();
+    const start = Date.now();
+    db.getSupabase.mockReturnValue(positionTables(EMPTY, (q, n, reply) => {
+      // Advance the wall clock during the read without touching the timer queue.
+      if (q.table === 'positions') vi.setSystemTime(new Date(start + jump));
+      return endlessWallet(5)(q, n, reply);
+    }));
+    await expect(fetchCategorizedPositions(ADDRESS, COMPLETE)).rejects.toMatchObject({
+      name: 'PositionEnumerationLimitError',
+      limit: 'deadline',
+    });
+  });
+
+  it('attaches ONE deadline signal to every read of the traversal', async () => {
+    // The install proof for the abort. `positions-enumeration-abort.test.ts`
+    // shows a stalled read IS cancelled, but only through the scan; this is what
+    // says the same signal reaches the joins, which no stalled-read case can
+    // observe without stalling a join specifically.
+    //
+    // "One signal" is the load-bearing half. A per-read signal would also abort a
+    // stalled read and pass that file, while giving every read its own fifteen
+    // seconds and leaving the TOTAL unbounded again — which is the bug the
+    // whole-traversal wording exists to exclude.
+    freezeClock();
+    const sb = positionTables(scaleTables(250));
+    db.getSupabase.mockReturnValue(sb);
+    await fetchCategorizedPositions(ADDRESS, COMPLETE);
+    // Two scan reads plus a join chunk each, so the assertion spans all three
+    // read sites rather than just the first.
+    expect(sb.queries.length).toBeGreaterThanOrEqual(6);
+    expect(sb.queries.map((q) => q.signals.length)).toEqual(sb.queries.map(() => 1));
+    expect(new Set(sb.queries.map((q) => q.signals[0])).size).toBe(1);
+  });
+
+  it('attaches no signal on the DEFAULT capped path', async () => {
+    // Paired control. Own-state runs that path on a timer and must not acquire a
+    // cancellation it never asked for.
+    const sb = positionTables(scaleTables(10));
+    db.getSupabase.mockReturnValue(sb);
+    await fetchCategorizedPositions(ADDRESS);
+    expect(sb.queries.length).toBeGreaterThan(0);
+    expect(sb.queries.every((q) => q.signals.length === 0)).toBe(true);
+  });
 
   it('leaves the DEFAULT capped path alone — one read, no budget, no refusal', async () => {
     // Negative control for the whole change. Own-state runs this path on a
