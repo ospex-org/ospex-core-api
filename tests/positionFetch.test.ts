@@ -684,3 +684,216 @@ describe('fetchCategorizedPositions — mixed and edge cases', () => {
     await expect(fetchCategorizedPositions(ADDR)).rejects.toThrow(/boom/);
   });
 });
+
+/**
+ * ospex-core-api#77 — an OPEN speculation on a VOIDED contest is settlement work.
+ *
+ * `settlementCandidates` answers "whose speculation needs `settleSpeculation`",
+ * not "who gets paid". A voided contest has an outcome on chain, so the answer is
+ * yes, and before this block the bucket was gated on `scored` alone.
+ *
+ * These cases run on `makeSupabase`, whose builder ignores the query — so rows
+ * reach the categorizer that production's `.eq('claimed', false)` /
+ * `.gt('risk_amount', 0)` predicates would have filtered at the DB layer. That is
+ * deliberate here: it is the only way to exercise the helper's own redundant
+ * `!p.claimed` / `riskWei6 > 0n` guards. End-to-end behaviour, including those DB
+ * predicates and the real handler, is pinned in `positions-bounded.test.ts`
+ * against a double that really applies them.
+ */
+describe('fetchCategorizedPositions — settlement work across the contest_status vocabulary (#77)', () => {
+  const OPEN_SPEC = {
+    speculation_id: 1,
+    contest_id: 42,
+    market_type: 'moneyline',
+    line_ticks: 0,
+    speculation_status: 'open',
+    win_side: 'tbd',
+  };
+
+  function openOn(
+    contestStatus: string,
+    overrides: {
+      positionType?: string;
+      marketType?: string;
+      lineTicks?: number;
+      claimed?: boolean;
+      risk?: string;
+      scores?: boolean;
+    } = {},
+  ) {
+    const withScores = overrides.scores !== false;
+    return makeSupabase({
+      positions: [
+        {
+          speculation_id: 1,
+          user_address: ADDR,
+          position_type: overrides.positionType ?? 'upper',
+          risk_amount: overrides.risk ?? '100000000',
+          profit_amount: '90000000',
+          claimed: overrides.claimed ?? false,
+          position_created_at: '2026-01-01T00:00:00Z',
+        },
+      ],
+      speculations: [
+        {
+          ...OPEN_SPEC,
+          market_type: overrides.marketType ?? 'moneyline',
+          line_ticks: overrides.lineTicks ?? 0,
+        },
+      ],
+      contests: [
+        {
+          contest_id: 42,
+          away_team: 'Lakers',
+          home_team: 'Celtics',
+          contest_status: contestStatus,
+          away_score: withScores ? 110 : null,
+          home_score: withScores ? 105 : null,
+        },
+      ],
+    });
+  }
+
+  /**
+   * The whole vocabulary, one row per value, every other input identical — so
+   * `contest_status` is the ONLY thing that can produce a difference between rows.
+   *
+   * Two fixture choices carry the discrimination and neither is the obvious one:
+   *
+   *  - Scores are PRESENT on every row, including `voided`. A realistic voided
+   *    contest has null scores, and with nulls the predicted-payout branch is
+   *    blocked by its own `away_score != null` check — so a build that wrongly
+   *    let `voided` into `pendingSettle` would still look correct. Present scores
+   *    are what make `expectedSecondBucket` load-bearing.
+   *  - `unverified` and `verified` carry scores too, so a predicate written as a
+   *    negation (`!== 'unverified'`, or "any status that has scores") is refused
+   *    here instead of passing on a fixture that never offered it the chance.
+   *
+   * Expectations are literals per row. Deriving them from the helper's own set
+   * would make the table move with a broken helper instead of catching it.
+   */
+  const VOCABULARY: Array<{
+    status: string;
+    isSettlementCandidate: boolean;
+    expectedSecondBucket: 'active' | 'pendingSettle';
+  }> = [
+    { status: 'unverified', isSettlementCandidate: false, expectedSecondBucket: 'active' },
+    { status: 'verified', isSettlementCandidate: false, expectedSecondBucket: 'active' },
+    { status: 'scored', isSettlementCandidate: true, expectedSecondBucket: 'pendingSettle' },
+    { status: 'voided', isSettlementCandidate: true, expectedSecondBucket: 'active' },
+  ];
+
+  it.each(VOCABULARY)(
+    'contest_status=$status is settlement work: $isSettlementCandidate, and the row is in $expectedSecondBucket',
+    async ({ status, isSettlementCandidate, expectedSecondBucket }) => {
+      supabaseMock.getSupabase.mockReturnValue(openOn(status));
+      const result = await fetchCategorizedPositions(ADDR);
+
+      expect(result.settlementCandidates.map((p) => p.speculationId)).toEqual(
+        isSettlementCandidate ? ['1'] : [],
+      );
+      // The row is never dropped: it is always in exactly one of the two
+      // non-terminal buckets. A future edit that makes the void branch
+      // `continue` — removing it from `active`, and with it from the own-state
+      // snapshot's positions array — goes red here rather than in production.
+      expect(result[expectedSecondBucket]).toHaveLength(1);
+      const other = expectedSecondBucket === 'active' ? 'pendingSettle' : 'active';
+      expect(result[other]).toEqual([]);
+      expect(result.claimable).toEqual([]);
+      expect(result.settledLost).toEqual([]);
+    },
+  );
+
+  it('a voided contest with no scores — the production shape — is still settlement work', async () => {
+    supabaseMock.getSupabase.mockReturnValue(openOn('voided', { scores: false }));
+    const result = await fetchCategorizedPositions(ADDR);
+    expect(result.settlementCandidates.map((p) => p.speculationId)).toEqual(['1']);
+    expect(result.active).toHaveLength(1);
+    expect(result.pendingSettle).toEqual([]);
+  });
+
+  it.each(['upper', 'lower'])(
+    'both sides are refunded: a %s position on a voided contest is settlement work',
+    async (positionType) => {
+      supabaseMock.getSupabase.mockReturnValue(openOn('voided', { positionType, scores: false }));
+      const result = await fetchCategorizedPositions(ADDR);
+      expect(result.settlementCandidates).toHaveLength(1);
+      expect(result.settlementCandidates[0]!.positionType).toBe(positionType === 'upper' ? 0 : 1);
+      // A void pays each side its OWN risk, so neither side is filtered out the
+      // way a scored predicted-loser is.
+      expect(result.pendingSettle).toEqual([]);
+    },
+  );
+
+  it.each([
+    ['moneyline', 0],
+    ['spread', -15],
+    ['total', 85],
+  ])('market_type=%s on a voided contest is settlement work', async (marketType, lineTicks) => {
+    supabaseMock.getSupabase.mockReturnValue(
+      openOn('voided', { marketType: marketType as string, lineTicks: lineTicks as number, scores: false }),
+    );
+    const result = await fetchCategorizedPositions(ADDR);
+    expect(result.settlementCandidates).toHaveLength(1);
+    expect(result.settlementCandidates[0]!.market).toBe(marketType);
+  });
+
+  it('a CLAIMED position on a voided contest is not settlement work', async () => {
+    // Final post-claim state. Production never reaches the helper's own
+    // `!p.claimed` guard, because the positions query filters `claimed=false` at
+    // the DB layer — so this case exists to prove that guard is real rather than
+    // decorative, and it is the answer to a reviewer asking what it is for.
+    supabaseMock.getSupabase.mockReturnValue(openOn('voided', { claimed: true, scores: false }));
+    const result = await fetchCategorizedPositions(ADDR);
+    expect(result.settlementCandidates).toEqual([]);
+  });
+
+  it('a ZERO-RISK position on a voided contest is not settlement work', async () => {
+    // Same shape as the claimed case: `gt('risk_amount', 0)` filters it in
+    // production, so this pins the helper's own `riskWei6 > 0n` guard. A
+    // transferred-out maker row sits at risk=0/claimed=false forever, and
+    // settling on its behalf releases nothing to it.
+    supabaseMock.getSupabase.mockReturnValue(openOn('voided', { risk: '0', scores: false }));
+    const result = await fetchCategorizedPositions(ADDR);
+    expect(result.settlementCandidates).toEqual([]);
+  });
+
+  it('a CLOSED void is claimable and not settlement work — settling it again is not the action', async () => {
+    // The paired positive case for the whole block: closed-void behaviour is
+    // unchanged, and the two void states stay distinguishable. Without this, a
+    // fix that routed every void into settlementCandidates regardless of
+    // speculation_status would pass everything above.
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabase({
+        positions: [
+          {
+            speculation_id: 1,
+            user_address: ADDR,
+            position_type: 'upper',
+            risk_amount: '100000000',
+            profit_amount: '90000000',
+            claimed: false,
+            position_created_at: '2026-01-01T00:00:00Z',
+          },
+        ],
+        speculations: [{ ...OPEN_SPEC, speculation_status: 'closed', win_side: 'void' }],
+        contests: [
+          {
+            contest_id: 42,
+            away_team: 'Lakers',
+            home_team: 'Celtics',
+            contest_status: 'voided',
+            away_score: null,
+            home_score: null,
+          },
+        ],
+      }),
+    );
+    const result = await fetchCategorizedPositions(ADDR);
+    expect(result.settlementCandidates).toEqual([]);
+    expect(result.claimable).toMatchObject([
+      { speculationId: '1', result: 'void', estimatedPayoutWei6: '100000000' },
+    ]);
+    expect(result.active).toEqual([]);
+  });
+});

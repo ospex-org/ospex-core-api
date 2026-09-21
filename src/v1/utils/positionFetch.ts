@@ -21,8 +21,14 @@
  *
  * Categorization:
  *   - active        — speculation_status = 'open',   claimed = false,
- *                     contest_status != 'scored' (parent contest not
- *                     yet final). The user can't do anything yet.
+ *                     and no payout bucket claimed the row. Usually
+ *                     contest_status is 'unverified' or 'verified' and
+ *                     there is genuinely nothing to do yet, but it is
+ *                     NOT "nothing to do": a 'scored' contest whose
+ *                     prediction inputs are missing, and every 'voided'
+ *                     contest, are settlementCandidates AND active.
+ *                     Read settlementCandidates for the work, not the
+ *                     absence of a row here.
  *   - pendingSettle — speculation_status = 'open',   claimed = false,
  *                     contest_status = 'scored'. The contest is final
  *                     but `settleSpeculation` hasn't been called yet.
@@ -33,10 +39,15 @@
  *                     Lost positions are filtered out of this payout
  *                     bucket (`claimPosition` reverts with NoPayout).
  *   - settlementCandidates — ALL positive-risk unclaimed positions on
- *                     scored contests with open speculations, including
- *                     predicted losers and rows with missing prediction
- *                     inputs. Settlement can release counterparty funds
- *                     even when the controlled position itself lost.
+ *                     'scored' OR 'voided' contests with open
+ *                     speculations, including predicted losers and rows
+ *                     with missing prediction inputs. Settlement can
+ *                     release counterparty funds even when the
+ *                     controlled position itself lost, and a voided
+ *                     contest refunds both sides. Not a payout bucket:
+ *                     an open void's refund AMOUNT is not served here
+ *                     or in pendingSettle — see the bound in
+ *                     `docs/positions-complete-enumeration.md`.
  *   - claimable     — speculation_status = 'closed', claimed = false,
  *                     estimated payout > 0 (won, push, or void; lost
  *                     positions have payout = 0 and are filtered out
@@ -225,6 +236,25 @@ interface ContestRow {
   home_score: number | null;
   row_updated_at: string;
 }
+
+/**
+ * The contest statuses that put settlement work in front of an OPEN speculation.
+ *
+ * `contest_status` has exactly four values (ospex-indexer writes them; see
+ * `ContestRow` above), and only two of them carry an outcome a caller could act on:
+ *
+ *   - `scored` — the scorer published a result, so `settleSpeculation` can assign
+ *     the winning side and release the counterparty's funds.
+ *   - `voided` — the contest was voided, so `settleSpeculation` assigns `void` and
+ *     BOTH positions become refundable for their own risk.
+ *
+ * `unverified` and `verified` have no outcome on chain yet, so there is nothing to
+ * settle. Enumerated as a set rather than written as `!== 'unverified'` on purpose:
+ * membership here is what makes a row actionable, so a fifth status must be
+ * classified deliberately instead of being admitted by a negation.
+ */
+const SETTLEABLE_OPEN_CONTEST_STATUSES: ReadonlySet<ContestRow['contest_status']> =
+  new Set<ContestRow['contest_status']>(['scored', 'voided']);
 
 
 function impliedOddsDecimal(risk: bigint, profit: bigint | null): number | null {
@@ -519,10 +549,19 @@ export async function fetchCategorizedPositions(
     }
 
     // speculation_status === 'open'
-    if (contest?.contest_status === 'scored' && !p.claimed && riskWei6 > 0n) {
+    if (contest && SETTLEABLE_OPEN_CONTEST_STATUSES.has(contest.contest_status)
+        && !p.claimed && riskWei6 > 0n) {
       // Independent of predicted winner OR availability of prediction
       // inputs. A losing controlled side can still finalize the market
       // for its winning counterparty. Do not add losers to payout buckets.
+      //
+      // A `voided` contest reaches here too, and it is the one case with no
+      // winner to predict at all: settlement assigns `void` and refunds both
+      // sides their own risk. The row therefore also stays in `active` below
+      // — identical to a `scored` contest whose prediction inputs are missing
+      // — because its REFUND is not yet carried by a payout bucket. See the
+      // module header and `docs/positions-complete-enumeration.md` for the
+      // bound on that, and why closing it needs an ospex-sdk release first.
       settlementCandidates.push(base);
     }
     if (

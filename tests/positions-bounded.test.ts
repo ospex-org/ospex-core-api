@@ -145,7 +145,15 @@ describe('bounded complete positions enumeration', () => {
     expect(result.pendingSettle.at(-1)?.speculationId).toBe('1');
   });
 
-  it('includes scored/open candidates even when a prediction cannot be computed', async () => {
+  it('includes candidates whose prediction cannot be computed, and open-void candidates', async () => {
+    // Two independent reasons a row is settlement work without being payable,
+    // asserted side by side because they used to be confused for each other.
+    //   spec 1 — scored, but a score is missing, so no side can be predicted.
+    //   spec 2 — scored, but a spread with no line, so the scorer cannot replay.
+    //   spec 3 — VOIDED, so there is no side to predict at all. Until #77 this
+    //            row was delivered in `active` only and this case asserted its
+    //            absence; that expectation described the defect, not a contract.
+    //   spec 4 — closed void: already settled, so claimable rather than work.
     const tables = scaleTables(4);
     tables.contests[0]!.home_score = null;
     tables.speculations[1]!.market_type = 'spread'; tables.speculations[1]!.line_ticks = null;
@@ -153,9 +161,13 @@ describe('bounded complete positions enumeration', () => {
     tables.speculations[3]!.speculation_status = 'closed'; tables.speculations[3]!.win_side = 'void';
     db.getSupabase.mockReturnValue(positionTables(tables));
     const result = await fetchCategorizedPositions(ADDRESS, COMPLETE);
-    expect(result.settlementCandidates.map((p) => p.speculationId)).toEqual(['2', '1']);
+    expect(result.settlementCandidates.map((p) => p.speculationId)).toEqual(['3', '2', '1']);
     expect(result.pendingSettle).toEqual([]);
     expect(result.claimable).toMatchObject([{ speculationId: '4', result: 'void' }]);
+    // All three work rows stay in `active` as well — none of them is payable,
+    // and dropping them from `active` would remove them from the own-state
+    // snapshot's positions array.
+    expect(result.active.map((p) => p.speculationId)).toEqual(['3', '2', '1']);
   });
 
   it('builds all 450 claim plans, not just the first 200', async () => {
@@ -300,5 +312,114 @@ describe('real-ledger regression (offline deterministic mapping, no live writes)
       ] },
     ]);
     expect((await invoke(getClaimParamsHandler, flow)).body.positions).toEqual([]);
+  });
+});
+
+/**
+ * ospex-core-api#77 — an open-void backlog cannot falsely report complete.
+ *
+ * The issue's reproduction is at the HANDLER, not the helper: "call the real
+ * complete status handler: the row is delivered in `active`, not
+ * settlementCandidates." So these cases drive `getPositionStatusHandler` and
+ * `getClaimParamsHandler` through the filtering double and assert on the served
+ * body, which is the artifact a backlog consumer actually reads.
+ */
+describe('open-void settlement backlog, through the real handlers (#77)', () => {
+  /**
+   * A wallet whose ONLY unclaimed rows are two open positions, both sides of one
+   * speculation, on a voided contest. Nothing else is actionable, so
+   * `settlementCandidates` is the single field that can tell a consumer there is
+   * work — which is exactly the false-complete this issue is about.
+   *
+   * Scores are null, as a real voided contest's are.
+   */
+  function voidedSlate(): Tables {
+    const tables = scaleTables(1);
+    tables.contests[0]!.contest_status = 'voided';
+    tables.contests[0]!.away_score = null;
+    tables.contests[0]!.home_score = null;
+    // The counterparty side of the SAME speculation, held by the same wallet.
+    tables.positions.push({
+      ...tables.positions[0]!, id: 2, position_type: 'lower',
+      risk_amount: '15000', profit_amount: '10000',
+    } as Row);
+    return tables;
+  }
+
+  it('serves the open-void work in settlementCandidates, so a bucket-driven backlog sees it', async () => {
+    db.getSupabase.mockReturnValue(positionTables(voidedSlate()));
+    const res = await invoke(getPositionStatusHandler);
+    expect(res.statusCode).toBe(200);
+    // Both sides, not deduplicated: a void refunds each position its own risk,
+    // and the response contract puts speculationId dedup on the consumer. The
+    // order is the scan's immutable `id DESC`, so the `lower` row (id 2) leads.
+    expect(res.body.settlementCandidates).toMatchObject([
+      { speculationId: '1', positionType: 1, riskAmountWei6: '15000' },
+      { speculationId: '1', positionType: 0, riskAmountWei6: '10000' },
+    ]);
+    expect(res.body.pendingSettle).toEqual([]);
+    expect(res.body.claimable).toEqual([]);
+    expect(res.body.settledLost).toEqual([]);
+  });
+
+  it('keeps identity and count consistency: the raw count still equals the bucket union', async () => {
+    db.getSupabase.mockReturnValue(positionTables(voidedSlate()));
+    const res = await invoke(getPositionStatusHandler);
+    const buckets = ['active', 'pendingSettle', 'claimable', 'settlementCandidates', 'settledLost'] as const;
+    const union = new Set<string>();
+    for (const b of buckets) for (const p of res.body[b] as Array<{ positionId: string }>) union.add(p.positionId);
+    expect(res.body.enumeration).toEqual({ complete: true, pageSize: 199, pages: 1, positionCount: 2 });
+    expect(union.size).toBe(2);
+  });
+
+  it('adds no money and moves no total — settlementCandidates is work, not payout', async () => {
+    // Negative control for the whole change. If a later edit routes an open void
+    // into a payout bucket without the coordinated ospex-sdk release that
+    // `docs/positions-complete-enumeration.md` names, these numbers move and this
+    // goes red. `activeCount` staying at 2 is the other half: the rows must not
+    // silently leave `active`, or they leave the own-state snapshot with it.
+    db.getSupabase.mockReturnValue(positionTables(voidedSlate()));
+    const res = await invoke(getPositionStatusHandler);
+    expect(res.body.totals).toEqual({
+      activeCount: 2,
+      pendingSettleCount: 0,
+      claimableCount: 0,
+      estimatedPayoutUSDC: 0,
+      estimatedPayoutWei6: '0',
+      pendingSettlePayoutUSDC: 0,
+      pendingSettlePayoutWei6: '0',
+    });
+  });
+
+  it('serves no claim plan for an open void, which is the documented bound', async () => {
+    // Paired with the case above: claim-params is payable-only, and an open void
+    // has no payable bucket yet. Asserted rather than assumed, because the
+    // tempting next edit is to emit a settle+claim plan here — and that plan's
+    // `predictedWinSide` is the field an installed SDK client rejects.
+    db.getSupabase.mockReturnValue(positionTables(voidedSlate()));
+    const res = await invoke(getClaimParamsHandler);
+    expect(res.statusCode).toBe(200);
+    expect(res.body.positions).toEqual([]);
+  });
+
+  it('a scored contest in the same slate still settles and pays, so the gate did not widen', async () => {
+    // Positive control. Without it, a predicate that admitted every contest
+    // status would pass every case above.
+    const tables = voidedSlate();
+    tables.positions.push({ ...tables.positions[0]!, id: 3, speculation_id: 2 } as Row);
+    tables.speculations.push({ ...tables.speculations[0]!, speculation_id: 2, contest_id: 2 } as Row);
+    tables.contests.push({ ...tables.contests[0]!, contest_id: 2, contest_status: 'scored', away_score: 7, home_score: 6 } as Row);
+    // And a third contest that is merely verified: still nothing to settle.
+    tables.positions.push({ ...tables.positions[0]!, id: 4, speculation_id: 3 } as Row);
+    tables.speculations.push({ ...tables.speculations[0]!, speculation_id: 3, contest_id: 3 } as Row);
+    tables.contests.push({ ...tables.contests[0]!, contest_id: 3, contest_status: 'verified', away_score: 7, home_score: 6 } as Row);
+
+    db.getSupabase.mockReturnValue(positionTables(tables));
+    const res = await invoke(getPositionStatusHandler);
+    expect((res.body.settlementCandidates as Array<{ speculationId: string }>).map((p) => p.speculationId))
+      .toEqual(['2', '1', '1']);
+    expect(res.body.pendingSettle).toMatchObject([{ speculationId: '2', result: 'won', predictedWinSide: 'away' }]);
+    expect((res.body.active as Array<{ speculationId: string }>).map((p) => p.speculationId))
+      .toEqual(['3', '1', '1']);
   });
 });

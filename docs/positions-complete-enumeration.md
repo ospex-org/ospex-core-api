@@ -4,10 +4,10 @@ Public `GET /v1/positions/:address/status` and `claim-params` explicitly opt int
 
 - Raw positive-risk, unclaimed positions are scanned by immutable `id DESC` with strict `id < cursor`, 199 rows per read. Continue past categorized-empty/loser-only pages; only a short raw page terminates the scan. Related speculation/contest joins are chunked at 199.
 - `enumeration = {complete:true,pageSize:199,pages,positionCount}` counts successful raw reads (including terminal empty reads where applicable), and raw positions before payout filtering. An error, stalled cursor, missing identity, or missing join produces an error response, not partial-success metadata.
-- `settlementCandidates` contains all scored-contest/open-speculation controlled positive-risk positions, including losers and unavailable predictions. Deduplicate speculation IDs before settlement. It is NOT a payout bucket. `pendingSettle` retains winnings-only semantics.
+- `settlementCandidates` contains all open-speculation controlled positive-risk positions whose contest is `scored` **or** `voided`, including losers and unavailable predictions. Deduplicate speculation IDs before settlement. It is NOT a payout bucket. `pendingSettle` retains winnings-only semantics.
 - `settledLost` is always present (including `[]`) and contains positive-risk, unclaimed positions on **closed** speculations with an authoritative losing `win_side`. Each row is the existing structured `PositionBase` plus `result: "lost"`: `positionId`, string `speculationId`/`contestId`, numeric `positionType` (0 upper / 1 lower), `team`, `opponent`, `market`, `oddsDecimal`, `riskAmountUSDC`, `profitAmountUSDC`, `sport`, `awayTeam`, `homeTeam`, `riskAmountWei6`, `counterpartyRiskWei6`, `updatedAtUnixSec`. The `positionId` remains `${speculationId}_${lowercaseAddress}_${positionType}`. No `estimatedPayout*`, `predictedWinSide`, or `txParams` is added. Historical risk/profit is evidence, not active exposure, claim value, or money owed. These terminal rows are excluded from `active`, `settlementCandidates`, `pendingSettle`, `claimable`, every money total, and claim-params. No data is mutated to mark them claimed.
 - Reconcile raw `enumeration.positionCount` against the stable-position-identity **union** of `active`, `settlementCandidates`, `pendingSettle`, `claimable`, and `settledLost`. Candidates overlap pending/active rows; summing bucket lengths is incorrect. Never replace the raw count with categorized counts to manufacture completeness. A closed/`tbd` inconsistent outcome is still unclassified and thus remains a raw/union mismatch for strict consumers. Read/join/cursor error handling remains unchanged.
-- Open predicted losers are still settlement work, **not** `settledLost`; do not use the broader own-state stream's advisory `settledLost` derivation to populate this bucket. Closed push (draw) and void refunds remain claimable. Open-void behavior is deliberately unchanged (still active, no settlement or claim plan); that separately accepted false-done issue is not fixed here.
+- Open predicted losers are still settlement work, **not** `settledLost`; do not use the broader own-state stream's advisory `settledLost` derivation to populate this bucket. Closed push (draw) and void refunds remain claimable. An **open** speculation on a `voided` contest is now a `settlementCandidates` row as well as an `active` one, which is the fix for ospex-core-api#77; the earlier statement that this bucket ignored voided contests no longer describes the code. What it still does not do is serve that refund's AMOUNT or a claim plan — see the bound below.
 - Default shared-helper/own-state calls retain their single 200-row cap, join budget, raw `hitCap`, and UNKNOWN handling. History/list endpoints are unchanged.
 - This is an observational multi-query scan, not a transactionally frozen database snapshot. Rows can change after they are read; descend by immutable ID to avoid offset-skipping a shrinking unclaimed set. New head inserts are picked up by the next scan. Chain state remains authoritative at execution; backlog completion requires a fresh readback and repeated bounded passes.
 
@@ -18,6 +18,25 @@ Rollout is separately approved: deploy this producer before the MVE consumer. Th
 The exclusion of closed/`tbd` relies on the registered moneyline, spread and total scorers returning only `{Away, Home, Over, Under, Push}` on successful scoring. Atomic indexer writes are not the guarantee: settlement does not enforce a non-TBD result, and the indexer's unknown-outcome fallback is `tbd`. If an inconsistent closed/`tbd` row exists, the strict raw/union mismatch blocks that wallet's entire consumer lane. Identity reconciliation detects omission and contradiction, not a producer misclassification whose fields are stamped by the same branch that chose its bucket.
 
 Within REST-visible positive-risk, unclaimed positions, the own-state advisory `settledLost` label is broader than this REST bucket: it also includes closed/`tbd` rows and open predicted losers. The REST bucket contains only authoritative closed losses. Do not substitute one for the other.
+
+### Open-void refunds: settlement work is served, the refund amount is not
+
+An open speculation on a `voided` contest is reported as settlement work. Its refund is deliberately
+absent from `pendingSettle`, from the `totals` money fields, and from `claim-params`, and the reason is
+a consumer contract rather than a preference.
+
+`pendingSettle` rows carry a required `predictedWinSide`, and ospex-sdk validates that field with
+`z.enum(['away', 'home', 'over', 'under', 'push'])` in `packages/sdk/src/ownState/schemas.ts`. The
+own-state snapshot's position row is a `z.discriminatedUnion` on `status` with no `void` member. So a
+server that emitted a void into either shape would not degrade an installed client, it would fail that
+client's decode outright — on the feed a market maker uses to track its own money. Widening those two
+declarations and releasing the SDK has to land before the amount can be served, so it is one
+coordinated change rather than a unilateral server edit.
+
+What follows from that, for a consumer today: an open-void row appears in `settlementCandidates` and in
+`active`, `settleSpeculation` is the action, and the refund becomes visible through the ordinary
+`claimable` path once the speculation is closed. Do not read the absence of a payout figure as evidence
+that nothing is owed. Tracked as the follow-up to ospex-core-api#77.
 
 Two pre-existing behaviors remain separate follow-ups, not fixes in #74:
 
