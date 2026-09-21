@@ -165,6 +165,34 @@ const LEDGER_SELECT = [
   'seal_source_sha256', 'reveal_source_sha256',
 ].join(', ');
 
+/**
+ * The five axis ratings, each passed through exactly as stored.
+ *
+ * Two defects lived here and both fabricated data:
+ *
+ *   - `?? 0` on four of the five. A schema-valid partial vector — valuation 3,
+ *     trend null — became trend 0, which is not merely wrong, it is OUTSIDE the
+ *     1-5 scale this endpoint advertises in `axisScale`. The same `3g-nullish`
+ *     collapse the hold-out tag is guarded against, one field family over.
+ *   - Using `axis_valuation` alone as the sentinel for "no axes". A row with a
+ *     null valuation and a real trend returned `axes: null` and DISCARDED the
+ *     trend.
+ *
+ * So the object is null only when every axis is null — "no shape" is the honest
+ * rendering of nothing, and a zeroed radar is a shape — and otherwise each axis
+ * carries its own value or its own null.
+ */
+function axesOf(row: LedgerRow): Record<string, number | null> | null {
+  const axes = {
+    valuation: row.axis_valuation,
+    trend: row.axis_trend,
+    consensus: row.axis_consensus,
+    news: row.axis_news,
+    softness: row.axis_softness,
+  };
+  return Object.values(axes).every((v) => v === null) ? null : axes;
+}
+
 /** The no-pick body, shared by every state that has no row to serve. */
 function withoutPick(
   identity: PickIdentity,
@@ -197,6 +225,13 @@ function toPickBody(row: LedgerRow, writeup: string | null, sealedAt: string | n
   // Same convention the picks endpoint serves: a spread carries the side-labelled
   // pair and a null `line`, because the stored value is the HOME handicap.
   const spread = row.market === 'spread' ? spreadLines(row.line) : { awayLine: null, homeLine: null };
+  // The CLOSE is a spread too, and it is stored the same way: the HOME handicap.
+  // Serving it as a bare `line` reintroduced exactly the ospex-core-api#71 defect
+  // one object over from the fix for it — caught in review. Derived separately
+  // from the pick's own pair, because the two numbers differ.
+  const closingSpread = row.market === 'spread'
+    ? spreadLines(row.closing_line)
+    : { awayLine: null, homeLine: null };
 
   return {
     participantId: row.participant_id,
@@ -224,7 +259,9 @@ function toPickBody(row: LedgerRow, writeup: string | null, sealedAt: string | n
     priceDecimal: row.pick_price_decimal,
     priceAmerican: american,
     closing: {
-      line: row.closing_line,
+      line: row.market === 'spread' ? null : row.closing_line,
+      awayLine: closingSpread.awayLine,
+      homeLine: closingSpread.homeLine,
       priceDecimal: row.closing_price_decimal,
       priceAmerican: decimalToAmerican(row.closing_price_decimal),
       capturedAt: row.closing_captured_at,
@@ -240,15 +277,7 @@ function toPickBody(row: LedgerRow, writeup: string | null, sealedAt: string | n
       scoredAt: row.clv_scored_at,
       heldOutOfPrimary: row.held_out_of_primary,
     },
-    axes: row.axis_valuation === null
-      ? null
-      : {
-          valuation: row.axis_valuation,
-          trend: row.axis_trend ?? 0,
-          consensus: row.axis_consensus ?? 0,
-          news: row.axis_news ?? 0,
-          softness: row.axis_softness ?? 0,
-        },
+    axes: axesOf(row),
     primaryAxis: row.primary_axis,
     primaryExpectation: row.primary_expectation,
     execution: {

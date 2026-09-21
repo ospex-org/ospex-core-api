@@ -287,18 +287,52 @@ describe('pick detail — published body', () => {
     expect((body.pick as any).clv.unscoredReason).toBe(reason);
   });
 
-  it('serves a spread as the side-labelled pair with a null line', async () => {
+  it('serves a spread AND its close as side-labelled pairs with null lines', async () => {
     // The convention merged in #80: the stored value is the HOME handicap, so an
     // away pick's number is its negation and no bare `line` ships.
+    //
+    // The CLOSING line is a spread too, and the first draft of this endpoint
+    // served it raw — #71 reintroduced one object over from the fix for it. The
+    // first draft of this TEST could not catch that, because it left
+    // `closing_line` at the fixture's null.
+    //
+    // -1.5 for the pick and -2.5 for the close on purpose: equal values would let
+    // a build that reused the pick's pair for the close pass, and that is the
+    // most likely wrong implementation.
     const { body } = await call(
       { market: 'spread' },
-      { benchmark_pick_ledger: [ledgerRow({ market: 'spread', line: -1.5, pick_price_decimal: 1.9 })] },
+      {
+        benchmark_pick_ledger: [ledgerRow({
+          market: 'spread', line: -1.5, closing_line: -2.5, pick_price_decimal: 1.9,
+        })],
+      },
     );
     const pick = body.pick as Record<string, any>;
     expect(pick.line).toBeNull();
     expect(pick.awayLine).toBe(1.5);
     expect(pick.homeLine).toBe(-1.5);
     expect(pick.selectionLabel).toBe('New York Yankees +1.5');
+
+    expect(pick.closing.line).toBeNull();
+    expect(pick.closing.awayLine).toBe(2.5);
+    expect(pick.closing.homeLine).toBe(-2.5);
+  });
+
+  it('keeps a non-spread closing line as the stored threshold', async () => {
+    // Paired control: only a spread loses its bare `line`. A total's close is
+    // perspective-neutral and must survive untouched.
+    const { body } = await call(
+      { market: 'total' },
+      {
+        benchmark_pick_ledger: [ledgerRow({
+          market: 'total', selection: 'under', line: 8.5, closing_line: 9,
+        })],
+      },
+    );
+    const pick = body.pick as Record<string, any>;
+    expect(pick.closing.line).toBe(9);
+    expect(pick.closing.awayLine).toBeNull();
+    expect(pick.closing.homeLine).toBeNull();
   });
 
   it('serves a total line as the perspective-neutral threshold', async () => {
@@ -311,6 +345,62 @@ describe('pick detail — published body', () => {
     expect(pick.awayLine).toBeNull();
     expect(pick.homeLine).toBeNull();
     expect(pick.selectionLabel).toBe('Under 8.5');
+  });
+});
+
+describe('pick detail — the axis vector is never fabricated', () => {
+  /**
+   * The DDL permits each axis to be independently null, and this endpoint
+   * advertises a 1-5 scale. So a zero is not a low score, it is a value outside
+   * the scale — and the first draft produced one with `?? 0`.
+   *
+   * Four cases, because the two wrong implementations fail on different ones: a
+   * `?? 0` build fails the partial case, and a build using `valuation` as the
+   * sentinel for "no axes" fails the valuation-null case by discarding the rest.
+   */
+  const AXES = ['axis_valuation', 'axis_trend', 'axis_consensus', 'axis_news', 'axis_softness'] as const;
+
+  it('serves every axis when every axis is present', async () => {
+    const { body } = await call();
+    expect((body.pick as any).axes).toEqual({
+      valuation: 2, trend: 3, consensus: 4, news: 2, softness: 2,
+    });
+  });
+
+  it('preserves an individual null rather than turning it into a zero', async () => {
+    const { body } = await call({}, {
+      benchmark_pick_ledger: [ledgerRow({ axis_trend: null, axis_news: null })],
+    });
+    expect((body.pick as any).axes).toEqual({
+      valuation: 2, trend: null, consensus: 4, news: null, softness: 2,
+    });
+  });
+
+  it('keeps the other axes when VALUATION alone is null', async () => {
+    // The sentinel bug: valuation was used to decide whether any axes existed, so
+    // a null valuation discarded a real trend.
+    const { body } = await call({}, {
+      benchmark_pick_ledger: [ledgerRow({ axis_valuation: null })],
+    });
+    expect((body.pick as any).axes).toEqual({
+      valuation: null, trend: 3, consensus: 4, news: 2, softness: 2,
+    });
+  });
+
+  it('serves null for the whole vector only when every axis is null', async () => {
+    const empty = Object.fromEntries(AXES.map((k) => [k, null]));
+    const { body } = await call({}, { benchmark_pick_ledger: [ledgerRow(empty)] });
+    expect((body.pick as any).axes).toBeNull();
+  });
+
+  it.each(AXES)('a vector with only %s set is still a vector', async (present) => {
+    // Each axis alone, so no single field can be the one the implementation
+    // happens to consult.
+    const row = Object.fromEntries(AXES.map((k) => [k, k === present ? 4 : null]));
+    const { body } = await call({}, { benchmark_pick_ledger: [ledgerRow(row)] });
+    const axes = (body.pick as any).axes as Record<string, number | null>;
+    expect(axes).not.toBeNull();
+    expect(Object.values(axes).filter((v) => v !== null)).toEqual([4]);
   });
 });
 

@@ -611,9 +611,13 @@ All three answer `200`. `pick: null` rather than an object of nulls, so there is
 
 `not_published` **deliberately conflates causes** and it is worth knowing which. A sealed-but-unrevealed pick produces no reveal row, therefore no key row, therefore no conflicts row and no ledger row — byte-identical to "never existed" in every relation this endpoint reads. `benchmark_decisions` would distinguish it, and saying "this arm has a sealed pick on this game" before the reveal discloses which games an arm picked, which is what the seal withholds. A key resolving to a non-live cohort, and a slate before the publication gate, are also `not_published`. Claiming to tell these apart would be an invention, not a service.
 
-**Distinctions the body preserves**, each of which a normalisation would erase: `execution.netUsdc` is null only while `result` is `pending` — a push, void or no-fill carries a real `0`; `clv.pct` null WITH `clv.unscoredReason` set is the scorer refusing, null with both null is not-yet-scored; `clv.heldOutOfPrimary` stays tri-state and is never defaulted to `false`; `closing.ready` is its own boolean rather than an inferred null timestamp; the `marketOpen*` family is null on rows published before migration 084 and must be treated as optional for that reason rather than as missing data.
+**Distinctions the body preserves**, each of which a normalisation would erase: `execution.netUsdc` is null only while `result` is `pending` — a push, void or no-fill carries a real `0`; `clv.pct` null WITH `clv.unscoredReason` set is the scorer refusing, null with both null is not-yet-scored; `clv.heldOutOfPrimary` stays tri-state and is never defaulted to `false`; `closing.ready` is its own boolean rather than an inferred null timestamp.
 
-Spread picks follow the same convention as everywhere else in this service: `awayLine` / `homeLine` with a null `line`. `digests.algorithm` names the hash so a verifier need not guess.
+**`axes` is never fabricated.** Each of the five ratings carries its own value or its own `null`, and the whole object is `null` only when every one of them is null. A missing axis is not a zero: `axisScale` advertises 1–5, so a zero would be a value outside the scale the same payload declares. A partial vector — `valuation` set, `trend` null — is a real state the DDL permits and is served as such.
+
+**Both spread numbers are side-labelled**, the pick's and the close's: each carries `awayLine` / `homeLine` with a null `line`, because both are stored as the HOME handicap and the two values differ. `digests.algorithm` names the hash so a verifier need not guess.
+
+Market-open timing (`marketOpen*` on the underlying view) is **not served here**.
 
 #### `GET /v1/benchmark/stats?sport=`
 
