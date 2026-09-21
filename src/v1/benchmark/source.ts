@@ -116,7 +116,7 @@ export function respondToQueryError(
     res.status(503).json({
       error:
         `${FAULT_HINT[fault]} (${error.code}). ` +
-        'Apply the indexer migrations that create the benchmark serving projection (073-079).',
+        'Apply the indexer migrations that create the benchmark serving projection (073-086).',
       code: 'NOT_READY',
     } satisfies ApiError);
     return;

@@ -3,9 +3,16 @@
  *
  * Signer-free and unauthenticated, like every other `/v1` read: the acceptance
  * for this surface is that an auditor holding only the Supabase anon key can
- * reproduce the published numbers, and the anon key cannot read a single
- * `benchmark_*` row (migration 073 revokes it). The service role that CAN read
- * them never leaves this process.
+ * reproduce the published numbers.
+ *
+ * This docblock used to add that the anon key could reach none of the
+ * underlying schema. That held for migration 073 and stopped holding at
+ * 082/083/086, which grant anon SELECT on the relations this endpoint
+ * aggregates — verified with the anon key alone. (Paraphrased rather than
+ * quoted on purpose: a grep for the old sentence should find nothing.)
+ * What survives is the part that never depended on it: the
+ * numbers are computed once, server-side, from one vocabulary, and the
+ * `service_role` key never leaves this process.
  *
  * This file is the I/O half. Every number is computed in `standingsProject.ts`,
  * which is pure and is where the tests live.
