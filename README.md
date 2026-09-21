@@ -493,7 +493,11 @@ Query params: `limit` (max 500), `offset`.
 
 ### LLM benchmark read projection
 
-Three signer-free public reads over the `benchmark_*` serving tables that migrations 073–079 create in the protocol indexer's schema. No authentication: the acceptance for this surface is that an auditor holding only the Supabase anon key can reproduce the published numbers, and the anon key cannot read a single `benchmark_*` row (073 revokes it from `anon` and `authenticated`). The `service_role` key that CAN read them never leaves this process — the browser consumes this projection instead of the tables, so no metric math and no credential goes near the front end.
+Three signer-free public reads over the `benchmark_*` serving tables that migrations 073–086 create in the protocol indexer's schema. No authentication: the acceptance for this surface is that an auditor holding only the Supabase anon key can reproduce the published numbers.
+
+**The anon key CAN read much of that schema, and this projection is not what withholds it.** Migration 073 did revoke anon reads, and 082/083/086 then granted them back for the relations the public benchmark is built on — measured 2026-09-21 with the anon key alone: `benchmark_pick_writeups` 4,170 rows, `benchmark_scores` 7,092, `benchmark_decision_reveals` 7,092, `benchmark_execution_fills` 499, `benchmark_model_aggregates` 16, `benchmark_model_daily_beat_rate` 452, `benchmark_schema_capability` 3. (Counts move; the point is that they are non-zero.)
+
+What this projection is for survives that correction intact, on the three grounds that do not depend on the tables being unreadable: it serves **one vocabulary** rather than each client inventing its own; it keeps the scorer's arithmetic server-side so no metric math happens in a browser; and its publication gate is a config var this service can unset, which a row in a table it holds SELECT-only on could never be. The `service_role` key still never leaves this process, and no credential goes near the front end — both remain true.
 
 > ⚠ **Nothing is served until `BENCHMARK_PUBLIC_MIN_SLATE_DATE` is set.** With it unset the three endpoints answer `200` with empty collections and issue **no database query at all**. See **The two gates** below.
 
@@ -587,7 +591,7 @@ Each pick's `fill` (null until a receipt is published) carries the transaction h
 
 Both paragraphs describe a shape that **is not currently served**: run-line picks are excluded from this endpoint by ruling 2, so every served pick has `awayLine` and `homeLine` null. The contract is written down now because the semantics are the part that was wrong (`#71`), and enabling the market later should not also mean deciding them.
 
-Writeups (`benchmark_decision_rationales`) are **not read at all** — operator-gated, and the way to not publish something is to not query it.
+Writeups (`benchmark_decision_rationales`) are **not read by this endpoint**, so a pick card carries no prose. That is a choice about this surface, not a publication control: indexer migration 081's `benchmark_pick_writeups` view is anon-readable (measured 2026-09-21, 4,170 rows of prose), so the rationales are already public whatever this service queries. The view does withhold `evidence_refs`. Reason about publication from the grants, not from this endpoint's query list.
 
 #### `GET /v1/benchmark/stats?sport=`
 

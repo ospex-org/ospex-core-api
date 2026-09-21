@@ -165,10 +165,13 @@ v1Router.get('/stream/:resource', (req, res) => getStreamHandler(req, res));
 v1Router.get('/leaderboard', readRateLimit, asyncHandler(getLeaderboardHandler));
 
 // ── LLM benchmark read projection ────────────────────────────────────
-// Signer-free public reads over the `benchmark_*` serving tables, which the
-// anon key cannot touch (migration 073 revokes it) — the browser consumes this
-// projection instead of the raw tables, so no metric math and no credential
-// goes anywhere near the front end.
+// Signer-free public reads over the `benchmark_*` serving tables. The anon key
+// CAN read much of that schema — 073 revoked it, 082/083/086 granted it back for
+// the public benchmark relations — so this projection is not what withholds the
+// tables. It exists so the browser consumes one vocabulary with the metric math
+// already done server-side, and so no credential goes anywhere near the front
+// end. Both of those are still true; "the tables are unreadable" never was,
+// after 082.
 //
 // Nothing is served until BENCHMARK_PUBLIC_MIN_SLATE_DATE is set: the
 // publication gate is a config var rather than a database row, because

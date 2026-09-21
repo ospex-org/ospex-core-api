@@ -26,11 +26,22 @@
  * all three markets, and the work order's own acceptance number is the mean of
  * a moneyline and a spread pick.
  *
- * ## Writeups are not read
+ * ## Writeups are not served HERE, which is not the same as unpublished
  *
- * `benchmark_decision_rationales` is not queried at all. It is operator-gated
- * pending a publication decision, and the way to not publish something is to
- * not read it.
+ * `benchmark_decision_rationales` is not queried by this endpoint, so a pick
+ * card carries no prose. That is a choice about this surface and it stands.
+ *
+ * What does NOT follow, and what this docblock used to claim, is that
+ * abstaining keeps the rationales unpublished. It does not. Indexer migration
+ * 081 created the `benchmark_pick_writeups` view over that table and 082/083
+ * granted anon SELECT, so the rationale text is public with the anon key alone
+ * — measured 2026-09-21, 4,170 rows, full prose in `writeup`. The publication
+ * decision was taken elsewhere and it went the other way.
+ *
+ * The one thing the view does withhold is `evidence_refs`, which it does not
+ * project; the prose is public and the internal reference tokens are not. So
+ * reason about publication from the GRANTS, never from which queries this file
+ * happens to make.
  */
 
 import type { Request, Response } from 'express';
