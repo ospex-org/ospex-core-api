@@ -38,6 +38,15 @@ What follows from that, for a consumer today: an open-void row appears in `settl
 `claimable` path once the speculation is closed. Do not read the absence of a payout figure as evidence
 that nothing is owed. Tracked as the follow-up to ospex-core-api#77.
 
+The dual membership is deliberate and the MVE consumer already permits it: `active` overlapping
+`settlementCandidates` is not one of the overlaps that consumer refuses, and its union count is keyed by
+`(speculationId, side)` so a row in both is counted once. Keeping the row in `active` is what holds the
+raw-count-equals-bucket-union reconciliation together — a row in no bucket at all would fail that
+wallet's entire lane closed, and it would also vanish from the own-state snapshot, whose positions array
+is built from these buckets. The pinned SDK never reads `settlementCandidates` at all (its
+`PositionStatusBody` names only `active`, `pendingSettle`, `claimable` and `totals`), so no installed SDK
+or CLI client observes this change.
+
 Two pre-existing behaviors remain separate follow-ups, not fixes in #74:
 
 - **Own-state 200-row cap:** terminal losses remain unclaimed with positive historical risk and no payout/transfer clearing path, so they can permanently consume the default capped query's budget and keep `positionsTruncated`/the MM health hold asserted. A durable correction must exclude terminal rows before applying the actionable own-state cap (without falsifying raw complete-enumeration evidence), and prove with more than 200 terminal losses plus actionable rows that health recovers without hiding live exposure. Raising the cap only delays the problem. This source finding does not establish whether any live maker is currently latched.

@@ -557,11 +557,18 @@ export async function fetchCategorizedPositions(
       //
       // A `voided` contest reaches here too, and it is the one case with no
       // winner to predict at all: settlement assigns `void` and refunds both
-      // sides their own risk. The row therefore also stays in `active` below
-      // — identical to a `scored` contest whose prediction inputs are missing
-      // — because its REFUND is not yet carried by a payout bucket. See the
-      // module header and `docs/positions-complete-enumeration.md` for the
-      // bound on that, and why closing it needs an ospex-sdk release first.
+      // sides their own risk (PositionModule._calculatePayout returns
+      // `riskAmount` for Push/Void before it looks at the side, so this is
+      // market-type and side independent).
+      //
+      // The row also stays in `active` below, identical to a `scored` contest
+      // whose prediction inputs are missing. That is required, not tidy: a row
+      // in NO bucket breaks the MVE consumer's raw-count-equals-bucket-union
+      // check and fails that wallet's whole lane, and it would disappear from
+      // the own-state snapshot, which builds its positions array from these
+      // buckets. Its REFUND is still not carried by a payout bucket — see
+      // `docs/positions-complete-enumeration.md` for that bound and why
+      // closing it needs a coordinated ospex-sdk release.
       settlementCandidates.push(base);
     }
     if (
