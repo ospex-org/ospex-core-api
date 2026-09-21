@@ -11,6 +11,13 @@ export interface Query {
   joins: Array<[string, unknown[]]>;
   orders: Array<[string, { ascending: boolean; nullsFirst?: boolean }]>;
   limit?: number;
+  /**
+   * Every `AbortSignal` attached to this read. Recorded rather than ignored so a
+   * test can assert the complete traversal's deadline signal actually reaches
+   * every read site — a double that silently accepted and dropped it would let
+   * an unabortable scan pass.
+   */
+  signals: AbortSignal[];
 }
 export interface Reply { data: Row[] | null; error: { message: string } | null }
 
@@ -23,7 +30,7 @@ export function positionTables(
   return {
     queries,
     from(table: Table) {
-      const q: Query = { table, eq: [], gt: [], lt: [], joins: [], orders: [] };
+      const q: Query = { table, eq: [], gt: [], lt: [], joins: [], orders: [], signals: [] };
       const builder = {
         select(columns: string) { q.select = columns; return builder; },
         eq(column: string, value: unknown) { q.eq.push([column, value]); return builder; },
@@ -34,6 +41,7 @@ export function positionTables(
           q.orders.push([column, options]); return builder;
         },
         limit(value: number) { q.limit = value; return builder; },
+        abortSignal(signal: AbortSignal) { q.signals.push(signal); return builder; },
         range() { throw new Error('Offset paging must never be used for an unclaimed scan'); },
         then(resolve: (reply: Reply) => void) {
           queries.push(q);

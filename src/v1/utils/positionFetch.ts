@@ -77,6 +77,74 @@ import { maxIsoTimestamptz } from '../ownState/timestamps.js';
 const POSITION_QUERY_LIMIT = 200;
 const COMPLETE_PAGE_SIZE = 199;
 
+/**
+ * The resource budget on a COMPLETE traversal. Applies to `complete` only; the
+ * default capped path is a single read and is untouched.
+ *
+ * ## Why this is allowed to refuse, when a linter is not
+ *
+ * `.claude/rules/advisory-tooling.md` keeps the blocking list short and
+ * deliberate. This belongs on it: it is a fail-closed resource gate on a
+ * money-adjacent read, and the thing it refuses to do is return a number
+ * nobody bounded. It is not convenience tooling and it cannot fail while the
+ * system is fine — it fires only when a traversal genuinely exceeded a stated
+ * bound.
+ *
+ * ## The unit, which decides the off-by-one
+ *
+ * `COMPLETE_MAX_PAGES` counts DATABASE READS of the positions scan, the same
+ * thing `enumeration.pages` reports — terminal short read included. The loop
+ * stops on a short page, so a population that is an exact multiple of
+ * `COMPLETE_PAGE_SIZE` costs one extra read to discover it has ended. The
+ * largest population that completes is therefore
+ * `COMPLETE_MAX_PAGES * COMPLETE_PAGE_SIZE - 1` = 12,735 rows; 12,736 needs a
+ * 65th read and is refused. Stated because "at the limit" and "one over" are
+ * otherwise indistinguishable from an off-by-one.
+ *
+ * Rows need no separate budget: an oversized page is already refused below, so
+ * reads x page size bounds rows exactly. A third constant would only drift.
+ *
+ * ## Which of the two is the real guard
+ *
+ * The DEADLINE is. It covers the whole traversal — the scan and both joins —
+ * because that is what a request spends, and it is half of Heroku's 30s router
+ * timeout so the categorisation and the response still fit in the other half.
+ * `COMPLETE_MAX_PAGES` is the backstop for a loop that is pathological but
+ * FAST, where elapsed time would never notice. So the page budget is set
+ * generously on purpose: 12,735 rows is roughly 28x the largest population this
+ * repo has ever exercised, and a wallet legitimately past it should get the
+ * bound raised deliberately rather than be refused by a number nobody chose.
+ */
+const COMPLETE_MAX_PAGES = 64;
+const COMPLETE_DEADLINE_MS = 15_000;
+
+/** Which bound a complete traversal ran into. */
+export type EnumerationLimit = 'pages' | 'deadline';
+
+/**
+ * A complete traversal refused to continue.
+ *
+ * Typed, and distinct per bound, because the two call for different operator
+ * actions: `pages` means a population outgrew a constant and somebody decides
+ * whether to raise it; `deadline` means reads got slower and somebody looks at
+ * why. Flattening both into a bare `INTERNAL_ERROR` — which is what the
+ * handlers did with every throw on this path — makes them the same page in the
+ * logs as a dropped connection.
+ *
+ * Neither is transient. Retrying the same wallet reproduces it.
+ */
+export class PositionEnumerationLimitError extends Error {
+  constructor(readonly limit: EnumerationLimit, message: string) {
+    super(message);
+    this.name = 'PositionEnumerationLimitError';
+  }
+}
+
+/** The bound a thrown value ran into, or null when it is any other failure. */
+export function enumerationLimitOf(err: unknown): EnumerationLimit | null {
+  return err instanceof PositionEnumerationLimitError ? err.limit : null;
+}
+
 const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower: 1 };
 const POSITION_TYPE_FROM_INT: Record<0 | 1, 'upper' | 'lower'> = { 0: 'upper', 1: 'lower' };
 
@@ -335,8 +403,60 @@ export async function fetchCategorizedPositions(
   const positions: PositionRow[] = [];
   let pages = 0;
   let beforeId: bigint | undefined;
+  // One deadline for the WHOLE complete traversal, read once. The scan and both
+  // joins share it because a request spends the sum of all three, and bounding
+  // them separately would let three in-budget phases add up to an out-of-budget
+  // request.
+  const deadlineAt = Date.now() + COMPLETE_DEADLINE_MS;
+  // An ABORT is what makes the deadline real; a clock read between reads is only
+  // the cheap part of it. Checking the clock alone cannot interrupt a read that
+  // is already in flight, and cannot see a read that RETURNS late — both of
+  // which were reproduced on the check-only version of this: a stalled response
+  // body left the endpoint pending past the deadline, and a slow terminal read
+  // answered 200 with `enumeration.complete = true`. So one signal is attached
+  // to every read of the traversal, and it cancels the request and its body.
+  //
+  // Unref'd and deliberately never cleared (`windows-tooling.md`, the timer
+  // rule): nothing races it, so it must not hold the event loop open after a
+  // fast request, and aborting a controller nobody is listening to is a no-op.
+  const deadline = options.complete ? new AbortController() : undefined;
+  if (deadline !== undefined) {
+    setTimeout(() => { deadline.abort(); }, COMPLETE_DEADLINE_MS).unref();
+  }
+  // Two mechanisms, one job each, and deliberately not overlapping: the SIGNAL
+  // cancels, the CLOCK classifies. A cancelled read comes back as an ordinary
+  // error, and by then the clock is necessarily at or past the deadline, so
+  // checking `signal.aborted` here as well would be a second branch that no
+  // test could isolate from the first. `>=` rather than `>` because the timer
+  // is set for exactly this instant.
+  //
+  // A genuine read failure arriving at or after the deadline is reported as the
+  // deadline on purpose: both facts are true by then, and this is the
+  // actionable one.
+  const refuseIfLate = (phase: string): void => {
+    if (!options.complete) return;
+    if (Date.now() >= deadlineAt) {
+      throw new PositionEnumerationLimitError(
+        'deadline',
+        `fetchCategorizedPositions ${phase}: exceeded the ${String(COMPLETE_DEADLINE_MS)}ms complete-traversal deadline`,
+      );
+    }
+  };
   const columns = 'speculation_id, user_address, position_type, risk_amount, profit_amount, claimed, position_created_at, row_updated_at';
   do {
+    // Checked BEFORE the read, so the budget bounds reads issued rather than
+    // reads completed — a refusal costs nothing. Only the scan keeps a pre-read
+    // deadline check: the joins are entered immediately after a post-read check,
+    // with nothing but synchronous dedup in between, so a pre-check there could
+    // never see a clock the previous one did not. Their post-read checks are the
+    // live ones.
+    if (options.complete && pages >= COMPLETE_MAX_PAGES) {
+      throw new PositionEnumerationLimitError(
+        'pages',
+        `fetchCategorizedPositions positions: exceeded ${String(COMPLETE_MAX_PAGES)} pages without reaching a short page`,
+      );
+    }
+    refuseIfLate('positions');
     let query = sb.from('positions')
       .select(options.complete ? `id, ${columns}` : columns)
       .eq('network', config.network)
@@ -354,7 +474,12 @@ export async function fetchCategorizedPositions(
       query = query.order('position_created_at', { ascending: false, nullsFirst: false })
         .limit(POSITION_QUERY_LIMIT);
     }
+    if (deadline !== undefined) query = query.abortSignal(deadline.signal);
     const posRes = await query;
+    // Before the error is generalised: an aborted read arrives here as an
+    // ordinary `error`, so this is where it becomes the typed refusal instead
+    // of an INTERNAL_ERROR. Also catches a read that simply RETURNED late.
+    refuseIfLate('positions');
     if (posRes.error) throw new Error(`fetchCategorizedPositions positions: ${posRes.error.message}`);
     if (options.complete && !Array.isArray(posRes.data)) {
       throw new Error('fetchCategorizedPositions positions: missing page data');
@@ -387,6 +512,9 @@ export async function fetchCategorizedPositions(
   // saturate the cap budget?".
   const hitCap = !options.complete && positions.length >= POSITION_QUERY_LIMIT;
   if (positions.length === 0) {
+    // A wallet with nothing in it is still a traversal, and a single read that
+    // came back after the deadline must not answer an authoritative empty.
+    refuseIfLate('result');
     return { active: [], pendingSettle: [], claimable: [], settlementCandidates: [], settledLost: [], hitCap, derivedStatuses: [],
       ...(enumeration ? { enumeration } : {}) };
   }
@@ -404,7 +532,9 @@ export async function fetchCategorizedPositions(
       .eq('network', config.network)
       .in('speculation_id', specIds.slice(start, start + size));
     if (options.complete) query = query.limit(COMPLETE_PAGE_SIZE);
+    if (deadline !== undefined) query = query.abortSignal(deadline.signal);
     const specRes = await query;
+    refuseIfLate('speculations');
     if (specRes.error) throw new Error(`fetchCategorizedPositions speculations: ${specRes.error.message}`);
     const specs = (specRes.data ?? []) as unknown as SpeculationRow[];
     for (const s of specs) specById.set(s.speculation_id, s);
@@ -431,7 +561,9 @@ export async function fetchCategorizedPositions(
       .eq('network', config.network)
       .in('contest_id', contestIds.slice(start, start + size));
     if (options.complete) query = query.limit(COMPLETE_PAGE_SIZE);
+    if (deadline !== undefined) query = query.abortSignal(deadline.signal);
     const contestRes = await query;
+    refuseIfLate('contests');
     if (contestRes.error) throw new Error(`fetchCategorizedPositions contests: ${contestRes.error.message}`);
     const contests = (contestRes.data ?? []) as unknown as ContestRow[];
     for (const c of contests) contestById.set(c.contest_id, c);
@@ -653,6 +785,11 @@ export async function fetchCategorizedPositions(
     active.push(base);
   }
 
+  // No late result is ever presented as complete. With the signal attached this
+  // is a backstop rather than the mechanism — a read cannot overrun the deadline
+  // any more — but it is what makes the bound true of the WHOLE traversal
+  // including categorisation, rather than only of its reads.
+  refuseIfLate('result');
   return { active, pendingSettle, claimable, settlementCandidates, settledLost, hitCap, derivedStatuses,
     ...(enumeration ? { enumeration } : {}) };
 }

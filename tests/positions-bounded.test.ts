@@ -1,9 +1,9 @@
 /** Complete-enumeration tests execute the real helper + handlers against an in-memory DB double. */
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { ADDRESS, positionTables, scaleTables, STAMP, type Reply, type Row, type Table, type Tables } from './helpers/positionTables.js';
+import { ADDRESS, positionTables, scaleTables, STAMP, type Query, type Reply, type Row, type Table, type Tables } from './helpers/positionTables.js';
 
 const db = vi.hoisted(() => ({ getSupabase: vi.fn() }));
 vi.mock('../src/lib/supabase.js', () => db);
@@ -421,5 +421,253 @@ describe('open-void settlement backlog, through the real handlers (#77)', () => 
     expect(res.body.pendingSettle).toMatchObject([{ speculationId: '2', result: 'won', predictedWinSide: 'away' }]);
     expect((res.body.active as Array<{ speculationId: string }>).map((p) => p.speculationId))
       .toEqual(['3', '1', '1']);
+  });
+});
+
+/**
+ * `ospex-core-api#75` — the complete traversal refuses rather than continuing.
+ *
+ * ## Why these cases synthesise rows instead of using `scaleTables`
+ *
+ * The page budget is 64 reads, so the boundary sits at 12,735 / 12,736 rows.
+ * Materialising that as a fixture, three tables wide, costs more than it proves.
+ * `endlessWallet` answers each read from the cursor instead: strictly descending
+ * ids, exactly 199 per page until the population runs out, with matching
+ * speculation and contest rows for whatever ids the joins ask for — so the
+ * missing-join refusal cannot fire and change what is being measured.
+ *
+ * ## Each case disables the OTHER bound, deliberately
+ *
+ * Two mechanisms can stop this loop, and a test that lets either one fire
+ * cannot say which did (`verification-discipline.md` 3b-rescue). So the page
+ * cases FREEZE the clock — with fake timers and no advancement the deadline is
+ * structurally unreachable, and a slow CI machine cannot turn a page-budget
+ * assertion into a deadline that happened to arrive first. The deadline case
+ * runs three reads, far under 64, so the page budget cannot reach.
+ */
+describe('complete enumeration refuses past its budget (#75)', () => {
+  const EMPTY: Tables = { positions: [], speculations: [], contests: [] };
+
+  /**
+   * `advanceMs` moves the fake clock while a given table is being read, which is
+   * how the deadline is reached without waiting. Per-table on purpose: the
+   * deadline is checked at THREE sites — the scan and both joins — and a single
+   * knob could only ever exercise the first. Advancing during the positions
+   * reads lands the refusal on the scan or, tuned a little higher, on the
+   * speculations check that runs right after the scan ends.
+   */
+  function endlessWallet(totalRows: number, advanceMs: Partial<Record<Table, number>> = {}) {
+    return (q: Query, _n: number, _reply: Reply): Reply | void => {
+      const step = advanceMs[q.table];
+      if (step !== undefined) vi.advanceTimersByTime(step);
+      if (q.table === 'positions') {
+        const before = q.lt.length > 0 ? Number(q.lt[0]![1]) : totalRows + 1;
+        // Honour the limit the caller ASKED for rather than assuming the
+        // complete page size. The first draft hardcoded 199, so the default
+        // capped path — which asks for 200 — never saturated and its `hitCap`
+        // signal read false. A fake that ignores the query is the thing these
+        // tests exist to avoid.
+        const want = q.limit ?? 199;
+        const rows: Row[] = [];
+        for (let id = before - 1; id >= 1 && rows.length < want; id--) {
+          rows.push({
+            id, speculation_id: id, user_address: ADDRESS, network: 'polygon',
+            position_type: 'upper', risk_amount: '10000', profit_amount: '15000',
+            claimed: false, position_created_at: STAMP, row_updated_at: STAMP,
+          });
+        }
+        return { data: rows, error: null };
+      }
+      const ids = (q.joins[0]?.[1] ?? []) as number[];
+      if (q.table === 'speculations') {
+        return { data: ids.map((id) => ({
+          speculation_id: id, contest_id: id, network: 'polygon', market_type: 'moneyline',
+          line_ticks: 0, speculation_status: 'open', win_side: 'tbd', row_updated_at: STAMP,
+        })), error: null };
+      }
+      return { data: ids.map((id) => ({
+        contest_id: id, network: 'polygon', away_team: 'A', home_team: 'B', sport_slug: 'mlb',
+        contest_status: 'verified', away_score: null, home_score: null, row_updated_at: STAMP,
+      })), error: null };
+    };
+  }
+
+  afterEach(() => { vi.useRealTimers(); });
+
+  function freezeClock(): void {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-21T00:00:00Z'));
+  }
+
+  it('completes the largest population that fits the budget, in exactly 64 reads', async () => {
+    // 64 * 199 - 1. The 64th read returns 198 rows, which is short, so the loop
+    // ends there — this is the boundary the unit definition produces, and the
+    // reason the doc states that unit rather than leaving it to be inferred.
+    freezeClock();
+    db.getSupabase.mockReturnValue(positionTables(EMPTY, endlessWallet(12_735)));
+    const result = await fetchCategorizedPositions(ADDRESS, COMPLETE);
+    expect(result.enumeration).toEqual({ complete: true, pageSize: 199, pages: 64, positionCount: 12_735 });
+  });
+
+  it('refuses one row further, naming the bound it hit', async () => {
+    // 64 * 199 exactly: sixty-four FULL pages, so a 65th read is needed to learn
+    // the population ended. That read is the one refused.
+    freezeClock();
+    db.getSupabase.mockReturnValue(positionTables(EMPTY, endlessWallet(12_736)));
+    await expect(fetchCategorizedPositions(ADDRESS, COMPLETE)).rejects.toMatchObject({
+      name: 'PositionEnumerationLimitError',
+      limit: 'pages',
+    });
+  });
+
+  it.each([
+    ['the scan', 100_000, { positions: 8_000 }, 'positions'],
+    ['a terminal short read that returns late', 5, { positions: 20_000 }, 'positions'],
+    ['an empty wallet whose only read returns late', 0, { positions: 20_000 }, 'positions'],
+    ['the speculations join', 199, { speculations: 20_000 }, 'speculations'],
+    ['the contests join', 199, { contests: 20_000 }, 'contests'],
+  ] as Array<[string, number, Partial<Record<Table, number>>, string]>)(
+    'refuses on the deadline during %s, far inside the page budget',
+    async (_where, rows, advance, phase) => {
+      // The deadline covers the whole traversal, so it is checked after EVERY
+      // read. One case per site, each asserting the phase the message names —
+      // otherwise a build that kept only the scan check would pass on the scan
+      // case alone and ship two guards nothing executes.
+      //
+      // Two of these are the holes a check-only deadline left open, and they are
+      // the reason the post-read check exists at all: a terminal SHORT read and
+      // an EMPTY wallet both end the loop, so nothing ran afterwards to notice
+      // the clock and both answered an authoritative success late.
+      //
+      // Every case stays at a handful of reads, far under 64, so a refusal here
+      // can only be the clock and never the page budget.
+      freezeClock();
+      db.getSupabase.mockReturnValue(positionTables(EMPTY, endlessWallet(rows, advance)));
+      await expect(fetchCategorizedPositions(ADDRESS, COMPLETE)).rejects.toMatchObject({
+        name: 'PositionEnumerationLimitError',
+        limit: 'deadline',
+        message: expect.stringContaining(phase) as unknown as string,
+      });
+    },
+  );
+
+  it.each([
+    ['exactly at the deadline', 15_000],
+    ['past it', 20_000],
+  ])('refuses on the clock alone when time moves without the abort timer running (%s)', async (_why, jump) => {
+    // `setSystemTime` moves `Date.now()` WITHOUT running pending timers, so the
+    // abort never fires and the clock is the only thing that can refuse. That is
+    // what isolates the two mechanisms: the stalled-socket file proves the signal
+    // CANCELS, and this proves the clock CLASSIFIES, neither standing in for the
+    // other.
+    //
+    // It is also the production case the signal cannot cover: a busy event loop
+    // where the deadline has passed but its timer has not been run yet.
+    //
+    // The 15,000 row is the boundary. The check is `>=` because the timer is set
+    // for exactly that instant, and a `>` build lets that instant through.
+    freezeClock();
+    const start = Date.now();
+    db.getSupabase.mockReturnValue(positionTables(EMPTY, (q, n, reply) => {
+      // Advance the wall clock during the read without touching the timer queue.
+      if (q.table === 'positions') vi.setSystemTime(new Date(start + jump));
+      return endlessWallet(5)(q, n, reply);
+    }));
+    await expect(fetchCategorizedPositions(ADDRESS, COMPLETE)).rejects.toMatchObject({
+      name: 'PositionEnumerationLimitError',
+      limit: 'deadline',
+    });
+  });
+
+  it('attaches ONE deadline signal to every read of the traversal', async () => {
+    // The install proof for the abort. `positions-enumeration-abort.test.ts`
+    // shows a stalled read IS cancelled, but only through the scan; this is what
+    // says the same signal reaches the joins, which no stalled-read case can
+    // observe without stalling a join specifically.
+    //
+    // "One signal" is the load-bearing half. A per-read signal would also abort a
+    // stalled read and pass that file, while giving every read its own fifteen
+    // seconds and leaving the TOTAL unbounded again — which is the bug the
+    // whole-traversal wording exists to exclude.
+    freezeClock();
+    const sb = positionTables(scaleTables(250));
+    db.getSupabase.mockReturnValue(sb);
+    await fetchCategorizedPositions(ADDRESS, COMPLETE);
+    // Two scan reads plus a join chunk each, so the assertion spans all three
+    // read sites rather than just the first.
+    expect(sb.queries.length).toBeGreaterThanOrEqual(6);
+    expect(sb.queries.map((q) => q.signals.length)).toEqual(sb.queries.map(() => 1));
+    expect(new Set(sb.queries.map((q) => q.signals[0])).size).toBe(1);
+  });
+
+  it('attaches no signal on the DEFAULT capped path', async () => {
+    // Paired control. Own-state runs that path on a timer and must not acquire a
+    // cancellation it never asked for.
+    const sb = positionTables(scaleTables(10));
+    db.getSupabase.mockReturnValue(sb);
+    await fetchCategorizedPositions(ADDRESS);
+    expect(sb.queries.length).toBeGreaterThan(0);
+    expect(sb.queries.every((q) => q.signals.length === 0)).toBe(true);
+  });
+
+  it('leaves the DEFAULT capped path alone — one read, no budget, no refusal', async () => {
+    // Negative control for the whole change. Own-state runs this path on a
+    // timer; if either bound leaked into it, a snapshot would start failing.
+    //
+    // The 60s advance is what gives it teeth. It happens DURING the single
+    // positions read, so an ungated deadline check would fire at the
+    // speculations checkpoint immediately after — which is exactly the mutation
+    // this case exists to kill. Advancing before the call would prove nothing,
+    // because the deadline is computed from the clock inside it.
+    freezeClock();
+    db.getSupabase.mockReturnValue(positionTables(EMPTY, endlessWallet(100_000, { positions: 60_000 })));
+    const result = await fetchCategorizedPositions(ADDRESS);
+    expect(result.hitCap).toBe(true);
+    expect(result.enumeration).toBeUndefined();
+  });
+
+  it.each([
+    [getPositionStatusHandler, 'status'],
+    [getClaimParamsHandler, 'claim-params'],
+  ])('%#: the %s handler serves the typed refusal, not a generic failure', async (handler) => {
+    freezeClock();
+    db.getSupabase.mockReturnValue(positionTables(EMPTY, endlessWallet(12_736)));
+    const res = await invoke(handler as typeof getPositionStatusHandler);
+    expect(res.statusCode).toBe(500);
+    expect(res.body).toEqual({
+      error: expect.stringContaining('page budget') as unknown as string,
+      code: 'ENUMERATION_BUDGET_EXCEEDED',
+    });
+    // Never a partial body beside the refusal, and never a false zero.
+    expect(Object.keys(res.body).sort()).toEqual(['code', 'error']);
+  });
+
+  it.each([
+    [getPositionStatusHandler, 'status'],
+    [getClaimParamsHandler, 'claim-params'],
+  ])('%#: the %s handler distinguishes the deadline from the page budget', async (handler) => {
+    freezeClock();
+    db.getSupabase.mockReturnValue(
+      positionTables(EMPTY, endlessWallet(100_000, { positions: 8_000 })),
+    );
+    const res = await invoke(handler as typeof getPositionStatusHandler);
+    expect(res.statusCode).toBe(500);
+    expect(res.body).toMatchObject({ code: 'ENUMERATION_DEADLINE_EXCEEDED' });
+  });
+
+  it.each([
+    [getPositionStatusHandler, 'status'],
+    [getClaimParamsHandler, 'claim-params'],
+  ])('%#: an ordinary read failure on the %s handler is still INTERNAL_ERROR', async (handler) => {
+    // The paired negative control. Without it, a catch branch that returned the
+    // typed body for EVERY throw would pass both cases above.
+    freezeClock();
+    db.getSupabase.mockReturnValue(
+      positionTables(scaleTables(10), (q) =>
+        q.table === 'positions' ? { data: [], error: { message: 'injected read failure' } } : undefined),
+    );
+    const res = await invoke(handler as typeof getPositionStatusHandler);
+    expect(res.statusCode).toBe(500);
+    expect(res.body).toMatchObject({ code: 'INTERNAL_ERROR' });
   });
 });
