@@ -156,6 +156,70 @@ export function decimalToAmerican(decimal: number | null): number | null {
   return -Math.round(100 / (decimal - 1));
 }
 
+/** Which side of a game a selection names. */
+export type PickSide = 'away' | 'home';
+
+/**
+ * The side of the game `selection` names, or null when the canonical teams
+ * cannot decide it.
+ *
+ * A spread reveal's stored `line` is the HOME team's handicap whichever side was
+ * picked — `ospex-benchmark/src/prompt.ts` instructs the arm to "copy the
+ * bundle's designated run-line `line` value verbatim (it is expressed as the home
+ * team's handicap; selecting the away team means taking the away side of that same
+ * designated line)", and `src/clv.ts` says the same where it scores them. So
+ * rendering a spread pick at all requires knowing which side it is, and this is
+ * the only place that decides.
+ *
+ * `selection` is the bundle's own team string, so the name should match exactly;
+ * the abbreviation, trimming and case-folding are there for drift between the
+ * bundle's copy and `teams`, not because a fuzzy match is wanted. There is no
+ * fuzzy match: anything that resolves to BOTH sides or NEITHER returns null, and
+ * the caller then renders no number rather than a guessed sign.
+ *
+ * Both-sides is reachable in exactly one way today, and it is not a data problem:
+ * an unresolved team id falls back to the shared `UNKNOWN_TEAM` sentinel, so a
+ * game missing both teams presents two identical sides. A real pair of teams
+ * sharing a name or an abbreviation within one game is not a state `games` can
+ * hold.
+ */
+export function resolveSelectionSide(
+  selection: string | null,
+  away: { name: string; abbreviation: string },
+  home: { name: string; abbreviation: string },
+): PickSide | null {
+  if (selection === null) return null;
+  const key = (s: string): string => s.trim().toLowerCase();
+  const want = key(selection);
+  if (want === '') return null;
+  const isAway = want === key(away.name) || want === key(away.abbreviation);
+  const isHome = want === key(home.name) || want === key(home.abbreviation);
+  // Equal means BOTH matched or NEITHER did. Both are "cannot decide", and
+  // collapsing them here is what makes "never guess a sign" one branch.
+  if (isAway === isHome) return null;
+  return isAway ? 'away' : 'home';
+}
+
+/**
+ * The handicap on each side of a spread, from the stored HOME handicap.
+ *
+ * Same shape and same rule as `utils/odds.ts` serves for `current_odds`
+ * (`awayLine = -homeLine`), deliberately: this service already decided that a
+ * spread carries both sides explicitly and no bare `line`, because one
+ * un-labelled number is what lets a caller misalign. See `README.md`.
+ *
+ * Zero is normalised rather than negated. `-0` is a distinct IEEE value, and
+ * although it happens to stringify as `"0"` today, a pick-em line is neutral on
+ * both sides and should not depend on that.
+ */
+export function spreadLines(homeLine: number | null): {
+  awayLine: number | null;
+  homeLine: number | null;
+} {
+  if (homeLine === null) return { awayLine: null, homeLine: null };
+  return { awayLine: homeLine === 0 ? 0 : -homeLine, homeLine };
+}
+
 /**
  * A human-readable selection, composed once.
  *
@@ -167,21 +231,38 @@ export function decimalToAmerican(decimal: number | null): number | null {
  * on Red Sox, Blue Jays and White Sox. A proper short name needs a nickname
  * column on `teams`, which is an indexer change and out of scope here; the full
  * name is served instead of a guess.
+ *
+ * ## The number this appends on a spread is the SELECTED side's, not the stored one
+ *
+ * `line` in is the raw HOME handicap (see `resolveSelectionSide`). An away pick's
+ * handicap is its negation, so pasting the stored value onto an away selection
+ * names the opposite bet — `ospex-core-api#71`. `side` is therefore required
+ * rather than optional: the compiler, not a convention, is what stops a caller
+ * from omitting it.
+ *
+ * When `side` is null the label carries no number at all. That is the whole of
+ * the "unknown or ambiguous selection must not guess a sign" rule, and it is
+ * safe in the direction that matters — a missing number is a rendering gap, a
+ * wrong sign is a wrong bet.
  */
 export function selectionLabel(
   market: string,
   selection: string | null,
   line: number | null,
   american: number | null,
+  side: PickSide | null,
 ): string | null {
   if (selection === null) return null;
   const signed = (v: number): string => (v > 0 ? `+${String(v)}` : String(v));
   if (market === 'total') {
-    const side = selection.charAt(0).toUpperCase() + selection.slice(1);
-    return line === null ? side : `${side} ${String(line)}`;
+    const overUnder = selection.charAt(0).toUpperCase() + selection.slice(1);
+    return line === null ? overUnder : `${overUnder} ${String(line)}`;
   }
   if (market === 'spread') {
-    return line === null ? selection : `${selection} ${signed(line)}`;
+    if (line === null || side === null) return selection;
+    const lines = spreadLines(line);
+    const selected = side === 'away' ? lines.awayLine : lines.homeLine;
+    return selected === null ? selection : `${selection} ${signed(selected)}`;
   }
   return american === null ? selection : `${selection} ${signed(american)}`;
 }
@@ -374,7 +455,20 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
     market: string;
     selection: string | null;
     selectionLabel: string | null;
+    /**
+     * `total` only — the perspective-neutral over/under threshold. Null on
+     * `moneyline`, which is line-less, and null on `spread`, which carries the
+     * side-labelled pair below instead of one un-labelled number.
+     */
     line: number | null;
+    /**
+     * `spread` only — the handicap on each side, always negations of each other.
+     * Null on every other market. Same convention as `/v1/odds`: the stored value
+     * is the HOME handicap, and serving both sides is what stops a caller pairing
+     * a number with the wrong team (`ospex-core-api#71`).
+     */
+    awayLine: number | null;
+    homeLine: number | null;
     observedDecimal: number | null;
     priceAmerican: number | null;
     confidence: number | null;
@@ -433,6 +527,16 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
             softness: reveal.axis_softness ?? 0,
           };
     const fill = fillByKey.get(`${d.participant_id} ${d.game_id} ${d.market}`);
+    // The same two teams the game card below serves, resolved through the same
+    // `?? UNKNOWN_TEAM` fallback — so a label and the card it sits on cannot
+    // disagree about who is who.
+    const game = win.games.get(d.game_id);
+    const away = (game === undefined ? undefined : teamsRes.teams.get(game.awayTeamId)) ?? UNKNOWN_TEAM;
+    const home = (game === undefined ? undefined : teamsRes.teams.get(game.homeTeamId)) ?? UNKNOWN_TEAM;
+    const side = resolveSelectionSide(reveal.selection, away, home);
+    // Normalised ONCE, here. Everything downstream reads this pair rather than
+    // re-deriving a sign from the stored HOME value.
+    const spread = d.market === 'spread' ? spreadLines(reveal.line) : { awayLine: null, homeLine: null };
     const pick: WirePick = {
       decisionId: d.id,
       participantId: d.participant_id,
@@ -440,8 +544,11 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
       lab: who.lab_id,
       market: d.market,
       selection: reveal.selection,
-      selectionLabel: selectionLabel(d.market, reveal.selection, reveal.line, american),
-      line: reveal.line,
+      selectionLabel: selectionLabel(d.market, reveal.selection, reveal.line, american, side),
+      // A spread's number is served as the labelled pair, never here.
+      line: d.market === 'spread' ? null : reveal.line,
+      awayLine: spread.awayLine,
+      homeLine: spread.homeLine,
       observedDecimal: reveal.observed_decimal,
       priceAmerican: american,
       confidence: reveal.confidence,

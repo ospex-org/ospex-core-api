@@ -409,6 +409,42 @@ describe('picks — the pick card fields', () => {
   });
 
   /**
+   * `ospex-core-api#71`, from the handler's side.
+   *
+   * The spread branch cannot be reached here: `EXECUTED_MARKETS` is
+   * `{moneyline, total}` and the handler skips everything else, which is why the
+   * fixture's spread decision never appears in `pickCount`. So what a handler case
+   * CAN pin is the coupling itself — that no spread row is served, and that the
+   * side-labelled pair is therefore null on everything that is. The day spread is
+   * enabled, this goes red and points at `tests/benchmark-spread-line.test.ts`,
+   * where the sign logic actually lives.
+   *
+   * It is also the only place the real wiring runs at all: `resolveSelectionSide`
+   * is called for EVERY pick, so a broken `win.games` / `teams` lookup would 500
+   * the endpoint rather than mislabel one market. A 200 with two picks is that
+   * proof, thin as it is, and it is stated rather than left to be assumed.
+   */
+  it('serves no spread row, so the side-labelled pair is null on every pick', async () => {
+    const { body } = await call('picks');
+    const all = gamesOf(body).flatMap((g) => g.picks);
+    expect(all.map((p) => p.market).sort()).toEqual(['moneyline', 'total']);
+    for (const p of all) {
+      expect(p.awayLine).toBeNull();
+      expect(p.homeLine).toBeNull();
+    }
+  });
+
+  it('keeps `line` as the total threshold and null on moneyline', async () => {
+    // The other half of the per-market contract: `line` is the perspective-neutral
+    // over/under number on `total`, and absent on the line-less market. A spread
+    // row would carry null here and the pair above instead.
+    const { body } = await call('picks');
+    const all = gamesOf(body).flatMap((g) => g.picks);
+    expect(all.find((p) => p.market === 'total')?.line).toBe(8.5);
+    expect(all.find((p) => p.market === 'moneyline')?.line).toBeNull();
+  });
+
+  /**
    * The stored axes are integers 1..5, not the 0..100 the radar recipe expects.
    * Both the raw value and the declared bounds ship; inferring the ceiling from
    * observed values would give softness (live max 4) a different scale from the

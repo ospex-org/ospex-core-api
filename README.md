@@ -566,6 +566,12 @@ Each pick's `fill` (null until a receipt is published) carries the transaction h
 
 `axes` are the raw stored integers with `axisScale: {min: 1, max: 5}` beside them. They are NOT 0–100: passing the raw value into an 0–100 radar collapses every polygon to ~2px from the centre, and inferring the ceiling from observed values gives softness (live max 4) a different scale from the other four. `axes` and `primaryAxis` are both nullable. `matchTime` is the same bounded minimum `/v1/games` serves, not the raw column. `priceAmerican` is converted once, server-side, matching every other odds field in this service.
 
+**A pick's number is per-market, and a spread's is side-labelled.** `line` is the perspective-neutral over/under threshold on `total`, and null on `moneyline` (line-less) and on `spread`. A spread pick carries `awayLine` and `homeLine` instead — always negations of each other — and they are null on every other market. Same convention, and the same reason, as `/v1/odds` and `/v1/contests/:contestId`: the producer stores a spread as the **home** team's handicap whichever side the arm picked (`ospex-benchmark` instructs the arm to copy the designated run line verbatim, "expressed as the home team's handicap"), so one un-labelled number is what lets a caller pair a handicap with the wrong team.
+
+`selectionLabel` appends the **selected** side's handicap, not the stored one. When the selection cannot be matched to either canonical team — by full name or abbreviation, trimmed and case-folded — the label carries no number at all rather than a guessed sign. Note what that means for a consumer: a spread label without a number is a rendering gap to handle, never an implied zero.
+
+Both paragraphs describe a shape that **is not currently served**: run-line picks are excluded from this endpoint by ruling 2, so every served pick has `awayLine` and `homeLine` null. The contract is written down now because the semantics are the part that was wrong (`#71`), and enabling the market later should not also mean deciding them.
+
 Writeups (`benchmark_decision_rationales`) are **not read at all** — operator-gated, and the way to not publish something is to not query it.
 
 #### `GET /v1/benchmark/stats?sport=`
