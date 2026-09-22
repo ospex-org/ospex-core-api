@@ -43,6 +43,18 @@ export const BENCHMARK = {
   executionFills: 'benchmark_execution_fills',
   siteStats: 'benchmark_site_stats',
   capability: 'benchmark_schema_capability',
+  /**
+   * The published pick projection and its two companions.
+   *
+   * All three are VIEWS, and that is what makes them safe for this process to
+   * read: 086 scopes live-cohort membership inside the view bodies, so a
+   * `service_role` connection — which the RESTRICTIVE `TO anon, authenticated`
+   * policies do not constrain — still gets live rows only. A base table read
+   * carries no such protection.
+   */
+  pickLedger: 'benchmark_pick_ledger',
+  pickLedgerConflicts: 'benchmark_pick_ledger_conflicts',
+  pickWriteups: 'benchmark_pick_writeups',
 } as const;
 
 /**
