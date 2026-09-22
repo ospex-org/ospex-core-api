@@ -625,7 +625,7 @@ A keyset-paged walk of the published pick ledger along one axis — one arm's wh
 
 **A filter is required.** At least one **anchor** — `participantId`, `gameId` or `slateDate` — or the request is a `400 FILTER_REQUIRED` before any read. `sport` and `market` narrow an anchored read and **do not qualify on their own**.
 
-That is a measurement, not a house style. The ledger is a view that ranks over the whole live-scoped set before any `LIMIT` applies, so an unanchored read cannot be bounded by the page size. Measured against production on 2026-09-21, with the publication gate pushed down and `limit=25`:
+That is a measurement, not a house style. The ledger is a view that ranks over the whole live-scoped set before any `LIMIT` applies, so an unanchored read cannot be bounded by the page size. Measured against production on 2026-09-21 **as the anonymous role**, with the publication gate pushed down and `limit=25`:
 
 | filter | page | `count=exact` | rows |
 |---|---|---|---|
@@ -636,6 +636,8 @@ That is a measurement, not a house style. The ledger is a view that ranks over t
 | `gameId` + `market` | 0.31s | 0.39s | 8 |
 | `sport` alone | **statement timeout** | **statement timeout** | — |
 | the publication gate alone | **statement timeout** | — | — |
+
+Those timings are the `anon` role, which carries a 3-second statement timeout. This service connects as `service_role`, and whether that role carries the same timeout is **not verified** — so the numbers bound the shape of the problem and the ordering of the filter sets, and the 3.2s figures are where anon's timeout cut in rather than how long the query would run unbounded. The contract does not depend on the exact threshold: the qualifying filters are two orders of magnitude cheaper than the refused ones either way.
 
 Two things follow. The gate is **not** a filter — `slate_date >= …` on its own is a timeout, so an endpoint leaning on it to bound a bare request would fail every call. And what qualifies is **selectivity, not the column**: `market` alone measured a comfortable 0.59s and is still refused, because a third of one sport's rows is a property of today's data rather than a bound — while `sport` alone times out for the mirror-image reason, every row being `mlb`. Admitting a filter because it is fast on the current distribution is how an endpoint starts failing a year later with nothing changed but row count.
 

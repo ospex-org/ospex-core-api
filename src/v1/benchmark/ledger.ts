@@ -13,9 +13,9 @@
  *
  * `benchmark_pick_ledger` is a view whose body ranks over the live-scoped set
  * (indexer migration 086:375) and filters above the window, so no `LIMIT`
- * pushes through to the ranking. Measured against the live anon REST surface on
- * 2026-09-21, with `slate_date >= 2026-08-15` (the publication gate) pushed
- * down, ordering `source_decision_id desc`, `limit 25`:
+ * pushes through to the ranking. Measured against the live REST surface AS THE
+ * ANON ROLE on 2026-09-21, with `slate_date >= 2026-08-15` (the publication
+ * gate) pushed down, ordering `source_decision_id desc`, `limit 25`:
  *
  * | filter                    | page   | `count=exact` | rows |
  * |---------------------------|--------|---------------|------|
@@ -26,6 +26,14 @@
  * | `game_id`+`market`        | 0.31s  | 0.39s         |    8 |
  * | `sport` alone             | **57014 timeout** | **57014 timeout** | — |
  * | the gate alone            | **57014 timeout** | —  | — |
+ *
+ * The role matters and the numbers are bounded by it: `anon` carries a 3-second
+ * statement timeout, this service connects as `service_role`, and whether that
+ * role carries the same timeout is UNVERIFIED. So `57014 at ~3.2s` is where
+ * anon's timeout cut in, not how long the query would run given longer. What the
+ * table establishes is the ORDERING — the qualifying filters are two orders of
+ * magnitude cheaper than the refused ones — and the contract rests on that
+ * rather than on the exact threshold.
  *
  * Two conclusions, and the second is the one that shapes the contract.
  *
