@@ -217,22 +217,46 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
    * ONE `degraded` frame per connection, whichever layer notices first.
    *
    * Returns true when the caller now owns the emission. Three producers reach
-   * here — the cold-start snapshot's `positionsTruncated`, the resume catch-up's
-   * `saturated`, and the hub's live derivation (`#83`) — and they are three
-   * observations of one condition, since all three read
-   * `claimed=false AND risk_amount>0` under the same 200-row cap. A consumer
-   * gains nothing from the repeat: the SDK de-dupes same-level statuses anyway,
-   * and its `degraded` latch also suppresses `onError` for the rest of the
-   * connection, so a redundant frame would quietly cost error visibility.
+   * here: the cold-start snapshot's `positionsTruncated`, the resume catch-up's
+   * `saturated`, and the hub's live derivation (`#83`). The first two and part of
+   * the third are one condition — `claimed=false AND risk_amount>0` over the same
+   * 200-row cap — which is why a repeat carries nothing; the hub can ALSO report
+   * exhausting its per-tick maintenance budget, which the snapshot's cap knows
+   * nothing about, and `degradedPending` below is what keeps that reportable
+   * rather than assuming the equivalence holds.
+   *
+   * What the repeat would cost, beyond noise: the SDK de-dupes same-level
+   * statuses anyway, and its `degraded` latch suppresses `onError` for the rest
+   * of the connection, so a redundant frame quietly costs error visibility.
    *
    * The consequence worth stating: for every wallet over the cap on polygon
    * today the cold start already emits this frame, so the hub's new signal
    * changes no wire byte for any of them. What it adds is the case the old code
    * could not report at all — a wallet that was complete at connect and crosses
    * the cap later in the session.
+   *
+   * ## The latch is taken by the WRITE, never by the notification
+   *
+   * A first version consumed it inside `onDegraded` and only then checked the
+   * phase, so a hub signal arriving while the snapshot was still loading — which
+   * happens whenever another subscriber's poller is already live on this wallet
+   * — claimed the latch, wrote nothing, and then silenced the snapshot's own
+   * frame. Reproduced by the reviewer and independently here: a 201-row wallet
+   * served `snapshot` → `ready` with `positionsTruncated: true` on the wire and
+   * no `degraded` at all, where the base served `snapshot` → `degraded` →
+   * `ready`.
+   *
+   * So a preReady notification records `degradedPending` and the pre-ready path
+   * below emits on `positionsTruncated || degradedPending`. That ordering is
+   * safe because everything from the emission check to `ready` runs in one
+   * synchronous block, so no tick can interleave between them. It is also
+   * strictly better than the equivalence the first version assumed: the hub's
+   * phase-B budget can saturate for reasons the snapshot's `hitCap` knows
+   * nothing about, and `degradedPending` is what carries that to the wire.
    */
   let degradedSent = false;
-  const emitDegradedOnce = (_reason: string): boolean => {
+  let degradedPending = false;
+  const emitDegradedOnce = (): boolean => {
     if (degradedSent) return false;
     degradedSent = true;
     return true;
@@ -286,15 +310,17 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
       // nothing already sent, so forcing a resync would turn a partial view
       // into a reconnect loop — the exact loop the cold-start `degraded`
       // emission exists to break.
-      if (!emitDegradedOnce(reason)) return;
-      if (phase === 'live') writeOwnStateEvent(res, 'degraded', { reason });
-      // preReady: the hub saturates on `>= STATUS_DERIVATION_LIMIT` actionable
-      // rows, which is the SAME condition and the same filter that makes the
-      // snapshot's `positionsTruncated` true and the catch-up's `saturated`
-      // true. So a hub signal in this window is that condition observed one
-      // layer down, and the pre-ready path below emits the frame itself in the
-      // documented `degraded` → `ready` order. Taking the latch here and
-      // writing nothing keeps the frame ordering and suppresses the duplicate.
+      if (phase !== 'live') {
+        // Hold it, do NOT take the latch. The pre-ready path emits the frame in
+        // the documented `degraded` → `ready` order; consuming the latch here
+        // would silence that emission and lose the signal entirely.
+        degradedPending = true;
+        return;
+      }
+      // `emitDegradedOnce` is the SINGLE owner of the latch — an earlier version
+      // also checked `degradedSent` here, which made the helper's own check
+      // unreachable and therefore untestable (found by a surviving mutant).
+      if (emitDegradedOnce()) writeOwnStateEvent(res, 'degraded', { reason });
     },
   });
 
@@ -379,7 +405,7 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
         // first live tick suppresses the transition. By construction
         // the seed cannot disagree with the snapshot.
         getOwnStateHub().seedStatusCache(address, result.seedRows);
-        if (result.body.positionsTruncated) {
+        if (result.body.positionsTruncated || degradedPending) {
           // Snapshot exposed `positionsTruncated:true` — actionable
           // population exceeded the snapshot helper's cap. Emit
           // `degraded` so the SDK / market maker enters quote-hold,
@@ -387,7 +413,7 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
           // row we could observe. This breaks the earlier
           // `positionsTruncated → reconnect → resync → reconnect` loop
           // for wallets at the cap.
-          if (emitDegradedOnce('positionsTruncated')) {
+          if (emitDegradedOnce()) {
             writeOwnStateEvent(res, 'degraded', { reason: 'positionsTruncated' });
           }
         }
@@ -440,12 +466,12 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
           claimableAmount: r.body.claimableAmount,
         })),
       );
-      if (catchupResult.degraded) {
+      if (catchupResult.degraded || degradedPending) {
         // Actionable population saturated during catch-up — same defined
         // terminal state as cold-start positionsTruncated. Emit
         // `degraded` so the SDK reaches `ready` without looping back
         // through resync.
-        if (emitDegradedOnce('positionsTruncated')) {
+        if (emitDegradedOnce()) {
           writeOwnStateEvent(res, 'degraded', { reason: 'positionsTruncated' });
         }
       }

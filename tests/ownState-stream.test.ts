@@ -1054,3 +1054,111 @@ describe('GET /v1/stream/own-state — hub saturation reaches the wire once', ()
     expect(events(res).filter((e) => e.event === 'degraded')).toHaveLength(1);
   });
 });
+
+/**
+ * Review blocker B1: a hub signal arriving while the snapshot is still loading
+ * must not consume the once-per-connection latch.
+ *
+ * The first version of `onDegraded` took the latch and only then checked the
+ * phase, so a preReady signal wrote nothing and then silenced the snapshot's own
+ * frame. That window is not exotic — it is every connection to a wallet that
+ * already has a live poller, which is precisely the multi-subscriber case the
+ * hub exists to serve. The reviewer reproduced it with a 201-row wallet: head
+ * served `snapshot` -> `ready` with `positionsTruncated: true` on the wire, base
+ * served `snapshot` -> `degraded` -> `ready`.
+ */
+describe('GET /v1/stream/own-state — a preReady saturation signal is held, not swallowed', () => {
+  class PreReadyDegradingHub extends OwnStateHub {
+    subscribe(
+      address: string,
+      cb: Parameters<InstanceType<typeof OwnStateHub>['subscribe']>[1],
+    ): ReturnType<InstanceType<typeof OwnStateHub>['subscribe']> {
+      const sub = super.subscribe(address, cb);
+      // Synchronously, before the handler's snapshot await — the same position in
+      // the lifecycle a tick from another subscriber's poller occupies.
+      cb.onDegraded('positionsTruncated');
+      return sub;
+    }
+  }
+
+  function install(): void {
+    __setOwnStateHubForTest(
+      new PreReadyDegradingHub({
+        getClient: () => emptyClient(),
+        getNetwork: () => 'polygon',
+        pollMs: 1e9,
+        resyncMs: 1e9,
+      }),
+    );
+  }
+
+  it('still emits the truncated snapshot its own degraded frame, exactly once', async () => {
+    // THE regression. Both producers fire on this connection; the frame must
+    // appear once, before `ready`, and must not be lost to the latch.
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: [],
+      pendingSettle: [],
+      claimable: [],
+      hitCap: true,
+      derivedStatuses: [],
+    });
+    install();
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+    await flushTicks(64);
+
+    const names = events(res).map((e) => e.event);
+    expect(names).toEqual(['snapshot', 'degraded', 'ready']);
+    // And the wire still says so in the snapshot body, which is the field the
+    // market maker's durable latch actually reads.
+    const snap = events(res).find((e) => e.event === 'snapshot') as {
+      data: { positionsTruncated: boolean };
+    };
+    expect(snap.data.positionsTruncated).toBe(true);
+    expect(events(res).find((e) => e.event === 'resync')).toBeUndefined();
+  });
+
+  it('emits it even when the snapshot itself is COMPLETE', async () => {
+    // The half that is genuinely new information rather than a duplicate. The
+    // hub's phase-B budget can saturate for reasons the snapshot's `hitCap`
+    // knows nothing about, so a preReady signal on an untruncated snapshot has
+    // to reach the wire — holding it in `degradedPending` is what does that.
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: [],
+      pendingSettle: [],
+      claimable: [],
+      hitCap: false,
+      derivedStatuses: [],
+    });
+    install();
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+    await flushTicks(64);
+
+    const names = events(res).map((e) => e.event);
+    expect(names).toEqual(['snapshot', 'degraded', 'ready']);
+    const snap = events(res).find((e) => e.event === 'snapshot') as {
+      data: { positionsTruncated: boolean };
+    };
+    // PIN the fixture state (rule 3i-conditional): if this ever became true the
+    // case above would be the one running and this one would prove nothing.
+    expect(snap.data.positionsTruncated).toBe(false);
+  });
+
+  it('holds it on the resume path too, ahead of ready', async () => {
+    // Same window, the other pre-ready branch. Resume takes a different code
+    // path to the same emission, and N branches are N properties.
+    install();
+    const res = makeRes();
+    getOwnStateStreamHandler(
+      makeReq({ query: { cursor: liveCursor() } }),
+      res as unknown as Response,
+    );
+    await flushTicks(64);
+
+    const names = events(res).map((e) => e.event);
+    expect(names.filter((n) => n === 'degraded')).toHaveLength(1);
+    expect(names.indexOf('degraded')).toBeLessThan(names.indexOf('ready'));
+    expect(names).not.toContain('resync');
+  });
+});

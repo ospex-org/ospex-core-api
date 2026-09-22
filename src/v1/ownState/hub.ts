@@ -224,16 +224,35 @@ interface WalletPoller {
    */
   statusCache: Map<string, StatusCacheEntry>;
   /**
-   * Latch for {@link OwnStateCallbacks.onDegraded}. Set the first time this
-   * wallet's derivation could not cover its population, and never cleared —
-   * a stream does not un-degrade itself, the consumer clears it by
-   * reconnecting (which builds a new poller).
+   * OBSERVABILITY dedup — one log line and one metric bump per poller. Set the
+   * first time this wallet's derivation could not cover its population and never
+   * cleared, because the tick runs every `pollMs` and an over-cap wallet
+   * saturates on EVERY tick: unlatched, that is 2,400 identical log lines per
+   * hour per wallet.
    *
-   * One-shot because the tick runs every `pollMs` and an over-cap wallet
-   * saturates on EVERY tick: an unlatched signal would be 2,400 identical
-   * wire events and log lines per hour per wallet.
+   * It does NOT gate delivery. Conflating the two was a review blocker: a poller
+   * outlives the connection that first saturated it, so a subscriber joining a
+   * latched poller was never told anything — reproduced with a first subscriber
+   * saturating, the population falling to 10, a second subscriber connecting on
+   * a COMPLETE snapshot, and the population then growing to 210. The tick hit
+   * the cap and the second connection received nothing at all. Delivery is
+   * tracked per subscriber in {@link WalletPoller.saturationNotified}.
    */
   saturationSignalled: boolean;
+  /**
+   * DELIVERY dedup — the subscribers that have already been handed
+   * `onDegraded`. Each connection is told exactly once, and a subscriber that
+   * joins later is told on the next tick that actually observes saturation
+   * rather than on the strength of a latch set for someone else.
+   *
+   * A WeakSet rather than a Set: it holds no strong reference, so a subscriber
+   * that leaves is collectable whether or not anything removes it. An earlier
+   * version used a Set plus an explicit `delete` in `unsubscribe`, which works
+   * and which no test can distinguish from forgetting the delete — the observable
+   * is retained memory, not behaviour. Removing the need for the line beats
+   * documenting a permanent survivor for it.
+   */
+  saturationNotified: WeakSet<OwnStateSubscriber>;
   polling: boolean;
 }
 
@@ -340,6 +359,7 @@ export class OwnStateHub {
         fills: { tip: { s: nowIso, i: '0' }, emitted: new Map() },
         statusCache: new Map(),
         saturationSignalled: false,
+        saturationNotified: new WeakSet(),
         polling: false,
         // Timer is deliberately NOT started here — the handler calls
         // `beginLive(sub)` after seeding the status cache. Starting the
@@ -674,7 +694,17 @@ export class OwnStateHub {
     let staleRows: typeof actionable = [];
     for (let off = 0; off < Math.min(staleCachedSpecIds.length, staleBudget); off += STALE_REFRESH_CHUNK) {
       const chunk = staleCachedSpecIds.slice(off, off + STALE_REFRESH_CHUNK);
-      const pageLimit = chunk.length * 2;
+      // One MORE than can legally exist. `(network, speculation_id,
+      // user_address, position_type)` is unique, so a chunk of N speculations
+      // holds at most 2N rows for one wallet — and asking for exactly 2N then
+      // treating 2N as overflow condemns the legal maximum. That was a review
+      // blocker: one closed push with the upper side claimable and the lower
+      // side just claimed returns both rows, nothing omitted, and the old bound
+      // called it truncation and could have put the market maker on quote hold.
+      // The sentinel row is the standard fix — ask for one that cannot exist,
+      // and getting it is the only proof the uniqueness assumption is wrong.
+      const legalMax = chunk.length * 2;
+      const pageLimit = legalMax + 1;
       const staleRes = await sb
         .from('positions')
         .select(
@@ -694,11 +724,9 @@ export class OwnStateHub {
         return;
       }
       const page = (staleRes.data ?? []) as unknown as typeof actionable;
-      if (page.length >= pageLimit) {
-        // Unreachable while `(network, speculation_id, user_address,
-        // position_type)` is unique — at most two rows per speculation per
-        // wallet. Reaching it means that assumption is wrong, and the page is
-        // then a truncation rather than a complete chunk, so it is saturation
+      if (page.length > legalMax) {
+        // Only reachable if the uniqueness assumption above is wrong. The page
+        // is then a truncation rather than a complete chunk, so it is saturation
         // and not just a log line.
         logger.warn(
           { address, chunk: chunk.length, rows: page.length },
@@ -1125,10 +1153,18 @@ export class OwnStateHub {
    *   - the METRIC, `stats().positionSaturationTotal`, cumulative across pollers
    *     and readable from `/v1/stream/metrics` without grepping anything.
    *
-   * Latched, because the tick that saturates saturates every 1.5s. The latch is
-   * per POLLER, so it dies with the last subscriber and a fresh connection is
-   * told again — which is what makes it safe for the consumer to clear the state
-   * by reconnecting even though the hub never clears it.
+   * The two kinds of dedup are SEPARATE, and conflating them was a review
+   * blocker. The log and the metric are deduped per POLLER, because a saturated
+   * wallet saturates on every tick and 2,400 identical log lines an hour is not
+   * observability. DELIVERY is deduped per SUBSCRIBER, because the poller
+   * outlives the connection that first saturated it: with one latch doing both, a
+   * subscriber that connected later — on a snapshot that was complete at the time
+   * — was silenced by a signal sent to somebody else, and never learned that the
+   * wallet had gone back over the cap.
+   *
+   * A subscriber is marked told only after its callback RETURNS. One that threw
+   * has not been told, and the next tick (which will saturate again) retries it —
+   * the same rule the handler's own latch had to learn.
    */
   private signalSaturation(
     address: string,
@@ -1136,16 +1172,23 @@ export class OwnStateHub {
     cause: 'actionable_cap' | 'stale_budget' | 'stale_chunk_full',
     counts: { actionable: number; staleKeys: number },
   ): void {
-    if (state.saturationSignalled) return;
-    state.saturationSignalled = true;
-    this.positionSaturationTotal += 1;
-    logger.warn(
-      { address, cause, ...counts, cap: STATUS_DERIVATION_LIMIT },
-      'ownStateHub positionStatus: derivation saturated — position visibility is partial',
-    );
+    if (!state.saturationSignalled) {
+      state.saturationSignalled = true;
+      this.positionSaturationTotal += 1;
+      logger.warn(
+        { address, cause, ...counts, cap: STATUS_DERIVATION_LIMIT },
+        'ownStateHub positionStatus: derivation saturated — position visibility is partial',
+      );
+    }
     for (const sub of state.subs) {
+      if (state.saturationNotified.has(sub)) continue;
       try {
         sub.onDegraded('positionsTruncated');
+        // Marked only AFTER the call returned. A subscriber that threw has not
+        // been told, and the next tick — which will saturate again — retries it.
+        // The same rule the handler's own latch had to learn: mark it sent when
+        // it was actually sent.
+        state.saturationNotified.add(sub);
       } catch (err) {
         logger.error(
           { err: err instanceof Error ? err.message : String(err), address },

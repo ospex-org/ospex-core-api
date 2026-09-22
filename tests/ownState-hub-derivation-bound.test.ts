@@ -271,9 +271,12 @@ describe('reDerivePositionStatuses — phase A discovery is capped, and says so'
     expect(hub.stats().positionSaturationTotal).toBe(1);
   });
 
-  it('tells a subscriber that joined after the latch, on its own poller', () => {
-    // The latch lives on the POLLER, so it dies with the last subscriber. That
-    // is what makes "reconnect to clear it" honest.
+  it('starts a fresh poller once the last subscriber leaves', () => {
+    // The poller — and with it both the observability latch and the
+    // per-subscriber delivery set — dies with the last subscriber. That is what
+    // makes "reconnect to clear it" honest. The harder case, a subscriber
+    // joining a poller that is still alive and already latched, is pinned
+    // separately below (review blocker B2).
     const sb = positionTables(buildTables(250));
     const hub = makeHub(sb);
     const first = subscribeRecording(hub);
@@ -337,7 +340,11 @@ describe('reDerivePositionStatuses — phase B maintains tracked keys determinis
     expect(lists[0]).toEqual(Array.from({ length: 50 }, (_, i) => 201 + i));
     for (const q of phaseBQueries(sb.queries)) {
       expect(q.orders).toEqual([['id', { ascending: true }]]);
-      expect(q.limit).toBe(100); // 2 x chunk, the uniqueness bound
+      const ids = (q.joins.find(([c]) => c === 'speculation_id')?.[1] ?? []) as number[];
+      // 2N + 1: the SENTINEL row. `2N` is the legal maximum (two sides per
+      // speculation per wallet), so asking for exactly 2N and calling 2N a
+      // truncation condemns the legal maximum — review blocker B3.
+      expect(q.limit).toBe(ids.length * 2 + 1);
     }
   });
 
@@ -526,5 +533,157 @@ describe('reDerivePositionStatuses — a finished position is retired from the w
     // The rival is excluded: phase B never asked for it.
     expect(phaseBIdLists(sb.queries.slice(before)).flat()).not.toContain(205);
     expect(rec.statuses[1]).toEqual({ id: '205', status: 'claimable' });
+  });
+});
+
+// ── review round 1: three blockers, three pins ───────────────────────────
+
+describe('reDerivePositionStatuses — the saturation signal reaches every connection', () => {
+  it('tells a subscriber that joined a poller ALREADY latched, and does not re-tell the first', async () => {
+    // Review blocker B2. The poller outlives the connection that first
+    // saturated it, so a per-POLLER latch on delivery meant a later subscriber
+    // was silenced by a signal sent to someone else. The reviewer's shape: the
+    // first subscriber saturates, the population falls below the cap, a second
+    // subscriber connects on a COMPLETE view, and the population grows again.
+    // The second connection has to hear about that, and the first must not hear
+    // it twice.
+    const tables = buildTables(250);
+    const sb = positionTables(tables);
+    const hub = makeHub(sb);
+    const first = subscribeRecording(hub);
+
+    await hub.pollWallet(ADDRESS);
+    expect(first.degradeds).toEqual(['positionsTruncated']);
+
+    // SETUP: the poller survives (first is still subscribed) and is latched.
+    expect(hub.stats().wallets).toBe(1);
+    expect(hub.stats().positionSaturationTotal).toBe(1);
+
+    const second = subscribeRecording(hub);
+    expect(second.degradeds).toEqual([]);
+
+    await hub.pollWallet(ADDRESS);
+
+    expect(second.degradeds).toEqual(['positionsTruncated']);
+    // The first is NOT re-notified: delivery is once per subscriber, and a
+    // re-notified maker would re-run its cancel sweep every 1.5s.
+    expect(first.degradeds).toEqual(['positionsTruncated']);
+    // And the observability half stays deduped per poller — the counter is a
+    // count of EPISODES, not of notifications, so it must not move.
+    expect(hub.stats().positionSaturationTotal).toBe(1);
+  });
+
+  it('retries a subscriber whose onDegraded threw, instead of marking it told', async () => {
+    // The same lesson B1 taught the handler, applied here: mark it sent when it
+    // was actually sent. A consumer callback that throws has not been told.
+    const sb = positionTables(buildTables(250));
+    const hub = makeHub(sb);
+    let calls = 0;
+    const seen: string[] = [];
+    hub.subscribe(ADDRESS, {
+      onCommitment: () => undefined,
+      onFill: () => undefined,
+      onPositionStatus: () => undefined,
+      onResync: () => undefined,
+      onDegraded: (reason) => {
+        calls += 1;
+        if (calls === 1) throw new Error('consumer blew up');
+        seen.push(reason);
+      },
+    });
+
+    await hub.pollWallet(ADDRESS);
+    expect(calls).toBe(1);
+    expect(seen).toEqual([]);
+
+    await hub.pollWallet(ADDRESS);
+    expect(seen).toEqual(['positionsTruncated']);
+  });
+});
+
+describe('reDerivePositionStatuses — a full legal page is not a truncated one', () => {
+  /**
+   * One speculation, both sides, the lower one already claimed.
+   *
+   * A closed PUSH pays both sides, so this is ordinary on-chain state. And the
+   * claimed row is what makes the shape reachable at ANY population size: it
+   * fails phase A's `claimed=false` filter, so its key is a stale key and phase
+   * B is what asks for the speculation — which means the page carries 2 rows for
+   * a 1-id chunk, the exact legal maximum.
+   *
+   * Deliberately ONE speculation, well under phase A's 200-row cap: a fixture
+   * large enough to saturate phase A reports truncation for a different reason
+   * and cannot tell whether the page bound is right (rule 3b). My first attempt
+   * used 205 rows and did exactly that.
+   */
+  function pushBothSides(extraLowerRows = 0): Tables {
+    const tables = buildTables(1, {
+      1: { specStatus: 'closed', winSide: 'push', contestStatus: 'scored', awayScore: 10, homeScore: 10 },
+    });
+    const upper = tables.positions[0]!;
+    for (let n = 0; n <= extraLowerRows; n += 1) {
+      tables.positions.push({ ...upper, id: 100 + n, position_type: 'lower', claimed: true });
+    }
+    return tables;
+  }
+
+  function seedBothSides(hub: InstanceType<typeof OwnStateHub>): void {
+    // Both sides at their already-derived state, so the only event this tick can
+    // produce is the claim on the lower side.
+    for (const key of ['1_0', '1_1']) {
+      hub.seedStatusCache(ADDRESS, [
+        {
+          key,
+          status: 'claimable',
+          sourceUpdatedAt: stampFor(1),
+          result: 'push',
+          claimableAmount: '10000',
+        },
+      ]);
+    }
+  }
+
+  it('accepts exactly two sides of one speculation without calling it saturation', async () => {
+    // Review blocker B3, and the reason no test here caught it: `buildTables`
+    // builds ONE side per speculation, so a chunk of N ids returned N rows and
+    // the legal maximum of 2N never appeared. The old bound asked for exactly 2N
+    // and treated 2N as overflow, so a closed push with the upper side claimable
+    // and the lower side just claimed reported truncation on a page that had
+    // omitted nothing — and that can put the market maker on quote hold.
+    const sb = positionTables(pushBothSides());
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    seedBothSides(hub);
+
+    await hub.pollWallet(ADDRESS);
+
+    // SETUP FIRST (rule 3g-silentsetup). Phase A is nowhere near its cap, phase B
+    // asked for this one speculation, and the page came back FULL — so the
+    // absence of a signal below is about the bound and not about a short chunk.
+    const phaseA = sb.queries.filter((q) => q.table === 'positions')[0]!;
+    expect(phaseA.joins).toEqual([]);
+    const phaseB = phaseBQueries(sb.queries)[0]!;
+    expect(phaseB.joins).toEqual([['speculation_id', [1]]]);
+    expect(phaseB.limit).toBe(1 * 2 + 1); // the sentinel: one more than can exist
+
+    expect(rec.statuses).toEqual([{ id: '100', status: 'claimed' }]);
+    expect(rec.degradeds).toEqual([]);
+    expect(hub.stats().positionSaturationTotal).toBe(0);
+  });
+
+  it('still reports a page that exceeds the legal maximum', async () => {
+    // The negative control, and it needs an ILLEGAL fixture: a THIRD row on one
+    // (speculation, wallet, side) triple, which the unique key forbids. Without
+    // it the sentinel row is untested in the direction it exists for, and a build
+    // that deleted the overflow check entirely would pass everything above.
+    const sb = positionTables(pushBothSides(1));
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    seedBothSides(hub);
+
+    await hub.pollWallet(ADDRESS);
+
+    expect(rec.degradeds).toEqual(['positionsTruncated']);
+    expect(hub.stats().positionSaturationTotal).toBe(1);
   });
 });
