@@ -1456,15 +1456,106 @@ describe('profile — a market filter scopes the metrics and says what it does n
    * number's clothes, so each block carries its own scope and the labels differ
    * within one response.
    */
-  it('labels the money and the chart all-markets even under a market filter', async () => {
+  /**
+   * REVIEW ROUND. The money used to be pooled under an honest `all-markets` label,
+   * and that was an acceptance gap rather than a labelling choice: #72 requires
+   * filtered risk and ROI, and a label saying the figure is pooled does not deliver
+   * a filtered one. `executed` and `roi` are now market-scoped; `series` and
+   * `headline` genuinely cannot be and stay labelled.
+   */
+  it('scopes the money to the market, and labels what still cannot be scoped', async () => {
     const { body } = await run(
-      { benchmark_scoring_runs: [OPEN_RUN] }, { market: 'total' }, {}, undefined, FABLE,
+      { ...FABLE_WITH_FILL, benchmark_scoring_runs: [OPEN_RUN] },
+      { market: 'total' }, {}, undefined, FABLE,
     );
     expect((body.metrics as Record<string, unknown>).scope).toBe('market');
-    expect((body.executed as Record<string, unknown>).scope).toBe('all-markets');
+    expect((body.executed as Record<string, unknown>).scope).toBe('market');
+    expect((body.roi as Record<string, unknown>).scope).toBe('market');
+    // These two are pooled by nature: a series point is a cohort-day's figure
+    // across markets, and the headline is the basis over the whole sample.
     expect((body.series as Record<string, unknown>).scope).toBe('all-markets');
-    expect((body.roi as Record<string, unknown>).scope).toBe('all-markets');
     expect((body.headline as Record<string, unknown>).scope).toBe('all-markets');
+  });
+
+  /**
+   * The blocker's property, pinned on the fixture that actually prices a fill.
+   *
+   * This arm's one priced fill is MONEYLINE. So `?market=moneyline` must answer its
+   * 10 / +7 / 70%, and `?market=spread` and `?market=total` must answer NOTHING —
+   * a handler that ignored the filter would answer the pooled 10 for all three,
+   * which is exactly the defect review caught.
+   *
+   * BOUND, stated because it matters: this pins market scoping with ONE priced
+   * fill. A two-priced-fill fixture would be stronger evidence and is not here —
+   * binding a second receipt needs the whole identity chain in `executedFetch`, and
+   * a first attempt produced a receipt that silently failed to price, which reads
+   * identically to the filter failing. The reviewer's own two-fill probe is the
+   * stronger evidence for the multi-market case; this is what the suite enforces.
+   */
+  it('serves the requested market’s risk, not the pooled figure', async () => {
+    const tables = { ...FABLE_WITH_FILL, benchmark_scoring_runs: [OPEN_RUN] };
+    const roi = (b: Record<string, unknown>): Record<string, number | null> =>
+      b.roi as Record<string, number | null>;
+
+    const pooled = await run(tables, {}, {}, undefined, FABLE);
+    expect(roi(pooled.body).riskUsdc).toBe(10);
+    expect(roi(pooled.body).netUsdc).toBe(7);
+    expect(roi(pooled.body).pct).toBe(70);
+
+    const ml = await run(tables, { market: 'moneyline' }, {}, undefined, FABLE);
+    expect(roi(ml.body).riskUsdc).toBe(10);
+    expect(roi(ml.body).netUsdc).toBe(7);
+    expect(roi(ml.body).pct).toBe(70);
+    // On the market that HAS fills: the rollup must invent no unresolved-receipt
+    // count. An unresolved receipt was never bound to a priced fill, so it has no
+    // market, and attributing one to a market would be a fabricated figure. This
+    // has to be asserted here rather than on an empty market, where the summary is
+    // absent and the zero comes from the empty default instead of from the rollup.
+    expect((ml.body.executed as Record<string, unknown>).unresolvedFills).toBe(0);
+
+    // The discriminating half: no fill on these markets, so no money on them.
+    for (const market of ['spread', 'total']) {
+      const other = await run(tables, { market }, {}, undefined, FABLE);
+      expect(roi(other.body).riskUsdc).toBeNull();
+      expect(roi(other.body).netUsdc).toBeNull();
+      expect(roi(other.body).pct).toBeNull();
+      expect((other.body.executed as Record<string, unknown>).fills).toBe(0);
+      // A market rollup must invent NO unresolved-receipt count: an unresolved
+      // receipt was never bound to a priced fill, so it has no market and
+      // attributing one to a market would be a fabricated figure.
+      expect((other.body.executed as Record<string, unknown>).unresolvedFills).toBe(0);
+    }
+  });
+
+  /**
+   * The one assertion that catches a wrong filter, a double count and a divergent
+   * conversion together: the markets must SUM to the pooled totals.
+   *
+   * `unresolvedFills` is deliberately excluded — those receipts were never bound to
+   * a priced fill, so they have no market and appear only in the pooled entry. That
+   * is why a market response carries `unattributedFills` instead.
+   */
+  it('has the three markets sum to the pooled executed totals', async () => {
+    const tables = { ...FABLE_WITH_FILL, benchmark_scoring_runs: [OPEN_RUN] };
+    const pooled = (await run(tables, {}, {}, undefined, FABLE)).body.executed as Record<
+      string,
+      number | null
+    >;
+    const parts = [];
+    for (const market of ['moneyline', 'spread', 'total']) {
+      const { body } = await run(tables, { market }, {}, undefined, FABLE);
+      parts.push(body.executed as Record<string, number | null>);
+    }
+    const sum = (k: string): number => parts.reduce((a, p) => a + (p[k] ?? 0), 0);
+    expect(sum('fills')).toBe(pooled.fills);
+    expect(sum('stakedUsdc')).toBe(pooled.stakedUsdc);
+    expect(sum('netUsdc')).toBe(pooled.netUsdc);
+    expect(sum('pendingStakeUsdc')).toBe(pooled.pendingStakeUsdc ?? 0);
+    // And the pooled-only quantity is surfaced rather than attributed to a market.
+    const ml = await run(tables, { market: 'moneyline' }, {}, undefined, FABLE);
+    expect((ml.body.executed as Record<string, unknown>).unattributedFills).toBe(
+      pooled.unresolvedFills,
+    );
   });
 
   /**
@@ -1561,7 +1652,55 @@ describe('profile — the ROI denominator ships with its own numerator', () => {
     expect(roi.pendingRiskUsdc ?? 0).toBeLessThanOrEqual(risk);
     // And the quotient is derivable from the two numbers served beside it.
     expect(roi.pct).toBe(Math.round((10_000 * net) / risk) / 100);
-    expect(String(roi.basis)).toContain('SETTLED');
+  });
+
+  /**
+   * REVIEW ROUND. The basis used to say "net over SETTLED fills", and that was
+   * false: `netWei6` accumulates whenever `payoutWei6` is non-null, and
+   * `deriveExecutedVerdict` produces a payout for a `'predicted'` source (scores
+   * posted, not yet settled) as well as a `'settled'` one.
+   *
+   * The pair below is what makes the label checkable rather than asserted. The
+   * fixture's `chainHistory` carries a `SPECULATION_SETTLED` event; dropping just
+   * that row leaves the contest's posted scores, so the verdict falls to the
+   * predicted path — and the net is STILL counted, which is the whole point.
+   */
+  it('counts a PREDICTED payout in the numerator, and says so', async () => {
+    const withoutSettle = {
+      ...FABLE_WITH_FILL,
+      chain_events: FABLE_WITH_FILL.chain_events.filter(
+        (e) => (e as { event_name: string }).event_name !== 'SPECULATION_SETTLED',
+      ),
+      benchmark_scoring_runs: [OPEN_RUN],
+    };
+    const { body } = await run(withoutSettle, {}, {}, undefined, FABLE);
+    const executed = body.executed as Record<string, unknown>;
+    const source = executed.verdictSource as Record<string, number>;
+    // The fixture really is predicted-only — without this the case could pass on a
+    // settled fill and prove nothing about the label.
+    expect(source.settled).toBe(0);
+    expect(source.predicted).toBeGreaterThan(0);
+    // And the predicted payout IS in the numerator.
+    expect(executed.netUsdc).not.toBeNull();
+    expect(executed.netUsdc).not.toBe(0);
+    const basis = String((body.roi as Record<string, unknown>).basis);
+    expect(basis).toContain('DECIDED');
+    expect(basis).toContain('predicted');
+    // The word that was wrong must not come back.
+    expect(basis).not.toContain('SETTLED fills');
+  });
+
+  it('records a chain-settled verdict as settled — the control for the case above', async () => {
+    const { body } = await run(
+      { ...FABLE_WITH_FILL, benchmark_scoring_runs: [OPEN_RUN] }, {}, {}, undefined, FABLE,
+    );
+    const source = (body.executed as Record<string, unknown>).verdictSource as Record<
+      string,
+      number
+    >;
+    // With the settlement event present the provenance differs, which is what
+    // proves the previous case's `settled: 0` was the fixture and not a constant.
+    expect(source.settled).toBeGreaterThan(0);
   });
 
   /**

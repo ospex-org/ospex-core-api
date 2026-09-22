@@ -70,6 +70,7 @@ import {
   type WireBaseline,
 } from './standingsProject.js';
 import { collectExecuted } from './executedFetch.js';
+import type { ExecutedSummary } from './executed.js';
 import type { ScorerAddresses } from '../../lib/speculation.js';
 
 /**
@@ -406,6 +407,14 @@ export type AssembledStandings =
       arms: WireArm[];
       baselines: WireBaseline[];
       /** Cohorts that contributed at least one scored pick at `version`. */
+      /**
+       * The executed rollup split by (participant, market), keyed by
+       * `armMarketKey`. Built from the same fills and the same
+       * `summarizeExecuted` as the pooled figure inside each arm, so a
+       * market-scoped money figure is one arithmetic over a subset. The table
+       * does not use it; the profile serves #72's filtered risk and ROI from it.
+       */
+      executedByMarket: ReadonlyMap<string, ExecutedSummary>;
       cohortsWithScores: Set<string>;
       scoringRunByCohort: Map<string, ScoringRunRow>;
       rankingAllowed: boolean;
@@ -492,6 +501,7 @@ export async function assembleStandings(
     return { kind: 'queryError', error: fills.error, context: fills.context };
   }
   const executed = fills.byParticipant;
+  const executedByMarket = fills.byParticipantMarket;
 
   const slateDateByCohort = new Map(win.cohorts.map((c) => [c.cohortId, c.slateDate]));
   const { models, baselines: baselineRoster } = splitRoster(collected.data.roster);
@@ -539,6 +549,7 @@ export async function assembleStandings(
     available,
     arms,
     baselines,
+    executedByMarket,
     cohortsWithScores,
     scoringRunByCohort,
     rankingAllowed,

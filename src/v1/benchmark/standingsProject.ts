@@ -498,7 +498,7 @@ export interface ProjectStandingsInput {
 
 const WEI6 = 1_000_000;
 
-function wireExecuted(summary: ExecutedSummary | undefined): WireExecuted {
+export function wireExecuted(summary: ExecutedSummary | undefined): WireExecuted {
   if (summary === undefined) return EMPTY_WIRE_EXECUTED;
   if (summary.fills === 0) {
     // No PRICED fill, but there may still be receipts this service refused to

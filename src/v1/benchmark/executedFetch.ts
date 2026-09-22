@@ -236,6 +236,18 @@ const WIN_SIDE_BY_VALUE: Readonly<Record<string, WinSide>> = {
 };
 
 /** One benchmark fill receipt, joined and ready to render on a pick card. */
+/**
+ * The key for {@link ExecutedCollection.byParticipantMarket}.
+ *
+ * LENGTH-PREFIXED rather than separator-joined. A separator is only safe while
+ * neither component can contain it, which a participant id does not promise —
+ * `wv-1` + `23` and `wv-12` + `3` would collide on a plain join. Same reasoning
+ * as the composite-key note in `.claude/rules/windows-tooling.md`.
+ */
+export function armMarketKey(participantId: string, market: string): string {
+  return `${String(participantId.length)}:${participantId}:${market}`;
+}
+
 export interface BenchmarkFill {
   cohortId: string;
   participantId: string;
@@ -269,6 +281,17 @@ export interface BenchmarkFill {
 export interface ExecutedCollection {
   fills: BenchmarkFill[];
   byParticipant: Map<string, ExecutedSummary>;
+  /**
+   * The same rollup, split by market, keyed by {@link armMarketKey}.
+   *
+   * Built from the SAME priced fills and the SAME `summarizeExecuted` as
+   * `byParticipant`, so the market figures are one arithmetic over a subset
+   * rather than a second arithmetic that happens to agree. Summing a
+   * participant's markets reproduces its pooled totals, except for
+   * `unresolvedFills`: those receipts were never bound to a priced fill, so
+   * they have no market and appear only in the pooled entry.
+   */
+  byParticipantMarket: Map<string, ExecutedSummary>;
 }
 
 /**
@@ -491,9 +514,13 @@ export async function collectExecuted(
   const scoped =
     inScopeGames === undefined ? receiptRows : receiptRows.filter((r) => inScopeGames.has(r.game_id));
 
-  if (scoped.length === 0) return { fills: [], byParticipant: new Map() };
+  if (scoped.length === 0) {
+    return { fills: [], byParticipant: new Map(), byParticipantMarket: new Map() };
+  }
 
   const byArm = new Map<string, ExecutedFill[]>();
+  /** The same fills, additionally grouped by the receipt's market. */
+  const byArmMarket = new Map<string, ExecutedFill[]>();
   const unresolvedByArm = new Map<string, number>();
   const resolvedTx = new Set<string>();
   const refuse = (participantId: string): void => {
@@ -506,6 +533,12 @@ export async function collectExecuted(
         participantId,
         summarizeExecuted(byArm.get(participantId) ?? [], unresolvedByArm.get(participantId) ?? 0),
       );
+    }
+    const byParticipantMarket = new Map<string, ExecutedSummary>();
+    for (const [key, list] of byArmMarket) {
+      // `unresolvedFills` is deliberately NOT passed: an unresolved receipt has
+      // no market, so attributing it to one would invent a figure.
+      byParticipantMarket.set(key, summarizeExecuted(list));
     }
     const fills: BenchmarkFill[] = scoped.map((f) => ({
       cohortId: f.cohort_id,
@@ -524,7 +557,7 @@ export async function collectExecuted(
       stakeUsdc: Number(f.stake_usdc),
       wouldAbstain: f.would_abstain,
     }));
-    return { fills, byParticipant };
+    return { fills, byParticipant, byParticipantMarket };
   };
 
   // Without the scorer addresses no chain speculation can be assigned a
@@ -784,6 +817,10 @@ export async function collectExecuted(
       speculation,
       contest,
     };
+    const marketKey = armMarketKey(receipt.participant_id, receipt.market);
+    const marketList = byArmMarket.get(marketKey);
+    if (marketList === undefined) byArmMarket.set(marketKey, [entry]);
+    else marketList.push(entry);
     const list = byArm.get(receipt.participant_id);
     if (list === undefined) byArm.set(receipt.participant_id, [entry]);
     else list.push(entry);

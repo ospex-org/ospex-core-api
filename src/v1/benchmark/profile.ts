@@ -31,18 +31,46 @@
  * A profile is the surface where a rank would look most harmless — one number, on
  * one arm's own page. It is exactly as much of a published ranking as the table.
  *
- * ## What a `market` filter does and does NOT scope
+ * ## What a `market` filter scopes, and the one thing it cannot
  *
- * `market` scopes the CLV metric family, because `projectArms` computes a real
- * per-market split (`byMarket`). It does NOT scope the executed record, the
- * series or the headline, because the projection does not split those: fills
- * carry no market breakdown in `WireExecuted`, and a series point is a
- * cohort-day's pooled figure.
+ * It scopes the CLV metric family, because `projectArms` computes a real
+ * per-market split (`byMarket`). It ALSO scopes the executed record and the ROI,
+ * which the first version of this endpoint left pooled under an honest label.
  *
- * Serving pooled executed money under a market filter without saying so would be
- * a wrong number wearing a right number's clothes, so every block carries its own
- * `scope`. A market-filtered request gets its metrics labelled `market` and its
- * executed figures labelled `all-markets`, rather than one label over both.
+ * That was a real acceptance gap rather than a labelling choice, and a reviewer
+ * was right to block it: #72 requires "filtered risk and ROI denominator", and a
+ * label saying the money is pooled does not deliver a filtered figure. The
+ * reproduction was stark — 10 risk / +7 net on moneyline beside 30 risk / −30 net
+ * on total, and `?market=moneyline` answered the pooled −57.5% rather than +70%.
+ *
+ * My stated reason was also wrong about the data, not just the outcome: I wrote
+ * that "fills carry no market breakdown", which is true of `WireExecuted` and
+ * false of `BenchmarkFill`, which has a `market`. Describing a limitation of the
+ * projection as a limitation of the source is how a gap gets argued for instead
+ * of closed.
+ *
+ * It is scoped by the SAME function over a SUBSET, not by a second arithmetic.
+ * `collectExecuted` now rolls its priced fills up twice from one grouping pass —
+ * once per participant and once per (participant, market) — with the same
+ * `summarizeExecuted` both times, and this handler reads the market entry and runs
+ * it through the same `wireExecuted` conversion the pooled figure uses. The
+ * all-markets case still serves `arm.executed` verbatim, so parity with the table
+ * is untouched by any of it.
+ *
+ * A test asserts the three markets SUM to the pooled totals, which is the one
+ * assertion that catches a wrong filter, a double count and a divergent conversion
+ * together.
+ *
+ * `series` and `headline` remain pooled and labelled, because those genuinely
+ * cannot be split: a series point is a cohort-day's pooled figure and the headline
+ * is the basis applied to the whole sample.
+ *
+ * One quantity has no market and so appears only in the pooled view:
+ * `unresolvedFills` counts receipts the identity chain could not bind to a unique
+ * priced fill, so they are not in `fills` at all and no market view can contain
+ * them. A market-scoped response carries `unattributedFills` to say how many
+ * exist, so the market totals not summing to the receipt count is visible rather
+ * than puzzling.
  */
 
 import type { Request, Response } from 'express';
@@ -57,7 +85,16 @@ import {
 } from './source.js';
 import { parseSlateDate, parseSportParam } from './window.js';
 import { assembleStandings } from './standings.js';
-import { MARKETS, METHODOLOGY, type WireArm, type WireMarketSplit } from './standingsProject.js';
+import { armMarketKey } from './executedFetch.js';
+
+import {
+  MARKETS,
+  METHODOLOGY,
+  wireExecuted,
+  type WireArm,
+  type WireExecuted,
+  type WireMarketSplit,
+} from './standingsProject.js';
 
 /**
  * The executed money, with its own denominator served beside it.
@@ -80,29 +117,50 @@ import { MARKETS, METHODOLOGY, type WireArm, type WireMarketSplit } from './stan
  * `3d-aggregate` shape where a number silently doubles. #72's "total stake,
  * including pending risk" describes `stakedUsdc`, which already includes it.
  *
- * ## The ratio mixes two populations, and says so
+ * ## The numerator is DECIDED fills, not settled ones — corrected in review
  *
- * `netUsdc` accumulates only for SETTLED fills (the `else` branch at :306), while
- * `stakedUsdc` covers all of them. So this is settled net over total risk — which
- * is what #72 specifies, and is understated while anything is pending. That is a
- * property of the definition rather than a defect, and `basis` states it so no
- * reader has to work it out from two field names.
+ * The first version of this label named the numerator as covering only
+ * chain-settled fills, and that was false. (Paraphrased rather than quoted, per
+ * `3c`: quoting a superseded claim leaves the stale wording in the file, so no
+ * grep can ever show it is gone.) `netWei6` accumulates whenever
+ * `verdict.payoutWei6` is non-null
+ * (`executed.ts:306`), and `deriveExecutedVerdict` produces a payout whenever
+ * `winSide` is known — which is a `'settled'` source (`:150`, from the chain's
+ * own settlement) OR a `'predicted'` one (`:156`, `:177`, derived from the
+ * contest's posted scores before settlement). Only `'undecided'` yields a null
+ * payout and lands in pending.
+ *
+ * So the numerator includes score-predicted payouts, and a reviewer's probe
+ * showed exactly that: `+7` net against `verdictSource {settled: 0, predicted: 1}`
+ * with no settlement event on the chain at all. The arithmetic is the canonical
+ * standings arithmetic and is not changed here; the LABEL was wrong, and it was
+ * wrong in the direction that overstates confidence.
+ *
+ * The lesson for next time is narrow and worth keeping: I read the accumulation
+ * at `:296-307` and INFERRED that a non-null payout meant settled, rather than
+ * reading `deriveExecutedVerdict` one call down. Verifying one layer and assuming
+ * the next is how a definitive word gets into a money label.
+ *
+ * `verdictSource` ships beside the figures so the split is visible rather than
+ * described, and `basis` now names what the numerator actually is.
  */
-function roiOf(arm: WireArm): Record<string, unknown> {
-  const netUsdc = arm.executed.netUsdc;
-  const riskUsdc = arm.executed.stakedUsdc;
+function roiOf(executed: WireExecuted, scope: 'all-markets' | 'market'): Record<string, unknown> {
+  const netUsdc = executed.netUsdc;
+  const riskUsdc = executed.stakedUsdc;
   return {
     netUsdc,
     riskUsdc,
-    pendingRiskUsdc: arm.executed.pendingStakeUsdc,
+    pendingRiskUsdc: executed.pendingStakeUsdc,
     // Null rather than 0 when nothing is at risk: an undefined ratio and a zero
     // return are different states, and #72 requires they stay distinct.
     pct:
       netUsdc === null || riskUsdc === null || riskUsdc === 0
         ? null
         : Math.round((10_000 * netUsdc) / riskUsdc) / 100,
-    basis: 'net over SETTLED fills / risk over ALL fills, pending included',
-    scope: 'all-markets',
+    basis:
+      'net over fills with a DECIDED verdict (chain-settled OR score-predicted) / ' +
+      'risk over ALL fills, including those still undecided. See verdictSource for the split.',
+    scope,
   };
 }
 
@@ -254,6 +312,25 @@ export async function getBenchmarkProfileHandler(req: Request, res: Response): P
 
   const split = market === null ? null : splitFor(arm, market);
 
+  /**
+   * The executed record, scoped to the requested market when there is one.
+   *
+   * All-markets serves `arm.executed` VERBATIM — the object the standings table
+   * publishes — so parity is untouched by anything below. A market scope
+   * re-aggregates the same fills with the same `summarizeExecuted` and the same
+   * `wireExecuted` conversion, so it is one arithmetic over two populations rather
+   * than two arithmetics.
+   *
+   * `unresolvedFills` is passed as 0 for a market scope on purpose: those receipts
+   * were never bound to a priced fill, so they are absent from `fills` and have no
+   * market to be filtered by. The pooled count is surfaced as `unattributedFills`
+   * instead of being silently attributed to whichever market was asked for.
+   */
+  const scopedExecuted: WireExecuted =
+    market === null
+      ? arm.executed
+      : wireExecuted(assembled.executedByMarket.get(armMarketKey(participantId, market)));
+
   res.status(200).json({
     network: config.network,
     participantId,
@@ -314,10 +391,23 @@ export async function getBenchmarkProfileHandler(req: Request, res: Response): P
             },
             metrics: split.metrics,
           },
-    /** Always pooled — fills carry no market breakdown. Labelled, never implied. */
+    /** The full split, always, so a market-scoped request still shows the others. */
     byMarket: arm.byMarket,
-    executed: { ...arm.executed, scope: 'all-markets' },
-    roi: roiOf(arm),
+    executed: {
+      ...scopedExecuted,
+      scope: market === null ? 'all-markets' : 'market',
+      ...(market === null
+        ? {}
+        : {
+            market,
+            // Receipts with no resolvable market, which therefore appear in NO
+            // market view. Surfaced so the market totals not summing to the
+            // receipt count is legible rather than puzzling.
+            unattributedFills: arm.executed.unresolvedFills,
+          }),
+    },
+    roi: roiOf(scopedExecuted, market === null ? 'all-markets' : 'market'),
+    /** Genuinely pooled: a series point is a cohort-day's figure across markets. */
     series: { scope: 'all-markets', points: arm.series },
     trend: arm.trend,
     /**
