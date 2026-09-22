@@ -253,6 +253,17 @@ async function run(
   config: Record<string, unknown> = {},
   /** Answer a request yourself; return undefined to fall through to the fixture. */
   override?: (req: CapturedRequest, index: number) => FakeReply | undefined,
+  /**
+   * Drive `/benchmark/profile/:participantId` instead of the standings table,
+   * over THIS SAME fixture.
+   *
+   * Appended rather than given its own harness on purpose: the profile's binding
+   * acceptance criterion is exact all/all parity with the table, and a parity
+   * test whose two sides read different fixtures is not testing parity. Both
+   * sides now share one fake, one fixture and one config, so the only difference
+   * between the calls is which handler runs.
+   */
+  profileFor?: string,
 ): Promise<Harness> {
   const data: Tables = { ...DEFAULT_TABLES, ...tables };
   const seen = new Map<string, number>();
@@ -297,8 +308,6 @@ async function run(
     isHeadlineBasis: () => true,
   }));
 
-  const { getBenchmarkStandingsHandler } = await import('../src/v1/benchmark/standings.js');
-
   let status = 0;
   let body: Record<string, unknown> = {};
   const res = {
@@ -312,7 +321,16 @@ async function run(
     },
   } as unknown as Response;
 
-  await getBenchmarkStandingsHandler({ query, params: {} } as unknown as Request, res);
+  if (profileFor === undefined) {
+    const { getBenchmarkStandingsHandler } = await import('../src/v1/benchmark/standings.js');
+    await getBenchmarkStandingsHandler({ query, params: {} } as unknown as Request, res);
+  } else {
+    const { getBenchmarkProfileHandler } = await import('../src/v1/benchmark/profile.js');
+    await getBenchmarkProfileHandler(
+      { query, params: { participantId: profileFor } } as unknown as Request,
+      res,
+    );
+  }
   return { fake, body, status };
 }
 
@@ -1261,5 +1279,254 @@ describe('parameter validation', () => {
     const { status: ok, body: served } = await run();
     expect(ok).toBe(200);
     expect(served.scoringPolicyVersion).toBe(V1);
+  });
+});
+
+// ── /v1/benchmark/profile/:participantId ───────────────────────────────────
+//
+// In THIS file, not a new one, because the fixture is here. The profile's binding
+// acceptance criterion is exact all/all parity with the table above, and a parity
+// test whose two sides read different fixtures tests nothing. `run(..., FABLE)`
+// drives the profile handler over the same fake, the same rows and the same
+// config, so the only difference between the two calls is which handler runs.
+
+describe('profile — exact all/all parity with the standings table', () => {
+  /**
+   * #72's binding criterion. Parity here is STRUCTURAL — both handlers consume one
+   * `assembleStandings` — so this test is not what makes the numbers agree. What
+   * it guards is a future change that separates the two paths, which is exactly
+   * the drift a shared-intermediate comparison would miss (`3d-witness`).
+   *
+   * It compares the whole arm object rather than a chosen field, because a
+   * per-field list is the shape that goes stale silently: add a field to
+   * `WireArm` and a field-by-field test keeps passing while the new field is
+   * unpinned (`3d`).
+   */
+  it('serves the same figures the table serves for that arm', async () => {
+    const table = await run({ benchmark_scoring_runs: [OPEN_RUN] });
+    const profile = await run({ benchmark_scoring_runs: [OPEN_RUN] }, {}, {}, undefined, FABLE);
+
+    expect(table.status).toBe(200);
+    expect(profile.status).toBe(200);
+    expect(profile.body.found).toBe(true);
+
+    const arms = table.body.arms as Array<Record<string, unknown>>;
+    const fromTable = arms.find((a) => a.participantId === FABLE);
+    expect(fromTable).toBeDefined();
+
+    const m = profile.body.metrics as Record<string, unknown>;
+    // The metric family and its denominators, whole.
+    expect(m.scope).toBe('all-markets');
+    expect(m.sample).toEqual(fromTable?.sample);
+    expect(m.metrics).toEqual(fromTable?.metrics);
+    // The headline pair, the per-market splits, the money and the chart.
+    expect(profile.body.headline).toEqual({ ...(fromTable?.headline as object), scope: 'all-markets' });
+    expect(profile.body.byMarket).toEqual(fromTable?.byMarket);
+    expect(profile.body.executed).toEqual({ ...(fromTable?.executed as object), scope: 'all-markets' });
+    expect((profile.body.series as Record<string, unknown>).points).toEqual(fromTable?.series);
+    expect(profile.body.trend).toEqual(fromTable?.trend);
+    // And the published context a reader needs to interpret them.
+    expect(profile.body.scoringPolicyVersion).toEqual(table.body.scoringPolicyVersion);
+    expect(profile.body.availableVersions).toEqual(table.body.availableVersions);
+    expect(profile.body.publication).toEqual(table.body.publication);
+    expect(profile.body.methodology).toEqual(table.body.methodology);
+  });
+
+  it('keeps parity under a sport filter and under a policy-version choice', async () => {
+    for (const query of [{ sport: 'mlb' }, { scoringPolicyVersion: V1 }, { sport: 'all' }]) {
+      const table = await run({ benchmark_scoring_runs: [OPEN_RUN] }, query);
+      const profile = await run({ benchmark_scoring_runs: [OPEN_RUN] }, query, {}, undefined, FABLE);
+      const arms = table.body.arms as Array<Record<string, unknown>>;
+      const fromTable = arms.find((a) => a.participantId === FABLE);
+      const m = profile.body.metrics as Record<string, unknown>;
+      expect(m.metrics).toEqual(fromTable?.metrics);
+      expect(m.sample).toEqual(fromTable?.sample);
+      expect(profile.body.scoringPolicyVersion).toEqual(table.body.scoringPolicyVersion);
+    }
+  });
+});
+
+describe('profile — publishes no ranking', () => {
+  /**
+   * `standingsProject.ts` states that an order IS a ranking, and `3j-ordering`
+   * extends it: a designated winner, a default sort key or a rendered position are
+   * the same judgement in another costume. A single arm's own page is where a rank
+   * looks most harmless and is exactly as much of a published ranking as the table.
+   *
+   * So the assertion is on the ABSENCE of a whole family of fields, over the
+   * serialised body, rather than on one name — a handler that renamed `rank` to
+   * `position` would pass a single-key check.
+   */
+  it.each([['rank'], ['position'], ['place'], ['percentile'], ['standing'], ['leader'], ['orderedBy']])(
+    'serves no "%s" anywhere in the body',
+    async (field) => {
+      const { body } = await run({ benchmark_scoring_runs: [OPEN_RUN] }, {}, {}, undefined, FABLE);
+      expect(JSON.stringify(body)).not.toContain(`"${field}"`);
+    },
+  );
+
+  it('echoes the gate STATE without deriving anything from it', async () => {
+    const open = await run({ benchmark_scoring_runs: [OPEN_RUN] }, {}, {}, undefined, FABLE);
+    expect((open.body.ranking as Record<string, unknown>).allowed).toBe(true);
+    expect((open.body.ranking as Record<string, unknown>).withheldBy).toEqual([]);
+
+    // Withheld: the figures still serve, and still no rank. A profile that went
+    // blank when ranking was withheld would be withholding the DATA rather than
+    // the judgement, which is the opposite error.
+    const shut = await run({}, {}, {}, undefined, FABLE);
+    expect(shut.status).toBe(200);
+    expect((shut.body.ranking as Record<string, unknown>).allowed).toBe(false);
+    expect(shut.body.found).toBe(true);
+    expect((shut.body.metrics as Record<string, unknown>).metrics).toBeDefined();
+  });
+});
+
+describe('profile — a market filter scopes the metrics and says what it does not scope', () => {
+  it('serves the per-market split, matching the table row for that market', async () => {
+    const table = await run({ benchmark_scoring_runs: [OPEN_RUN] });
+    const profile = await run(
+      { benchmark_scoring_runs: [OPEN_RUN] }, { market: 'moneyline' }, {}, undefined, FABLE,
+    );
+    const arms = table.body.arms as Array<Record<string, unknown>>;
+    const fromTable = arms.find((a) => a.participantId === FABLE);
+    const split = (fromTable?.byMarket as Array<Record<string, unknown>>).find(
+      (s) => s.market === 'moneyline',
+    );
+    const m = profile.body.metrics as Record<string, unknown>;
+    expect(m).toMatchObject({ scope: 'market', market: 'moneyline', marketPresent: true });
+    expect(m.metrics).toEqual(split?.metrics);
+    expect(m.sample).toEqual({
+      eligible: split?.eligible, picks: split?.picks, scoreable: split?.scoreable,
+    });
+  });
+
+  /**
+   * The honesty requirement. Fills carry no market breakdown in `WireExecuted`
+   * and a series point is a cohort-day's pooled figure, so a market-filtered
+   * request CANNOT have market-scoped money or chart. Serving pooled figures
+   * under a market filter without saying so is a wrong number wearing a right
+   * number's clothes, so each block carries its own scope and the labels differ
+   * within one response.
+   */
+  it('labels the money and the chart all-markets even under a market filter', async () => {
+    const { body } = await run(
+      { benchmark_scoring_runs: [OPEN_RUN] }, { market: 'total' }, {}, undefined, FABLE,
+    );
+    expect((body.metrics as Record<string, unknown>).scope).toBe('market');
+    expect((body.executed as Record<string, unknown>).scope).toBe('all-markets');
+    expect((body.series as Record<string, unknown>).scope).toBe('all-markets');
+    expect((body.roi as Record<string, unknown>).scope).toBe('all-markets');
+    expect((body.headline as Record<string, unknown>).scope).toBe('all-markets');
+  });
+
+  it('distinguishes a market the arm never picked from an arm with no picks', async () => {
+    const { body } = await run(
+      { benchmark_scoring_runs: [OPEN_RUN] }, { market: 'spread' }, {}, undefined, FABLE,
+    );
+    const m = body.metrics as Record<string, unknown>;
+    if (m.marketPresent === false) {
+      // Null, never zero: "this arm made no spread picks" and "this arm's spread
+      // CLV is 0%" are different statements.
+      expect(m.metrics).toBeNull();
+      expect(m.sample).toBeNull();
+      expect(body.found).toBe(true);
+    } else {
+      expect(m.metrics).toBeDefined();
+    }
+  });
+});
+
+describe('profile — the ROI denominator ships with its own numerator', () => {
+  /**
+   * Verified against `executed.ts:296-307` rather than inferred from field names:
+   * `stakedWei6` accumulates on EVERY fill unconditionally, while
+   * `pendingStakeWei6` accumulates only for fills with no payout. So pending risk
+   * is a SUBSET of staked, and `staked + pending` double-counts it — the
+   * `3d-aggregate` shape where a money figure silently doubles.
+   */
+  it('divides by staked alone, which already includes pending risk', async () => {
+    const { body } = await run({ benchmark_scoring_runs: [OPEN_RUN] }, {}, {}, undefined, FABLE);
+    const roi = body.roi as Record<string, number | null | string>;
+    const executed = body.executed as Record<string, number | null>;
+    expect(roi.netUsdc).toBe(executed.netUsdc);
+    expect(roi.riskUsdc).toBe(executed.stakedUsdc);
+    expect(roi.pendingRiskUsdc).toBe(executed.pendingStakeUsdc);
+    // Pending is inside staked, so it can never exceed it. This is the assertion
+    // that would redden if the denominator were ever changed to staked+pending.
+    if (typeof roi.riskUsdc === 'number' && typeof roi.pendingRiskUsdc === 'number') {
+      expect(roi.pendingRiskUsdc).toBeLessThanOrEqual(roi.riskUsdc);
+    }
+    // The quotient is derivable from the two numbers served beside it.
+    if (typeof roi.netUsdc === 'number' && typeof roi.riskUsdc === 'number' && roi.riskUsdc !== 0) {
+      expect(roi.pct).toBe(Math.round((10_000 * roi.netUsdc) / roi.riskUsdc) / 100);
+    } else {
+      expect(roi.pct).toBeNull();
+    }
+    expect(String(roi.basis)).toContain('SETTLED');
+  });
+
+  it('reports an undefined ratio as null rather than as a zero return', async () => {
+    // No fills at all for this arm: nothing at risk, so the ratio has no value.
+    // 0 would read as "broke even", which is a different claim.
+    const { body } = await run(
+      { benchmark_execution_fills: [], position_fills: [], chain_events: [] },
+      {}, {}, undefined, GEMINI,
+    );
+    const roi = body.roi as Record<string, unknown>;
+    if (roi.riskUsdc === 0 || roi.riskUsdc === null) expect(roi.pct).toBeNull();
+  });
+});
+
+describe('profile — absences, validation and the gate', () => {
+  it('serves sources and notebook as null by contract, not by omission', async () => {
+    const { body } = await run({ benchmark_scoring_runs: [OPEN_RUN] }, {}, {}, undefined, FABLE);
+    // #72: evidence-reference URLs need a producer (artifact source_path/sha256
+    // are provenance, not citations), and the notebook must stay absent until
+    // editorial data exists. Present-and-null says "known to be missing"; absent
+    // would say "forgotten".
+    expect('sources' in body).toBe(true);
+    expect('notebook' in body).toBe(true);
+    expect(body.sources).toBeNull();
+    expect(body.notebook).toBeNull();
+  });
+
+  it('answers not_on_roster for an unknown arm, distinct from an arm with no picks', async () => {
+    const { status, body } = await run(
+      { benchmark_scoring_runs: [OPEN_RUN] }, {}, {}, undefined, 'nobody-at-all',
+    );
+    expect(status).toBe(200);
+    expect(body).toMatchObject({ found: false, reason: 'not_on_roster', arm: null, roi: null });
+  });
+
+  it('answers not_published with NO read at all when the gate is unset', async () => {
+    const { status, body, fake } = await run(
+      {}, {}, { benchmarkPublicMinSlateDate: undefined }, undefined, FABLE,
+    );
+    expect(status).toBe(200);
+    expect(body).toMatchObject({ found: false, reason: 'not_published' });
+    expect(fake.requests).toHaveLength(0);
+  });
+
+  it.each([
+    ['an unknown sport', { sport: 'quidditch' }],
+    ['an unknown market', { market: 'parlay' }],
+    ['a market differing only in case', { market: 'Moneyline' }],
+    ['an impossible date', { date: '2026-02-30' }],
+    ['a malformed date', { date: '15-08-2026' }],
+    ['an empty scoringPolicyVersion', { scoringPolicyVersion: '' }],
+  ])('refuses %s with 400 before any read', async (_why, query) => {
+    const { status, body, fake } = await run({}, query, {}, undefined, FABLE);
+    expect(status).toBe(400);
+    expect(body.code).toBe('INVALID_PARAM');
+    expect(fake.requests).toHaveLength(0);
+  });
+
+  it.each([
+    ['a real leap day', { date: '2024-02-29' }],
+    ['sport=all', { sport: 'all' }],
+    ['each executed market', { market: 'moneyline' }],
+  ])('accepts %s — the control the refusals need', async (_why, query) => {
+    const { status } = await run({ benchmark_scoring_runs: [OPEN_RUN] }, query, {}, undefined, FABLE);
+    expect(status).toBe(200);
   });
 });

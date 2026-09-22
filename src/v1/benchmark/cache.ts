@@ -194,7 +194,7 @@ export async function serveCachedBenchmark(
  * pass on the first fix.
  */
 export function benchmarkCacheKey(
-  endpoint: 'standings' | 'picks' | 'stats' | 'pick' | 'ledger',
+  endpoint: 'standings' | 'picks' | 'stats' | 'pick' | 'ledger' | 'profile',
   req: Request,
   config: {
     network: string;
