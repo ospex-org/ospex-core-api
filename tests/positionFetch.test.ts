@@ -29,8 +29,14 @@ const envMock = vi.hoisted(() => ({
  * this expects.
  */
 const cooldownMock = vi.hoisted(() => ({
-  readVoidCooldownSeconds: vi.fn<() => Promise<number | null>>(async () => null),
+  readVoidCooldownSeconds: vi.fn<(o?: { timeoutMs?: number }) => Promise<number | null>>(
+    async () => null,
+  ),
   resetVoidCooldownCacheForTests: vi.fn(),
+  // The module's default budget. Present because the caller IMPORTS it to size the
+  // read against the traversal's remaining deadline, and vitest refuses a named
+  // import a mock does not provide.
+  DEFAULT_COOLDOWN_TIMEOUT_MS: 2_500,
 }));
 
 vi.mock('../src/lib/supabase.js', () => supabaseMock);
@@ -62,6 +68,10 @@ function makeSupabase(tables: Tables): { from: (table: keyof Tables) => unknown 
         in: () => builder,
         order: () => builder,
         limit: () => builder,
+        // Completed for `#79`: the `complete: true` path attaches the traversal's
+        // abort signal to every read, and a double missing the method makes that
+        // path untestable rather than merely unasserted.
+        abortSignal: () => builder,
         then: (resolve: (v: { data: unknown[]; error: null }) => void) =>
           resolve({ data, error: null }),
       };
@@ -1078,6 +1088,9 @@ describe('fetchCategorizedPositions — the #79 prediction, end to end', () => {
     return makeSupabase({
       positions: [
         {
+          // `id` is only read by the COMPLETE keyset walk, which refuses a row
+          // without an immutable identity — so the budget case below needs it.
+          id: 1,
           speculation_id: 1,
           user_address: ADDR,
           position_type: 'upper',
@@ -1171,6 +1184,46 @@ describe('fetchCategorizedPositions — the #79 prediction, end to end', () => {
     const result = await fetchCategorizedPositions(ADDR);
     expect(result.settlementCandidates).toEqual([]);
     expect(result.active).toHaveLength(1);
+  });
+
+  it('spends no RPC when no contest is verified', async () => {
+    // The cost gate, asserted on the CALL and not on the answer. Before PR #92's
+    // first blocker this read sat ahead of the empty-wallet return, so EVERY request
+    // paid it - including one that could not have used the term.
+    vi.useFakeTimers();
+    vi.setSystemTime(PAST);
+    cooldownMock.readVoidCooldownSeconds.mockResolvedValue(SEVEN_DAYS);
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabase({
+        positions: [{ speculation_id: 1, user_address: ADDR, position_type: 'upper', risk_amount: '1', profit_amount: '1', claimed: false, position_created_at: null }],
+        speculations: [{ speculation_id: 1, contest_id: 42, market_type: 'moneyline', line_ticks: 0, speculation_status: 'open', win_side: 'tbd' }],
+        contests: [{ contest_id: 42, away_team: 'L', home_team: 'C', contest_status: 'scored', away_score: 7, home_score: 6, start_time: START }],
+      }),
+    );
+
+    const result = await fetchCategorizedPositions(ADDR);
+    expect(cooldownMock.readVoidCooldownSeconds).not.toHaveBeenCalled();
+    expect(result.voidCooldownSeconds).toBeNull();
+  });
+
+  it('hands the read a budget bounded by the traversal deadline', async () => {
+    // The other half of that blocker: the RPC must fit INSIDE the complete
+    // traversal's 15,000 ms rather than alongside it, so the budget passed is what
+    // remains, capped at the module's own default. Asserted on the ARGUMENT, because
+    // a read that ignored the budget would still return the right answer here.
+    vi.useFakeTimers();
+    vi.setSystemTime(PAST);
+    cooldownMock.readVoidCooldownSeconds.mockResolvedValue(SEVEN_DAYS);
+    supabaseMock.getSupabase.mockReturnValue(openVerified());
+
+    await fetchCategorizedPositions(ADDR, { complete: true });
+
+    expect(cooldownMock.readVoidCooldownSeconds).toHaveBeenCalledTimes(1);
+    const [arg] = cooldownMock.readVoidCooldownSeconds.mock.calls[0]!;
+    expect(typeof arg?.timeoutMs).toBe('number');
+    expect(arg?.timeoutMs).toBeGreaterThan(0);
+    // Never more than the module default, and never the whole traversal budget.
+    expect(arg?.timeoutMs).toBeLessThanOrEqual(2_500);
   });
 
   it('reads start_time from the contests query rather than an effective-start view', async () => {

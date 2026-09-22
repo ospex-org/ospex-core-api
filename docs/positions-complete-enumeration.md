@@ -43,7 +43,11 @@ Three consequences a consumer should know:
   chain's frozen value and would read past-cooldown EARLY.
 - **The cooldown is read from the chain, not configured as a number.** One `eth_call` to the
   `uint32 public immutable i_voidCooldown` getter per process, cached — so the term cannot disagree
-  with the module address it describes, which a constant or an env var can.
+  with the module address it describes, which a constant or an env var can. It is read ONLY when a
+  `verified` contest is actually in scope, and it is bounded three ways so an optional term can
+  never hold a request: a 2,000 ms transport timeout, the caller's remaining traversal budget
+  (capped at 2,500 ms), and a 60 s window in which a failed attempt is not retried. Any failure,
+  including a provider that never answers, degrades the prediction rather than the response.
 - **`voidCooldownSeconds` is served on the response**, and `null` means the term was unavailable and
   every `verified` contest was therefore refused. A short `settlementCandidates` list plus a null term
   is a missing configuration, not an idle wallet. The number also lets a consumer recompute the

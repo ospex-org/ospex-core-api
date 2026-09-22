@@ -80,7 +80,10 @@ import {
 } from '../ownState/positionStatus.js';
 import { maxIsoTimestamptz } from '../ownState/timestamps.js';
 import { parseTimestampMicros } from './gameTime.js';
-import { readVoidCooldownSeconds } from '../../lib/voidCooldown.js';
+import {
+  DEFAULT_COOLDOWN_TIMEOUT_MS,
+  readVoidCooldownSeconds,
+} from '../../lib/voidCooldown.js';
 
 const POSITION_QUERY_LIMIT = 200;
 const COMPLETE_PAGE_SIZE = 199;
@@ -603,29 +606,14 @@ export async function fetchCategorizedPositions(
   // PostgREST returns 201 on a `limit(200)`; the predicate here is "did we
   // saturate the cap budget?".
   const hitCap = !options.complete && positions.length >= POSITION_QUERY_LIMIT;
-  /**
-   * The cooldown prediction's two terms, taken ONCE per traversal (`#79`).
-   *
-   * One clock for the whole answer, so two rows with the same `start_time` cannot
-   * land on opposite sides of the boundary because the loop took a millisecond.
-   * The seconds come from `readVoidCooldownSeconds`, which is one `eth_call` per
-   * PROCESS and cached — the cost here is amortised to zero, and the first request
-   * after a boot pays one round trip.
-   *
-   * `null` when the term could not be established, which refuses every `verified`
-   * contest and reproduces the pre-#79 answer exactly.
-   */
-  const voidCooldownSeconds = await readVoidCooldownSeconds();
-  const cooldownTerms: CooldownTerms | null =
-    voidCooldownSeconds === null
-      ? null
-      : { seconds: voidCooldownSeconds, nowMicros: BigInt(Date.now()) * 1000n };
   if (positions.length === 0) {
     // A wallet with nothing in it is still a traversal, and a single read that
     // came back after the deadline must not answer an authoritative empty.
     refuseIfLate('result');
     return { active: [], pendingSettle: [], claimable: [], settlementCandidates: [], settledLost: [], hitCap,
-      voidCooldownSeconds, derivedStatuses: [],
+      // Not read: no row could have used it, so no request is spent on it. `null`
+      // means "not applied to this answer", which is exactly true here.
+      voidCooldownSeconds: null, derivedStatuses: [],
       ...(enumeration ? { enumeration } : {}) };
   }
 
@@ -678,6 +666,42 @@ export async function fetchCategorizedPositions(
     const contests = (contestRes.data ?? []) as unknown as ContestRow[];
     for (const c of contests) contestById.set(c.contest_id, c);
   }
+
+  /**
+   * The cooldown prediction's two terms (`#79`), read here and not earlier.
+   *
+   * ## Only when it can change an answer
+   *
+   * Gated on a `verified` contest actually being in scope, so a wallet with nothing
+   * verified — and an empty wallet, which returned above — spends no request at all.
+   * Before this gate the read sat ahead of the empty-wallet return and every caller
+   * paid it.
+   *
+   * ## Inside the traversal's budget, not alongside it
+   *
+   * A complete traversal owns 15,000 ms and this read must fit INSIDE it rather than
+   * add to it, so the budget handed over is what is left, capped at the module's own
+   * default. At or past the deadline nothing is attempted: `refuseIfLate` below is
+   * what reports it, and spending an RPC first would only make the report later.
+   *
+   * ## One clock for the whole answer
+   *
+   * Taken once here, so two rows with the same `start_time` cannot land on opposite
+   * sides of the boundary because the loop took a millisecond.
+   */
+  const anyVerified = [...contestById.values()].some((c) => c.contest_status === 'verified');
+  const cooldownBudgetMs = Math.min(
+    DEFAULT_COOLDOWN_TIMEOUT_MS,
+    deadline === undefined ? DEFAULT_COOLDOWN_TIMEOUT_MS : deadlineAt - Date.now(),
+  );
+  const voidCooldownSeconds =
+    anyVerified && cooldownBudgetMs > 0
+      ? await readVoidCooldownSeconds({ timeoutMs: cooldownBudgetMs })
+      : null;
+  const cooldownTerms: CooldownTerms | null =
+    voidCooldownSeconds === null
+      ? null
+      : { seconds: voidCooldownSeconds, nowMicros: BigInt(Date.now()) * 1000n };
 
   // Step 4: categorize + derive in one pass.
   // Categorization (active/pendingSettle/claimable) mirrors the

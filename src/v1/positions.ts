@@ -382,12 +382,29 @@ interface StatusResponse {
   pendingSettle: PendingSettlePosition[];
   claimable: ClaimablePosition[];
   /**
-   * All open-speculation controlled positions whose contest is 'scored' OR
-   * 'voided', including losers; not a payout bucket. A voided contest refunds
-   * both sides, and that refund amount is deliberately not served here — see
+   * All open-speculation controlled positions whose contest has settlement work in
+   * front of it — 'scored', 'voided', OR 'verified' with the void cooldown elapsed
+   * (`#79`) — including losers; not a payout bucket. A voided contest refunds both
+   * sides, and that refund amount is deliberately not served here — see
    * `docs/positions-complete-enumeration.md`.
    */
   settlementCandidates: PositionBase[];
+  /**
+   * `SpeculationModule.i_voidCooldown` in seconds, or `null` when the cooldown
+   * prediction was NOT applied to this answer (`#79`).
+   *
+   * Served because `null` changes the answer: every `verified` contest is then
+   * refused as a settlement candidate, and a caller reading a short
+   * `settlementCandidates` list is entitled to know whether that is the wallet or a
+   * term this service could not establish. A cap with no signal is the defect
+   * `#83` is about; this is the same rule applied to a predicate.
+   *
+   * `null` also when no `verified` contest was in scope at all, because the term is
+   * then never read — no request is spent establishing something no row could use.
+   * The number, when present, is what lets a consumer recompute the boundary from
+   * `start_time` rather than trust it.
+   */
+  voidCooldownSeconds: number | null;
   /** Closed losing positions: historical identity, never exposure, work, or payout. */
   settledLost: SettledLostPosition[];
   enumeration: PositionEnumeration;
@@ -442,6 +459,7 @@ export async function getPositionStatusHandler(req: Request, res: Response): Pro
     claimable: result.claimable,
     settlementCandidates: result.settlementCandidates,
     settledLost: result.settledLost,
+    voidCooldownSeconds: result.voidCooldownSeconds,
     enumeration: result.enumeration,
     totals: {
       activeCount: result.active.length,

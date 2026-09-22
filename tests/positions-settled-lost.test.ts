@@ -8,6 +8,17 @@ vi.mock('../src/lib/supabase.js', () => db);
 vi.mock('../src/lib/env.js', () => ({ loadConfig: () => ({ network: 'polygon', chainId: 137 }) }));
 vi.mock('../src/lib/logger.js', () => ({ logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn() }, formatError: String }));
 
+/**
+ * `#79`'s chain term, stubbed at the module boundary. The `eth_call` itself, and
+ * every bound on it, are covered against a real socket in `tests/voidCooldown.test.ts`
+ * (`3i-install`: this file drives the CALL SITE and the serialization).
+ */
+const cooldown = vi.hoisted(() => ({
+  readVoidCooldownSeconds: vi.fn<() => Promise<number | null>>(async () => null),
+  DEFAULT_COOLDOWN_TIMEOUT_MS: 2_500,
+}));
+vi.mock('../src/lib/voidCooldown.js', () => cooldown);
+
 const { getPositionStatusHandler, getClaimParamsHandler } = await import('../src/v1/positions.js');
 
 async function invoke(handler = getPositionStatusHandler) {
@@ -28,7 +39,13 @@ const ZERO_TOTALS = {
 };
 const ACTION_BUCKETS = ['active', 'settlementCandidates', 'pendingSettle', 'claimable'] as const;
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => {
+  vi.clearAllMocks();
+  // `clearAllMocks` clears CALLS, not implementations, so a `mockResolvedValue`
+  // set by one case would leak into every later one and the block below would
+  // pass only because of where it sits in the file. Each case states its own world.
+  cooldown.readVoidCooldownSeconds.mockResolvedValue(null);
+});
 
 describe('public settledLost terminal identity, never exposure or payout', () => {
   it.each([
@@ -158,5 +175,73 @@ describe('public settledLost terminal identity, never exposure or payout', () =>
     expect(body.enumeration).toEqual({ complete: true, pageSize: 199, pages: 1, positionCount: 1 });
     expect(body.totals).toEqual(ZERO_TOTALS);
     expect(await invoke(getClaimParamsHandler)).toEqual({ address: ADDRESS, positions: [] });
+  });
+});
+
+
+/**
+ * `#79`'s diagnostic has to be on the WIRE, not just in the helper's return value.
+ *
+ * PR #92's second blocker: `voidCooldownSeconds` was added to `CategorizedPositions`,
+ * documented in the README and in `docs/positions-complete-enumeration.md` as a
+ * served number-or-null, and never threaded through `StatusResponse` or the
+ * serialized body. Every test asserted it off the HELPER, so nothing noticed - rule
+ * 2, probe the artifact and not the function. These read the HTTP body.
+ *
+ * Key PRESENCE is asserted separately from the value, because reading a missing key
+ * and reading an explicit `null` both yield `undefined`/`null`-ish in a loose check.
+ * Only an `in` test tells them apart, and "the key is absent" was exactly the defect.
+ */
+describe('#79 voidCooldownSeconds reaches the public status body', () => {
+  it('carries the key with a null when the term was not applied', async () => {
+    db.getSupabase.mockReturnValue(positionTables(scaleTables(1)));
+    const body = await invoke();
+    expect('voidCooldownSeconds' in body).toBe(true);
+    expect(body['voidCooldownSeconds']).toBeNull();
+  });
+
+  it('carries the key on an EMPTY wallet too', async () => {
+    // The empty-wallet path returns from its own early exit, so it is a SECOND
+    // serialization site and a separate property (`3d-sibling`).
+    db.getSupabase.mockReturnValue(positionTables(scaleTables(0)));
+    const body = await invoke();
+    expect('voidCooldownSeconds' in body).toBe(true);
+    expect(body['voidCooldownSeconds']).toBeNull();
+  });
+
+  it('carries the NUMBER when the cooldown was read', async () => {
+    cooldown.readVoidCooldownSeconds.mockResolvedValue(604_800);
+    const tables = scaleTables(1);
+    // A `verified` contest has to be in scope or the term is never read - that gate
+    // is what keeps a wallet with nothing verified from spending an RPC request.
+    Object.assign(tables.contests[0]!, {
+      contest_status: 'verified',
+      away_score: null,
+      home_score: null,
+      start_time: '2026-08-01T12:00:00+00:00',
+    });
+    db.getSupabase.mockReturnValue(positionTables(tables));
+    const body = await invoke();
+    expect(body['voidCooldownSeconds']).toBe(604_800);
+  });
+
+  it('never reads the term when no contest is verified', async () => {
+    // The cost property, asserted on the CALL rather than on the answer: a fixture
+    // with only a scored contest must not touch the provider at all.
+    cooldown.readVoidCooldownSeconds.mockResolvedValue(604_800);
+    db.getSupabase.mockReturnValue(positionTables(scaleTables(1)));
+    const body = await invoke();
+    expect(cooldown.readVoidCooldownSeconds).not.toHaveBeenCalled();
+    expect(body['voidCooldownSeconds']).toBeNull();
+  });
+
+  it('is absent from claim-params, which stays payable-only', async () => {
+    // The negative control on the field's SCOPE: a diagnostic about settlement work
+    // does not belong on a claim plan, and putting it there would be a wire change
+    // nobody asked for.
+    cooldown.readVoidCooldownSeconds.mockResolvedValue(604_800);
+    db.getSupabase.mockReturnValue(positionTables(scaleTables(1)));
+    const body = await invoke(getClaimParamsHandler);
+    expect('voidCooldownSeconds' in body).toBe(false);
   });
 });

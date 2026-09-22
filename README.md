@@ -877,7 +877,7 @@ See `.env.example`. Required values are validated at boot — missing vars exit 
 | `ALCHEMY_RPC_URL` | for `/v1/positions/by-tx/:txHash` and `/v1/positions/claim-result/:txHash` | Polygon RPC endpoint for tx-receipt parsing |
 | `MATCHING_MODULE_ADDRESS` | for `POST /v1/commitments` | EIP-712 `verifyingContract`. Format-validated when set. |
 | `POSITION_MODULE_ADDRESS` | optional | Defensive log-source filter for tx parsers. When set, by-tx / claim-result only decode logs from this address. Format-validated when set. |
-| `SPECULATION_MODULE_ADDRESS` | optional | The deployed `SpeculationModule`, read ONLY for its `i_voidCooldown` immutable — one cached `eth_call` per process. **Unset ⇒ a `verified` contest is never reported as settlement work**, i.e. the pre-`#79` behaviour, and `voidCooldownSeconds` is served as `null`. Needs `ALCHEMY_RPC_URL` too. Format-validated when set. |
+| `SPECULATION_MODULE_ADDRESS` | optional | The deployed `SpeculationModule`, read ONLY for its `i_voidCooldown` immutable — one cached `eth_call` per process, and only when a `verified` contest is in scope. Bounded by a 2s transport timeout, the caller's remaining budget, and a 60s no-retry window, so a slow or dead RPC degrades the prediction and never the response. **Unset ⇒ a `verified` contest is never reported as settlement work**, i.e. the pre-`#79` behaviour, and `voidCooldownSeconds` is served as `null`. Needs `ALCHEMY_RPC_URL` too. Format-validated when set. |
 | `SCORER_MONEYLINE_ADDRESS` | for `POST /v1/commitments` | All-or-nothing; partial config rejected at boot |
 | `SCORER_SPREAD_ADDRESS` | for `POST /v1/commitments` | |
 | `SCORER_TOTAL_ADDRESS` | for `POST /v1/commitments` | |
