@@ -72,7 +72,7 @@ await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve
 server.unref();
 const { port } = server.address() as { port: number };
 
-vi.mock('../src/lib/logger.js', () => ({ logger: { error: vi.fn() }, formatError: String }));
+vi.mock('../src/lib/logger.js', () => ({ logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn() }, formatError: String }));
 vi.doMock('../src/lib/env.js', () => ({
   loadConfig: () => ({
     supabaseUrl: `http://127.0.0.1:${String(port)}`,

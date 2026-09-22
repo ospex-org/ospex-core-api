@@ -137,7 +137,7 @@ async function call(
       ...config,
     }),
   }));
-  vi.doMock('../src/lib/logger.js', () => ({ logger: { error: vi.fn() }, formatError: String }));
+  vi.doMock('../src/lib/logger.js', () => ({ logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn() }, formatError: String }));
 
   const { getBenchmarkPickHandler } = await import('../src/v1/benchmark/pick.js');
   const res = {

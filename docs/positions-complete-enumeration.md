@@ -21,19 +21,33 @@ The exclusion of closed/`tbd` relies on the registered moneyline, spread and tot
 
 Within REST-visible positive-risk, unclaimed positions, the own-state advisory `settledLost` label is broader than this REST bucket: it also includes closed/`tbd` rows and open predicted losers. The REST bucket contains only authoritative closed losses. Do not substitute one for the other.
 
-### The settleable set is bounded by what the row alone proves
+### The settleable set: two mirrored facts and one prediction
 
-`settlementCandidates` admits an open speculation whose contest is `scored` or `voided`. On chain a
-third state is settleable: a `verified` contest past the void cooldown settles to `Void`, and doing so
-is what makes a contest read `voided` at all — `ContestStatus.Voided` has one write site, reachable
-only from inside that cooldown branch. So this bucket catches a stalled contest's sibling speculations
-and not the first one.
+`settlementCandidates` admits an open speculation on a contest that is `scored`, `voided`, **or**
+`verified` with the void cooldown provably elapsed. The third ground closed ospex-core-api#79, and it
+is the one that matters most in practice: settling a still-`verified` contest is what makes it read
+`voided` at all — `ContestStatus.Voided` has one write site, reachable only from inside that cooldown
+branch — so before #79 this bucket caught a stalled contest's SIBLING speculations and never the first
+one, which is the settlement that starts the refund.
 
-That is a stated bound rather than an oversight. `scored` and `voided` are facts the indexer mirrors
-from events; `verified` + past-cooldown is a prediction from a stored timestamp plus the deployment's
-`voidCooldown` immutable, neither of which this endpoint reads, and a wrong constant would advertise
-work whose transaction reverts `ContestNotFinalized`. Tracked as ospex-core-api#79, which also records
-that the right timestamp is `contests.start_time` and not the effective-start view.
+The two kinds of claim are kept apart deliberately. `scored` and `voided` are facts the indexer mirrors
+from events. `verified` + past-cooldown is a PREDICTION from three terms — the status,
+`contests.start_time`, and the deployed `SpeculationModule`'s `i_voidCooldown` — and it refuses itself
+whenever any term is missing, because a wrong "yes" advertises work whose transaction reverts
+`ContestNotFinalized` while a wrong "no" is just the pre-#79 answer.
+
+Three consequences a consumer should know:
+
+- **The timestamp is `contests.start_time`, never `contests_effective.effective_start_time`.** The
+  effective view is a bounded `LEAST` over `games.match_time` and provider snapshots, so it is `<=` the
+  chain's frozen value and would read past-cooldown EARLY.
+- **The cooldown is read from the chain, not configured as a number.** One `eth_call` to the
+  `uint32 public immutable i_voidCooldown` getter per process, cached — so the term cannot disagree
+  with the module address it describes, which a constant or an env var can.
+- **`voidCooldownSeconds` is served on the response**, and `null` means the term was unavailable and
+  every `verified` contest was therefore refused. A short `settlementCandidates` list plus a null term
+  is a missing configuration, not an idle wallet. The number also lets a consumer recompute the
+  boundary instead of trusting it.
 
 ### Open-void refunds: settlement work is served, the refund amount is not
 

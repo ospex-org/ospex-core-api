@@ -38,13 +38,19 @@
  *                     contest scores by replaying the scorer logic.
  *                     Lost positions are filtered out of this payout
  *                     bucket (`claimPosition` reverts with NoPayout).
- *   - settlementCandidates — ALL positive-risk unclaimed positions on
- *                     'scored' OR 'voided' contests with open
- *                     speculations, including predicted losers and rows
+ *   - settlementCandidates — ALL positive-risk unclaimed positions with
+ *                     open speculations whose contest has settlement work
+ *                     in front of it, including predicted losers and rows
  *                     with missing prediction inputs. Settlement can
  *                     release counterparty funds even when the
  *                     controlled position itself lost, and a voided
- *                     contest refunds both sides. Not a payout bucket:
+ *                     contest refunds both sides. Three grounds, and the
+ *                     third is a PREDICTION rather than a mirrored fact:
+ *                     'scored', 'voided', or 'verified' once the deployed
+ *                     `SpeculationModule`'s void cooldown has provably
+ *                     elapsed (`isSettleableOpenContest`, `#79`). That
+ *                     third ground refuses itself whenever either of its
+ *                     terms is missing. Not a payout bucket:
  *                     an open void's refund AMOUNT is not served here
  *                     or in pendingSettle — see the bound in
  *                     `docs/positions-complete-enumeration.md`.
@@ -73,6 +79,8 @@ import {
   type PositionStatus,
 } from '../ownState/positionStatus.js';
 import { maxIsoTimestamptz } from '../ownState/timestamps.js';
+import { parseTimestampMicros } from './gameTime.js';
+import { readVoidCooldownSeconds } from '../../lib/voidCooldown.js';
 
 const POSITION_QUERY_LIMIT = 200;
 const COMPLETE_PAGE_SIZE = 199;
@@ -251,6 +259,20 @@ export interface PositionFetchResult {
    */
   hitCap: boolean;
   /**
+   * `SpeculationModule.i_voidCooldown` in seconds, or `null` when this service
+   * could not establish it (`#79`).
+   *
+   * Served rather than kept private because `null` CHANGES THE ANSWER: every
+   * `verified` contest is then refused as a settlement candidate, and a caller
+   * reading a short `settlementCandidates` list is entitled to know whether that
+   * is the wallet or a missing term. A cap with no signal is the defect
+   * `ospex-core-api#83` is about; this is the same rule applied to a predicate.
+   *
+   * The number is also what makes the prediction AUDITABLE: a consumer holding
+   * `start_time` and this value can recompute the boundary rather than trust it.
+   */
+  voidCooldownSeconds: number | null;
+  /**
    * Derived positionStatus + sourceUpdatedAt for EVERY position the
    * helper saw (including predicted-losers and zero-payout rows the
    * buckets drop). Consumers seeding the own-state hub cache use this to
@@ -302,6 +324,18 @@ interface ContestRow {
   contest_status: 'unverified' | 'verified' | 'scored' | 'voided';
   away_score: number | null;
   home_score: number | null;
+  /**
+   * The contest's FROZEN start time, mirrored from the `CONTEST_VERIFIED` event's
+   * own `startTime` — i.e. the chain's `s_contestStartTimes`, which has one write
+   * site gated on `Unverified`. Nullable, and a null means "not verified yet",
+   * because the same indexer UPDATE writes this column and `contest_status`.
+   *
+   * Deliberately NOT `contests_effective.effective_start_time`: that view is a
+   * bounded `LEAST` over `games.match_time` and provider snapshots, so it is `<=`
+   * the chain's frozen value and would read past-cooldown EARLY — advertising work
+   * whose transaction reverts. `#79` names this explicitly.
+   */
+  start_time: string | null;
   row_updated_at: string;
 }
 
@@ -316,8 +350,10 @@ interface ContestRow {
  *     winning side and releases the counterparty's funds. IN this set.
  *   - `voided` — already voided, so `settleSpeculation` assigns `void` and BOTH
  *     positions become refundable for their own risk. IN this set.
- *   - `verified` — **settleable too, once the void cooldown has elapsed**, and NOT
- *     in this set. See the bound below; tracked as #79.
+ *   - `verified` — **settleable too, once the void cooldown has elapsed**. NOT in
+ *     this set, because membership here is decided by the row alone and that case
+ *     needs a clock and a chain term as well. `isSettleableOpenContest` below is
+ *     what admits it (`#79`); this set remains the row-only half.
  *   - `unverified` — unreachable for an open speculation, because creating one
  *     requires a Verified contest. Kept as a defensive negative control only.
  *
@@ -338,11 +374,12 @@ interface ContestRow {
  * sibling speculations and not the first one, which is the settlement that starts
  * a stalled contest's refund.
  *
- * That gap is deliberate rather than overlooked, and it is #79 rather than a line
- * here, because `verified` + past-cooldown is a PREDICTION from a stored timestamp
- * plus the deployment's `voidCooldown` immutable — neither of which this endpoint
- * reads — where `scored` and `voided` are facts the indexer mirrors from events.
- * Advertising work on a wrong constant reverts `ContestNotFinalized`.
+ * `#79` closes that gap, and the shape of the closure matters: `scored` and `voided`
+ * are FACTS the indexer mirrors from events, while `verified` + past-cooldown is a
+ * PREDICTION from a stored timestamp plus the deployment's `voidCooldown`. The two
+ * kinds of claim are kept in two places rather than blurred into one set — this set
+ * is the facts, `isSettleableOpenContest` adds the prediction, and the prediction
+ * refuses itself whenever either of its terms is missing.
  *
  * Enumerated as a set rather than written as a negation on purpose: membership is
  * what makes a row actionable, so a status must be classified deliberately instead
@@ -350,6 +387,56 @@ interface ContestRow {
  */
 const SETTLEABLE_OPEN_CONTEST_STATUSES: ReadonlySet<ContestRow['contest_status']> =
   new Set<ContestRow['contest_status']>(['scored', 'voided']);
+
+/** One microsecond-resolution instant, and the cooldown that applies to it. */
+export interface CooldownTerms {
+  /** `SpeculationModule.i_voidCooldown`, seconds. See `src/lib/voidCooldown.ts`. */
+  seconds: number;
+  /** The request's clock, taken ONCE so every row in one answer is judged together. */
+  nowMicros: bigint;
+}
+
+/**
+ * Does an OPEN speculation on this contest have settlement work in front of it?
+ *
+ * Two independent grounds, and the second one is a prediction that must refuse
+ * itself rather than guess:
+ *
+ *  1. The contest is `scored` or `voided` — a fact from the event mirror.
+ *  2. The contest is `verified` AND the void cooldown has provably elapsed.
+ *
+ * ## Every term of (2) fails CLOSED
+ *
+ * A wrong "yes" advertises work whose transaction reverts
+ * `SpeculationModule__ContestNotFinalized`; a wrong "no" simply reports what the
+ * service reported before #79. So `null` cooldown terms (unset module address,
+ * unreachable RPC, an implausible answer), a null `start_time`, and a `start_time`
+ * this service cannot parse STRICTLY all refuse. `settleSpeculation` itself reverts
+ * `InvalidStartTime` on a zero or future start, so refusing an unreadable one agrees
+ * with the contract rather than merely being cautious.
+ *
+ * ## Microseconds, not `Date.parse`
+ *
+ * `parseTimestampMicros` is the service's canonical strict RFC3339 reader — it
+ * rejects `2026-02-30`, a zone-less value (which `Date.parse` reads in the SERVER's
+ * local time, a different instant per deployment) and more than six fractional
+ * digits. The clock is milliseconds widened to microseconds, so at a sub-millisecond
+ * boundary this can refuse for up to 1 ms longer than the chain would accept. That is
+ * the conservative direction and it is the one to be wrong in: 1 ms against a
+ * seven-day cooldown.
+ */
+export function isSettleableOpenContest(
+  contest: Pick<ContestRow, 'contest_status' | 'start_time'>,
+  cooldown: CooldownTerms | null,
+): boolean {
+  if (SETTLEABLE_OPEN_CONTEST_STATUSES.has(contest.contest_status)) return true;
+  if (contest.contest_status !== 'verified') return false;
+  if (cooldown === null) return false;
+  if (contest.start_time === null) return false;
+  const startMicros = parseTimestampMicros(contest.start_time);
+  if (startMicros === null) return false;
+  return cooldown.nowMicros >= startMicros + BigInt(cooldown.seconds) * 1_000_000n;
+}
 
 
 function impliedOddsDecimal(risk: bigint, profit: bigint | null): number | null {
@@ -511,11 +598,29 @@ export async function fetchCategorizedPositions(
   // PostgREST returns 201 on a `limit(200)`; the predicate here is "did we
   // saturate the cap budget?".
   const hitCap = !options.complete && positions.length >= POSITION_QUERY_LIMIT;
+  /**
+   * The cooldown prediction's two terms, taken ONCE per traversal (`#79`).
+   *
+   * One clock for the whole answer, so two rows with the same `start_time` cannot
+   * land on opposite sides of the boundary because the loop took a millisecond.
+   * The seconds come from `readVoidCooldownSeconds`, which is one `eth_call` per
+   * PROCESS and cached — the cost here is amortised to zero, and the first request
+   * after a boot pays one round trip.
+   *
+   * `null` when the term could not be established, which refuses every `verified`
+   * contest and reproduces the pre-#79 answer exactly.
+   */
+  const voidCooldownSeconds = await readVoidCooldownSeconds();
+  const cooldownTerms: CooldownTerms | null =
+    voidCooldownSeconds === null
+      ? null
+      : { seconds: voidCooldownSeconds, nowMicros: BigInt(Date.now()) * 1000n };
   if (positions.length === 0) {
     // A wallet with nothing in it is still a traversal, and a single read that
     // came back after the deadline must not answer an authoritative empty.
     refuseIfLate('result');
-    return { active: [], pendingSettle: [], claimable: [], settlementCandidates: [], settledLost: [], hitCap, derivedStatuses: [],
+    return { active: [], pendingSettle: [], claimable: [], settlementCandidates: [], settledLost: [], hitCap,
+      voidCooldownSeconds, derivedStatuses: [],
       ...(enumeration ? { enumeration } : {}) };
   }
 
@@ -557,7 +662,7 @@ export async function fetchCategorizedPositions(
   for (let start = 0, size = options.complete ? COMPLETE_PAGE_SIZE : contestIds.length; start < contestIds.length; start += size) {
     let query = sb
       .from('contests')
-      .select('contest_id, away_team, home_team, sport_slug, contest_status, away_score, home_score, row_updated_at')
+      .select('contest_id, away_team, home_team, sport_slug, contest_status, away_score, home_score, start_time, row_updated_at')
       .eq('network', config.network)
       .in('contest_id', contestIds.slice(start, start + size));
     if (options.complete) query = query.limit(COMPLETE_PAGE_SIZE);
@@ -708,8 +813,7 @@ export async function fetchCategorizedPositions(
     }
 
     // speculation_status === 'open'
-    if (contest && SETTLEABLE_OPEN_CONTEST_STATUSES.has(contest.contest_status)
-        && !p.claimed && riskWei6 > 0n) {
+    if (contest && isSettleableOpenContest(contest, cooldownTerms) && !p.claimed && riskWei6 > 0n) {
       // Independent of predicted winner OR availability of prediction
       // inputs. A losing controlled side can still finalize the market
       // for its winning counterparty. Do not add losers to payout buckets.
@@ -790,7 +894,8 @@ export async function fetchCategorizedPositions(
   // any more — but it is what makes the bound true of the WHOLE traversal
   // including categorisation, rather than only of its reads.
   refuseIfLate('result');
-  return { active, pendingSettle, claimable, settlementCandidates, settledLost, hitCap, derivedStatuses,
+  return { active, pendingSettle, claimable, settlementCandidates, settledLost, hitCap,
+    voidCooldownSeconds, derivedStatuses,
     ...(enumeration ? { enumeration } : {}) };
 }
 

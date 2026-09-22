@@ -6,7 +6,7 @@ import { ADDRESS, positionTables, scaleTables, STAMP } from './helpers/positionT
 const db = vi.hoisted(() => ({ getSupabase: vi.fn() }));
 vi.mock('../src/lib/supabase.js', () => db);
 vi.mock('../src/lib/env.js', () => ({ loadConfig: () => ({ network: 'polygon', chainId: 137 }) }));
-vi.mock('../src/lib/logger.js', () => ({ logger: { error: vi.fn() }, formatError: String }));
+vi.mock('../src/lib/logger.js', () => ({ logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn() }, formatError: String }));
 
 const { getPositionStatusHandler, getClaimParamsHandler } = await import('../src/v1/positions.js');
 

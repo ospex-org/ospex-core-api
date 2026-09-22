@@ -47,6 +47,13 @@ export interface Config {
   alchemyRpcUrl?: string;
   matchingModuleAddress?: string;
   positionModuleAddress?: string;
+  /**
+   * The deployed `SpeculationModule`, read ONLY for its `i_voidCooldown`
+   * immutable (`src/lib/voidCooldown.ts`, `#79`). Absent ⇒ a `verified`
+   * contest is never reported as settlement work, i.e. exactly the behaviour
+   * before #79 — the term is refused rather than guessed.
+   */
+  speculationModuleAddress?: string;
   scorers?: ScorerAddresses;
   /** SSE concurrent-connection caps. Absent ⇒ the stream module's defaults apply. */
   maxStreamConnectionsTotal?: number | undefined;
@@ -316,6 +323,7 @@ export function loadConfig(): Config {
   const alchemyRpcUrl = optionalEnv('ALCHEMY_RPC_URL');
   const matchingModuleAddress = optionalAddressEnv('MATCHING_MODULE_ADDRESS');
   const positionModuleAddress = optionalAddressEnv('POSITION_MODULE_ADDRESS');
+  const speculationModuleAddress = optionalAddressEnv('SPECULATION_MODULE_ADDRESS');
 
   // Deploy provenance from Heroku dyno-metadata features (optional; see Config).
   const herokuBuildCommit = optionalEnv('HEROKU_BUILD_COMMIT');
@@ -503,6 +511,7 @@ export function loadConfig(): Config {
     ...(alchemyRpcUrl !== undefined ? { alchemyRpcUrl } : {}),
     ...(matchingModuleAddress !== undefined ? { matchingModuleAddress } : {}),
     ...(positionModuleAddress !== undefined ? { positionModuleAddress } : {}),
+    ...(speculationModuleAddress !== undefined ? { speculationModuleAddress } : {}),
     ...(scorers !== undefined ? { scorers } : {}),
     ...(maxStreamConnectionsTotal !== undefined ? { maxStreamConnectionsTotal } : {}),
     ...(maxStreamConnectionsPerIp !== undefined ? { maxStreamConnectionsPerIp } : {}),

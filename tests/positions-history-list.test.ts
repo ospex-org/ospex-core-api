@@ -131,7 +131,7 @@ async function call(
       network: 'polygon',
     }),
   }));
-  vi.doMock('../src/lib/logger.js', () => ({ logger: { error: vi.fn() }, formatError: String }));
+  vi.doMock('../src/lib/logger.js', () => ({ logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn() }, formatError: String }));
 
   const { getPositionsByAddressHandler } = await import('../src/v1/positions.js');
   const res = {
