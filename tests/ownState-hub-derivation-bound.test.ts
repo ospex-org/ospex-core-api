@@ -341,6 +341,33 @@ describe('reDerivePositionStatuses — phase B maintains tracked keys determinis
     }
   });
 
+  it('reports its own budget, at a population where phase A is NOT saturated', async () => {
+    // rule 3b: with >200 actionable rows phase A's cap fires too, so a test
+    // built that way cannot tell which bound spoke. Here the TABLE holds 10
+    // rows — phase A is nowhere near its cap — and the CACHE holds the rest, so
+    // the phase-B budget is the only thing that can produce a signal.
+    for (const [seeded, expected] of [
+      // 410 seeded, 10 of them inside phase A's result -> exactly 400 stale,
+      // which four pages of 100 cover completely. Nothing is missed, so nothing
+      // is reported: the negative control, and the only case that separates
+      // `> budget` from `>= budget`.
+      [410, [] as string[]],
+      // 500 seeded -> 490 stale, of which 90 go uncovered.
+      [500, ['positionsTruncated']],
+    ] as const) {
+      const sb = positionTables(buildTables(10));
+      const hub = makeHub(sb);
+      const rec = subscribeRecording(hub);
+      seedAll(hub, Array.from({ length: seeded }, (_, i) => i + 1));
+
+      await hub.pollWallet(ADDRESS);
+
+      const lists = phaseBIdLists(sb.queries);
+      expect(lists.flat().length, `seeded=${String(seeded)}`).toBe(400);
+      expect(rec.degradeds, `seeded=${String(seeded)}`).toEqual(expected);
+    }
+  });
+
   it('refuses to exceed its page budget, and reports that instead of truncating', async () => {
     // 700 actionable rows: 200 inside phase A's window, 500 stale keys against a
     // 4 x 100 budget. The 100 uncovered keys are exactly what the old single
@@ -430,6 +457,45 @@ describe('reDerivePositionStatuses — a finished position is retired from the w
     expect(first).toContain(205);
     expect(statuses.map((s) => s.status)).toEqual(['settledLost']);
     expect(second).toContain(205);
+  });
+
+  it('retires a loser that never emits, which is the shape production actually takes', async () => {
+    // Found by a SURVIVING mutant: deleting the retirement on the non-emitting
+    // branch changed nothing, because every other case here seeds `active` and
+    // then watches the row transition — so the emission path did the retiring.
+    //
+    // Production does the opposite. The cold-start seed comes from the SAME
+    // derivation the snapshot published (`loadOwnStateSnapshot` returns
+    // `seedRows`), so a settled loser is seeded with the status it already has,
+    // the first tick finds no change, and NOTHING emits. That makes the
+    // non-emitting branch the only path by which the 86% of rows this change
+    // exists to retire ever get retired.
+    const sb = positionTables(buildTables(205, { 205: { specStatus: 'closed', winSide: 'home' } }));
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    seedAll(hub, Array.from({ length: 204 }, (_, i) => i + 1));
+    // Key 205 seeded at its ALREADY-DERIVED state, fields included, so the
+    // dedup comparison matches on all four and suppresses the event.
+    hub.seedStatusCache(ADDRESS, [
+      {
+        key: '205_0',
+        status: 'settledLost',
+        sourceUpdatedAt: stampFor(205),
+        result: 'lost',
+      },
+    ]);
+
+    await hub.pollWallet(ADDRESS);
+
+    // SETUP FIRST: prove we are on the non-emitting branch. If anything emitted
+    // for 205, the emission path could be doing the retiring and the assertion
+    // below would pass for the wrong reason (rule 3b).
+    expect(rec.statuses).toEqual([]);
+    expect(phaseBIdLists(sb.queries).flat()).toContain(205);
+
+    const before = sb.queries.length;
+    await hub.pollWallet(ADDRESS);
+    expect(phaseBIdLists(sb.queries.slice(before)).flat()).not.toContain(205);
   });
 
   it('still delivers a change on a retired key, because a touched row re-enters the window', async () => {

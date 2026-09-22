@@ -311,6 +311,18 @@ describe('isTerminalForever', () => {
     { status: 'settledLost', spec: CLOSED_AWAY, frozen: true, why: 'settleSpeculation closes once; a loser pays zero forever' },
     { status: 'settledLost', spec: OPEN, frozen: false, why: 'a PREDICTION off a scored contest — a score correction flips it' },
     { status: 'settledLost', spec: CLOSED_TBD, frozen: false, why: "closed + tbd is a shouldn't-happen state; a real side arriving later turns it claimable" },
+    // THE case that separates the two clauses. Every other `open` row here
+    // carries win_side 'tbd', so a build checking only `winSide !== 'tbd'`
+    // answers identically on all of them (rule 3g-both: the fixture has to sit
+    // where the two candidate rules disagree). This state is UNOBSERVED in
+    // production — 0 of 990 polygon speculations are open with a real side,
+    // measured 2026-09-22 — and it is not constrained either: `win_side` and
+    // `speculation_status` are two independently-written indexer columns, so the
+    // reachable producer is a writer change, not today's data (rule
+    // 3d-reachable). While the speculation is open the derivation ignores
+    // `win_side` entirely and predicts from the contest, so freezing here would
+    // retire a row whose prediction a score correction can still flip.
+    { status: 'settledLost', spec: { speculationStatus: 'open', winSide: 'away' }, frozen: false, why: 'an open speculation is a prediction whatever win_side says' },
     { status: 'claimable', spec: CLOSED_AWAY, frozen: false, why: 'still owes a `claimed` transition, and it is carrying money' },
     { status: 'void', spec: { speculationStatus: 'closed', winSide: 'void' }, frozen: false, why: 'payout equals the stake and is still unclaimed' },
     { status: 'pendingSettle', spec: OPEN, frozen: false, why: 'settlement has not run; claimable is still ahead of it' },
