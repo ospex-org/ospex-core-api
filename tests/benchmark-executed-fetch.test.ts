@@ -142,12 +142,16 @@ const created = (over: Record<string, unknown> = {}, payload: Record<string, str
     { speculationId: '88', contestId: '41', scorer: SCORERS.moneyline, lineTicks: '0', ...payload },
     { block_number: 90, tx_hash: '0xcreate', ...over },
   );
-const settled = (winSideValue = '1', over: Record<string, unknown> = {}): Record<string, unknown> =>
+const settled = (
+  winSideValue = '1',
+  over: Record<string, unknown> = {},
+  payload: Record<string, string> = {},
+): Record<string, unknown> =>
   log(
     'SPECULATION_SETTLED',
     'speculation',
     88,
-    { speculationId: '88', winSideValue, scorer: SCORERS.moneyline },
+    { speculationId: '88', winSideValue, scorer: SCORERS.moneyline, ...payload },
     { block_number: 200, tx_hash: '0xsettle', ...over },
   );
 const contestCreated = (over: Record<string, unknown> = {}, payload: Record<string, string> = {}): Record<string, unknown> =>
@@ -1237,6 +1241,155 @@ describe('paging over the receipts', () => {
  * service is — and anything else is NOT handled, so a genuine bug still
  * reaches the error handler as a 500.
  */
+/**
+ * The per-(participant, market) rollup — `#89`.
+ *
+ * Added in #88 and, at THIS level, it had no coverage at all: every assertion
+ * about it went through the profile endpoint, over a fixture with exactly one
+ * priced fill. Two mutants measured that, and both survived the entire suite:
+ * forcing every fill's key to `'moneyline'`, and deleting the branch that
+ * accumulates a second fill onto an existing market entry. With one fill per
+ * arm neither mutation can change an answer, so the grouping key and the
+ * accumulation were unpinned on a money path.
+ *
+ * The fixtures here are the smallest ones where the right answer and the wrong
+ * answers differ: two fills whose markets differ AND whose money differs, and
+ * two fills that share a market.
+ */
+describe('the per-market rollup', () => {
+  /** The rollup, read through the REAL key function rather than a re-derived string. */
+  async function markets(result: unknown): Promise<{ size: number; get: (m: string) => Summary | undefined }> {
+    // Imported after `collect` has run, so this is the same module instance the
+    // collector used rather than a second copy loaded before `vi.doMock`.
+    const { armMarketKey } = await import('../src/v1/benchmark/executedFetch.js');
+    const byKey = (result as { byParticipantMarket: Map<string, Summary> }).byParticipantMarket;
+    return { size: byKey.size, get: (m: string) => byKey.get(armMarketKey(ARM, m)) };
+  }
+
+  /** A second, LOSING moneyline fill: 5 risked, settled `home` against an `upper` taker. */
+  const secondMoneyline = {
+    receipt: receipt({
+      speculation_id: 90, commitment_hash: '0xcc', tx_hash: '0xtx3',
+      block_number: 102, stake_usdc: 5,
+    }),
+    event: event({
+      id: 3, speculation_id: 90, commitment_hash: '0xcc', tx_hash: '0xtx3',
+      taker_risk_amount: String(5 * USDC), maker_risk_amount: String(4 * USDC),
+    }),
+    log: [
+      matched({ entity_id: 90, tx_hash: '0xtx3', block_number: 102 }, { speculationId: '90', commitmentHash: '0xCC' }),
+      created({ entity_id: 90, tx_hash: '0xcreate3', block_number: 91 }, { speculationId: '90' }),
+      settled('2', { entity_id: 90, tx_hash: '0xsettle3', block_number: 202 }, { speculationId: '90' }),
+    ],
+  };
+
+  /** A LOSING total fill on the same contest: 30 risked, settled `under` against an `upper` taker. */
+  const totalFill = {
+    receipt: receipt({
+      market: 'total', speculation_id: 89, commitment_hash: '0xbb', tx_hash: '0xtx2',
+      block_number: 101, stake_usdc: 30,
+    }),
+    event: event({
+      id: 2, speculation_id: 89, commitment_hash: '0xbb', tx_hash: '0xtx2',
+      taker_risk_amount: String(30 * USDC), maker_risk_amount: String(21 * USDC),
+    }),
+    log: [
+      matched(
+        { entity_id: 89, tx_hash: '0xtx2', block_number: 101 },
+        { speculationId: '89', commitmentHash: '0xBB', scorer: SCORERS.total, lineTicks: '85' },
+      ),
+      created(
+        { entity_id: 89, tx_hash: '0xcreate2', block_number: 91 },
+        { speculationId: '89', scorer: SCORERS.total, lineTicks: '85' },
+      ),
+      settled('4', { entity_id: 89, tx_hash: '0xsettle2', block_number: 201 }, { speculationId: '89', scorer: SCORERS.total }),
+    ],
+  };
+
+  it('accumulates a SECOND fill on the SAME market instead of replacing it', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt(), secondMoneyline.receipt],
+      position_fills: [event(), secondMoneyline.event],
+      chain_events: [matched(), created(), settled('1'), contestCreated(), scoresSet(), ...secondMoneyline.log],
+    });
+    // The setup, before the claim: both receipts priced, nothing unresolved.
+    // A second receipt that silently failed to bind looks exactly like a rollup
+    // that dropped it (`3g-silentsetup`).
+    const pooled = summaryOf(result);
+    expect(pooled.fills).toBe(2);
+    expect(pooled.unresolvedFills).toBe(0);
+    expect(pooled.stakedWei6).toBe(BigInt(15 * USDC));
+
+    const m = await markets(result);
+    expect(m.size).toBe(1);
+    const ml = m.get('moneyline') as Summary;
+    expect(ml.fills).toBe(2);
+    expect(ml.stakedWei6).toBe(BigInt(15 * USDC));
+    // +7 on the win, −5 on the loss. A rollup that kept only the first fill
+    // would answer 10 and +7; one that kept only the last, 5 and −5.
+    expect(ml.netWei6).toBe(BigInt(2 * USDC));
+    expect(ml.record).toMatchObject({ won: 1, lost: 1 });
+  });
+
+  it('keys two markets separately, and neither carries the other’s money', async () => {
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt(), totalFill.receipt],
+      position_fills: [event(), totalFill.event],
+      chain_events: [matched(), created(), settled('1'), contestCreated(), scoresSet(), ...totalFill.log],
+    });
+    const pooled = summaryOf(result);
+    expect(pooled.fills).toBe(2);
+    expect(pooled.unresolvedFills).toBe(0);
+    expect(pooled.stakedWei6).toBe(BigInt(40 * USDC));
+
+    const m = await markets(result);
+    expect(m.size).toBe(2);
+    expect(m.get('moneyline')).toMatchObject({
+      fills: 1, stakedWei6: BigInt(10 * USDC), netWei6: BigInt(7 * USDC),
+    });
+    expect(m.get('total')).toMatchObject({
+      fills: 1, stakedWei6: BigInt(30 * USDC), netWei6: BigInt(-30 * USDC),
+    });
+    // Nothing on the third market, and the two present entries sum to the pool.
+    expect(m.get('spread')).toBeUndefined();
+    expect((m.get('moneyline') as Summary).netWei6 + (m.get('total') as Summary).netWei6).toBe(
+      pooled.netWei6,
+    );
+  });
+
+  it('never attributes an unresolved receipt to a market', async () => {
+    // The second receipt has no `position_fills` row at all, so it is refused at
+    // Link 1 and has no market. It must appear in the POOLED count and nowhere
+    // else — attributing it to the market its receipt happens to name would be a
+    // figure invented from a receipt the service could not identify.
+    const { result } = await collect({
+      benchmark_execution_fills: [receipt(), totalFill.receipt],
+      position_fills: [event()],
+      chain_events: [matched(), created(), settled('1'), contestCreated(), scoresSet()],
+    });
+    const pooled = summaryOf(result);
+    expect(pooled.fills).toBe(1);
+    expect(pooled.unresolvedFills).toBe(1);
+
+    const m = await markets(result);
+    expect(m.size).toBe(1);
+    expect(m.get('moneyline')).toMatchObject({ fills: 1, unresolvedFills: 0 });
+    expect(m.get('total')).toBeUndefined();
+  });
+
+  it('cannot be collided by moving the separator into a component', async () => {
+    const { armMarketKey } = await import('../src/v1/benchmark/executedFetch.js');
+    // The property the LENGTH PREFIX exists for, and the only thing that pins it:
+    // under a plain `${id}:${market}` join both of these are `a:b:moneyline`.
+    expect(armMarketKey('a:b', 'moneyline')).not.toBe(armMarketKey('a', 'b:moneyline'));
+    // Reachability, stated rather than implied: no participant id or market in
+    // this system carries a colon today, so the producer of a collision would be
+    // a new id scheme or a refactor, not an attacker (`3d-reachable`). The guard
+    // is one expression and the alternative is a silent cross-arm merge of money.
+    expect(armMarketKey('fable-5-1', 'total')).not.toBe(armMarketKey('fable-5', '1:total'));
+  });
+});
+
 describe('respondProjectionFault', () => {
   async function respondTo(err: unknown): Promise<{ handled: boolean; status: number; body: unknown }> {
     const { respondProjectionFault } = await import('../src/v1/benchmark/source.js');

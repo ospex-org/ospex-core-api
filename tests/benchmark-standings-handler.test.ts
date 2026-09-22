@@ -137,31 +137,143 @@ const SCORERS = {
 };
 const CORE = '0x40047bafcded16c938058b7b67186299a2893561';
 
-/**
- * The raw-log history one settled, won moneyline fill needs: its own
- * COMMITMENT_MATCHED row (the deployment mark), the speculation's creation and
- * settlement, and the contest's creation (for the game spine) and scores.
- */
-function chainHistory(o: { gameId: string; txHash: string; block: number; taker: string }): Record<string, unknown>[] {
-  const row = (id: number, event_name: string, entity_type: string, entity_id: number, payload: Record<string, string>, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
-    id,
+/** One raw-log row, in the shape every `chain_events` fixture here shares. */
+function chainEvent(o: {
+  id: number;
+  eventName: string;
+  entityType: string;
+  entityId: number;
+  block: number;
+  txHash: string;
+  payload: Record<string, string>;
+}): Record<string, unknown> {
+  return {
+    id: o.id,
     network: 'polygon',
-    event_name,
-    entity_type,
-    entity_id,
+    event_name: o.eventName,
+    entity_type: o.entityType,
+    entity_id: o.entityId,
     emitter_address: CORE,
     block_number: o.block,
     tx_hash: o.txHash,
     log_index: 0,
-    payload: { raw: '0x', ...payload },
-    ...extra,
-  });
+    payload: { raw: '0x', ...o.payload },
+  };
+}
+
+/**
+ * The SPECULATION-level log one priced fill needs: its own COMMITMENT_MATCHED
+ * row (the deployment mark) and the speculation's creation and settlement.
+ *
+ * ## Every parameter here is a trap the identity chain in `executedFetch` sets
+ *
+ * Split out of `chainHistory` so a SECOND speculation on the same contest can be
+ * built, which is what `#89` asked for, and parameterised rather than copied
+ * because each hard-coded value below is a link the chain checks:
+ *
+ * - **`txHash` must be this fill's own**, distinct from any other fill's. Link 1
+ *   requires that EVERY `position_fills` row on the transaction belong to this
+ *   receipt (`mine.length !== events.length` refuses), and Link 2 matches the
+ *   COMMITMENT_MATCHED row by `tx_hash`. Two fills sharing a hash refuse each
+ *   other. `createTxHash` / `settleTxHash` are separate because the raw log is
+ *   UNIQUE on `(tx_hash, log_index)` and every row here carries `log_index: 0` —
+ *   reusing `'0xcreate'` for a second speculation is not a real history.
+ * - **`block` must equal the RECEIPT's `block_number`**, not the creation's.
+ *   Link 2 compares them.
+ * - **`scorer` must name the receipt's `market`** through the configured
+ *   `SCORERS`, and Link 3b additionally requires the MATCHED row and the
+ *   SETTLED row to name the SAME scorer and `lineTicks` as the creation. That is
+ *   the one that cost the first attempt at this fixture: a second speculation
+ *   whose creation said `total` while its copied MATCHED row still said
+ *   `moneyline` is refused, and a refused receipt is indistinguishable from a
+ *   broken market filter.
+ * - **`lineTicks` must parse as an integer** (10x-scaled; `'0'` on moneyline).
+ * - **`winSideValue`** is the on-chain enum: `1` away, `2` home, `3` over,
+ *   `4` under, `5` push, `6` void. With `taker_position_type: 'upper'`
+ *   (positionType 0) the taker wins on `away` or `over` and loses on `home` or
+ *   `under`.
+ */
+function speculationHistory(o: {
+  idBase: number;
+  speculationId: number;
+  contestId: number;
+  taker: string;
+  commitmentHash: string;
+  txHash: string;
+  block: number;
+  scorer: string;
+  lineTicks: string;
+  winSideValue: string;
+  createTxHash: string;
+  createBlock: number;
+  settleTxHash: string;
+  settleBlock: number;
+}): Record<string, unknown>[] {
+  const spec = String(o.speculationId);
+  const contest = String(o.contestId);
   return [
-    row(1, 'COMMITMENT_MATCHED', 'fill', 88, { speculationId: '88', contestId: '41', taker: o.taker, commitmentHash: '0xaa', scorer: SCORERS.moneyline, lineTicks: '0' }),
-    row(2, 'SPECULATION_CREATED', 'speculation', 88, { speculationId: '88', contestId: '41', scorer: SCORERS.moneyline, lineTicks: '0' }, { block_number: 90, tx_hash: '0xcreate' }),
-    row(3, 'SPECULATION_SETTLED', 'speculation', 88, { speculationId: '88', winSideValue: '1', scorer: SCORERS.moneyline }, { block_number: 200, tx_hash: '0xsettle' }),
-    row(4, 'CONTEST_CREATED', 'contest', 41, { contestId: '41', jsonoddsId: o.gameId }, { block_number: 80, tx_hash: '0xcontest' }),
-    row(5, 'CONTEST_SCORES_SET', 'contest', 41, { contestId: '41', awayScore: '5', homeScore: '3' }, { block_number: 190, tx_hash: '0xscore' }),
+    chainEvent({
+      id: o.idBase, eventName: 'COMMITMENT_MATCHED', entityType: 'fill',
+      entityId: o.speculationId, block: o.block, txHash: o.txHash,
+      payload: { speculationId: spec, contestId: contest, taker: o.taker, commitmentHash: o.commitmentHash, scorer: o.scorer, lineTicks: o.lineTicks },
+    }),
+    chainEvent({
+      id: o.idBase + 1, eventName: 'SPECULATION_CREATED', entityType: 'speculation',
+      entityId: o.speculationId, block: o.createBlock, txHash: o.createTxHash,
+      payload: { speculationId: spec, contestId: contest, scorer: o.scorer, lineTicks: o.lineTicks },
+    }),
+    chainEvent({
+      id: o.idBase + 2, eventName: 'SPECULATION_SETTLED', entityType: 'speculation',
+      entityId: o.speculationId, block: o.settleBlock, txHash: o.settleTxHash,
+      payload: { speculationId: spec, winSideValue: o.winSideValue, scorer: o.scorer },
+    }),
+  ];
+}
+
+/**
+ * The CONTEST-level log: the creation (the game spine) and the scores.
+ *
+ * Emitted **exactly once per contest**, which is why it is not part of
+ * `speculationHistory`. Link 4 refuses a receipt when
+ * `contestCreated.length !== 1` under the emitter, so a second speculation on
+ * the same contest that brought its own copy of these two rows would refuse
+ * BOTH fills rather than add one.
+ */
+function contestHistory(o: {
+  idBase: number;
+  contestId: number;
+  gameId: string;
+  createTxHash: string;
+  scoreTxHash: string;
+}): Record<string, unknown>[] {
+  const contest = String(o.contestId);
+  return [
+    chainEvent({
+      id: o.idBase, eventName: 'CONTEST_CREATED', entityType: 'contest',
+      entityId: o.contestId, block: 80, txHash: o.createTxHash,
+      payload: { contestId: contest, jsonoddsId: o.gameId },
+    }),
+    chainEvent({
+      id: o.idBase + 1, eventName: 'CONTEST_SCORES_SET', entityType: 'contest',
+      entityId: o.contestId, block: 190, txHash: o.scoreTxHash,
+      payload: { contestId: contest, awayScore: '5', homeScore: '3' },
+    }),
+  ];
+}
+
+/** The whole raw-log history one settled, WON moneyline fill needs. */
+function chainHistory(o: { gameId: string; txHash: string; block: number; taker: string }): Record<string, unknown>[] {
+  return [
+    ...speculationHistory({
+      idBase: 1, speculationId: 88, contestId: 41, taker: o.taker, commitmentHash: '0xaa',
+      txHash: o.txHash, block: o.block, scorer: SCORERS.moneyline, lineTicks: '0',
+      winSideValue: '1', createTxHash: '0xcreate', createBlock: 90,
+      settleTxHash: '0xsettle', settleBlock: 200,
+    }),
+    ...contestHistory({
+      idBase: 4, contestId: 41, gameId: o.gameId,
+      createTxHash: '0xcontest', scoreTxHash: '0xscore',
+    }),
   ];
 }
 
@@ -287,6 +399,96 @@ const FABLE_WITH_FILL = {
     },
   ],
   chain_events: chainHistory({ gameId: GAME, txHash: '0xtx1', block: 100, taker: '0xabc' }),
+};
+
+/**
+ * `FABLE_WITH_FILL` plus a SECOND priced fill on a different market — `#89`.
+ *
+ * One arm, one sport, one contest, two speculations:
+ *
+ * | view | risk | net | ROI |
+ * |---|---|---|---|
+ * | `?market=moneyline` | 10 | +7 | 70% |
+ * | `?market=total` | 30 | −30 | −100% |
+ * | pooled | 40 | −23 | −57.5% |
+ *
+ * Three DIFFERENT triples, which is the whole point: with only the moneyline
+ * fill, a projection that ignored the market filter and answered the pooled
+ * figure everywhere agreed with the correct one on the market that had the fill,
+ * and the grouping key itself was unpinned. The mutant that measured that gap
+ * forced every fill into `'moneyline'` and changed nothing the suite could see.
+ *
+ * ## Why this is a separate fixture rather than a second fill in the one above
+ *
+ * Nine tests read `FABLE_WITH_FILL` and several assert its pooled 10 / +7 / 70%.
+ * Those assertions are coverage in their own right — the single-fill case is the
+ * one where a market filter and a pooled answer COINCIDE, which is worth keeping
+ * pinned — so this extends rather than replaces, and the blast radius is zero.
+ *
+ * ## What the second fill has to satisfy, and what it must not collide with
+ *
+ * A separate speculation (89) under the SAME contest, which is how Ospex models
+ * a second market on one game. See `speculationHistory` for the per-link reasons;
+ * the collision surfaces are its own `tx_hash` (`0xtx2`, so Link 1's
+ * every-event-is-mine check holds), its own `commitment_hash` (`0xbb`), its own
+ * `position_fills.id`, its own `chain_events.id` range (6–8, after the first
+ * fill's 1–3 and the contest's 4–5), and its own creation and settlement hashes.
+ * The contest rows are NOT repeated: Link 4 wants exactly one CONTEST_CREATED.
+ *
+ * It LOSES on purpose, because a fixture where both fills win cannot tell a
+ * market-scoped net from a doubled one: +7 and +21 sum to +28 either way, while
+ * +7 and −30 make the pooled net land between the two market nets and outside
+ * both. `winSideValue: '4'` is `under` and the taker is `'upper'` (over), so
+ * `didWin(0, 'under')` is false — payout 0, net −30, ROI −100%.
+ */
+const FABLE_TWO_MARKETS = {
+  ...FABLE_WITH_FILL,
+  benchmark_execution_fills: [
+    ...FABLE_WITH_FILL.benchmark_execution_fills,
+    {
+      cohort_id: COHORT,
+      participant_id: FABLE,
+      network: 'polygon',
+      game_id: GAME,
+      market: 'total',
+      run_id: RUN,
+      deployment_round: 'R5',
+      contest_id: 41,
+      speculation_id: 89,
+      commitment_hash: '0xbb',
+      taker_address: '0xabc',
+      tx_hash: '0xtx2',
+      block_number: 101,
+      filled_at: '2026-08-15T20:05:00+00:00',
+      stake_usdc: 30,
+      would_abstain: false,
+    },
+  ],
+  position_fills: [
+    ...FABLE_WITH_FILL.position_fills,
+    {
+      id: 2,
+      network: 'polygon',
+      speculation_id: 89,
+      contest_id: 41,
+      commitment_hash: '0xbb',
+      taker_address: '0xabc',
+      taker_position_type: 'upper',
+      taker_risk_amount: '30000000',
+      maker_risk_amount: '21000000',
+      tx_hash: '0xtx2',
+      log_index: 0,
+    },
+  ],
+  chain_events: [
+    ...FABLE_WITH_FILL.chain_events,
+    ...speculationHistory({
+      idBase: 6, speculationId: 89, contestId: 41, taker: '0xabc', commitmentHash: '0xbb',
+      txHash: '0xtx2', block: 101, scorer: SCORERS.total, lineTicks: '85',
+      winSideValue: '4', createTxHash: '0xcreate2', createBlock: 91,
+      settleTxHash: '0xsettle2', settleBlock: 201,
+    }),
+  ],
 };
 
 const open: FakePostgrest[] = [];
@@ -1449,19 +1651,22 @@ describe('profile — a market filter scopes the metrics and says what it does n
   });
 
   /**
-   * The honesty requirement. Fills carry no market breakdown in `WireExecuted`
-   * and a series point is a cohort-day's pooled figure, so a market-filtered
-   * request CANNOT have market-scoped money or chart. Serving pooled figures
-   * under a market filter without saying so is a wrong number wearing a right
-   * number's clothes, so each block carries its own scope and the labels differ
-   * within one response.
-   */
-  /**
-   * REVIEW ROUND. The money used to be pooled under an honest `all-markets` label,
-   * and that was an acceptance gap rather than a labelling choice: #72 requires
-   * filtered risk and ROI, and a label saying the figure is pooled does not deliver
-   * a filtered one. `executed` and `roi` are now market-scoped; `series` and
-   * `headline` genuinely cannot be and stay labelled.
+   * The honesty requirement: every block carries its OWN scope, and the labels
+   * differ within one response.
+   *
+   * `metrics`, `executed` and `roi` are market-scoped. `series` and `headline`
+   * are pooled by nature — a series point is a cohort-day's figure across
+   * markets and the headline is the basis over the whole sample — so they say
+   * `all-markets` rather than pretending.
+   *
+   * Two earlier claims are superseded and deliberately paraphrased rather than
+   * quoted, so a grep for them finds nothing (`3c`). The first version of this
+   * docblock said a market-filtered request could not have market-scoped money
+   * because the wire fill type carried no market; that was a limitation of the
+   * projection, not of the source row, which carries a `market` (`3b-layer`).
+   * The second said pooled money under an honest label was sufficient; #72 asks
+   * for filtered risk and ROI, and a label saying a figure is pooled does not
+   * make it filtered. Both were fixed in #88.
    */
   it('scopes the money to the market, and labels what still cannot be scoped', async () => {
     const { body } = await run(
@@ -1485,12 +1690,13 @@ describe('profile — a market filter scopes the metrics and says what it does n
    * a handler that ignored the filter would answer the pooled 10 for all three,
    * which is exactly the defect review caught.
    *
-   * BOUND, stated because it matters: this pins market scoping with ONE priced
-   * fill. A two-priced-fill fixture would be stronger evidence and is not here —
-   * binding a second receipt needs the whole identity chain in `executedFetch`, and
-   * a first attempt produced a receipt that silently failed to price, which reads
-   * identically to the filter failing. The reviewer's own two-fill probe is the
-   * stronger evidence for the multi-market case; this is what the suite enforces.
+   * WHAT THIS CASE UNIQUELY COVERS, now that `#89` has added the two-market
+   * fixture below. This is the COINCIDENCE case: with one priced fill, the correct
+   * market-scoped answer and the pooled answer are the same numbers, so it pins
+   * that the empty markets stay empty and that the rollup invents no
+   * unresolved-receipt count. What it cannot pin is the grouping KEY, because
+   * every fill belongs to the same market — that is the two-market block's job,
+   * and a mutant forcing every fill into `'moneyline'` survived until it existed.
    */
   it('serves the requested market’s risk, not the pooled figure', async () => {
     const tables = { ...FABLE_WITH_FILL, benchmark_scoring_runs: [OPEN_RUN] };
@@ -1541,7 +1747,9 @@ describe('profile — a market filter scopes the metrics and says what it does n
       string,
       number | null
     >;
-    const parts = [];
+    // Annotated, like its two-market sibling below. Left bare this was the last
+    // `yarn typecheck:tests` error in the repo (TS7034/TS7005, implicit any[]).
+    const parts: Record<string, number | null>[] = [];
     for (const market of ['moneyline', 'spread', 'total']) {
       const { body } = await run(tables, { market }, {}, undefined, FABLE);
       parts.push(body.executed as Record<string, number | null>);
@@ -1556,6 +1764,99 @@ describe('profile — a market filter scopes the metrics and says what it does n
     expect((ml.body.executed as Record<string, unknown>).unattributedFills).toBe(
       pooled.unresolvedFills,
     );
+  });
+
+  /**
+   * `#89` — the two-priced-market case, which is what actually pins the grouping key.
+   *
+   * With one priced fill, the correct answer and the pooled answer COINCIDE on the
+   * market that has it, so a mutant forcing every fill into `'moneyline'` changed
+   * nothing any test could see. Two fills on different markets, with different
+   * money, is the fixture where they diverge.
+   */
+  describe('profile — two priced markets', () => {
+    const tables = { ...FABLE_TWO_MARKETS, benchmark_scoring_runs: [OPEN_RUN] };
+    const roi = (b: Record<string, unknown>): Record<string, number | null> =>
+      b.roi as Record<string, number | null>;
+    const executed = (b: Record<string, unknown>): Record<string, number | null> =>
+      b.executed as Record<string, number | null>;
+
+    /**
+     * THE SETUP ASSERTION, and it comes first for a reason (`3g-silentsetup`).
+     *
+     * The first attempt at this fixture produced a second receipt that silently
+     * failed to bind to a priced fill, so the pooled total stayed at the first
+     * fill's 10 — which is exactly what a broken market filter produces. A
+     * fixture named for two markets that delivers one is worse than none, because
+     * its name is what does the lying. So: both fills priced, nothing unresolved,
+     * asserted before a single claim about the split.
+     */
+    it('prices BOTH fills, so the split below is about the filter', async () => {
+      const { body } = await run(tables, {}, {}, undefined, FABLE);
+      const e = executed(body);
+      expect(e.fills).toBe(2);
+      expect(e.stakedUsdc).toBe(40);
+      // A receipt that failed to bind lands here instead, and it is the number
+      // that tells a setup failure apart from a projection failure.
+      expect(e.unresolvedFills).toBe(0);
+    });
+
+    it('answers three different money triples for the two markets and the pool', async () => {
+      const pooled = await run(tables, {}, {}, undefined, FABLE);
+      const ml = await run(tables, { market: 'moneyline' }, {}, undefined, FABLE);
+      const total = await run(tables, { market: 'total' }, {}, undefined, FABLE);
+
+      expect(roi(ml.body)).toMatchObject({ riskUsdc: 10, netUsdc: 7, pct: 70 });
+      expect(roi(total.body)).toMatchObject({ riskUsdc: 30, netUsdc: -30, pct: -100 });
+      expect(roi(pooled.body)).toMatchObject({ riskUsdc: 40, netUsdc: -23, pct: -57.5 });
+
+      // The three are pairwise DISTINCT, which is the property a single-fill
+      // fixture cannot have: there, the pooled and the one market's figures are
+      // the same numbers, so answering either was indistinguishable.
+      const triples = [ml, total, pooled].map((r) => JSON.stringify([
+        roi(r.body).riskUsdc, roi(r.body).netUsdc, roi(r.body).pct,
+      ]));
+      expect(new Set(triples).size).toBe(3);
+      // And the pooled net lands BETWEEN the two market nets rather than beside
+      // either, so a response that answered one market's money for the pool is
+      // refused by arithmetic and not only by a literal.
+      expect(roi(pooled.body).netUsdc as number).toBeLessThan(roi(ml.body).netUsdc as number);
+      expect(roi(pooled.body).netUsdc as number).toBeGreaterThan(roi(total.body).netUsdc as number);
+    });
+
+    it('keeps each market’s record and fill count its own', async () => {
+      const ml = await run(tables, { market: 'moneyline' }, {}, undefined, FABLE);
+      const total = await run(tables, { market: 'total' }, {}, undefined, FABLE);
+      const spread = await run(tables, { market: 'spread' }, {}, undefined, FABLE);
+
+      expect(executed(ml.body).fills).toBe(1);
+      expect((ml.body.executed as Record<string, unknown>).record)
+        .toMatchObject({ won: 1, lost: 0 });
+      expect(executed(total.body).fills).toBe(1);
+      expect((total.body.executed as Record<string, unknown>).record)
+        .toMatchObject({ won: 0, lost: 1 });
+      // The market with no fill still answers nothing rather than a pooled
+      // figure — the negative control, on a fixture that now has money on two
+      // markets to leak from.
+      expect(executed(spread.body).fills).toBe(0);
+      expect(roi(spread.body)).toMatchObject({ riskUsdc: null, netUsdc: null, pct: null });
+    });
+
+    it('has the two markets sum to the pooled totals', async () => {
+      const pooled = executed((await run(tables, {}, {}, undefined, FABLE)).body);
+      const parts: Record<string, number | null>[] = [];
+      for (const market of ['moneyline', 'spread', 'total']) {
+        parts.push(executed((await run(tables, { market }, {}, undefined, FABLE)).body));
+      }
+      const sum = (k: string): number => parts.reduce((a, p) => a + (p[k] ?? 0), 0);
+      expect(sum('fills')).toBe(pooled.fills);
+      expect(sum('stakedUsdc')).toBe(pooled.stakedUsdc);
+      expect(sum('netUsdc')).toBe(pooled.netUsdc);
+      // Stated because the single-fill version of this test could not: the sum is
+      // now over two non-zero contributions, so a rollup that dropped one or
+      // double-counted the other fails here rather than agreeing by coincidence.
+      expect(parts.filter((p) => (p.fills ?? 0) > 0)).toHaveLength(2);
+    });
   });
 
   /**
