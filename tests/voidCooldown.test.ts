@@ -114,7 +114,15 @@ describe('readVoidCooldownSeconds — every failure is a null, never a throw', (
     // And it must not reach the chain at all — a refusal that still spent a request
     // would be the wrong shape even with the right answer.
     expect(provider.call).not.toHaveBeenCalled();
-    expect(logMock.logger.warn).toHaveBeenCalled();
+    // The REASON, not merely that something warned (`3b`). Without this the case
+    // passed for the wrong reason: an unconfigured address falls through to
+    // `new Contract(undefined, ...)`, that throw is caught, and the answer is the
+    // same null under a different reason - so a mutant deleting this guard survived
+    // the whole suite. Measured, not supposed.
+    expect(logMock.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'no-module-address' }),
+      expect.any(String),
+    );
   });
 
   it('returns null when the provider is unavailable', async () => {

@@ -432,6 +432,11 @@ export function isSettleableOpenContest(
   if (SETTLEABLE_OPEN_CONTEST_STATUSES.has(contest.contest_status)) return true;
   if (contest.contest_status !== 'verified') return false;
   if (cooldown === null) return false;
+  // A TYPE NARROWING rather than a second guard, and worth saying so: measured,
+  // the strict parser below refuses a null on its own (`RFC3339.exec(null)` is
+  // null), so a mutation of this line alone changes no behaviour. The runtime
+  // refusal of a null `start_time` is the parse check, and that is the line a
+  // mutation battery has to attack.
   if (contest.start_time === null) return false;
   const startMicros = parseTimestampMicros(contest.start_time);
   if (startMicros === null) return false;
