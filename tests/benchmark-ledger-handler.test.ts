@@ -299,6 +299,67 @@ describe('ledger — a filter is required, and the refusal costs nothing', () =>
     },
   );
 
+  /**
+   * A cursor is shape-checked AND magnitude-checked.
+   *
+   * `/^\d+$/` accepts a 20-digit string, `Number` turns it into something past
+   * `Number.MAX_SAFE_INTEGER`, and PostgREST interpolates it into
+   * `source_decision_id=lt.1e+21` — which Postgres refuses on a bigint column
+   * with 22P02 or 22003. Neither is a schema-drift code, so before the fix this
+   * answered 500 INTERNAL_ERROR while every sibling param answered 400. The
+   * 17-digit case is the quieter half: `Number` ROUNDS it, so the walk would page
+   * from a number the caller never sent.
+   */
+  it.each([
+    ['past Number.MAX_SAFE_INTEGER', '10000000000000000000'],
+    ['past int8 entirely', '1000000000000000000000'],
+    ['silently rounded by Number', '90071992547409911'],
+  ])('refuses a cursor %s with 400 rather than 500', async (_why, after) => {
+    const { status, body, fake } = await call({ participantId: PARTICIPANT, after });
+    expect(status).toBe(400);
+    expect(body).toMatchObject({ code: 'INVALID_PARAM' });
+    expect(fake.requests).toHaveLength(0);
+  });
+
+  it('accepts a cursor inside the safe range — the control for the refusals above', async () => {
+    const { status, body } = await call({ participantId: PARTICIPANT, after: '4374' });
+    expect(status).toBe(200);
+    expect(rowsOf(body).length).toBeGreaterThan(0);
+  });
+
+  /**
+   * `sport` goes through the SAME validator as the three sibling endpoints.
+   *
+   * Taken raw, `?sport=MLB` and `?sport=typo` both became `sport=eq.<literal>` and
+   * answered 200 with an empty page — one param name behaving differently across
+   * sibling endpoints and failing SILENTLY. `all` must mean "no sport filter"
+   * here, which is `/benchmark/picks`'s reading and deliberately not
+   * `/benchmark/stats`'s, where `all` is a real stored value.
+   */
+  it('case-folds sport rather than filtering on the raw spelling', async () => {
+    const { status, body, fake } = await call({ participantId: PARTICIPANT, sport: 'MLB', limit: '100' });
+    expect(status).toBe(200);
+    expect(requestTo(fake, LEDGER)?.params.get('sport')).toBe('eq.mlb');
+    // The discriminating half: raw handling sends eq.MLB, which matches nothing.
+    expect(rowsOf(body).length).toBeGreaterThan(0);
+  });
+
+  it('treats sport=all as no sport filter, not as a literal', async () => {
+    const { status, body, fake } = await call({ participantId: PARTICIPANT, sport: 'all', limit: '100' });
+    expect(status).toBe(200);
+    expect(requestTo(fake, LEDGER)?.params.get('sport')).toBeNull();
+    expect(body.filters).toMatchObject({ sport: null });
+    expect(rowsOf(body).length).toBeGreaterThan(0);
+  });
+
+  it('refuses an unknown sport instead of serving an empty page', async () => {
+    const { status, body, fake } = await call({ participantId: PARTICIPANT, sport: 'quidditch' });
+    expect(status).toBe(400);
+    expect(body).toMatchObject({ code: 'INVALID_PARAM' });
+    expect(String(body.error)).toContain('sport');
+    expect(fake.requests).toHaveLength(0);
+  });
+
   it('serves an empty page with no read at all when the gate is unset', async () => {
     const { status, body, fake } = await call(
       { participantId: PARTICIPANT },
@@ -439,8 +500,45 @@ describe('ledger — paging', () => {
    * ENFORCED here rather than assumed, because a `lt` cursor over a non-unique
    * key skips rows across the page boundary — silently.
    */
-  it('refuses a page that carries the same decisionId twice', async () => {
-    const dupes = [row({ source_decision_id: 7 }), row({ source_decision_id: 7 })];
+  /**
+   * THE case that carries the discrimination, and the one the first version of
+   * this suite did not have.
+   *
+   * Ids [100, 99, 98, 97, 97] at `limit: 4`. The handler fetches five, serves the
+   * first four — [100, 99, 98, 97], all distinct — and discards the second 97 as
+   * the probe row. A guard that scanned only the SERVED slice sees nothing wrong,
+   * answers 200, and sets `nextAfter: 97`; the next page's strict `lt.97` then
+   * excludes the second 97 from that page and from every later one, so the row is
+   * unreachable for the whole walk. That is the only duplicate arrangement that
+   * loses a row, because ties are adjacent under a descending order — and it is
+   * exactly the arrangement `served` cannot see.
+   *
+   * Five independent lenses of an adversarial pass found that hole. The test
+   * below it could not, and the reason is worth keeping: its limit was larger
+   * than its fixture, so `hasMore` was false, `served === fetched`, and the two
+   * builds were indistinguishable.
+   */
+  it('refuses a duplicate decisionId straddling the page boundary', async () => {
+    const ids = [100, 99, 98, 97, 97];
+    const dupes = ids.map((id, i) => row({ source_decision_id: id, game_id: `g${String(i)}` }));
+    const { status, body } = await call({ participantId: PARTICIPANT, limit: '4' }, dupes);
+    expect(status).toBe(503);
+    expect(body).toMatchObject({ code: 'NOT_READY' });
+    expect(String(body.error)).toContain('twice');
+    // If this ever answers 200, read `nextAfter`: it will be 97, and the row that
+    // was dropped is the other 97.
+    expect(body.rows).toBeUndefined();
+  });
+
+  /**
+   * The same defect wholly INSIDE the page. Kept because it pins the guard's
+   * other half, and marked because on its own it proves less than it looks:
+   * `limit: 10` over 2 rows makes `hasMore` false, so it passes identically on a
+   * build that scans `served` and one that scans `fetched`. The case above is
+   * what separates them.
+   */
+  it('refuses a duplicate decisionId inside the page', async () => {
+    const dupes = [row({ source_decision_id: 7 }), row({ source_decision_id: 7, game_id: 'g2' })];
     const { status, body } = await call({ participantId: PARTICIPANT, limit: '10' }, dupes);
     expect(status).toBe(503);
     expect(body).toMatchObject({ code: 'NOT_READY' });

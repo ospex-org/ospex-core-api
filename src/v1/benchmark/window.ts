@@ -491,7 +491,7 @@ function resolveActiveCohort(
   };
 }
 
-/** `sport` query-param validation shared by all three endpoints. */
+/** `sport` query-param validation shared by every benchmark endpoint that takes a `sport` filter. */
 export function parseSportParam(raw: unknown): Sport | 'all' | 'invalid' | undefined {
   if (raw === undefined) return undefined;
   const value = String(raw).toLowerCase();

@@ -248,9 +248,11 @@ export function spreadLines(homeLine: number | null): {
  * `.claude/rules/verification-discipline.md`: a convention applied at one site
  * and not at its sibling, at a scale too small to look like two sites.
  *
- * Every number on this surface that could be a spread goes through here, so
- * there is no second site to forget. Adding a new one is a call, not a
- * re-derivation.
+ * All four sites that serve a spread number now call this: the list endpoint's
+ * pick line, and the detail endpoint's pick line and closing line, and the
+ * ledger's two. Adding another is a call rather than a re-derivation, which is
+ * the property worth having — not a promise that none will ever be added
+ * elsewhere, which no comment can keep.
  */
 export function sidedLine(
   market: string,
@@ -577,7 +579,10 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
     const side = resolveSelectionSide(reveal.selection, away, home);
     // Normalised ONCE, here. Everything downstream reads this pair rather than
     // re-deriving a sign from the stored HOME value.
-    const spread = d.market === 'spread' ? spreadLines(reveal.line) : { awayLine: null, homeLine: null };
+    // Through the shared helper, like the other two endpoints. This was the THIRD
+    // site deriving the pair independently — in the file that defines the helper,
+    // which is what made the docblock's "no second site to forget" false until now.
+    const pickLine = sidedLine(d.market, reveal.line);
     const pick: WirePick = {
       decisionId: d.id,
       participantId: d.participant_id,
@@ -587,9 +592,9 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
       selection: reveal.selection,
       selectionLabel: selectionLabel(d.market, reveal.selection, reveal.line, american, side),
       // A spread's number is served as the labelled pair, never here.
-      line: d.market === 'spread' ? null : reveal.line,
-      awayLine: spread.awayLine,
-      homeLine: spread.homeLine,
+      line: pickLine.line,
+      awayLine: pickLine.awayLine,
+      homeLine: pickLine.homeLine,
       observedDecimal: reveal.observed_decimal,
       priceAmerican: american,
       confidence: reveal.confidence,

@@ -109,6 +109,8 @@ import {
   respondToQueryError,
 } from './source.js';
 import { decimalToAmerican, resolveSelectionSide, selectionLabel, sidedLine } from './picks.js';
+import { parseSportParam } from './window.js';
+import { SPORTS as VALID_SPORTS } from '../../lib/sports.js';
 import { axesOf } from './pick.js';
 
 /** Markets a pick can be on. A typo is a 400, not a 200 with nothing. */
@@ -298,12 +300,36 @@ export async function getBenchmarkLedgerHandler(req: Request, res: Response): Pr
     return trimmed === '' ? null : trimmed;
   };
 
+  // `sport` goes through the SHARED validator the three sibling endpoints use,
+  // not through `str()` raw.
+  //
+  // Taking it raw looked harmless and was not: `parseSportParam` lower-cases and
+  // validates, so `?sport=MLB` and `?sport=typo` would have been passed straight
+  // to `sport=eq.MLB` / `eq.typo` and answered 200 with an EMPTY PAGE — the same
+  // param name on a sibling endpoint, failing silently instead of with a 400.
+  // Found by the adversarial pass; it is the `invariant-at-every-site` shape,
+  // where the new site is the one that skipped the shared helper.
+  //
+  // `all` means NO sport filter here, matching `/benchmark/picks`. It deliberately
+  // does NOT match `/benchmark/stats`, where `all` is a real stored value the
+  // publisher writes a pooled row under and is passed through to the filter. Copy
+  // stats' handling to this endpoint and `?sport=all` filters `sport=eq.all`,
+  // which matches no pick row at all.
+  const parsedSport = parseSportParam(req.query.sport);
+  if (parsedSport === 'invalid') {
+    res.status(400).json({
+      error: `Invalid "sport". Must be "all" or one of: ${[...VALID_SPORTS].sort().join(', ')}.`,
+      code: 'INVALID_PARAM',
+    } satisfies ApiError);
+    return;
+  }
+
   const filters: LedgerFilters = {
     participantId: str('participantId'),
     gameId: str('gameId'),
     slateDate: str('slateDate'),
     market: str('market'),
-    sport: str('sport'),
+    sport: parsedSport === undefined || parsedSport === 'all' ? null : parsedSport,
   };
 
   const bad = (error: string, code: string): void => {
@@ -363,6 +389,17 @@ export async function getBenchmarkLedgerHandler(req: Request, res: Response): Pr
       return;
     }
     after = Number(afterRaw);
+    // Shape is not enough. `/^\d+$/` accepts a 22-digit string, `Number` turns it
+    // into `1e+21`, and PostgREST interpolates that into `source_decision_id=lt.1e+21`
+    // — which Postgres refuses on a bigint column with 22P02 or 22003. Neither code
+    // is a schema fault, so the handler answered 500 INTERNAL_ERROR where every
+    // sibling param answers 400. `isSafeInteger` also closes the quieter half: a
+    // 17+ digit value is silently ROUNDED by `Number` before it reaches the query,
+    // so the cursor would page from a number the caller never sent.
+    if (!Number.isSafeInteger(after)) {
+      bad('Invalid "after". Must be a decisionId from a previous page\'s nextAfter.', 'INVALID_PARAM');
+      return;
+    }
   }
 
   const countRaw = str('count');
@@ -430,16 +467,35 @@ export async function getBenchmarkLedgerHandler(req: Request, res: Response): Pr
   try {
     // The keyset cursor is only sound while `source_decision_id` is unique per
     // row. Measured true over the largest live scope (1,095/1,095 distinct), and
-    // enforced here rather than assumed: a `lt` cursor over a non-unique key
-    // SKIPS rows across the page boundary, silently, on an endpoint whose whole
-    // purpose is to report measured results.
+    // enforced here rather than assumed, because it is also SCHEMA-PERMITTED to
+    // break: indexer 083:108-110 keys the snapshot table
+    // `PRIMARY KEY (participant_id, game_id, market, as_of)` with only
+    // `UNIQUE (source_decision_id, as_of)`, so nothing binds a decision id to one
+    // (participant, game, market) and two keys' surviving snapshots can carry the
+    // same id.
+    //
+    // ## It scans `fetched`, not `served`, and that is the whole point
+    //
+    // The first version scanned `served` — and the one duplicate arrangement that
+    // actually loses a row is invisible there. Rows tie only ADJACENTLY under
+    // `order=source_decision_id.desc`, so the lossy case is copy #1 at index
+    // `limit - 1` and copy #2 as the discarded probe row: the loop sees one id,
+    // throws nothing, `nextAfter` becomes that id, and the next page's STRICT
+    // `lt` excludes copy #2 from this and every later page. The row is
+    // unreachable for the whole walk. Meanwhile the arrangement `served` COULD
+    // see — both copies inside the page — loses nothing, because both were
+    // served. So the guard fired only on the harmless case and stayed silent on
+    // the harmful one: rule `3k`, a verifier whose skipped case is the reachable
+    // one. Five independent lenses of an adversarial pass reported it; the test
+    // could not, because its fixture used a limit large enough that
+    // `served === fetched`.
     const ids = new Set<number>();
-    for (const row of served) {
+    for (const row of fetched) {
       if (ids.has(row.source_decision_id)) {
         throw new ProjectionIntegrityError(
           BENCHMARK.pickLedger,
-          `decisionId ${String(row.source_decision_id)} appeared twice in one page, so a keyset ` +
-            'cursor on it would skip rows',
+          `decisionId ${String(row.source_decision_id)} appeared twice in one fetch window, so a ` +
+            'keyset cursor on it would skip rows',
         );
       }
       ids.add(row.source_decision_id);

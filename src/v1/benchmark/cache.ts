@@ -3,9 +3,11 @@
  *
  * **This is the first read cache in this service, and it is deliberate.** Every
  * other endpoint here answers from one or two PostgREST round trips and needs
- * nothing; these three fan out across several relations and then run a
- * projection over every score row in the window, and `readRateLimit` admits 600
- * requests a minute from a single IP against one Basic dyno.
+ * nothing; the benchmark reads fan out across several relations and some of them
+ * project over every score row in the window, and `readRateLimit` admits 600
+ * requests a minute from a single IP against one Basic dyno. Every benchmark read
+ * goes through the memo, including the keyed ones, because the budget is what
+ * bounds them rather than the fan-out of any single endpoint.
  *
  * ## Single-flight is the part that matters
  *

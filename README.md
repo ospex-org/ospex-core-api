@@ -499,9 +499,9 @@ Three signer-free public reads over the `benchmark_*` serving tables that migrat
 
 What this projection is for survives that correction intact, on the three grounds that do not depend on the tables being unreadable: it serves **one vocabulary** rather than each client inventing its own; it keeps the scorer's arithmetic server-side so no metric math happens in a browser; and its publication gate is a config var this service can unset, which a row in a table it holds SELECT-only on could never be. The `service_role` key still never leaves this process, and no credential goes near the front end — both remain true.
 
-> ⚠ **Nothing is served until `BENCHMARK_PUBLIC_MIN_SLATE_DATE` is set.** With it unset the three endpoints answer `200` with empty collections and issue **no database query at all**. See **The two gates** below.
+> ⚠ **Nothing is served until `BENCHMARK_PUBLIC_MIN_SLATE_DATE` is set.** With it unset every endpoint in this section answers `200` with empty collections and issues **no database query at all**. See **The two gates** below.
 
-Failure modes, for all three: a missing relation (`PGRST205` / `42P01`), a relation older than this service expects (`42703`), or a foreign key an embed names being absent or ambiguous (`PGRST200` / `PGRST201`) each answer `503 NOT_READY` naming the migration — **for that endpoint only**. Benchmark relations are deliberately NOT probed by `/readyz`: this is a secondary surface and an unapplied benchmark migration must not mark the whole API unready. Anything else is `500 INTERNAL_ERROR`; an invalid parameter is `400 INVALID_PARAM`.
+Failure modes, for every endpoint in this section: a missing relation (`PGRST205` / `42P01`), a relation older than this service expects (`42703`), or a foreign key an embed names being absent or ambiguous (`PGRST200` / `PGRST201`) each answer `503 NOT_READY` naming the migration — **for that endpoint only**. Benchmark relations are deliberately NOT probed by `/readyz`: this is a secondary surface and an unapplied benchmark migration must not mark the whole API unready. Anything else is `500 INTERNAL_ERROR`; an invalid parameter is `400 INVALID_PARAM`.
 
 #### The two gates, which answer different questions
 
@@ -641,6 +641,8 @@ Those timings are the `anon` role, which carries a 3-second statement timeout. T
 
 Two things follow. The gate is **not** a filter — `slate_date >= …` on its own is a timeout, so an endpoint leaning on it to bound a bare request would fail every call. And what qualifies is **selectivity, not the column**: `market` alone measured a comfortable 0.59s and is still refused, because a third of one sport's rows is a property of today's data rather than a bound — while `sport` alone times out for the mirror-image reason, every row being `mlb`. Admitting a filter because it is fast on the current distribution is how an endpoint starts failing a year later with nothing changed but row count.
 
+**`sport` behaves as it does on `/benchmark/picks`**, through the same validator: case-insensitive, `all` meaning no sport filter, and an unknown value a `400 INVALID_PARAM` rather than a silently empty page. That is deliberately **not** `/benchmark/stats`'s reading, where `all` is a real stored value the publisher writes a pooled row under and is passed through to the filter — copy that handling here and `?sport=all` filters for the literal, which matches no pick.
+
 **Ordering is `source_decision_id` descending**, and "newest reveal first" is not available: migration 086 keeps `revealed_at` in the ledger's inner subqueries and never projects it, so no consumer of the view can order by it. `as_of` ties heavily — picks land on exact 15-minute boundaries — so it cannot key a cursor either. `source_decision_id` is the monotone proxy, measured unique and strictly decreasing across all 1,095 rows of the largest participant scope. A page carrying one twice is refused as a `503 NOT_READY` rather than served, because a strict cursor over a non-unique key **skips** rows silently.
 
 **Paging.** `limit` is 1–100, default 25. Follow `page.nextAfter` back as `after`; it is null on the last page, so a caller that follows it terminates. The endpoint requests one row more than it serves to decide `page.hasMore`, so paging is correct without asking for a count.
@@ -649,7 +651,7 @@ Two things follow. The gate is **not** a filter — `slate_date >= …` on its o
 
 The count is opt-in because it is the part of the request that grows: a `participantId` scope is bounded by days of history rather than by a constant — 1,095 rows and about 27 a day — while the default page is one keyed read regardless of how much history exists.
 
-Rows carry the same distinctions and the same conventions as the detail endpoint — side-labelled spreads on both the pick and the close, never-fabricated `axes`, tri-state `heldOutOfPrimary`, a real `0` net distinct from a pending null. The write-up prose, digests and seal/reveal timeline are **not** in the list; fetch the pick for those.
+Rows carry the same distinctions and the same conventions as the detail endpoint — side-labelled spreads on both the pick and the close, never-fabricated `axes`, tri-state `heldOutOfPrimary`, a real `0` net distinct from a pending null. Not in the list, so fetch the pick for them: the write-up prose, the digests, the seal/reveal timeline, `primaryExpectation`, `runId`, and `execution.fillPriceDecimal` / `settlementTxHash` / `claimTxHash`.
 
 #### `GET /v1/benchmark/stats?sport=`
 
