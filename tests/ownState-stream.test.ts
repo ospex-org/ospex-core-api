@@ -942,3 +942,115 @@ describe('GET /v1/stream/own-state — live deltas', () => {
     expect(decoded.k).toBe('live');
   });
 });
+
+/**
+ * The hub's live-derivation saturation signal on the wire (`#83`).
+ *
+ * Three properties, and each has a mutant it is the only case to kill: the
+ * signal is NOT an abort (a `degraded` during preReady must not become a
+ * resync), it DOES reach the wire in the live phase, and it lands AT MOST ONCE
+ * per connection whichever layer noticed first.
+ */
+describe('GET /v1/stream/own-state — hub saturation reaches the wire once', () => {
+  /** Hub that hands the handler's callbacks back to the test. */
+  class CapturingHub extends OwnStateHub {
+    captured: Parameters<InstanceType<typeof OwnStateHub>['subscribe']>[1] | undefined;
+    /** When set, fire `onDegraded` synchronously inside `subscribe` (preReady). */
+    degradeAtSubscribe = false;
+    subscribe(
+      address: string,
+      cb: Parameters<InstanceType<typeof OwnStateHub>['subscribe']>[1],
+    ): ReturnType<InstanceType<typeof OwnStateHub>['subscribe']> {
+      this.captured = cb;
+      const sub = super.subscribe(address, cb);
+      if (this.degradeAtSubscribe) cb.onDegraded('positionsTruncated');
+      return sub;
+    }
+  }
+
+  function installCapturing(degradeAtSubscribe = false): CapturingHub {
+    const hub = new CapturingHub({
+      getClient: () => emptyClient(),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+    });
+    hub.degradeAtSubscribe = degradeAtSubscribe;
+    __setOwnStateHubForTest(hub);
+    return hub;
+  }
+
+  it('does not turn a preReady saturation signal into a resync', async () => {
+    // Every OTHER hub callback latches `aborted` during preReady, because it
+    // carries a row whose ordering against the snapshot the handler cannot
+    // vouch for. This one carries no row. If it aborted, an over-cap wallet
+    // would resync on its first tick forever — the exact loop the cold-start
+    // `degraded` emission was introduced to break.
+    installCapturing(true);
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+    await flushTicks(64);
+    const ev = events(res);
+    expect(ev.find((e) => e.event === 'resync')).toBeUndefined();
+    expect(ev.find((e) => e.event === 'ready')).toBeDefined();
+    expect(res.writableEnded).toBe(false);
+    // The frame ordering is preserved too: nothing was written ahead of the
+    // snapshot, which is where the documented grammar puts `degraded`.
+    expect(ev[0]?.event).toBe('snapshot');
+  });
+
+  it('writes one degraded frame when the hub saturates in the live phase', async () => {
+    // The case the old code could not report at all: a wallet complete at
+    // connect whose population crosses the cap later in the session. The
+    // snapshot below is NOT truncated, so this frame can only come from the hub.
+    const hub = installCapturing();
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+    await flushTicks(64);
+    expect(events(res).find((e) => e.event === 'degraded')).toBeUndefined();
+    expect(events(res).find((e) => e.event === 'ready')).toBeDefined();
+
+    hub.captured?.onDegraded('positionsTruncated');
+    hub.captured?.onDegraded('positionsTruncated');
+
+    const ev = events(res);
+    const degraded = ev.filter((e) => e.event === 'degraded');
+    expect(degraded).toHaveLength(1);
+    expect((degraded[0] as { data: { reason: string } }).data.reason).toBe('positionsTruncated');
+    // After `ready`, which is what makes it durable for the SDK: its `degraded`
+    // latch is only cleared by a fresh `ready` or a reconnect.
+    const readyIdx = ev.findIndex((e) => e.event === 'ready');
+    expect(ev.findIndex((e) => e.event === 'degraded')).toBeGreaterThan(readyIdx);
+    expect(ev.find((e) => e.event === 'resync')).toBeUndefined();
+  });
+
+  it('does not repeat the frame the truncated cold start already sent', async () => {
+    // Both layers observe ONE condition — the actionable set at its 200-row cap
+    // — so the second frame carries no information, and it is not free: the
+    // SDK's `degraded` latch suppresses `onError` for the rest of the
+    // connection, so a repeat would cost error visibility.
+    //
+    // This is also why merging this change moves no wire byte for any wallet
+    // over the cap on polygon today: their cold start already sends it.
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: [],
+      pendingSettle: [],
+      claimable: [],
+      hitCap: true,
+      derivedStatuses: [],
+    });
+    const hub = installCapturing();
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+    await flushTicks(64);
+    expect(events(res).filter((e) => e.event === 'degraded')).toHaveLength(1);
+
+    // Prove the signal REACHED the handler (rule 3b-reach). Without this the
+    // count below is satisfied by the cold-start frame alone, so a captured
+    // callback that never existed would read as a working suppression.
+    expect(hub.captured).toBeDefined();
+    hub.captured!.onDegraded('positionsTruncated');
+
+    expect(events(res).filter((e) => e.event === 'degraded')).toHaveLength(1);
+  });
+});

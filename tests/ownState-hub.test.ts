@@ -136,18 +136,22 @@ interface RecordedEvents {
   fills: Array<{ ts: string; id: string; commitmentHash: string }>;
   positionStatuses: Array<{ ts: string; id: string; status: string }>;
   resyncs: string[];
+  /** `onDegraded` reasons, in order. The cap/saturation seam (`#83`). */
+  degradeds: string[];
 }
 function makeCallbacks(): RecordedEvents & {
   onCommitment: (b: { commitmentHash: string }, ts: string, id: string) => void;
   onFill: (b: { commitmentHash: string }, ts: string, id: string) => void;
   onPositionStatus: (b: { status: string }, ts: string, id: string) => void;
   onResync: (r: string) => void;
+  onDegraded: (r: string) => void;
 } {
   const ev: RecordedEvents = {
     commitments: [],
     fills: [],
     positionStatuses: [],
     resyncs: [],
+    degradeds: [],
   };
   return {
     ...ev,
@@ -162,6 +166,9 @@ function makeCallbacks(): RecordedEvents & {
     },
     onResync(r) {
       ev.resyncs.push(r);
+    },
+    onDegraded(r) {
+      ev.degradeds.push(r);
     },
   };
 }
@@ -439,12 +446,21 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
   });
 
   it('population unification: spec transition on actionable position emits even when many newer claimed rows exist', async () => {
-    // Scenario: a wallet has many recent
-    // claimed positions whose row_updated_at dominates the table, plus a
-    // few older actionable positions. The previous top-200-by-row_updated_at
-    // window could miss the older actives; the new `claimed=false AND
-    // risk>0` filter guarantees they're always queried. A spec transition
-    // on the OLD active position then surfaces.
+    // Scenario: a wallet has many recent claimed positions whose
+    // row_updated_at dominates the table, plus a few older actionable
+    // positions. The `claimed=false AND risk>0` filter removes the claimed
+    // rows from the population, so an older active row is no longer competing
+    // with them for window slots, and a spec transition on it surfaces.
+    //
+    // NARROWED (`#83`): this comment used to say the filter "guarantees
+    // they're always queried". It does not — the filter narrows the
+    // population and `.limit(STATUS_DERIVATION_LIMIT)` still truncates what
+    // is left, so above 200 ACTIONABLE rows the oldest-updated actives are
+    // cut. This fixture is one row and cannot see that; the case that can is
+    // `ownState-hub-derivation-bound.test.ts`, which measures the drop and the
+    // signal that now reports it. Kept here because what it does pin — that
+    // the claimed rows no longer crowd the window — is still true and still
+    // worth a test.
     const oldActive = {
       speculation_id: 101,
       user_address: ADDRESS,

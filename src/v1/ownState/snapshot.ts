@@ -40,8 +40,11 @@
  *     mechanism to drain unseen positions. Consumers enter degraded /
  *     quote-hold mode; the stream cold-start emits `event: degraded`
  *     before `ready` so the SDK / MM treats the wallet's position view
- *     as partial-visibility. The `/v1/positions/:address`
- *     fallback covers full history for operator tooling.
+ *     as partial-visibility. The live derivation can reach the same frame
+ *     after `ready` when its own per-tick bound saturates (`#83`), so this
+ *     field being `false` is not a promise about the rest of the session.
+ *     The `/v1/positions/:address` fallback covers full history for
+ *     operator tooling.
  *
  * ── Passive-expiry contract ────────────────────────────────────────────
  *
@@ -141,7 +144,9 @@ interface OwnStateSnapshotBody {
    * `?cursor=` paging on the actionable-positions filter. Instead the
    * stream cold-start treats `positionsTruncated: true` as a degraded
    * state: emits `event: degraded` then `ready`, and the SDK / MM
-   * enters quote-hold. The `cursor.p` watermark is
+   * enters quote-hold. That frame is emitted at most once per connection
+   * whichever layer notices first — the hub's live derivation is a second
+   * producer of it (`#83`). The `cursor.p` watermark is
    * preserved (or sentinel on cold start) so resume catch-up still
    * uses it for the terminal-since-cursor filter; the
    * `/v1/positions/:address` REST endpoint covers operator-side full
@@ -465,6 +470,8 @@ export async function loadOwnStateSnapshot(
   // as partial. There is no paging/convergence mechanism that drains
   // positions beyond the actionable cap; full history is available
   // out-of-band via `/v1/positions/:address` for operator tooling.
+  // (The live derivation emits the same frame mid-stream when its own
+  // bound saturates — see `#83`. This read is unchanged by that.)
   let cWatermark: ResourceWatermark;
   let outputK: OwnStateCursorKind;
   let outputCAnchor: ResourceWatermark | undefined;

@@ -28,14 +28,22 @@
  *
  * Cursor `p` advances on the DERIVED `sourceUpdatedAt = max(positions,
  * speculations, contests)` row_updated_at — not raw
- * `positions.row_updated_at`. The hub queries actionable positions every
- * tick (matching `fetchCategorizedPositions`' filter) plus, when the
- * cache tracks keys that left the actionable set, a refresh by id. The
- * derivation emits in sorted `(sourceUpdatedAt, id)` ASC order so a
- * mid-tick disconnect cannot leave the subscriber's cursor past an
+ * `positions.row_updated_at`. Every tick the hub runs a capped recency query
+ * over the actionable set to DISCOVER positions the subscriber has not been
+ * told about, plus a by-id refresh of the tracked keys that are still live and
+ * fell outside it. The derivation emits in sorted `(sourceUpdatedAt, id)` ASC
+ * order so a mid-tick disconnect cannot leave the subscriber's cursor past an
  * undelivered earlier-source event. The SDK reducer's dedup key
  *   `(address, speculationId, positionType, status, sourceUpdatedAt)`
  * absorbs any over-emission from overlap re-scans.
+ *
+ * Neither read is unbounded, and neither is silent: saturating either one is
+ * `onDegraded('positionsTruncated')`, once per poller, and the handler forwards
+ * it as `event: degraded`. The contract those bounds are measured against is
+ * stated on `reDerivePositionStatuses` (`#83`) — every position whose derived
+ * status can still change is re-derived every tick, a position `positionStatus`
+ * has proved finished is retired, and a derivation that cannot honour the first
+ * clause says so.
  *
  * Dependency-injected (client/network/intervals) so it unit-tests against
  * a recorded mock with no timers or live DB.
@@ -62,6 +70,7 @@ import {
 } from '../fills.js';
 import {
   derivePositionStatus,
+  isTerminalForever,
   type ContestInput,
   type PositionStatusEventBody,
   type SpeculationInput,
@@ -92,6 +101,22 @@ export interface OwnStateCallbacks {
    * overlap window honest — the subscriber should reconnect/re-snapshot.
    */
   onResync: (reason: string) => void;
+  /**
+   * The live derivation could not cover the wallet's whole population this
+   * tick — position visibility is PARTIAL from here on (`#83`).
+   *
+   * Distinct from {@link onResync} in both directions. A resync says
+   * "reconnect, my view may be out of order"; this says "I am still ordered
+   * and still delivering, and there are rows I cannot see." Reconnecting does
+   * not fix it, so the subscriber should degrade rather than retry — the
+   * handler maps it to `event: degraded` with the same `positionsTruncated`
+   * reason the cold-start and catch-up legs already use, which is the only
+   * degradation channel the SDK observes (`onStatus('degraded')`).
+   *
+   * Required rather than optional so every construction site has to decide.
+   * Fired at most ONCE per wallet poller — see `signalSaturation`.
+   */
+  onDegraded: (reason: string) => void;
 }
 
 export interface OwnStateSubscriber extends OwnStateCallbacks {
@@ -163,6 +188,19 @@ interface StatusCacheEntry {
   result: 'won' | 'lost' | 'push' | 'void' | undefined;
   /** wei6 claimable amount — part of the payload-level dedup. */
   claimableAmount: string | undefined;
+  /**
+   * `true` once the derivation proved this key can never transition again
+   * (`isTerminalForever`). A frozen entry is RETIRED FROM THE WORK-LIST: it
+   * is still consulted for dedup, and it is no longer re-fetched by id in
+   * phase B. Phase A still returns it whenever it is inside the recency
+   * window, so a change that touches the position row is still observed.
+   *
+   * Seeded entries start `false` — the handler's seed carries a derived
+   * status but not the speculation row the predicate needs, so the first
+   * tick is what retires them. One tick of full work on connect is the
+   * cost, and it is work the first tick does anyway.
+   */
+  frozen: boolean;
 }
 
 interface WalletPoller {
@@ -185,6 +223,17 @@ interface WalletPoller {
    * as the appearance of a previously-unknown position.
    */
   statusCache: Map<string, StatusCacheEntry>;
+  /**
+   * Latch for {@link OwnStateCallbacks.onDegraded}. Set the first time this
+   * wallet's derivation could not cover its population, and never cleared —
+   * a stream does not un-degrade itself, the consumer clears it by
+   * reconnecting (which builds a new poller).
+   *
+   * One-shot because the tick runs every `pollMs` and an over-cap wallet
+   * saturates on EVERY tick: an unlatched signal would be 2,400 identical
+   * wire events and log lines per hour per wallet.
+   */
+  saturationSignalled: boolean;
   polling: boolean;
 }
 
@@ -199,14 +248,60 @@ interface ScanResult {
 // verifyStreamToken middleware after EIP-712 recovery.
 
 /**
- * Per-tick cap on the position re-derivation query. Mirrors
- * `POSITION_QUERY_LIMIT` in `positionFetch.ts` so the stream and snapshot
- * cover the same population. `ORDER BY row_updated_at DESC` keeps the most
- * recent transitions in-window; long-quiet terminal positions naturally
- * fall out of the window without losing future events (they don't
- * transition again).
+ * Per-tick cap on the phase-A discovery query. Same number and same filter as
+ * `POSITION_QUERY_LIMIT` in `positionFetch.ts` and `CATCHUP_POSITIONS_LIMIT` in
+ * `stream.ts`, so the three reads saturate on the same condition.
+ *
+ * ## What this bound is FOR, and what it is not
+ *
+ * Phase A is DISCOVERY: it finds positions the subscriber has not been told
+ * about. That is why recency is the right window rather than an arbitrary one —
+ * a new or re-touched position carries `row_updated_at = now`, so it enters at
+ * the HEAD of the window and cannot be cut by it. Maintenance of positions the
+ * subscriber already holds is phase B's job, keyed by identity rather than by
+ * recency, and phase B covers its whole non-frozen work-list or says so.
+ *
+ * Recency is NOT a liveness signal, and the comment this replaces claimed it
+ * was ("long-quiet terminal positions naturally fall out of the window without
+ * losing future events"). `positions.row_updated_at` does not move when a
+ * parent speculation settles or a contest scores — this module's own header
+ * says so at the top — so a quiet ACTIVE position sorts to the tail exactly
+ * like a settled one. Measured on polygon 2026-09-22: three of eight wallets
+ * exceed this cap (633 / 499 / 210 actionable rows), 742 rows fall outside the
+ * window in total, and every one of them derives to `settledLost` with 0.00
+ * USDC claimable. The window happens to be right because a position can only
+ * become terminal AFTER its contest resolves, which is after it was created,
+ * and no wallet here creates 200 positions inside one contest's lifetime. That
+ * is a property of the data, not of the query: the margin on the worst wallet
+ * is 119 rows (its oldest still-transitionable row sits at rank 80 of 200).
+ *
+ * So the bound stays, and saturation is SIGNALLED rather than silent —
+ * `signalSaturation` → `onDegraded('positionsTruncated')`. Raising the number
+ * would move the margin without changing the class; making the traversal
+ * complete every tick would cost the whole unclaimed history every 1.5s, which
+ * is the trade `#76` has to price (see `reDerivePositionStatuses`).
  */
 const STATUS_DERIVATION_LIMIT = 200;
+
+/**
+ * Phase-B budget: how many cached `speculation_id`s one tick refreshes, and in
+ * pages of what size.
+ *
+ * Chunked rather than one `IN` list because the list length is the caller's
+ * data, not a constant — it grows with the number of positions the subscriber
+ * holds, and an unbounded `IN` list is an unbounded URL. `4 × 100` covers 400
+ * keys per tick; beyond that the tick signals saturation instead of quietly
+ * refreshing an arbitrary subset, which is what the single
+ * `.limit(STATUS_DERIVATION_LIMIT)` with no `.order()` did before.
+ *
+ * The per-page row limit is `2 ×` the chunk because
+ * `(network, speculation_id, user_address, position_type)` is unique, so a
+ * chunk of N speculations yields at most 2N rows for one wallet. That makes the
+ * limit an assertion rather than a truncation: reaching it means the uniqueness
+ * assumption is wrong, which is worth a warning and is not a silent short read.
+ */
+const STALE_REFRESH_CHUNK = 100;
+const STALE_REFRESH_MAX_PAGES = 4;
 
 
 export class OwnStateHub {
@@ -217,6 +312,7 @@ export class OwnStateHub {
   private resyncCursor: { completedAt: string; id: bigint } | null = null;
   private resyncPolling = false;
   private resyncBroadcastTotal = 0;
+  private positionSaturationTotal = 0;
 
   constructor(deps: OwnStateHubDeps) {
     this.deps = {
@@ -243,6 +339,7 @@ export class OwnStateHub {
         commitments: { tip: { s: nowIso, i: '0' }, emitted: new Map() },
         fills: { tip: { s: nowIso, i: '0' }, emitted: new Map() },
         statusCache: new Map(),
+        saturationSignalled: false,
         polling: false,
         // Timer is deliberately NOT started here — the handler calls
         // `beginLive(sub)` after seeding the status cache. Starting the
@@ -318,6 +415,10 @@ export class OwnStateHub {
         sourceUpdatedAt: e.sourceUpdatedAt,
         result: e.result,
         claimableAmount: e.claimableAmount,
+        // Deliberately not derived from `e.status` alone: `settledLost` freezes
+        // only on a CLOSED speculation and the seed does not carry one. The
+        // first tick reads the speculation row and retires it then.
+        frozen: false,
       });
     }
   }
@@ -432,19 +533,52 @@ export class OwnStateHub {
    * speculations → contests) so the stream and snapshot agree on derived
    * state.
    *
-   * Population: `claimed=false AND risk_amount>0` (the actionable set,
-   * matching `fetchCategorizedPositions`) UNION currently-cached keys.
-   * Cached keys carry forward any position the handler seeded — so a
-   * recent transition that has just left the actionable filter (e.g.
-   * `claimed` just flipped to true and the row has `risk_amount=0`) is
-   * still re-derived against current spec/contest data, and the resulting
-   * terminal status (`claimed`) is emitted before the row falls out of
-   * tracking.
+   * ## What this owes, stated (`#83`)
    *
-   * Per-tick cost: one positions query (capped at 200 by
-   * `STATUS_DERIVATION_LIMIT`) + one positions IN-list query for stale
-   * cached keys + one speculations IN-list query + one contests IN-list
-   * query. Bounded.
+   * **Every position whose derived status can still change is re-derived every
+   * tick; a position that is provably finished may be retired; and when the
+   * derivation cannot honour the first clause it says so on the wire.**
+   *
+   * The two phases divide that work by the question they answer, not by table:
+   *
+   *   - **Phase A — discovery.** `claimed=false AND risk_amount>0` (the
+   *     actionable set, the same filter `fetchCategorizedPositions` uses),
+   *     ordered by recency and capped at {@link STATUS_DERIVATION_LIMIT}. Finds
+   *     positions the subscriber has not been told about. A new or re-touched
+   *     row carries `row_updated_at = now` and so enters at the head.
+   *   - **Phase B — maintenance.** Every cached key that is NOT frozen and NOT
+   *     in phase A's result, re-fetched BY IDENTITY in ordered chunks. These are
+   *     rows the subscriber holds in its book, including ones that have just
+   *     left the actionable filter (`claimed` flipped, stake transferred out) —
+   *     their terminal status is emitted before the entry falls out of tracking.
+   *
+   * Saturating either phase is `onDegraded('positionsTruncated')`, once per
+   * poller. It is not a resync: the view stays ordered and keeps delivering,
+   * and reconnecting would not widen it.
+   *
+   * ## Per-tick cost, and what bounds it
+   *
+   * Four statements per tick per wallet: phase A (≤200 rows), phase B (0–4
+   * pages of ≤200), one speculations `IN` list, one contests `IN` list. Rows
+   * read per tick are therefore `≤ 200 + 800` positions plus one spec and one
+   * contest per distinct parent.
+   *
+   * Phase A is constant. Phase B is linear in the wallet's NON-FROZEN cached
+   * keys, and that is the number this design controls: without the freeze it
+   * would be linear in unclaimed history, which only grows — the oldest
+   * unclaimed row on polygon is from 2026-06-29 and nothing will ever claim a
+   * loser. Measured across the six wallets holding positions (2026-09-22):
+   * 1,644 of 1,916 actionable rows (86%) are `isTerminalForever`, so the live
+   * work-list is 36–79 rows per wallet against 185–633 actionable. Today phase
+   * B issues NO query for any of them, because the seed and phase A's window
+   * currently coincide; the freeze is what keeps that true once `#76` seeds the
+   * complete population (633 keys → 79 live, instead of 433 stale keys a tick).
+   *
+   * The traversal that phase A does not do — paging the whole actionable set
+   * every tick — would cost the largest wallet ~1,800 rows per 1.5s, 4.3M row
+   * reads an hour, growing with history. That is `#76`'s trade to price, not
+   * this one's; `.claude/rules/production-cost-review.md` is the reason it is
+   * written down here rather than discovered later.
    *
    * Emit contract: handler seeds the cache before `beginLive`, so on the
    * first tick the cache reflects the catch-up's view of derived state.
@@ -459,9 +593,17 @@ export class OwnStateHub {
   ): Promise<void> {
     const sb = this.deps.getClient();
     const net = this.deps.getNetwork();
-    // Phase A — actionable population (matches snapshot's
-    // `fetchCategorizedPositions` filter so the live view and the
-    // snapshot view always cover the same rows).
+    // Phase A — DISCOVERY over the actionable population. Same filter and
+    // same cap as the snapshot's `fetchCategorizedPositions`, so the two
+    // saturate on the same condition — but NOT the same ORDER BY: the snapshot's
+    // capped read orders by `position_created_at DESC` and this one by
+    // `row_updated_at DESC`. Under the cap that is immaterial (both return the
+    // whole set); over it the two windows are only guaranteed to agree while a
+    // position's update order tracks its creation order. Measured on polygon
+    // 2026-09-22 they agree exactly — 200 of 200 keys on each of the three
+    // over-cap wallets — which is a fact about the data, not a guarantee, and
+    // the prose that used to say "always cover the same rows" claimed the
+    // second thing on the strength of the first.
     const actionableRes = await sb
       .from('positions')
       .select(
@@ -492,11 +634,25 @@ export class OwnStateHub {
       row_updated_at: string;
       id: string | number;
     }>;
-    // Phase B — currently-cached keys that are NOT in the actionable set
-    // any more. These are positions whose status may have transitioned
-    // (e.g. just claimed; just transferred-out) — we need to re-fetch their
-    // current row so the derivation reflects the transition before the
-    // cache entry falls out of tracking.
+    const actionableSaturated = actionable.length >= STATUS_DERIVATION_LIMIT;
+    // Phase B — MAINTENANCE of cached keys that are NOT in phase A's result.
+    // These are positions the subscriber already holds whose status may have
+    // transitioned (just claimed; stake just transferred out), so their current
+    // row is re-fetched by identity and the resulting terminal status is emitted
+    // before the cache entry falls out of tracking.
+    //
+    // Frozen entries are skipped: `isTerminalForever` has already proved they
+    // cannot transition, and a row that gets touched re-enters phase A's window
+    // at its head anyway. That skip is what keeps this phase proportional to
+    // unresolved exposure rather than to unclaimed history.
+    //
+    // Ordered and chunked, where it used to be one unordered `IN` list under a
+    // single `.limit(STATUS_DERIVATION_LIMIT)`. Two defects in that: with more
+    // than 200 matching rows PostgREST returned an UNSPECIFIED subset, so which
+    // cached positions stopped being maintained was not merely arbitrary but
+    // free to differ between ticks; and nothing reported the short read. Sorting
+    // the ids makes the covered prefix deterministic, and exhausting the page
+    // budget is saturation.
     const actionableKeys = new Set(
       actionable.map(
         (p) =>
@@ -504,14 +660,21 @@ export class OwnStateHub {
       ),
     );
     const staleCachedSpecIds: number[] = [];
-    for (const key of state.statusCache.keys()) {
+    for (const [key, entry] of state.statusCache) {
+      if (entry.frozen) continue;
       if (actionableKeys.has(key)) continue;
       const specPart = key.slice(0, key.lastIndexOf('_'));
       const id = Number(specPart);
       if (Number.isFinite(id)) staleCachedSpecIds.push(id);
     }
+    // Ascending so the prefix a budget-limited tick covers is specified.
+    staleCachedSpecIds.sort((a, b) => a - b);
+    const staleBudget = STALE_REFRESH_CHUNK * STALE_REFRESH_MAX_PAGES;
+    const staleSaturated = staleCachedSpecIds.length > staleBudget;
     let staleRows: typeof actionable = [];
-    if (staleCachedSpecIds.length > 0) {
+    for (let off = 0; off < Math.min(staleCachedSpecIds.length, staleBudget); off += STALE_REFRESH_CHUNK) {
+      const chunk = staleCachedSpecIds.slice(off, off + STALE_REFRESH_CHUNK);
+      const pageLimit = chunk.length * 2;
       const staleRes = await sb
         .from('positions')
         .select(
@@ -520,8 +683,9 @@ export class OwnStateHub {
         )
         .eq('network', net)
         .eq('user_address', address)
-        .in('speculation_id', staleCachedSpecIds)
-        .limit(STATUS_DERIVATION_LIMIT);
+        .in('speculation_id', chunk)
+        .order('id', { ascending: true })
+        .limit(pageLimit);
       if (staleRes.error) {
         logger.error(
           { err: staleRes.error.message, address },
@@ -529,7 +693,31 @@ export class OwnStateHub {
         );
         return;
       }
-      staleRows = (staleRes.data ?? []) as unknown as typeof actionable;
+      const page = (staleRes.data ?? []) as unknown as typeof actionable;
+      if (page.length >= pageLimit) {
+        // Unreachable while `(network, speculation_id, user_address,
+        // position_type)` is unique — at most two rows per speculation per
+        // wallet. Reaching it means that assumption is wrong, and the page is
+        // then a truncation rather than a complete chunk, so it is saturation
+        // and not just a log line.
+        logger.warn(
+          { address, chunk: chunk.length, rows: page.length },
+          'ownStateHub positionStatus: cached-key chunk filled its row limit',
+        );
+        this.signalSaturation(address, state, 'stale_chunk_full', {
+          actionable: actionable.length,
+          staleKeys: staleCachedSpecIds.length,
+        });
+      }
+      staleRows = staleRows.concat(page);
+    }
+    if (actionableSaturated || staleSaturated) {
+      this.signalSaturation(
+        address,
+        state,
+        actionableSaturated ? 'actionable_cap' : 'stale_budget',
+        { actionable: actionable.length, staleKeys: staleCachedSpecIds.length },
+      );
     }
     // Dedupe across the two queries by (speculation_id, position_type).
     const positionsByKey = new Map<string, (typeof actionable)[number]>();
@@ -686,11 +874,21 @@ export class OwnStateHub {
       );
       const key = `${String(row.speculation_id)}_${positionType}`;
       const prior = state.statusCache.get(key);
+      // Retire the key from phase B's work-list when the derivation proves no
+      // further transition is reachable. Computed for EVERY derived row, not
+      // only the emitting ones: a seeded entry arrives `frozen: false` and a
+      // settled loser is precisely the row that never emits again, so deciding
+      // this inside the emission loop would leave it live forever.
+      const frozen = isTerminalForever(body.status, {
+        speculationStatus: spec.speculation_status,
+        winSide: spec.win_side,
+      });
       const nextCacheEntry: StatusCacheEntry = {
         status: body.status,
         sourceUpdatedAt,
         result: body.result,
         claimableAmount: body.claimableAmount,
+        frozen,
       };
       // Dedup contract: we emit when ANY semantic field differs from the
       // seeded/cached entry. The SDK reducer's dedup key is
@@ -710,6 +908,9 @@ export class OwnStateHub {
         prior.result === body.result &&
         prior.claimableAmount === body.claimableAmount
       ) {
+        // No event, but the retirement still has to land — this is the only
+        // path a settled loser ever takes after its first derivation.
+        if (frozen && !prior.frozen) state.statusCache.set(key, { ...prior, frozen: true });
         continue;
       }
       let idBig: bigint;
@@ -908,6 +1109,52 @@ export class OwnStateHub {
     }
   }
 
+  /**
+   * Report that the live derivation could not cover this wallet's population.
+   *
+   * Three observability channels, deliberately, because they answer to different
+   * readers and a wire event alone is not enough for an operator:
+   *
+   *   - the WIRE, once per poller — `onDegraded('positionsTruncated')`, which the
+   *     handler turns into `event: degraded` and the SDK into
+   *     `onStatus('degraded')`. It reuses the existing reason string because that
+   *     is the only degradation the SDK observes at all; a new event name would
+   *     land in its `default: // ignore` branch and be a signal nobody receives;
+   *   - the LOG, once per poller, carrying `cause` and the two counts, so the
+   *     wallet and the magnitude are recoverable from Heroku logs;
+   *   - the METRIC, `stats().positionSaturationTotal`, cumulative across pollers
+   *     and readable from `/v1/stream/metrics` without grepping anything.
+   *
+   * Latched, because the tick that saturates saturates every 1.5s. The latch is
+   * per POLLER, so it dies with the last subscriber and a fresh connection is
+   * told again — which is what makes it safe for the consumer to clear the state
+   * by reconnecting even though the hub never clears it.
+   */
+  private signalSaturation(
+    address: string,
+    state: WalletPoller,
+    cause: 'actionable_cap' | 'stale_budget' | 'stale_chunk_full',
+    counts: { actionable: number; staleKeys: number },
+  ): void {
+    if (state.saturationSignalled) return;
+    state.saturationSignalled = true;
+    this.positionSaturationTotal += 1;
+    logger.warn(
+      { address, cause, ...counts, cap: STATUS_DERIVATION_LIMIT },
+      'ownStateHub positionStatus: derivation saturated — position visibility is partial',
+    );
+    for (const sub of state.subs) {
+      try {
+        sub.onDegraded('positionsTruncated');
+      } catch (err) {
+        logger.error(
+          { err: err instanceof Error ? err.message : String(err), address },
+          'ownStateHub positionStatus: onDegraded threw',
+        );
+      }
+    }
+  }
+
   private async checkRecentRecovery(sub: OwnStateSubscriber): Promise<void> {
     try {
       const cutoff = new Date(Date.now() - this.deps.resyncGraceMs).toISOString();
@@ -1004,11 +1251,17 @@ export class OwnStateHub {
     }
   }
 
-  stats(): { wallets: number; subscribers: number; resyncBroadcastTotal: number } {
+  stats(): {
+    wallets: number;
+    subscribers: number;
+    resyncBroadcastTotal: number;
+    positionSaturationTotal: number;
+  } {
     return {
       wallets: this.pollers.size,
       subscribers: this.totalSubs,
       resyncBroadcastTotal: this.resyncBroadcastTotal,
+      positionSaturationTotal: this.positionSaturationTotal,
     };
   }
 }

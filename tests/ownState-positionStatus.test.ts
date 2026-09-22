@@ -12,9 +12,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   derivePositionStatus,
+  isTerminalForever,
   positionStatusRank,
   type ContestInput,
   type PositionInput,
+  type PositionStatus,
   type SpeculationInput,
 } from '../src/v1/ownState/positionStatus.js';
 
@@ -281,5 +283,75 @@ describe('positionStatusRank', () => {
   it('all three terminal kinds share the highest rank', () => {
     expect(positionStatusRank('claimed')).toBe(positionStatusRank('settledLost'));
     expect(positionStatusRank('settledLost')).toBe(positionStatusRank('void'));
+  });
+});
+
+/**
+ * `isTerminalForever` — the predicate that lets the own-state hub retire a key
+ * from its per-tick work-list (`#83`).
+ *
+ * The table is exhaustive over `(status, speculationStatus, winSide)` for every
+ * combination the derivation can actually produce, because a false positive here
+ * silently stops re-deriving a position that could still pay out. Each row states
+ * WHY, so the next reader can check the reasoning rather than the shape.
+ */
+describe('isTerminalForever', () => {
+  const OPEN = { speculationStatus: 'open' as const, winSide: 'tbd' as const };
+  const CLOSED_AWAY = { speculationStatus: 'closed' as const, winSide: 'away' as const };
+  const CLOSED_TBD = { speculationStatus: 'closed' as const, winSide: 'tbd' as const };
+
+  const table: Array<{
+    status: PositionStatus;
+    spec: Pick<SpeculationInput, 'speculationStatus' | 'winSide'>;
+    frozen: boolean;
+    why: string;
+  }> = [
+    { status: 'claimed', spec: OPEN, frozen: true, why: 'the claim already happened; claimPosition cannot run twice' },
+    { status: 'claimed', spec: CLOSED_AWAY, frozen: true, why: 'same, and the speculation state is irrelevant to it' },
+    { status: 'settledLost', spec: CLOSED_AWAY, frozen: true, why: 'settleSpeculation closes once; a loser pays zero forever' },
+    { status: 'settledLost', spec: OPEN, frozen: false, why: 'a PREDICTION off a scored contest — a score correction flips it' },
+    { status: 'settledLost', spec: CLOSED_TBD, frozen: false, why: "closed + tbd is a shouldn't-happen state; a real side arriving later turns it claimable" },
+    { status: 'claimable', spec: CLOSED_AWAY, frozen: false, why: 'still owes a `claimed` transition, and it is carrying money' },
+    { status: 'void', spec: { speculationStatus: 'closed', winSide: 'void' }, frozen: false, why: 'payout equals the stake and is still unclaimed' },
+    { status: 'pendingSettle', spec: OPEN, frozen: false, why: 'settlement has not run; claimable is still ahead of it' },
+    { status: 'active', spec: OPEN, frozen: false, why: 'nothing has happened yet' },
+  ];
+
+  for (const row of table) {
+    it(`${row.frozen ? 'retires' : 'keeps'} ${row.status} / ${row.spec.speculationStatus} / ${row.spec.winSide} — ${row.why}`, () => {
+      expect(isTerminalForever(row.status, row.spec)).toBe(row.frozen);
+    });
+  }
+
+  it('retires nothing that the derivation reports as carrying a claimable amount', () => {
+    // A cross-check one level up rather than another spelling of the table: any
+    // status the derivation gives a `claimableAmount` to is money the wallet can
+    // still collect, so retiring it would drop the `claimed` event. Derived from
+    // `derivePositionStatus` itself, not from a hand-listed set, so a new
+    // money-bearing status added later lands in this loop automatically.
+    const specs: Array<Pick<SpeculationInput, 'speculationStatus' | 'winSide'>> = [
+      { speculationStatus: 'closed', winSide: 'away' },
+      { speculationStatus: 'closed', winSide: 'void' },
+      { speculationStatus: 'closed', winSide: 'push' },
+      { speculationStatus: 'open', winSide: 'tbd' },
+    ];
+    for (const spec of specs) {
+      const body = derivePositionStatus(
+        {
+          speculationId: '1',
+          address: '0xabc',
+          positionType: 0,
+          riskAmount: '1000',
+          profitAmount: '500',
+          claimed: false,
+        },
+        { ...spec, marketType: 'moneyline', lineTicks: null },
+        { contestStatus: 'scored', awayScore: 9, homeScore: 3 },
+        '2026-09-22T00:00:00.000000+00:00',
+      );
+      if (body.claimableAmount !== undefined) {
+        expect(isTerminalForever(body.status, spec)).toBe(false);
+      }
+    }
   });
 });
