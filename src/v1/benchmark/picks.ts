@@ -264,6 +264,53 @@ export function sidedLine(
 }
 
 /**
+ * The five axis ratings, each passed through exactly as stored.
+ *
+ * Two defects lived in the inline copy of this, and both published a number the
+ * stored row does not contain:
+ *
+ *   - `?? 0` on four of the five. A schema-valid partial vector — valuation 3,
+ *     trend null — became trend 0, which is not merely wrong, it is OUTSIDE the
+ *     1..5 scale `AXIS_SCALE` advertises in the same payload. The `3g-nullish`
+ *     collapse in `.claude/rules/verification-discipline.md`: `??` erases the
+ *     tri-state a nullable column actually has, and the tell is a nullable
+ *     column read through a defaulting operator.
+ *   - Using `axis_valuation` alone as the sentinel for "no axes". A row with a
+ *     null valuation and a real trend answered `axes: null` and DISCARDED the
+ *     four ratings beside it.
+ *
+ * So the object is null only when EVERY axis is null — "no shape" is the honest
+ * rendering of nothing, and a zeroed radar is a shape — and otherwise each axis
+ * carries its own value or its own null.
+ *
+ * ## Why it lives here rather than beside the endpoint that first fixed it
+ *
+ * It was fixed on the detail endpoint (`pick.ts`) during #85's review, exported
+ * from there, and imported by the ledger. This list endpoint was the origin the
+ * defect had been copied FROM (`3g-copy`) and kept its own inline copy, so the
+ * projection spoke two vocabularies about one set of columns until `#86`.
+ * Moving the function into this module is what let the third site become a call:
+ * `pick.ts` already imports from here, so importing back would have made the
+ * pair of modules a cycle. All three endpoints now read one implementation.
+ */
+export function axesOf(row: {
+  axis_valuation: number | null;
+  axis_trend: number | null;
+  axis_consensus: number | null;
+  axis_news: number | null;
+  axis_softness: number | null;
+}): Record<string, number | null> | null {
+  const axes = {
+    valuation: row.axis_valuation,
+    trend: row.axis_trend,
+    consensus: row.axis_consensus,
+    news: row.axis_news,
+    softness: row.axis_softness,
+  };
+  return Object.values(axes).every((v) => v === null) ? null : axes;
+}
+
+/**
  * A human-readable selection, composed once.
  *
  * `selection` is a full team name on `moneyline` and `spread` and a lowercase
@@ -523,7 +570,12 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
     probLoss: number | null;
     primaryAxis: string | null;
     primaryExpectation: string | null;
-    axes: Record<string, number> | null;
+    /**
+     * Each of the five ratings, or its own null — never a zero, which
+     * `axisScale` excludes. Null as a whole only when all five are null. See
+     * `axesOf`.
+     */
+    axes: Record<string, number | null> | null;
     wouldAbstain: boolean | null;
     selectedForExecution: boolean | null;
     sealedAt: string;
@@ -559,19 +611,10 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
     if (!EXECUTED_MARKETS.has(d.market)) continue;
 
     const american = decimalToAmerican(reveal.observed_decimal);
-    // Null on every baseline row and on any model reveal that carried no axis
-    // set — served as null rather than as five zeroes, because a zeroed radar
-    // is a shape and "no shape" is the honest rendering.
-    const axes =
-      reveal.axis_valuation === null
-        ? null
-        : {
-            valuation: reveal.axis_valuation,
-            trend: reveal.axis_trend ?? 0,
-            consensus: reveal.axis_consensus ?? 0,
-            news: reveal.axis_news ?? 0,
-            softness: reveal.axis_softness ?? 0,
-          };
+    // Through the shared helper, like the other two endpoints. This was the
+    // THIRD site projecting the axis columns independently, and the only one
+    // still fabricating a zero for a null rating (`#86`).
+    const axes = axesOf(reveal);
     const fill = fillByKey.get(`${d.participant_id} ${d.game_id} ${d.market}`);
     // The same two teams the game card below serves, resolved through the same
     // `?? UNKNOWN_TEAM` fallback — so a label and the card it sits on cannot

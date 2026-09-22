@@ -275,7 +275,16 @@ interface WireGame {
     market: string;
     selectionLabel: string | null;
     priceAmerican: number | null;
-    axes: Record<string, number> | null;
+    /**
+     * The per-market number and the side-labelled spread pair. Declared because
+     * four cases below already read them (`3d-sibling`): widening `axes` here
+     * and leaving its siblings undeclared would fix one field of a false wire
+     * declaration and leave the rest of the same object wrong.
+     */
+    line: number | null;
+    awayLine: number | null;
+    homeLine: number | null;
+    axes: Record<string, number | null> | null;
     confidence: number | null;
     fill: unknown;
   }>;
@@ -459,14 +468,107 @@ describe('picks — the pick card fields', () => {
     expect(ml?.axes).toEqual({ valuation: 4, trend: 3, consensus: 5, news: 2, softness: 4 });
   });
 
-  it('serves null axes rather than a zeroed radar', async () => {
+  /**
+   * `ospex-core-api#86`. Two defects shipped here, both publishing a number the
+   * stored row does not contain: `?? 0` on four of the five ratings, and
+   * `axis_valuation` used as the sentinel for "no axes at all" so a null
+   * valuation discarded the four beside it.
+   *
+   * **A passing test blessed the second one**, which is why it survived #85's
+   * review of the identical code on the detail endpoint. It was named "serves
+   * null axes rather than a zeroed radar" — a true and useful property — and its
+   * fixture nulled ONLY `axis_valuation` while leaving trend 3, consensus 5,
+   * news 2 and softness 4 in place. So what it actually pinned was the DISCARD,
+   * under a name describing the all-null case. That is `3j` in
+   * `.claude/rules/verification-discipline.md`: a test that blesses an anomaly
+   * consumes the one signal that would have caught it. The mechanism assertion
+   * is kept below, on a fixture that is genuinely all-null, and the consequence
+   * it was hiding is asserted beside it.
+   *
+   * The matrix is sized by which WRONG implementations each case can tell apart,
+   * not by shape coverage: a `?? 0` build passes the all-present and all-null
+   * cases and fails the partial one; a valuation-sentinel build passes both of
+   * those and fails the valuation-null one; a build whose sentinel is "any axis
+   * is null" passes all three and fails the one-axis-alone cases.
+   */
+  const AXIS_COLUMNS = [
+    'axis_valuation',
+    'axis_trend',
+    'axis_consensus',
+    'axis_news',
+    'axis_softness',
+  ] as const;
+
+  /** The served axes of the one model pick in a slate built from `over`. */
+  async function axesOfOnePick(over: Record<string, unknown>): Promise<unknown> {
     const { body } = await call('picks', {
-      benchmark_decisions: [
-        decision(1, FABLE, GAME_A, 'moneyline', reveal({ axis_valuation: null, primary_axis: null })),
-      ],
+      benchmark_decisions: [decision(1, FABLE, GAME_A, 'moneyline', reveal(over))],
     });
-    const pick = gamesOf(body).flatMap((g) => g.picks)[0];
-    expect(pick?.axes).toBeNull();
+    const picks = gamesOf(body).flatMap((g) => g.picks);
+    // `3g-silentsetup`: a fixture that silently loaded no pick is
+    // indistinguishable from the projection dropping the vector, and `axes:
+    // null` is one of the answers under test — so the pick's PRESENCE is
+    // asserted before anything about its axes.
+    expect(picks).toHaveLength(1);
+    return picks[0]?.axes;
+  }
+
+  it('maps each stored column to its own key', async () => {
+    // Five DISTINCT values, because the module fixture happens to carry 4 on
+    // both valuation and softness — so a projection that read one for the other
+    // would agree with every other case in this block (`3d`).
+    expect(
+      await axesOfOnePick({
+        axis_valuation: 1,
+        axis_trend: 2,
+        axis_consensus: 3,
+        axis_news: 4,
+        axis_softness: 5,
+      }),
+    ).toEqual({ valuation: 1, trend: 2, consensus: 3, news: 4, softness: 5 });
+  });
+
+  it('preserves an individual null rather than turning it into a zero', async () => {
+    // A zero is not a low rating: `axisScale` in this same payload advertises
+    // 1..5, so 0 is a value the declared scale excludes, and a radar drawn from
+    // it shows a spike to the centre no model produced.
+    expect(await axesOfOnePick({ axis_trend: null, axis_news: null })).toEqual({
+      valuation: 4,
+      trend: null,
+      consensus: 5,
+      news: null,
+      softness: 4,
+    });
+  });
+
+  it('keeps the other four axes when VALUATION alone is null', async () => {
+    expect(await axesOfOnePick({ axis_valuation: null, primary_axis: null })).toEqual({
+      valuation: null,
+      trend: 3,
+      consensus: 5,
+      news: 2,
+      softness: 4,
+    });
+  });
+
+  it('serves null axes rather than a zeroed radar, when every axis is null', async () => {
+    const empty = Object.fromEntries(AXIS_COLUMNS.map((k) => [k, null]));
+    expect(await axesOfOnePick({ ...empty, primary_axis: null })).toBeNull();
+  });
+
+  it.each(AXIS_COLUMNS)('a vector with only %s set is still a vector', async (present) => {
+    // One case per axis, so no single column can be the one the implementation
+    // happens to consult — a sentinel on `softness` would pass every case above.
+    // This case asks the SENTINEL question only; whether a value lands on its own
+    // key is the five-distinct-values case's job, and asserting a derived
+    // expected object here would put the input on both sides of the call (`3i`).
+    const row = Object.fromEntries(AXIS_COLUMNS.map((k) => [k, k === present ? 3 : null]));
+    const served = (await axesOfOnePick({ ...row, primary_axis: null })) as Record<
+      string,
+      number | null
+    > | null;
+    expect(served).not.toBeNull();
+    expect(Object.values(served ?? {}).filter((v) => v !== null)).toEqual([3]);
   });
 
   /**
