@@ -30,78 +30,98 @@
  *     the same module that would execute the settlement is the tightest binding
  *     available: the two cannot disagree.
  *
- * ## An OPTIONAL term must be bounded in TIME, not only in failure
+ * ## Why the transport is `fetch` and an `AbortController`, not an ethers provider
  *
- * The first version of this module was bounded against a rejection and not against a
- * stall, which is not the same thing — a promise that never settles never throws.
- * Measured on PR #92: a provider whose `call` never settled left the first caller
- * pending indefinitely AND, because the cache held that promise, left every
- * subsequent caller pending on it for the process lifetime. The only real bound was
- * ethers' default `FetchRequest.timeout` of **300,000 ms**, five minutes, against a
- * traversal deadline of fifteen seconds.
+ * Two review rounds were spent learning that "bounded" has three separate meanings
+ * here, and that an ethers `JsonRpcProvider` delivers none of them for this purpose.
  *
- * Three things fix it, and all three are needed because each bounds something the
- * others do not:
+ * Round 1 bounded a REJECTION and not a STALL: a provider whose call never settles
+ * never throws, so the first caller hung and — because the cache held that promise —
+ * every later caller hung on it for the process lifetime.
  *
- *   1. **A transport timeout**, on this module's OWN `FetchRequest`. That is what
- *      bounds body consumption — a caller-side race abandons the await while the
- *      socket keeps streaming, so a race alone leaves a stalled response in flight.
- *      An EXPLICIT `Network` goes with it, and `staticNetwork: true` alone is not
- *      enough: measured against a local JSON-RPC server, a provider given
- *      `staticNetwork: true` but no network still tries to DETECT one, fails, and
- *      retries on a one-second loop having sent no request at all. Handing it
- *      `Network.from(chainId)` — which this service already knows from config —
- *      skips detection entirely and sends exactly one `eth_call`. A mocked
- *      `provider.call` cannot show that; a real socket did (`3c-harness`).
- *   2. **A caller-side deadline**, because the transport timeout is the provider's
- *      promise and this module should not depend on another library's bound being
- *      the one that fires (`3b-rescue`: name the rival mechanism). The caller passes
- *      the budget, so a complete traversal can hand over what is left of its own
- *      fifteen seconds rather than adding to it.
- *   3. **A negative window**, so a failed or timed-out attempt is not retried by
- *      every request. Without it a broken provider costs one bounded attempt per
- *      request; with it, one per window. The cache never hands a later caller the
- *      promise that already timed out.
+ * Round 2 added `FetchRequest.timeout` and a caller-side race, and the reviewer
+ * showed, on real sockets on Node 20.19.0 and 22.23.2, that this is still not an
+ * absolute bound:
  *
- * A separate provider from `lib/rpc.ts` on purpose: that one is shared with the
- * tx-receipt parsers, and giving it a two-second transport timeout to suit this read
- * would change their behaviour for a reason that has nothing to do with them.
+ *   - **`FetchRequest.timeout` is an INACTIVITY timeout.** A server that sends part of
+ *     a JSON body and then a space every 100 ms keeps it alive indefinitely.
+ *   - **The timeout rejection does not destroy the request,** and `provider.destroy()`
+ *     does not cancel an exchange already dispatched. Measured: the caller returned
+ *     `null` promptly while the client went on consuming the unfinished body, socket
+ *     `destroyed: false`, `bytesRead` climbing 449 → 2,549 → 43,779.
+ *   - **So the shared attempt never settled,** and at t≈62.8 s — past the negative
+ *     window — the next caller awaited that same pending promise, timed out, and
+ *     re-armed the window. One `eth_call` ever, on a fixture that would have answered
+ *     a fresh request immediately. Never recovering is worse than being slow.
+ *
+ * `fetch` with an `AbortSignal` is the primitive that actually does it: aborting
+ * cancels request AND body consumption and destroys the socket. Verified here before
+ * this was written — an abort at 400 ms against an endless drip ended the read at
+ * 417 ms with the server observing the response close and the socket `destroyed`.
+ *
+ * ethers keeps the job it is good at, per `3e`: `Interface` computes the selector and
+ * decodes the `uint32`, so neither is hand-rolled. What is hand-rolled is a
+ * four-field JSON-RPC envelope, which is a stable wire format rather than a model of
+ * someone else's behaviour.
+ *
+ * ## Three bounds, and every one of them is now absolute
+ *
+ *   1. **The attempt's own deadline** ({@link ATTEMPT_DEADLINE_MS}) aborts the fetch.
+ *      Because the attempt therefore always settles, `inFlight` is always retired and
+ *      a later caller starts a FRESH attempt — the recovery property round 2 lacked.
+ *   2. **A response byte cap** ({@link MAX_RESPONSE_BYTES}), so "bounded" is true on
+ *      size as well as on time. The deadline alone caps bytes only at bandwidth ×
+ *      2 s, which is not a bound worth claiming.
+ *   3. **The caller's own budget**, because a complete traversal near the end of its
+ *      15,000 ms deadline must not wait the full attempt. It stops waiting; the
+ *      attempt continues and still caches a value for the next request.
+ *
+ * Plus a **negative window**: a failed attempt is not retried by every request, only
+ * once per window. With (1) in place the window now expires into a real retry.
  *
  * ## Fail CLOSED, and say so
  *
- * When the address is unset, the RPC is unreachable or slow, or the answer is not a
- * positive integer, this returns `null` and the caller must refuse every `verified`
- * contest — i.e. behave exactly as the service did before #79. That is the same shape
- * as `collectExecuted` refusing every receipt when `scorers` is unconfigured: a
- * missing term is not a licence to guess one.
+ * When the address is unset, the RPC is unreachable, slow, oversized, or the answer is
+ * not a positive integer, this returns `null` and the caller must refuse every
+ * `verified` contest — i.e. behave exactly as the service did before #79. That is the
+ * same shape as `collectExecuted` refusing every receipt when `scorers` is
+ * unconfigured: a missing term is not a licence to guess one.
  *
  * What this canNOT detect is a wrong-but-positive answer from a wrong address. The
  * protection there is that the address is deliberate operator configuration naming
  * the deployment whose settlement the prediction is about, not a band check inventing
  * a policy the contract does not have.
  */
-import { Contract, FetchRequest, JsonRpcProvider, Network } from 'ethers';
+import { Interface } from 'ethers';
 import { loadConfig } from './env.js';
 import { logger } from './logger.js';
 
 /** The one function this service reads. `uint32 public immutable i_voidCooldown`. */
-const ABI = ['function i_voidCooldown() view returns (uint32)'] as const;
+const IFACE = new Interface(['function i_voidCooldown() view returns (uint32)']);
+const FN = 'i_voidCooldown';
 
 /**
- * The transport bound. Generous against a healthy Alchemy `eth_call` (tens to low
- * hundreds of milliseconds) and small against the 15,000 ms traversal deadline this
- * read has to fit inside.
+ * The ABSOLUTE deadline for one attempt, enforced by aborting the fetch.
+ *
+ * Generous against a healthy `eth_call` (tens to low hundreds of milliseconds) and
+ * small against the 15,000 ms traversal deadline this read has to fit inside.
  */
-const TRANSPORT_TIMEOUT_MS = 2_000;
+const ATTEMPT_DEADLINE_MS = 2_000;
 
 /**
- * The caller's default bound, deliberately just ABOVE the transport one so that a
- * healthy-but-slow provider produces a real transport error — which names itself in
- * the log — rather than an opaque local timeout.
+ * The caller's default bound. Just ABOVE the attempt deadline, so a healthy-but-slow
+ * provider produces the attempt's own diagnostic rather than an opaque local timeout.
  */
 export const DEFAULT_COOLDOWN_TIMEOUT_MS = 2_500;
 
-/** How long a failed or timed-out attempt suppresses the next one. */
+/**
+ * The most body this read will consume. The real answer is 66 bytes of JSON-RPC
+ * envelope plus a 32-byte word; 64 KiB is four orders of magnitude of headroom and
+ * still a bound.
+ */
+const MAX_RESPONSE_BYTES = 64 * 1024;
+
+/** How long a failed or abandoned attempt suppresses the next one. */
 const NEGATIVE_WINDOW_MS = 60_000;
 
 /** The immutable answer, once known. Never re-read: it cannot change for an address. */
@@ -116,6 +136,9 @@ type Unavailable =
   | 'no-module-address'
   | 'no-rpc-url'
   | 'read-failed'
+  | 'deadline'
+  | 'response-too-large'
+  | 'rpc-error'
   | 'timed-out'
   | 'not-a-positive-integer';
 
@@ -127,43 +150,97 @@ function unavailable(reason: Unavailable, detail?: unknown): null {
     );
   } catch {
     // A logger that cannot log is not a reason to fail a request. Measured: six test
-    // doubles in this repo mock the logger as `{ error }` only, and the first draft's
+    // doubles in this repo mock the logger as `{ error }` only, and an earlier draft's
     // `logger.warn` raised a TypeError that propagated out of the caller and 500ed
     // thirty passing tests.
   }
   return null;
 }
 
+/**
+ * Read the body with a byte cap, aborting rather than buffering past it.
+ *
+ * `res.text()` cannot be capped, and it is the call that consumed 43,779 bytes of a
+ * drip in the reviewer's reproduction.
+ */
+async function readCapped(res: Response, abort: (reason: Error) => void): Promise<string | null> {
+  const reader = res.body?.getReader();
+  if (reader === undefined) return null;
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value !== undefined) {
+      received += value.byteLength;
+      if (received > MAX_RESPONSE_BYTES) {
+        abort(new Error(`response exceeded ${String(MAX_RESPONSE_BYTES)} bytes`));
+        return null;
+      }
+      chunks.push(value);
+    }
+  }
+  return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString('utf8');
+}
+
 async function attempt(): Promise<number | null> {
-  const { speculationModuleAddress, alchemyRpcUrl, chainId } = loadConfig();
+  const { speculationModuleAddress, alchemyRpcUrl } = loadConfig();
   if (speculationModuleAddress === undefined) return unavailable('no-module-address');
   if (alchemyRpcUrl === undefined || alchemyRpcUrl === '') return unavailable('no-rpc-url');
 
+  const controller = new AbortController();
+  let reason: Unavailable = 'read-failed';
+  // REF'd and cleared in the `finally`: an unref'd timer would let Node drain the
+  // loop while this await is the only pending work (`3f-timers`).
+  const timer = setTimeout(() => {
+    reason = 'deadline';
+    controller.abort(new Error(`void cooldown read exceeded ${String(ATTEMPT_DEADLINE_MS)}ms`));
+  }, ATTEMPT_DEADLINE_MS);
+
+  let body: string | null;
+  try {
+    const res = await fetch(alchemyRpcUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'eth_call',
+        params: [{ to: speculationModuleAddress, data: IFACE.encodeFunctionData(FN) }, 'latest'],
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      controller.abort(new Error(`HTTP ${String(res.status)}`));
+      return unavailable('rpc-error', `HTTP ${String(res.status)}`);
+    }
+    body = await readCapped(res, (err) => {
+      reason = 'response-too-large';
+      controller.abort(err);
+    });
+  } catch (err: unknown) {
+    return unavailable(reason, err);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (body === null) return unavailable(reason);
+
   let raw: unknown;
   try {
-    const request = new FetchRequest(alchemyRpcUrl);
-    // THE bound on body consumption. ethers' default here is 300_000 ms.
-    request.timeout = TRANSPORT_TIMEOUT_MS;
-    // The network is STATED, not detected — see the header. `chainId` is already
-    // derived from `NETWORK` in `env.ts`, so this adds no configuration.
-    const provider = new JsonRpcProvider(request, Network.from(chainId), {
-      staticNetwork: true,
-    });
-    try {
-      const contract = new Contract(speculationModuleAddress, [...ABI], provider);
-      raw = await (contract['i_voidCooldown'] as () => Promise<unknown>)();
-    } finally {
-      // Release the socket rather than leaving one per attempt behind. The negative
-      // window means attempts are rare, but "rare" is not "never".
-      provider.destroy();
+    const parsed = JSON.parse(body) as { result?: unknown; error?: { message?: string } };
+    if (parsed.error !== undefined) {
+      return unavailable('rpc-error', parsed.error.message ?? 'unknown');
     }
+    if (typeof parsed.result !== 'string') return unavailable('rpc-error', 'no result');
+    [raw] = IFACE.decodeFunctionResult(FN, parsed.result);
   } catch (err: unknown) {
     return unavailable('read-failed', err);
   }
 
-  // ethers returns a `uint32` as a `bigint`. Anything else, or a non-positive value,
-  // is a decode or address mistake rather than a protocol parameter: a zero would
-  // make EVERY verified contest read as past-cooldown immediately.
+  // `uint32` decodes to a `bigint`. Anything else, or a non-positive value, is a
+  // decode or address mistake rather than a protocol parameter: a zero would make
+  // EVERY verified contest read as past-cooldown immediately.
   if (typeof raw !== 'bigint' || raw <= 0n || raw > 0xffff_ffffn) {
     return unavailable('not-a-positive-integer', raw);
   }
@@ -182,8 +259,8 @@ async function attempt(): Promise<number | null> {
 /**
  * The cooldown in seconds, or `null` when it cannot be established WITHIN THE BUDGET.
  *
- * Never throws and never outlives `timeoutMs`. A caller with its own deadline should
- * pass what remains of it rather than the default.
+ * Never throws, never outlives `timeoutMs`, and never leaves an attempt that a later
+ * caller can be stuck behind.
  */
 export async function readVoidCooldownSeconds(
   options: { timeoutMs?: number } = {},
@@ -191,8 +268,7 @@ export async function readVoidCooldownSeconds(
   if (known !== undefined) return known;
   const budget = options.timeoutMs ?? DEFAULT_COOLDOWN_TIMEOUT_MS;
   if (budget <= 0) return null;
-  // Inside the negative window: refuse without spending anything. This is also what
-  // stops a later caller awaiting an attempt that has already timed out.
+  // Inside the negative window: refuse without spending anything.
   if (Date.now() < retryAfter) return null;
 
   if (inFlight === undefined) {
@@ -204,10 +280,9 @@ export async function readVoidCooldownSeconds(
         return value;
       })
       .catch((err: unknown) => {
-        // The outer safety net. `attempt` catches the failures it can name; this
-        // covers the ones it cannot — an unexpected config shape, an ethers version
-        // that throws somewhere new. An optional term must not be able to fail a
-        // request, whatever goes wrong inside it.
+        // The outer safety net, for the failures `attempt` cannot name — an
+        // unexpected config shape, a runtime that throws somewhere new. An optional
+        // term must not be able to fail a request, whatever goes wrong inside it.
         retryAfter = Date.now() + NEGATIVE_WINDOW_MS;
         inFlight = undefined;
         return unavailable('read-failed', err);
@@ -216,17 +291,14 @@ export async function readVoidCooldownSeconds(
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    // REF'd deliberately, and cleared in the `finally`: an unref'd timer would let
-    // Node drain the loop while this await is the only pending work, and the promise
-    // would never settle (`3f-timers`).
     const timeout = new Promise<'timeout'>((resolve) => {
       timer = setTimeout(() => resolve('timeout'), budget);
     });
     const outcome = await Promise.race([inFlight, timeout]);
     if (outcome === 'timeout') {
-      // The attempt may still be in flight and may still resolve usefully for a
-      // later request; what must not happen is this caller waiting on it, or the
-      // next caller waiting again immediately.
+      // This caller stops waiting. The attempt is absolutely bounded, so it will
+      // settle on its own and either cache a value for the next request or arm the
+      // window — `inFlight` is never left for a later caller to be stuck behind.
       retryAfter = Date.now() + NEGATIVE_WINDOW_MS;
       return unavailable('timed-out', `${String(budget)}ms`);
     }
@@ -240,5 +312,16 @@ export async function readVoidCooldownSeconds(
 export function resetVoidCooldownCacheForTests(): void {
   known = undefined;
   inFlight = undefined;
+  retryAfter = 0;
+}
+
+/**
+ * Test seam only: expire the negative window without clearing anything else.
+ *
+ * Exists so the RECOVERY property is testable without a sixty-second test: after an
+ * abandoned attempt, the next caller past the window must make a NEW request rather
+ * than await the old one. That is the property round 2 did not have.
+ */
+export function expireVoidCooldownWindowForTests(): void {
   retryAfter = 0;
 }

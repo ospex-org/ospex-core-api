@@ -28,9 +28,8 @@ const logMock = vi.hoisted(() => ({
 vi.mock('../src/lib/env.js', () => envMock);
 vi.mock('../src/lib/logger.js', () => logMock);
 
-const { readVoidCooldownSeconds, resetVoidCooldownCacheForTests } = await import(
-  '../src/lib/voidCooldown.js'
-);
+const { readVoidCooldownSeconds, resetVoidCooldownCacheForTests, expireVoidCooldownWindowForTests } =
+  await import('../src/lib/voidCooldown.js');
 
 const MODULE = '0xEA21b58E91eDcA41d0c42A8655234F8A64fa31bc';
 /** The R5 mainnet value, as recorded in the deploy parameters: 7 days. */
@@ -91,9 +90,76 @@ async function serve(
   });
 }
 
+/** Server-side sockets, so socket CLOSURE can be asserted rather than assumed. */
+let serverSockets: import('node:net').Socket[] = [];
+/** How many responses the server saw close — the far side of the cancellation. */
+let closedResponses = 0;
+/** Bytes the drip has written, so "stopped consuming" is a measurement. */
+let dripBytesWritten = 0;
+/** `drip` holds a partial body open; `answer` replies normally; `flood` oversends. */
+let dripMode: 'drip' | 'answer' | 'flood' = 'drip';
+
+/**
+ * A server that sends part of a JSON body and then whitespace forever.
+ *
+ * This is the shape that defeats an INACTIVITY timeout: the connection is never idle,
+ * so nothing upstream ever decides it has stalled. Only an absolute deadline that
+ * cancels the exchange ends it.
+ */
+async function serveDrip(): Promise<void> {
+  const s = createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => (raw += String(c)));
+    req.on('end', () => {
+      const body = JSON.parse(raw) as { id: number; method: string; params?: unknown[] };
+      seen.push({ method: body.method, params: body.params ?? [] });
+      if (dripMode === 'answer') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: encodeUint32(SEVEN_DAYS) }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      const chunk = dripMode === 'flood' ? ' '.repeat(16 * 1024) : ' ';
+      const opener = '{"jsonrpc":"2.0","id":1,"result":"0x000';
+      res.write(opener);
+      dripBytesWritten += opener.length;
+      const timer = setInterval(() => {
+        try {
+          res.write(chunk);
+          dripBytesWritten += chunk.length;
+        } catch {
+          clearInterval(timer);
+        }
+      }, dripMode === 'flood' ? 5 : 25);
+      timer.unref();
+      res.on('close', () => {
+        clearInterval(timer);
+        closedResponses += 1;
+      });
+    });
+  });
+  s.unref();
+  s.on('connection', (socket) => {
+    socket.unref();
+    serverSockets.push(socket);
+  });
+  await new Promise<void>((resolve) => s.listen(0, '127.0.0.1', resolve));
+  server = s;
+  const port = (s.address() as AddressInfo).port;
+  envMock.loadConfig.mockReturnValue({
+    speculationModuleAddress: MODULE,
+    alchemyRpcUrl: `http://127.0.0.1:${String(port)}`,
+    chainId: 137,
+  });
+}
+
 beforeEach(() => {
   resetVoidCooldownCacheForTests();
   seen = [];
+  serverSockets = [];
+  closedResponses = 0;
+  dripBytesWritten = 0;
+  dripMode = 'drip';
   // Nothing listening on port 1: the default for cases that must not reach a node.
   envMock.loadConfig.mockReturnValue({
     speculationModuleAddress: MODULE,
@@ -313,4 +379,106 @@ describe('readVoidCooldownSeconds — every failure is a null, never a throw', (
       logMock.logger.warn = real;
     }
   });
+});
+
+/**
+ * The round-3 blocker: "bounded" has to mean an ABSOLUTE deadline that cancels the
+ * exchange, not an inactivity timeout that a drip defeats.
+ *
+ * The reviewer reproduced this on real sockets on Node 20.19.0 and 22.23.2 against the
+ * previous head: a server sending part of a JSON body and then whitespace every 100 ms
+ * kept ethers' `FetchRequest.timeout` alive indefinitely, the timeout rejection did not
+ * destroy the request, `provider.destroy()` did not cancel a dispatched exchange, and
+ * so the SHARED attempt never settled. Measured consequences, in their numbers: socket
+ * `destroyed: false` throughout, `bytesRead` climbing 449 → 2,549 → 43,779, and at
+ * t≈62.8 s — past the negative window — the next caller awaited that same pending
+ * promise, timed out and re-armed the window. One `eth_call` ever, against a fixture
+ * that would have answered a fresh request immediately.
+ *
+ * Never recovering is worse than being slow, so these three cases pin the three things
+ * that were missing: the read ends, the socket is GONE, and the next caller past the
+ * window issues a NEW request.
+ */
+describe('readVoidCooldownSeconds — a drip body is cancelled, not waited out', () => {
+  it('ends the read and DESTROYS the socket against an endless partial body', async () => {
+    await serveDrip();
+
+    const started = Date.now();
+    expect(await readVoidCooldownSeconds({ timeoutMs: 400 })).toBeNull();
+    expect(Date.now() - started).toBeLessThan(2_000);
+
+    // The part an elapsed-time assertion cannot show, and the part that was false
+    // before: the exchange is actually gone. A caller that returns while the client
+    // keeps consuming the body has not bounded anything, it has only stopped looking.
+    await vi.waitFor(
+      () => {
+        expect(closedResponses).toBeGreaterThan(0);
+      },
+      { timeout: 5_000 },
+    );
+    expect(serverSockets.some((s) => s.destroyed)).toBe(true);
+    // And the diagnostic names the DEADLINE rather than a generic failure, so an
+    // operator can tell a cancelled read from a refused connection. The caller's own
+    // 400 ms bound warns 'timed-out' first; this is the attempt's own bound arriving
+    // afterwards, which is the one that did the cancelling.
+    expect(logMock.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'deadline' }),
+      expect.any(String),
+    );
+  }, 20_000);
+
+  it('stops consuming the body rather than growing bytesRead', async () => {
+    await serveDrip();
+    expect(await readVoidCooldownSeconds({ timeoutMs: 400 })).toBeNull();
+
+    // Let the attempt's own deadline pass, then take two readings a second apart. The
+    // reviewer's evidence is a growing count; a settled exchange cannot grow.
+    await vi.waitFor(
+      () => {
+        expect(closedResponses).toBeGreaterThan(0);
+      },
+      { timeout: 5_000 },
+    );
+    const first = dripBytesWritten;
+    await new Promise((r) => setTimeout(r, 400));
+    expect(dripBytesWritten).toBe(first);
+  }, 20_000);
+
+  it('makes a NEW request after the window, instead of awaiting the abandoned one', async () => {
+    // THE recovery property. Before the fix the abandoned attempt stayed in `inFlight`
+    // forever, so every later caller — including one past the sixty-second window —
+    // waited on a promise that would never settle. `seen` going from 1 to 2 is the
+    // whole assertion: a second `eth_call` reached the node.
+    await serveDrip();
+    expect(await readVoidCooldownSeconds({ timeoutMs: 300 })).toBeNull();
+    expect(seen).toHaveLength(1);
+
+    // Wait for the attempt's own absolute deadline to retire it.
+    await vi.waitFor(
+      () => {
+        expect(closedResponses).toBeGreaterThan(0);
+      },
+      { timeout: 5_000 },
+    );
+
+    // The node starts answering, and the window is expired the way sixty seconds
+    // would expire it.
+    dripMode = 'answer';
+    expireVoidCooldownWindowForTests();
+
+    expect(await readVoidCooldownSeconds({ timeoutMs: 3_000 })).toBe(SEVEN_DAYS);
+    expect(seen).toHaveLength(2);
+    expect(seen[1]!.method).toBe('eth_call');
+  }, 20_000);
+
+  it('refuses a body larger than the cap without buffering it', async () => {
+    // The second axis of "bounded": the deadline alone caps bytes at bandwidth x 2s,
+    // which is not a bound worth claiming. A flood is refused on SIZE, and well inside
+    // the time bound, so it is the cap that answered.
+    dripMode = 'flood';
+    await serveDrip();
+    const started = Date.now();
+    expect(await readVoidCooldownSeconds({ timeoutMs: 5_000 })).toBeNull();
+    expect(Date.now() - started).toBeLessThan(1_800);
+  }, 20_000);
 });
