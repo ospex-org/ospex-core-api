@@ -559,6 +559,9 @@ describe('picks — the pick card fields', () => {
   it.each(AXIS_COLUMNS)('a vector with only %s set is still a vector', async (present) => {
     // One case per axis, so no single column can be the one the implementation
     // happens to consult — a sentinel on `softness` would pass every case above.
+    // This case asks the SENTINEL question only; whether a value lands on its own
+    // key is the five-distinct-values case's job, and asserting a derived
+    // expected object here would put the input on both sides of the call (`3i`).
     const row = Object.fromEntries(AXIS_COLUMNS.map((k) => [k, k === present ? 3 : null]));
     const served = (await axesOfOnePick({ ...row, primary_axis: null })) as Record<
       string,
