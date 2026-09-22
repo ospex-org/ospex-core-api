@@ -241,6 +241,54 @@ const OPEN_RUN = {
   cost_per_pick_comparable: null,
 };
 
+/**
+ * One priced fill for FABLE on the in-scope game: 10 USDC risked, 7 USDC net.
+ *
+ * Module scope, and deliberately its own fixture rather than a reuse of the
+ * sport-scope one, because the DEFAULT tables give FABLE no executed money at all.
+ * A money formula tested against those is not tested: a mutant putting the ROI
+ * percentage out by a factor of ten survived the battery until this existed,
+ * because every branch that could have caught it was reading nulls.
+ */
+const FABLE_WITH_FILL = {
+  benchmark_execution_fills: [
+    {
+      cohort_id: COHORT,
+      participant_id: FABLE,
+      network: 'polygon',
+      game_id: GAME,
+      market: 'moneyline',
+      run_id: RUN,
+      deployment_round: 'R5',
+      contest_id: 41,
+      speculation_id: 88,
+      commitment_hash: '0xaa',
+      taker_address: '0xabc',
+      tx_hash: '0xtx1',
+      block_number: 100,
+      filled_at: '2026-08-15T20:00:00+00:00',
+      stake_usdc: 10,
+      would_abstain: false,
+    },
+  ],
+  position_fills: [
+    {
+      id: 1,
+      network: 'polygon',
+      speculation_id: 88,
+      contest_id: 41,
+      commitment_hash: '0xaa',
+      taker_address: '0xabc',
+      taker_position_type: 'upper',
+      taker_risk_amount: '10000000',
+      maker_risk_amount: '7000000',
+      tx_hash: '0xtx1',
+      log_index: 0,
+    },
+  ],
+  chain_events: chainHistory({ gameId: GAME, txHash: '0xtx1', block: 100, taker: '0xabc' }),
+};
+
 const open: FakePostgrest[] = [];
 afterEach(async () => {
   await Promise.all(open.splice(0).map((f) => f.close()));
@@ -1393,7 +1441,7 @@ describe('profile — a market filter scopes the metrics and says what it does n
       (s) => s.market === 'moneyline',
     );
     const m = profile.body.metrics as Record<string, unknown>;
-    expect(m).toMatchObject({ scope: 'market', market: 'moneyline', marketPresent: true });
+    expect(m).toMatchObject({ scope: 'market', market: 'moneyline' });
     expect(m.metrics).toEqual(split?.metrics);
     expect(m.sample).toEqual({
       eligible: split?.eligible, picks: split?.picks, scoreable: split?.scoreable,
@@ -1419,20 +1467,57 @@ describe('profile — a market filter scopes the metrics and says what it does n
     expect((body.headline as Record<string, unknown>).scope).toBe('all-markets');
   });
 
-  it('distinguishes a market the arm never picked from an arm with no picks', async () => {
-    const { body } = await run(
-      { benchmark_scoring_runs: [OPEN_RUN] }, { market: 'spread' }, {}, undefined, FABLE,
+  /**
+   * REPLACES a conditional test. The first version branched on
+   * `if (marketPresent === false) … else …`, so it passed either way and the mutant
+   * flipping that flag SURVIVED — an unfalsifiable test reading as coverage. The
+   * branch it probed was dead code (`byMarket` is `MARKETS.map(...)`, so every
+   * market always has a split) and is now deleted from the handler.
+   *
+   * The real property: an arm with no picks in a market gets a split of ZEROES
+   * rather than an absence. GEMINI carries no score rows in this fixture.
+   */
+  it('serves a zeroed split for a market the arm never picked, not an absence', async () => {
+    const { status, body } = await run(
+      { benchmark_scoring_runs: [OPEN_RUN] }, { market: 'spread' }, {}, undefined, GEMINI,
     );
+    expect(status).toBe(200);
+    expect(body.found).toBe(true);
     const m = body.metrics as Record<string, unknown>;
-    if (m.marketPresent === false) {
-      // Null, never zero: "this arm made no spread picks" and "this arm's spread
-      // CLV is 0%" are different statements.
-      expect(m.metrics).toBeNull();
-      expect(m.sample).toBeNull();
-      expect(body.found).toBe(true);
-    } else {
-      expect(m.metrics).toBeDefined();
-    }
+    expect(m).toMatchObject({ scope: 'market', market: 'spread' });
+    // `eligible: 1` beside `picks: 0` is the point, and it is why an absence would
+    // be the wrong rendering: this arm WAS offered a spread on a dispatched game
+    // and did not pick it. Opportunities and picks are different denominators,
+    // which #72 asks to have documented, and a null would throw that away.
+    expect(m.sample).toEqual({ eligible: 1, picks: 0, scoreable: 0 });
+    expect(m.metrics).not.toBeNull();
+  });
+
+  /**
+   * `picks` and `scoreable` are DIFFERENT denominators, and exactly one split in
+   * this fixture can tell them apart: FABLE's `total` carries a REFUSED pick, so it
+   * has a pick with no primary value. Everywhere else the two are equal, which is
+   * why a mutant reporting `scoreable: split.picks` survived until this case
+   * existed — the fixture was too tidy to discriminate (`3g`).
+   */
+  it('keeps picks and scoreable distinct, on the split where they differ', async () => {
+    const table = await run({ benchmark_scoring_runs: [OPEN_RUN] });
+    const profile = await run(
+      { benchmark_scoring_runs: [OPEN_RUN] }, { market: 'total' }, {}, undefined, FABLE,
+    );
+    const arms = table.body.arms as Array<Record<string, unknown>>;
+    const splits = arms.find((a) => a.participantId === FABLE)?.byMarket as Array<
+      Record<string, unknown>
+    >;
+    const split = splits.find((s) => s.market === 'total');
+    const sample = (profile.body.metrics as Record<string, unknown>).sample;
+    // The assertion that makes this discriminate: here the two numbers differ.
+    expect(split?.picks).not.toBe(split?.scoreable);
+    expect(sample).toEqual({
+      eligible: split?.eligible,
+      picks: split?.picks,
+      scoreable: split?.scoreable,
+    });
   });
 });
 
@@ -1445,35 +1530,66 @@ describe('profile — the ROI denominator ships with its own numerator', () => {
    * `3d-aggregate` shape where a money figure silently doubles.
    */
   it('divides by staked alone, which already includes pending risk', async () => {
-    const { body } = await run({ benchmark_scoring_runs: [OPEN_RUN] }, {}, {}, undefined, FABLE);
+    // FABLE_WITH_FILL, not the default tables: the default fixture gives this arm
+    // NO executed money, so every assertion below would compare nulls and the
+    // arithmetic would go unpinned. Verified by the battery — a mutant scaling the
+    // percentage by ten survived while this test read the default fixture.
+    const { body } = await run(
+      { ...FABLE_WITH_FILL, benchmark_scoring_runs: [OPEN_RUN] },
+      {},
+      {},
+      undefined,
+      FABLE,
+    );
     const roi = body.roi as Record<string, number | null | string>;
     const executed = body.executed as Record<string, number | null>;
     expect(roi.netUsdc).toBe(executed.netUsdc);
     expect(roi.riskUsdc).toBe(executed.stakedUsdc);
     expect(roi.pendingRiskUsdc).toBe(executed.pendingStakeUsdc);
-    // Pending is inside staked, so it can never exceed it. This is the assertion
-    // that would redden if the denominator were ever changed to staked+pending.
-    if (typeof roi.riskUsdc === 'number' && typeof roi.pendingRiskUsdc === 'number') {
-      expect(roi.pendingRiskUsdc).toBeLessThanOrEqual(roi.riskUsdc);
-    }
-    // The quotient is derivable from the two numbers served beside it.
-    if (typeof roi.netUsdc === 'number' && typeof roi.riskUsdc === 'number' && roi.riskUsdc !== 0) {
-      expect(roi.pct).toBe(Math.round((10_000 * roi.netUsdc) / roi.riskUsdc) / 100);
-    } else {
-      expect(roi.pct).toBeNull();
-    }
+
+    // Asserted UNCONDITIONALLY. Pinning that the fixture HAS money is what makes
+    // the arithmetic below discriminate; the first version wrapped it in
+    // `if (typeof … === 'number') … else expect(pct).toBeNull()`, which passes on a
+    // wrong formula whenever the numbers happen to be null.
+    expect(typeof roi.riskUsdc).toBe('number');
+    expect(typeof roi.netUsdc).toBe('number');
+    const net = roi.netUsdc as number;
+    const risk = roi.riskUsdc as number;
+    expect(risk).not.toBe(0);
+    // Pending is INSIDE staked, so it can never exceed it — this is what reddens
+    // if the denominator is ever changed to staked + pending.
+    expect(roi.pendingRiskUsdc ?? 0).toBeLessThanOrEqual(risk);
+    // And the quotient is derivable from the two numbers served beside it.
+    expect(roi.pct).toBe(Math.round((10_000 * net) / risk) / 100);
     expect(String(roi.basis)).toContain('SETTLED');
   });
 
+  /**
+   * REPLACES another conditional test, which read
+   * `if (riskUsdc === 0 || riskUsdc === null) expect(pct).toBeNull()` and so
+   * asserted nothing when neither held.
+   *
+   * It also could not discriminate the guard it was aimed at: with no fills,
+   * `EMPTY_WIRE_EXECUTED` sets BOTH `stakedUsdc` and `netUsdc` to null, so the
+   * `netUsdc === null` clause answers first and `riskUsdc === 0` never decides
+   * anything — the `3b` wrong-reason trap. A zero denominator beside a non-null net
+   * needs every fill to carry zero risk, which the data model does not produce; that
+   * clause is a guard against a REFACTOR defaulting `stakedUsdc` to 0, after which
+   * `net / 0` would ship as Infinity. It is recorded as a documented-equivalent
+   * survivor in the battery rather than pretended to be covered.
+   */
   it('reports an undefined ratio as null rather than as a zero return', async () => {
-    // No fills at all for this arm: nothing at risk, so the ratio has no value.
-    // 0 would read as "broke even", which is a different claim.
     const { body } = await run(
       { benchmark_execution_fills: [], position_fills: [], chain_events: [] },
       {}, {}, undefined, GEMINI,
     );
     const roi = body.roi as Record<string, unknown>;
-    if (roi.riskUsdc === 0 || roi.riskUsdc === null) expect(roi.pct).toBeNull();
+    // Nothing at risk and nothing settled: null throughout, and `pct` null rather
+    // than 0, because an undefined ratio and a break-even return are different
+    // claims. Unconditional.
+    expect(roi.riskUsdc).toBeNull();
+    expect(roi.netUsdc).toBeNull();
+    expect(roi.pct).toBeNull();
   });
 });
 

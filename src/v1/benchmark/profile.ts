@@ -50,7 +50,11 @@ import { loadConfig } from '../../lib/env.js';
 import { getSupabase } from '../../lib/supabase.js';
 import { SPORTS as VALID_SPORTS } from '../../lib/sports.js';
 import type { ApiError } from '../../middleware/errorHandler.js';
-import { respondProjectionFault, respondToQueryError } from './source.js';
+import {
+  ProjectionIntegrityError,
+  respondProjectionFault,
+  respondToQueryError,
+} from './source.js';
 import { parseSlateDate, parseSportParam } from './window.js';
 import { assembleStandings } from './standings.js';
 import { MARKETS, METHODOLOGY, type WireArm, type WireMarketSplit } from './standingsProject.js';
@@ -102,9 +106,34 @@ function roiOf(arm: WireArm): Record<string, unknown> {
   };
 }
 
-/** The per-market split for one market, or null when the arm has none. */
-function splitFor(arm: WireArm, market: string): WireMarketSplit | null {
-  return arm.byMarket.find((s) => s.market === market) ?? null;
+/**
+ * The per-market split for one market.
+ *
+ * `projectArms` builds `byMarket` as `MARKETS.map(...)` (standingsProject.ts:582),
+ * so every arm carries an entry for EVERY market — zeroed where it made no picks,
+ * which is the same roster-driven left join the rest of the projection uses. A
+ * market that validated against `MARKETS` therefore always has a split.
+ *
+ * The first version of this returned `null` for a missing split and the response
+ * carried a `marketPresent: false` state for it. That state was unreachable, and
+ * the test written for it was CONDITIONAL — `if (marketPresent === false) … else …`
+ * — so it passed either way and a mutant flipping the flag survived. Dead code
+ * plus an unfalsifiable test reads as coverage and is worse than neither.
+ *
+ * So an absent split is now an integrity fault rather than a served state: it can
+ * only mean `MARKETS` and `projectArms` have stopped agreeing, which is the server
+ * answering outside its own contract — the same class `readAllByKeyset` refuses a
+ * non-advancing cursor for, and answered the same way.
+ */
+function splitFor(arm: WireArm, market: string): WireMarketSplit {
+  const split = arm.byMarket.find((s) => s.market === market);
+  if (split === undefined) {
+    throw new ProjectionIntegrityError(
+      'benchmark_scores',
+      `market ${market} validated but the projection served no split for it`,
+    );
+  }
+  return split;
 }
 
 export async function getBenchmarkProfileHandler(req: Request, res: Response): Promise<void> {
@@ -271,21 +300,20 @@ export async function getBenchmarkProfileHandler(req: Request, res: Response): P
      * distinct from a zero.
      */
     metrics:
-      market === null
+      split === null
         ? { scope: 'all-markets', sample: arm.sample, metrics: arm.metrics }
-        : split === null
-          ? { scope: 'market', market, marketPresent: false, sample: null, metrics: null }
-          : {
-              scope: 'market',
-              market,
-              marketPresent: true,
-              sample: {
-                eligible: split.eligible,
-                picks: split.picks,
-                scoreable: split.scoreable,
-              },
-              metrics: split.metrics,
+        : {
+            scope: 'market',
+            market,
+            // A market the arm never picked is a split of ZEROES, not an absence:
+            // "0 picks" is a true statement and a more useful one than "no data".
+            sample: {
+              eligible: split.eligible,
+              picks: split.picks,
+              scoreable: split.scoreable,
             },
+            metrics: split.metrics,
+          },
     /** Always pooled — fills carry no market breakdown. Labelled, never implied. */
     byMarket: arm.byMarket,
     executed: { ...arm.executed, scope: 'all-markets' },
