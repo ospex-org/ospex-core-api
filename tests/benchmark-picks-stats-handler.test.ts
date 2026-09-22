@@ -275,6 +275,15 @@ interface WireGame {
     market: string;
     selectionLabel: string | null;
     priceAmerican: number | null;
+    /**
+     * The per-market number and the side-labelled spread pair. Declared because
+     * four cases below already read them (`3d-sibling`): widening `axes` here
+     * and leaving its siblings undeclared would fix one field of a false wire
+     * declaration and leave the rest of the same object wrong.
+     */
+    line: number | null;
+    awayLine: number | null;
+    homeLine: number | null;
     axes: Record<string, number | null> | null;
     confidence: number | null;
     fill: unknown;
