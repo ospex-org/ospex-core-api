@@ -250,7 +250,7 @@ describe('the key', () => {
   /** The ledger endpoint is its own namespace, not a variant of the others. */
   it('does not collide with another endpoint on the same params', () => {
     const q = { sport: 'mlb', participantId: 'a' };
-    const keys = (['standings', 'picks', 'stats', 'pick', 'ledger'] as const).map((e) =>
+    const keys = (['standings', 'picks', 'stats', 'pick', 'ledger', 'profile'] as const).map((e) =>
       benchmarkCacheKey(e, req(q), config),
     );
     expect(new Set(keys).size).toBe(keys.length);

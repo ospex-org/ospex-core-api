@@ -46,6 +46,7 @@ import { getBenchmarkStandingsHandler } from './benchmark/standings.js';
 import { getBenchmarkPicksHandler } from './benchmark/picks.js';
 import { getBenchmarkPickHandler } from './benchmark/pick.js';
 import { getBenchmarkLedgerHandler } from './benchmark/ledger.js';
+import { getBenchmarkProfileHandler } from './benchmark/profile.js';
 import { getBenchmarkStatsHandler } from './benchmark/stats.js';
 import { benchmarkCacheKey, serveCachedBenchmark } from './benchmark/cache.js';
 import { loadConfig } from '../lib/env.js';
@@ -239,6 +240,22 @@ v1Router.get(
       req,
       res,
       getBenchmarkLedgerHandler,
+    ),
+  ),
+);
+// One model arm's profile. Shares `assembleStandings` with /benchmark/standings,
+// so its unfiltered figures ARE the standings figures rather than a second
+// derivation of them - #72's "exact all/all parity". It publishes no rank: an
+// order is a ranking, and so is a position on a single arm's own page.
+v1Router.get(
+  '/benchmark/profile/:participantId',
+  benchmarkRateLimit,
+  asyncHandler((req, res) =>
+    serveCachedBenchmark(
+      benchmarkCacheKey('profile', req, loadConfig()),
+      req,
+      res,
+      getBenchmarkProfileHandler,
     ),
   ),
 );

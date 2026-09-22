@@ -43,9 +43,9 @@
 
 import type { Request, Response } from 'express';
 import type { PostgrestError, SupabaseClient } from '@supabase/supabase-js';
-import { loadConfig } from '../../lib/env.js';
+import { loadConfig, type HeadlineBasis } from '../../lib/env.js';
 import { getSupabase } from '../../lib/supabase.js';
-import { SPORTS as VALID_SPORTS } from '../../lib/sports.js';
+import { SPORTS as VALID_SPORTS, type Sport } from '../../lib/sports.js';
 import type { ApiError } from '../../middleware/errorHandler.js';
 import {
   BENCHMARK,
@@ -71,6 +71,7 @@ import {
 } from './standingsProject.js';
 import { collectExecuted } from './executedFetch.js';
 import type { ExecutedSummary } from './executed.js';
+import type { ScorerAddresses } from '../../lib/speculation.js';
 
 /**
  * Score-row read bound, a backstop behind the cohort window rather than a
@@ -367,6 +368,195 @@ async function collect(
 const NO_SCORING_RUN_REASON =
   'no scoring run has been published for the cohorts in this window';
 
+/**
+ * Everything both the standings table and a single model's profile need, read and
+ * projected ONCE.
+ *
+ * ## Why this is a shared function and not a second read path
+ *
+ * `/v1/benchmark/profile/...` has to agree with this table exactly - #72 words it
+ * as "exact all/all parity". The only way to get that is for the profile's numbers
+ * to BE these numbers: same reads, same sport scope, same policy-version choice,
+ * same `projectArms`. A profile that re-derived an arm's figures from
+ * `benchmark_model_aggregates` would agree on the day it was written and drift
+ * afterwards - and a test comparing two derivations that meet at a shared
+ * intermediate would not notice (`3d-witness`).
+ *
+ * So the seam is ASSEMBLE here, then each handler decides what to serve of it. The
+ * standings handler orders the arms and publishes the table; the profile handler
+ * picks one arm and publishes no order at all.
+ *
+ * ## What it deliberately does NOT do
+ *
+ * It does not call `orderArms` or `featuredOf`. Both ARE rankings, both are gated
+ * on `rankingAllowed`, and only the table publishes one. Keeping them outside this
+ * function is what stops the profile leaking an order by accident.
+ *
+ * Projection faults are THROWN rather than returned, because both callers already
+ * answer them identically through `respondProjectionFault`. Query errors are
+ * RETURNED, because they carry the relation name each caller reports.
+ */
+export type AssembledStandings =
+  | {
+      kind: 'ok';
+      win: ResolvedWindow;
+      /** The policy version actually used - the request's, or the resolved default. */
+      version: string | null;
+      available: VersionCoverage[];
+      /** Model arms, projected. Roster-driven, so an arm with no scores is present. */
+      arms: WireArm[];
+      baselines: WireBaseline[];
+      /** Cohorts that contributed at least one scored pick at `version`. */
+      /**
+       * The executed rollup split by (participant, market), keyed by
+       * `armMarketKey`. Built from the same fills and the same
+       * `summarizeExecuted` as the pooled figure inside each arm, so a
+       * market-scoped money figure is one arithmetic over a subset. The table
+       * does not use it; the profile serves #72's filtered risk and ROI from it.
+       */
+      executedByMarket: ReadonlyMap<string, ExecutedSummary>;
+      cohortsWithScores: Set<string>;
+      scoringRunByCohort: Map<string, ScoringRunRow>;
+      rankingAllowed: boolean;
+      withheldBy: Array<{ cohortId: string; reason: string }>;
+    }
+  | { kind: 'empty'; win: ResolvedWindow }
+  | { kind: 'queryError'; error: PostgrestError; context: string };
+
+export async function assembleStandings(
+  sb: SupabaseClient,
+  config: {
+    network: string;
+    benchmarkPublicMinSlateDate?: string | undefined;
+    benchmarkStandingsWindowDays: number;
+    benchmarkHeadlineBasis: HeadlineBasis;
+    scorers: ScorerAddresses | undefined;
+  },
+  params: {
+    sport?: Sport | 'all' | undefined;
+    slateDate?: string | undefined;
+    requestedVersion?: string | undefined;
+  },
+): Promise<AssembledStandings> {
+  const { sport, slateDate, requestedVersion } = params;
+
+  const windowRes = await resolveWindow(sb, {
+    network: config.network,
+    minSlateDate: config.benchmarkPublicMinSlateDate,
+    windowDays: config.benchmarkStandingsWindowDays,
+    ...(sport !== undefined && sport !== 'all' ? { sport } : {}),
+    ...(slateDate !== undefined ? { slateDate } : {}),
+  });
+  if (!windowRes.ok) {
+    return { kind: 'queryError', error: windowRes.error, context: windowRes.context };
+  }
+  const win = windowRes.window;
+  if (win.cohorts.length === 0) return { kind: 'empty', win };
+
+  const cohortIds = win.cohorts.map((c) => c.cohortId);
+  const collected = await collect(sb, config.network, cohortIds);
+  if ('error' in collected) {
+    return { kind: 'queryError', error: collected.error, context: collected.context };
+  }
+
+  // SPORT SCOPE, applied before anything reads the rows.
+  //
+  // `resolveWindow` filters each cohort's game list by sport, but the score and
+  // fill reads are scoped by COHORT - so on a mixed-sport cohort every
+  // out-of-scope row came back too, and fed the policy-version choice, the
+  // means, the counts, the ordering and the executed totals. Every cohort on
+  // production is 100% MLB today, so nothing leaked in practice and no
+  // production-shaped fixture could have caught it; the benchmark adding a
+  // second sport is what would have made it real. Caught in review.
+  //
+  // Filtering here rather than in the query keeps it in ONE place for both
+  // streams: `cohort.gameIds` is already the sport-scoped set, and the
+  // alternative - pushing a game-id list into every read - would be a second
+  // definition of the same scope that could drift from the first.
+  const inScopeGames = new Set(win.cohorts.flatMap((c) => c.gameIds));
+  const scopedScoreRows = collected.data.scores.filter((r) =>
+    inScopeGames.has(r.benchmark_decisions.game_id),
+  );
+
+  const { version: defaultVersion, available } = resolvePolicyVersion(scopedScoreRows);
+  const version = requestedVersion ?? defaultVersion;
+
+  const atVersion = scopedScoreRows.filter((r) => r.scoring_policy_version === version);
+  const scores: ScoredPickRow[] = atVersion.map((r) => ({
+    cohortId: r.benchmark_decisions.cohort_id,
+    participantId: r.benchmark_decisions.participant_id,
+    gameId: r.benchmark_decisions.game_id,
+    market: r.benchmark_decisions.market,
+    heldOutOfPrimary: r.held_out_of_primary,
+    refused: r.refused,
+    refusalReason: r.refusal_reason,
+    economicClvPct: r.economic_clv_pct,
+    marginAdjustedClvPct: r.margin_adjusted_clv_pct,
+  }));
+
+  const cohortsWithScores = new Set(scores.map((s) => s.cohortId));
+
+  const fills = await collectExecuted(sb, config.network, cohortIds, config.scorers, inScopeGames);
+  if ('error' in fills) {
+    return { kind: 'queryError', error: fills.error, context: fills.context };
+  }
+  const executed = fills.byParticipant;
+  const executedByMarket = fills.byParticipantMarket;
+
+  const slateDateByCohort = new Map(win.cohorts.map((c) => [c.cohortId, c.slateDate]));
+  const { models, baselines: baselineRoster } = splitRoster(collected.data.roster);
+  const modelIds = new Set(models.map((r) => r.participantId));
+  const baselineIds = new Set(baselineRoster.map((r) => r.participantId));
+
+  const arms = projectArms({
+    roster: models,
+    scores: scores.filter((s) => modelIds.has(s.participantId)),
+    attempts: win.attempts,
+    wallets: collected.data.wallets,
+    executed,
+    cohortOrder: cohortIds,
+    slateDateByCohort,
+    headlineBasis: config.benchmarkHeadlineBasis,
+  });
+  const baselines: WireBaseline[] = projectBaselines(
+    baselineRoster,
+    scores.filter((s) => baselineIds.has(s.participantId)),
+    config.benchmarkHeadlineBasis,
+    cohortIds,
+  );
+
+  // Ranking is unanimous or it is withheld. One cohort whose operator has not
+  // opened the gate is enough: the table is a single ordering over a pooled
+  // sample, so a partially-approved sample has not been approved.
+  const runsAtVersion = collected.data.scoringRuns.filter(
+    (r) => version !== null && r.scoringPolicyVersion === version,
+  );
+  const scoringRunByCohort = new Map(runsAtVersion.map((r) => [r.cohortId, r]));
+  const contributing = [...cohortsWithScores];
+  const withheldBy = contributing
+    .filter((c) => scoringRunByCohort.get(c)?.rankingAllowed !== true)
+    .sort()
+    .map((cohortId) => ({
+      cohortId,
+      reason: scoringRunByCohort.get(cohortId)?.rankingReason ?? NO_SCORING_RUN_REASON,
+    }));
+  const rankingAllowed = contributing.length > 0 && withheldBy.length === 0;
+
+  return {
+    kind: 'ok',
+    win,
+    version,
+    available,
+    arms,
+    baselines,
+    executedByMarket,
+    cohortsWithScores,
+    scoringRunByCohort,
+    rankingAllowed,
+    withheldBy,
+  };
+}
+
 export async function getBenchmarkStandingsHandler(req: Request, res: Response): Promise<void> {
   const sport = parseSportParam(req.query.sport);
   if (sport === 'invalid') {
@@ -411,131 +601,46 @@ export async function getBenchmarkStandingsHandler(req: Request, res: Response):
   const config = loadConfig();
   const sb = getSupabase();
 
-  let windowRes;
+  let assembled: AssembledStandings;
   try {
-    windowRes = await resolveWindow(sb, {
-      network: config.network,
-      minSlateDate: config.benchmarkPublicMinSlateDate,
-      windowDays: config.benchmarkStandingsWindowDays,
-      ...(sport !== undefined && sport !== 'all' ? { sport } : {}),
-      ...(slateDate !== undefined ? { slateDate } : {}),
-    });
+    assembled = await assembleStandings(
+      sb,
+      {
+        network: config.network,
+        benchmarkPublicMinSlateDate: config.benchmarkPublicMinSlateDate,
+        benchmarkStandingsWindowDays: config.benchmarkStandingsWindowDays,
+        benchmarkHeadlineBasis: config.benchmarkHeadlineBasis,
+        scorers: config.scorers,
+      },
+      { sport, slateDate, requestedVersion },
+    );
   } catch (err) {
     if (respondProjectionFault(res, err)) return;
     throw err;
   }
-  if (!windowRes.ok) {
-    respondToQueryError(res, windowRes.error, windowRes.context);
+  if (assembled.kind === 'queryError') {
+    respondToQueryError(res, assembled.error, assembled.context);
     return;
   }
-  const win = windowRes.window;
-
-  if (win.cohorts.length === 0) {
-    res.status(200).json(emptyBody(sport ?? null, config.network, win, requestedVersion ?? null));
-    return;
-  }
-
-  const cohortIds = win.cohorts.map((c) => c.cohortId);
-  let collected;
-  try {
-    collected = await collect(sb, config.network, cohortIds);
-  } catch (err) {
-    if (respondProjectionFault(res, err)) return;
-    throw err;
-  }
-  if ('error' in collected) {
-    respondToQueryError(res, collected.error, collected.context);
+  if (assembled.kind === 'empty') {
+    res
+      .status(200)
+      .json(emptyBody(sport ?? null, config.network, assembled.win, requestedVersion ?? null));
     return;
   }
 
-  // SPORT SCOPE, applied before anything reads the rows.
-  //
-  // `resolveWindow` filters each cohort's game list by sport, but the score and
-  // fill reads are scoped by COHORT — so on a mixed-sport cohort every
-  // out-of-scope row came back too, and fed the policy-version choice, the
-  // means, the counts, the ordering and the executed totals. Every cohort on
-  // production is 100% MLB today, so nothing leaked in practice and no
-  // production-shaped fixture could have caught it; the benchmark adding a
-  // second sport is what would have made it real. Caught in review.
-  //
-  // Filtering here rather than in the query keeps it in ONE place for both
-  // streams: `cohort.gameIds` is already the sport-scoped set, and the
-  // alternative — pushing a game-id list into every read — would be a second
-  // definition of the same scope that could drift from the first.
-  const inScopeGames = new Set(win.cohorts.flatMap((c) => c.gameIds));
-  const scopedScoreRows = collected.data.scores.filter((r) =>
-    inScopeGames.has(r.benchmark_decisions.game_id),
-  );
+  const {
+    win,
+    version,
+    available,
+    arms: projected,
+    baselines,
+    cohortsWithScores,
+    scoringRunByCohort: runByCohort,
+    rankingAllowed,
+    withheldBy,
+  } = assembled;
 
-  const { version: defaultVersion, available } = resolvePolicyVersion(scopedScoreRows);
-  const version = requestedVersion ?? defaultVersion;
-
-  const atVersion = scopedScoreRows.filter((r) => r.scoring_policy_version === version);
-  const scores: ScoredPickRow[] = atVersion.map((r) => ({
-    cohortId: r.benchmark_decisions.cohort_id,
-    participantId: r.benchmark_decisions.participant_id,
-    gameId: r.benchmark_decisions.game_id,
-    market: r.benchmark_decisions.market,
-    heldOutOfPrimary: r.held_out_of_primary,
-    refused: r.refused,
-    refusalReason: r.refusal_reason,
-    economicClvPct: r.economic_clv_pct,
-    marginAdjustedClvPct: r.margin_adjusted_clv_pct,
-  }));
-
-  const cohortsWithScores = new Set(scores.map((s) => s.cohortId));
-
-  let executed: ReadonlyMap<string, ExecutedSummary>;
-  try {
-    const fills = await collectExecuted(sb, config.network, cohortIds, config.scorers, inScopeGames);
-    if ('error' in fills) {
-      respondToQueryError(res, fills.error, fills.context);
-      return;
-    }
-    executed = fills.byParticipant;
-  } catch (err) {
-    if (respondProjectionFault(res, err)) return;
-    throw err;
-  }
-
-  const slateDateByCohort = new Map(win.cohorts.map((c) => [c.cohortId, c.slateDate]));
-  const { models, baselines: baselineRoster } = splitRoster(collected.data.roster);
-  const modelIds = new Set(models.map((r) => r.participantId));
-  const baselineIds = new Set(baselineRoster.map((r) => r.participantId));
-
-  const projected = projectArms({
-    roster: models,
-    scores: scores.filter((s) => modelIds.has(s.participantId)),
-    attempts: win.attempts,
-    wallets: collected.data.wallets,
-    executed,
-    cohortOrder: cohortIds,
-    slateDateByCohort,
-    headlineBasis: config.benchmarkHeadlineBasis,
-  });
-  const baselines: WireBaseline[] = projectBaselines(
-    baselineRoster,
-    scores.filter((s) => baselineIds.has(s.participantId)),
-    config.benchmarkHeadlineBasis,
-    cohortIds,
-  );
-
-  // Ranking is unanimous or it is withheld. One cohort whose operator has not
-  // opened the gate is enough: the table is a single ordering over a pooled
-  // sample, so a partially-approved sample has not been approved.
-  const runsAtVersion = collected.data.scoringRuns.filter(
-    (r) => version !== null && r.scoringPolicyVersion === version,
-  );
-  const runByCohort = new Map(runsAtVersion.map((r) => [r.cohortId, r]));
-  const contributing = [...cohortsWithScores];
-  const withheldBy = contributing
-    .filter((c) => runByCohort.get(c)?.rankingAllowed !== true)
-    .sort()
-    .map((cohortId) => ({
-      cohortId,
-      reason: runByCohort.get(cohortId)?.rankingReason ?? NO_SCORING_RUN_REASON,
-    }));
-  const rankingAllowed = contributing.length > 0 && withheldBy.length === 0;
 
   // Ordering is gated on the same flag, because an order IS a ranking — see
   // `orderArms`. The seed keeps the neutral order stable within a cohort-day.

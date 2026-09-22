@@ -657,6 +657,28 @@ What is constant is the **number of reads** — one for a page, two when a count
 
 Rows carry the same distinctions and the same conventions as the detail endpoint — side-labelled spreads on both the pick and the close, never-fabricated `axes`, tri-state `heldOutOfPrimary`, a real `0` net distinct from a pending null. Not in the list, so fetch the pick for them: the write-up prose, the digests, the seal/reveal timeline, `primaryExpectation`, `runId`, and `execution.fillPriceDecimal` / `settlementTxHash` / `claimTxHash`.
 
+#### `GET /v1/benchmark/profile/:participantId?sport=&market=&date=&scoringPolicyVersion=`
+
+One model arm's profile: its metric family, its per-market splits, its executed money, its chart series and the published context needed to read them.
+
+**Its unfiltered figures ARE the standings figures.** Not "agree with" — the same. Both this endpoint and `/v1/benchmark/standings` consume one `assembleStandings`, which performs the reads, the sport scope, the policy-version choice and the projection once. So the all/all parity #72 requires is structural rather than a numeric coincidence maintained by hand. Re-deriving an arm's figures from `benchmark_model_aggregates` was the alternative and is the wrong one: it would agree the day it was written and drift after, and a test comparing two derivations that meet at a shared intermediate cannot see the drift.
+
+**It publishes no ranking.** No rank, no position, no percentile, no peer comparison, and it calls neither `orderArms` nor `featuredOf`. An order is a ranking, and so is a position on a single arm's own page — which is where one looks most harmless. `ranking.allowed` and `ranking.withheldBy` are echoed so a consumer knows the state of the gate, and that is all this endpoint says about order. When ranking is withheld the figures still serve: withholding the *data* would be the opposite error to withholding the judgement.
+
+**What `market` scopes.** The CLV metric family **and** the executed record and ROI. The money is scoped by the same `summarizeExecuted` over the same priced fills, grouped additionally by the receipt's market, so a market figure is one arithmetic over a subset rather than a second arithmetic that happens to agree; the all-markets case still serves the standings object verbatim, so parity is untouched. The three markets sum to the pooled totals, and a test asserts it.
+
+`series` and `headline` are **not** scoped and say so in their own `scope` field, because those genuinely cannot be: a series point is a cohort-day's figure across markets and the headline is the basis over the whole sample. One quantity appears only in the pooled view — `unresolvedFills`, receipts the identity chain could not bind to a priced fill, which therefore have no market; a market response carries `unattributedFills` so the market totals not summing to the receipt count is legible. A market the arm never picked answers a split of **zeroes**, not an absence: `eligible` can be non-zero beside `picks: 0`, which says it was offered the market and declined it. Opportunities and picks are different denominators and a null would throw the distinction away.
+
+**`roi` ships its own numerator and denominator.** `netUsdc`, `riskUsdc`, `pendingRiskUsdc` and `pct`, where `pct` is computed from exactly the two numbers served beside it, so the division is checkable. The denominator is `riskUsdc` **alone**: `executed.ts` accumulates staked risk on every fill unconditionally and pending risk only on undecided ones, so pending is a *subset* of staked and `staked + pending` would count it twice.
+
+The numerator is fills with a **decided** verdict — chain-settled **or** score-predicted. It is not "settled fills": `netUsdc` accumulates whenever a payout is known, and a payout is known for a predicted verdict too, so a fill can contribute net before the chain has settled it. `roi.basis` says so and `executed.verdictSource` ships the `settled`/`predicted`/`undecided` split beside the figures. The ratio therefore mixes two populations by design — decided net over total risk — which is what #72 specifies, and it reads understated while anything is undecided. `pct` is `null`, never `0`, when nothing is at risk: an undefined ratio and a break-even return are different claims.
+
+**Absences are served as `null` rather than omitted.** `sources` (published evidence-reference URLs) needs a producer — no benchmark relation carries any, and an artifact's `source_path`/`source_sha256` are provenance for a file rather than citations. `notebook` stays absent until editorial data exists; `benchmark_pick_writeups.writeup` is per-*pick* prose and is not a model notebook. Present-and-null says "known to be missing"; omitted would say "forgotten".
+
+Absent from the roster for the window and sport answers `200` with `found: false, reason: "not_on_roster"` — distinct from an arm that is published but has no picks, which the roster-driven projection renders as a present arm with zeroes.
+
+**Cost:** the same bounded fan-out as `/benchmark/standings`, whose reads are bounded by `BENCHMARK_STANDINGS_WINDOW_DAYS` rather than by total history, and cached behind the same single-flight memo. Narrowing the score read to one participant is safe — the projection has no cross-arm dependency — and is not done here; it is an optimisation, not a correctness requirement.
+
 #### `GET /v1/benchmark/stats?sport=`
 
 The latest `benchmark_site_stats` snapshot for a sport. `sport` accepts `all` (the default, and a real stored value) plus the six slugs.
