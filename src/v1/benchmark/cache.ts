@@ -3,9 +3,11 @@
  *
  * **This is the first read cache in this service, and it is deliberate.** Every
  * other endpoint here answers from one or two PostgREST round trips and needs
- * nothing; these three fan out across several relations and then run a
- * projection over every score row in the window, and `readRateLimit` admits 600
- * requests a minute from a single IP against one Basic dyno.
+ * nothing; the benchmark reads fan out across several relations and some of them
+ * project over every score row in the window, and `readRateLimit` admits 600
+ * requests a minute from a single IP against one Basic dyno. Every benchmark read
+ * goes through the memo, including the keyed ones, because the budget is what
+ * bounds them rather than the fan-out of any single endpoint.
  *
  * ## Single-flight is the part that matters
  *
@@ -192,7 +194,7 @@ export async function serveCachedBenchmark(
  * pass on the first fix.
  */
 export function benchmarkCacheKey(
-  endpoint: 'standings' | 'picks' | 'stats' | 'pick',
+  endpoint: 'standings' | 'picks' | 'stats' | 'pick' | 'ledger',
   req: Request,
   config: {
     network: string;
@@ -216,6 +218,24 @@ export function benchmarkCacheKey(
     q('sport'),
     q('date'),
     q('scoringPolicyVersion'),
+    // `/benchmark/ledger`'s whole identity is here. Omitting these would give
+    // every ledger request one shared entry — one filter's page served for
+    // another filter's request, and one page of a keyset walk served for the
+    // next. Same collision class as the path-param one below, arriving through
+    // the params this key already reads; the difference is only that these
+    // names did not exist when the list was written.
+    //
+    // Adding a field can only FRAGMENT a key, never merge two inputs, so the
+    // four endpoints that do not read these are unaffected beyond a longer
+    // string. That asymmetry is why enumerating generously is safe and
+    // enumerating narrowly is not.
+    q('participantId'),
+    q('gameId'),
+    q('slateDate'),
+    q('market'),
+    q('limit'),
+    q('after'),
+    q('count'),
     // PATH params, sorted so the encoding is stable.
     //
     // `/benchmark/pick/:participantId/:gameId/:market` carries its whole

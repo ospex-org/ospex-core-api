@@ -92,17 +92,83 @@ export function applyFilters(rows: readonly unknown[], params: URLSearchParams):
     if (op === 'eq') {
       out = out.filter((r) => String(read(r)) === value);
     } else if (op === 'gte') {
-      out = out.filter((r) => String(read(r)) >= value);
+      out = out.filter((r) => compare(read(r), value) >= 0);
     } else if (op === 'lte') {
-      out = out.filter((r) => String(read(r)) <= value);
+      out = out.filter((r) => compare(read(r), value) <= 0);
     } else if (op === 'gt') {
-      out = out.filter((r) => String(read(r)) > value);
+      out = out.filter((r) => compare(read(r), value) > 0);
+    } else if (op === 'lt') {
+      out = out.filter((r) => compare(read(r), value) < 0);
     } else if (op === 'in') {
       const set = new Set(value.replace(/^\(|\)$/g, '').split(','));
       out = out.filter((r) => set.has(String(read(r))));
     } else if (op === 'is') {
       out = out.filter((r) => (value === 'null' ? read(r) === null : String(read(r)) === value));
     }
+  }
+  return out;
+}
+
+/**
+ * Order an ordered comparison the way Postgres would, not the way `String` does.
+ *
+ * The four ordered operators used to string-compare, which is right for the ISO
+ * timestamps and `YYYY-MM-DD` dates these tests mostly filter on and WRONG for a
+ * numeric column: `String(950) < String(1000)` is false, because `'9' > '1'`. A
+ * keyset cursor on an integer id is exactly that case, so a fake that
+ * string-compared would have dropped the wrong half of every page and the paging
+ * tests would have been measuring the fake.
+ *
+ * Numeric only when BOTH sides are finite numbers, so an ISO timestamp — which
+ * `Number()` rejects — still compares lexicographically, which for ISO-8601 is
+ * the same as chronologically.
+ */
+function compare(rowValue: unknown, filterValue: string): number {
+  const a = typeof rowValue === 'number' ? rowValue : Number(rowValue);
+  const b = Number(filterValue);
+  if (Number.isFinite(a) && Number.isFinite(b) && String(rowValue).trim() !== '') {
+    return a === b ? 0 : a < b ? -1 : 1;
+  }
+  const sa = String(rowValue);
+  return sa === filterValue ? 0 : sa < filterValue ? -1 : 1;
+}
+
+/**
+ * Apply `order` and `limit` — the TRANSFORMS, which `applyFilters` deliberately
+ * skips.
+ *
+ * Opt-in and separate, because it changes what a fixture returns and the tests
+ * written before it do not expect it. Where it matters, it matters a lot: a
+ * handler that pages by asking for `limit + 1` and serving `limit` cannot be
+ * tested against a fake that returns everything regardless — the extra-row probe
+ * would appear to work no matter what number the handler actually requested, and
+ * a build asking for plain `limit` would pass. Honouring both here is what makes
+ * "there is another page" a real assertion instead of a property of the fixture
+ * size.
+ *
+ * `order` is applied before `limit`, last key first, on a stable sort — so a
+ * multi-key `order` composes the way PostgREST's does.
+ */
+export function applyPage(rows: readonly unknown[], params: URLSearchParams): unknown[] {
+  let out = [...rows];
+  const order = params.get('order');
+  if (order !== null && order !== '') {
+    for (const clause of order.split(',').reverse()) {
+      const [column, ...rest] = clause.split('.');
+      if (column === undefined || column === '') continue;
+      const descending = rest.includes('desc');
+      out.sort((l, r) => {
+        const lv = (l as Record<string, unknown>)[column];
+        const rv = (r as Record<string, unknown>)[column];
+        const c = compare(lv, String(rv));
+        return descending ? -c : c;
+      });
+    }
+  }
+  const limit = params.get('limit');
+  if (limit !== null) {
+    const n = Number(limit);
+    if (Number.isFinite(n) && n >= 0) out = out.slice(0, n);
   }
   return out;
 }

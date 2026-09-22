@@ -55,7 +55,7 @@ import {
   respondProjectionFault,
   respondToQueryError,
 } from './source.js';
-import { parseSportParam, resolveWindow, type ResolvedWindow } from './window.js';
+import { parseSlateDate, parseSportParam, resolveWindow, type ResolvedWindow } from './window.js';
 import {
   METHODOLOGY,
   featuredOf,
@@ -379,15 +379,18 @@ export async function getBenchmarkStandingsHandler(req: Request, res: Response):
 
   let slateDate: string | undefined;
   if (req.query.date !== undefined) {
-    const raw = String(req.query.date);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    // Calendar validity, not just shape: `date=2026-02-30` was shape-valid, reached
+    // Postgres as a 22008 and answered 500 on the deployed service — measured
+    // 2026-09-22. See `parseSlateDate`.
+    const parsed = parseSlateDate(req.query.date);
+    if (parsed === 'invalid') {
       res.status(400).json({
-        error: 'date must be a slate date in YYYY-MM-DD form.',
+        error: 'date must be a real calendar date in YYYY-MM-DD form.',
         code: 'INVALID_PARAM',
       } satisfies ApiError);
       return;
     }
-    slateDate = raw;
+    slateDate = parsed;
   }
 
   const requestedVersion =

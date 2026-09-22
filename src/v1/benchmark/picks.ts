@@ -59,7 +59,7 @@ import {
   respondProjectionFault,
   respondToQueryError,
 } from './source.js';
-import { parseSportParam, resolveWindow, type BenchmarkGame } from './window.js';
+import { parseSlateDate, parseSportParam, resolveWindow, type BenchmarkGame } from './window.js';
 import { collectExecuted, type BenchmarkFill } from './executedFetch.js';
 
 /**
@@ -232,6 +232,38 @@ export function spreadLines(homeLine: number | null): {
 }
 
 /**
+ * The whole `ospex-core-api#71` convention for ONE stored number, in one place.
+ *
+ * A spread's stored value is the HOME handicap, so this service serves the
+ * side-labelled pair and a null bare `line`; every other market has no sides and
+ * serves the number as `line` with both sides null.
+ *
+ * ## Why this is a function and not a two-line expression at each call site
+ *
+ * It was the expression, twice, twelve lines apart inside one response literal —
+ * and review caught the second one still serving a raw HOME number after the
+ * first had been fixed. The pick's line was labelled and its CLOSING line was
+ * not, so an away pick displayed `+1.5` beside a close of `-2.5` when the away
+ * close is `+2.5`. That is `3d-sibling` in
+ * `.claude/rules/verification-discipline.md`: a convention applied at one site
+ * and not at its sibling, at a scale too small to look like two sites.
+ *
+ * All four sites that serve a spread number now call this: the list endpoint's
+ * pick line, and the detail endpoint's pick line and closing line, and the
+ * ledger's two. Adding another is a call rather than a re-derivation, which is
+ * the property worth having — not a promise that none will ever be added
+ * elsewhere, which no comment can keep.
+ */
+export function sidedLine(
+  market: string,
+  stored: number | null,
+): { line: number | null; awayLine: number | null; homeLine: number | null } {
+  if (market !== 'spread') return { line: stored, awayLine: null, homeLine: null };
+  const { awayLine, homeLine } = spreadLines(stored);
+  return { line: null, awayLine, homeLine };
+}
+
+/**
  * A human-readable selection, composed once.
  *
  * `selection` is a full team name on `moneyline` and `spread` and a lowercase
@@ -315,15 +347,18 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
 
   let slateDate: string | undefined;
   if (req.query.date !== undefined) {
-    const raw = String(req.query.date);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    // Calendar validity, not just shape: `date=2026-02-30` was shape-valid, reached
+    // Postgres as a 22008 and answered 500 on the deployed service — measured
+    // 2026-09-22. See `parseSlateDate`.
+    const parsed = parseSlateDate(req.query.date);
+    if (parsed === 'invalid') {
       res.status(400).json({
-        error: 'date must be a slate date in YYYY-MM-DD form.',
+        error: 'date must be a real calendar date in YYYY-MM-DD form.',
         code: 'INVALID_PARAM',
       } satisfies ApiError);
       return;
     }
-    slateDate = raw;
+    slateDate = parsed;
   }
 
   const config = loadConfig();
@@ -547,7 +582,10 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
     const side = resolveSelectionSide(reveal.selection, away, home);
     // Normalised ONCE, here. Everything downstream reads this pair rather than
     // re-deriving a sign from the stored HOME value.
-    const spread = d.market === 'spread' ? spreadLines(reveal.line) : { awayLine: null, homeLine: null };
+    // Through the shared helper, like the other two endpoints. This was the THIRD
+    // site deriving the pair independently — in the file that defines the helper,
+    // which is what made the docblock's "no second site to forget" false until now.
+    const pickLine = sidedLine(d.market, reveal.line);
     const pick: WirePick = {
       decisionId: d.id,
       participantId: d.participant_id,
@@ -557,9 +595,9 @@ export async function getBenchmarkPicksHandler(req: Request, res: Response): Pro
       selection: reveal.selection,
       selectionLabel: selectionLabel(d.market, reveal.selection, reveal.line, american, side),
       // A spread's number is served as the labelled pair, never here.
-      line: d.market === 'spread' ? null : reveal.line,
-      awayLine: spread.awayLine,
-      homeLine: spread.homeLine,
+      line: pickLine.line,
+      awayLine: pickLine.awayLine,
+      homeLine: pickLine.homeLine,
       observedDecimal: reveal.observed_decimal,
       priceAmerican: american,
       confidence: reveal.confidence,

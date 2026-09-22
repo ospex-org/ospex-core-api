@@ -641,6 +641,42 @@ describe('picks — the featured pick', () => {
   });
 });
 
+/**
+ * Shape is not validity, and this endpoint was answering 500 on the difference.
+ *
+ * Measured against the deployed service on 2026-09-22: `?date=2026-02-30`,
+ * `?date=2026-13-01` and `?date=0000-01-01` each returned
+ * `500 INTERNAL_ERROR`, because the old check tested only
+ * `/^\d{4}-\d{2}-\d{2}$/`, the string reached Postgres, and `22008` is not one of
+ * the schema-drift codes `source.ts` classifies. A malformed request is a 400.
+ * Now routed through the shared `parseSlateDate`, whose own matrix covers the
+ * calendar; these cases pin that this handler consults it.
+ */
+describe('picks — the date is a calendar date, not just a shape', () => {
+  it.each([
+    ['February 30th', '2026-02-30'],
+    ['a leap day in a non-leap year', '2026-02-29'],
+    ['the 31st of a 30-day month', '2026-04-31'],
+    ['month 13', '2026-13-01'],
+    ['day zero', '2026-01-00'],
+    ['year zero', '0000-01-01'],
+  ])('refuses %s with 400 rather than reaching the database', async (_why, date) => {
+    const { status, body, fake } = await call('picks', {}, { date });
+    expect(status).toBe(400);
+    expect(body.code).toBe('INVALID_PARAM');
+    // The refusal is before the read, so a malformed date costs nothing.
+    expect(fake.requests).toHaveLength(0);
+  });
+
+  it.each([
+    ['an ordinary date', '2026-08-15'],
+    ['a real leap day', '2024-02-29'],
+  ])('still accepts %s — the control the refusals need', async (_why, date) => {
+    const { status } = await call('picks', {}, { date });
+    expect(status).toBe(200);
+  });
+});
+
 describe('picks — the publication gate', () => {
   it('serves an empty slate and issues no query when unset', async () => {
     const { body, fake } = await call('picks', {}, {}, { benchmarkPublicMinSlateDate: undefined });

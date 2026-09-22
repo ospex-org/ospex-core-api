@@ -202,6 +202,60 @@ describe('the key', () => {
     expect(a).not.toBe(b);
   });
 
+  /**
+   * `/benchmark/ledger`'s whole identity is in QUERY params, and the key read
+   * only `sport`, `date` and `scoringPolicyVersion` before it existed.
+   *
+   * Without the seven new names, every ledger request shares one entry: one
+   * filter's page served for another filter's request, and — worse, because it
+   * corrupts a walk rather than one answer — page 2 of a keyset served as page 1.
+   * Each case moves exactly ONE param, so a key that dropped any single name
+   * fails on that case alone rather than being masked by its neighbours.
+   */
+  it('distinguishes ledger reads that differ in a single query param', () => {
+    const base = {
+      participantId: 'a', gameId: 'g', slateDate: '2026-08-27',
+      market: 'moneyline', sport: 'mlb', limit: '25', after: '4374', count: 'exact',
+    };
+    const key = (q: Record<string, string>): string => benchmarkCacheKey('ledger', req(q), config);
+    const baseKey = key(base);
+    const variants = [
+      key({ ...base, participantId: 'b' }),
+      key({ ...base, gameId: 'h' }),
+      key({ ...base, slateDate: '2026-08-28' }),
+      key({ ...base, market: 'spread' }),
+      key({ ...base, sport: 'nfl' }),
+      key({ ...base, limit: '26' }),
+      key({ ...base, after: '4373' }),
+      key({ ...base, count: 'none' }),
+    ];
+    for (const v of variants) expect(v).not.toBe(baseKey);
+    expect(new Set([baseKey, ...variants]).size).toBe(variants.length + 1);
+    expect(key({ ...base })).toBe(baseKey);
+  });
+
+  /**
+   * The cursor is the param whose collision does the most damage, so it gets its
+   * own case: two successive pages of one walk differ ONLY in `after`, and if
+   * they shared an entry the second page would serve the first page's rows and a
+   * caller following `nextAfter` would loop on the same rows forever.
+   */
+  it('distinguishes two pages of one keyset walk', () => {
+    const page = (after?: string): string =>
+      benchmarkCacheKey('ledger', req(after === undefined ? { participantId: 'a' } : { participantId: 'a', after }), config);
+    expect(page()).not.toBe(page('4374'));
+    expect(page('4374')).not.toBe(page('4001'));
+  });
+
+  /** The ledger endpoint is its own namespace, not a variant of the others. */
+  it('does not collide with another endpoint on the same params', () => {
+    const q = { sport: 'mlb', participantId: 'a' };
+    const keys = (['standings', 'picks', 'stats', 'pick', 'ledger'] as const).map((e) =>
+      benchmarkCacheKey(e, req(q), config),
+    );
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
   /** A param the handlers ignore must not fragment the cache. */
   it('ignores query params nothing reads', () => {
     expect(benchmarkCacheKey('standings', req({ cacheBust: '1' }), config)).toBe(

@@ -81,7 +81,7 @@ import {
   decimalToAmerican,
   resolveSelectionSide,
   selectionLabel,
-  spreadLines,
+  sidedLine,
 } from './picks.js';
 
 /** The markets a pick can be on. Rejected early so a typo is a 400, not a 200 with nothing. */
@@ -182,7 +182,13 @@ const LEDGER_SELECT = [
  * rendering of nothing, and a zeroed radar is a shape — and otherwise each axis
  * carries its own value or its own null.
  */
-function axesOf(row: LedgerRow): Record<string, number | null> | null {
+export function axesOf(row: {
+  axis_valuation: number | null;
+  axis_trend: number | null;
+  axis_consensus: number | null;
+  axis_news: number | null;
+  axis_softness: number | null;
+}): Record<string, number | null> | null {
   const axes = {
     valuation: row.axis_valuation,
     trend: row.axis_trend,
@@ -222,16 +228,11 @@ function toPickBody(row: LedgerRow, writeup: string | null, sealedAt: string | n
   const away = { name: row.away_team_name, abbreviation: row.away_team_abbreviation };
   const home = { name: row.home_team_name, abbreviation: row.home_team_abbreviation };
   const side = resolveSelectionSide(row.selection, away, home);
-  // Same convention the picks endpoint serves: a spread carries the side-labelled
-  // pair and a null `line`, because the stored value is the HOME handicap.
-  const spread = row.market === 'spread' ? spreadLines(row.line) : { awayLine: null, homeLine: null };
-  // The CLOSE is a spread too, and it is stored the same way: the HOME handicap.
-  // Serving it as a bare `line` reintroduced exactly the ospex-core-api#71 defect
-  // one object over from the fix for it — caught in review. Derived separately
-  // from the pick's own pair, because the two numbers differ.
-  const closingSpread = row.market === 'spread'
-    ? spreadLines(row.closing_line)
-    : { awayLine: null, homeLine: null };
+  // Both numbers go through the SAME helper. They used to be two copies of the
+  // same expression twelve lines apart, and review caught the second still
+  // serving a raw HOME handicap after the first was fixed — see `sidedLine`.
+  const pickLine = sidedLine(row.market, row.line);
+  const closingLine = sidedLine(row.market, row.closing_line);
 
   return {
     participantId: row.participant_id,
@@ -253,15 +254,15 @@ function toPickBody(row: LedgerRow, writeup: string | null, sealedAt: string | n
     selection: row.selection,
     selectionLabel: selectionLabel(row.market, row.selection, row.line, american, side),
     selectionSide: side,
-    line: row.market === 'spread' ? null : row.line,
-    awayLine: spread.awayLine,
-    homeLine: spread.homeLine,
+    line: pickLine.line,
+    awayLine: pickLine.awayLine,
+    homeLine: pickLine.homeLine,
     priceDecimal: row.pick_price_decimal,
     priceAmerican: american,
     closing: {
-      line: row.market === 'spread' ? null : row.closing_line,
-      awayLine: closingSpread.awayLine,
-      homeLine: closingSpread.homeLine,
+      line: closingLine.line,
+      awayLine: closingLine.awayLine,
+      homeLine: closingLine.homeLine,
       priceDecimal: row.closing_price_decimal,
       priceAmerican: decimalToAmerican(row.closing_price_decimal),
       capturedAt: row.closing_captured_at,
