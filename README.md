@@ -619,6 +619,36 @@ All three answer `200`. `pick: null` rather than an object of nulls, so there is
 
 Market-open timing (`marketOpen*` on the underlying view) is **not served here**.
 
+#### `GET /v1/benchmark/ledger?participantId=&gameId=&slateDate=&market=&sport=&limit=&after=&count=`
+
+A keyset-paged walk of the published pick ledger along one axis — one arm's whole history, one game across arms, one slate day. `/benchmark/picks` answers "what did the cohort pick on this date" and `/benchmark/pick/...` answers "everything about this one pick"; this is the list a research or audit consumer walks.
+
+**A filter is required.** At least one **anchor** — `participantId`, `gameId` or `slateDate` — or the request is a `400 FILTER_REQUIRED` before any read. `sport` and `market` narrow an anchored read and **do not qualify on their own**.
+
+That is a measurement, not a house style. The ledger is a view that ranks over the whole live-scoped set before any `LIMIT` applies, so an unanchored read cannot be bounded by the page size. Measured against production on 2026-09-21, with the publication gate pushed down and `limit=25`:
+
+| filter | page | `count=exact` | rows |
+|---|---|---|---|
+| `participantId` | 0.34s | 0.48s | 1095 |
+| `gameId` | 0.31s | 0.44s | 20 |
+| `slateDate` (one day) | 0.94s | 1.06s | 137 |
+| `participantId` + `market` | 0.32s | 0.41s | 395 |
+| `gameId` + `market` | 0.31s | 0.39s | 8 |
+| `sport` alone | **statement timeout** | **statement timeout** | — |
+| the publication gate alone | **statement timeout** | — | — |
+
+Two things follow. The gate is **not** a filter — `slate_date >= …` on its own is a timeout, so an endpoint leaning on it to bound a bare request would fail every call. And what qualifies is **selectivity, not the column**: `market` alone measured a comfortable 0.59s and is still refused, because a third of one sport's rows is a property of today's data rather than a bound — while `sport` alone times out for the mirror-image reason, every row being `mlb`. Admitting a filter because it is fast on the current distribution is how an endpoint starts failing a year later with nothing changed but row count.
+
+**Ordering is `source_decision_id` descending**, and "newest reveal first" is not available: migration 086 keeps `revealed_at` in the ledger's inner subqueries and never projects it, so no consumer of the view can order by it. `as_of` ties heavily — picks land on exact 15-minute boundaries — so it cannot key a cursor either. `source_decision_id` is the monotone proxy, measured unique and strictly decreasing across all 1,095 rows of the largest participant scope. A page carrying one twice is refused as a `503 NOT_READY` rather than served, because a strict cursor over a non-unique key **skips** rows silently.
+
+**Paging.** `limit` is 1–100, default 25. Follow `page.nextAfter` back as `after`; it is null on the last page, so a caller that follows it terminates. The endpoint requests one row more than it serves to decide `page.hasMore`, so paging is correct without asking for a count.
+
+**`count` is opt-in and `exact` is the only accepted value.** Omit it and `count.exact` is null. `Prefer: count=planned` and `count=estimated` are deliberately not offered: measured on a scope whose true total is 1095, the server accepts them and answers 1 and 1001 respectively — and `1` reads as a small result rather than as an error. The count is its own read, carries the same filters as the page and deliberately **not** the cursor, so the total describes the filtered population rather than what is left below the cursor and does not change as the caller pages.
+
+The count is opt-in because it is the part of the request that grows: a `participantId` scope is bounded by days of history rather than by a constant — 1,095 rows and about 27 a day — while the default page is one keyed read regardless of how much history exists.
+
+Rows carry the same distinctions and the same conventions as the detail endpoint — side-labelled spreads on both the pick and the close, never-fabricated `axes`, tri-state `heldOutOfPrimary`, a real `0` net distinct from a pending null. The write-up prose, digests and seal/reveal timeline are **not** in the list; fetch the pick for those.
+
 #### `GET /v1/benchmark/stats?sport=`
 
 The latest `benchmark_site_stats` snapshot for a sport. `sport` accepts `all` (the default, and a real stored value) plus the six slugs.

@@ -6,7 +6,10 @@
  * the reason `src/lib/tables.ts` gives about `contests_effective`: a name
  * asserted in more than one place drifts, and the drift is silent. These
  * relations live in the protocol indexer's schema and are created by migrations
- * 073–079, so they can be absent while Postgres itself is perfectly healthy —
+ * 073-086 — the same range the NOT_READY hint below names, which is the point:
+ * this docblock said 073-079 while the hint said 073-086, and a reader had no
+ * way to tell which was current. So they can be absent while Postgres itself is
+ * perfectly healthy —
  * a deploy-order hazard this service must report as a 503 on the affected
  * endpoint rather than as a 500.
  *

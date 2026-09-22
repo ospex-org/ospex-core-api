@@ -45,6 +45,7 @@ import { getScheduleHandler } from './schedule.js';
 import { getBenchmarkStandingsHandler } from './benchmark/standings.js';
 import { getBenchmarkPicksHandler } from './benchmark/picks.js';
 import { getBenchmarkPickHandler } from './benchmark/pick.js';
+import { getBenchmarkLedgerHandler } from './benchmark/ledger.js';
 import { getBenchmarkStatsHandler } from './benchmark/stats.js';
 import { benchmarkCacheKey, serveCachedBenchmark } from './benchmark/cache.js';
 import { loadConfig } from '../lib/env.js';
@@ -221,6 +222,23 @@ v1Router.get(
       req,
       res,
       getBenchmarkPickHandler,
+    ),
+  ),
+);
+// A filtered, keyset-paged walk of the published ledger, with an opt-in exact
+// count. A filter is REQUIRED rather than merely encouraged: the view ranks over
+// the whole live set before any limit applies, so an unanchored read is a 3.2s
+// statement timeout, measured. See `benchmark/ledger.ts` for the filter table
+// and for why a fast-today filter like `market` is still refused on its own.
+v1Router.get(
+  '/benchmark/ledger',
+  benchmarkRateLimit,
+  asyncHandler((req, res) =>
+    serveCachedBenchmark(
+      benchmarkCacheKey('ledger', req, loadConfig()),
+      req,
+      res,
+      getBenchmarkLedgerHandler,
     ),
   ),
 );

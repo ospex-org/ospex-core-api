@@ -232,6 +232,36 @@ export function spreadLines(homeLine: number | null): {
 }
 
 /**
+ * The whole `ospex-core-api#71` convention for ONE stored number, in one place.
+ *
+ * A spread's stored value is the HOME handicap, so this service serves the
+ * side-labelled pair and a null bare `line`; every other market has no sides and
+ * serves the number as `line` with both sides null.
+ *
+ * ## Why this is a function and not a two-line expression at each call site
+ *
+ * It was the expression, twice, twelve lines apart inside one response literal —
+ * and review caught the second one still serving a raw HOME number after the
+ * first had been fixed. The pick's line was labelled and its CLOSING line was
+ * not, so an away pick displayed `+1.5` beside a close of `-2.5` when the away
+ * close is `+2.5`. That is `3d-sibling` in
+ * `.claude/rules/verification-discipline.md`: a convention applied at one site
+ * and not at its sibling, at a scale too small to look like two sites.
+ *
+ * Every number on this surface that could be a spread goes through here, so
+ * there is no second site to forget. Adding a new one is a call, not a
+ * re-derivation.
+ */
+export function sidedLine(
+  market: string,
+  stored: number | null,
+): { line: number | null; awayLine: number | null; homeLine: number | null } {
+  if (market !== 'spread') return { line: stored, awayLine: null, homeLine: null };
+  const { awayLine, homeLine } = spreadLines(stored);
+  return { line: null, awayLine, homeLine };
+}
+
+/**
  * A human-readable selection, composed once.
  *
  * `selection` is a full team name on `moneyline` and `spread` and a lowercase
