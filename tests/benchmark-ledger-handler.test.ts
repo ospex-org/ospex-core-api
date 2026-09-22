@@ -182,7 +182,7 @@ async function call(
     }),
   }));
   vi.doMock('../src/lib/logger.js', () => ({
-    logger: { error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+    logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
     formatError: String,
   }));
 

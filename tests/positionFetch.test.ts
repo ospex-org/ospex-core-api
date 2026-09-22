@@ -21,10 +21,31 @@ const envMock = vi.hoisted(() => ({
   loadConfig: vi.fn(() => ({ network: 'polygon', chainId: 137 })),
 }));
 
+/**
+ * `#79`'s chain term. Mocked at the MODULE boundary rather than at the RPC, so
+ * these tests drive the real call site in `fetchCategorizedPositions` while the
+ * `eth_call` itself is covered by `tests/voidCooldown.test.ts`. Default `null` =
+ * unconfigured, which is the pre-#79 answer and what every test written before
+ * this expects.
+ */
+const cooldownMock = vi.hoisted(() => ({
+  readVoidCooldownSeconds: vi.fn<(o?: { timeoutMs?: number }) => Promise<number | null>>(
+    async () => null,
+  ),
+  resetVoidCooldownCacheForTests: vi.fn(),
+  // The module's default budget. Present because the caller IMPORTS it to size the
+  // read against the traversal's remaining deadline, and vitest refuses a named
+  // import a mock does not provide.
+  DEFAULT_COOLDOWN_TIMEOUT_MS: 2_500,
+}));
+
 vi.mock('../src/lib/supabase.js', () => supabaseMock);
 vi.mock('../src/lib/env.js', () => envMock);
+vi.mock('../src/lib/voidCooldown.js', () => cooldownMock);
 
-const { fetchCategorizedPositions } = await import('../src/v1/utils/positionFetch.js');
+const { fetchCategorizedPositions, isSettleableOpenContest } = await import(
+  '../src/v1/utils/positionFetch.js'
+);
 
 interface Tables {
   positions: unknown[];
@@ -47,6 +68,10 @@ function makeSupabase(tables: Tables): { from: (table: keyof Tables) => unknown 
         in: () => builder,
         order: () => builder,
         limit: () => builder,
+        // Completed for `#79`: the `complete: true` path attaches the traversal's
+        // abort signal to every read, and a double missing the method makes that
+        // path untestable rather than merely unasserted.
+        abortSignal: () => builder,
         then: (resolve: (v: { data: unknown[]; error: null }) => void) =>
           resolve({ data, error: null }),
       };
@@ -544,6 +569,10 @@ describe('fetchCategorizedPositions — mixed and edge cases', () => {
       pendingSettle: [],
       claimable: [],
       hitCap: false,
+      // `#79`: no `SPECULATION_MODULE_ADDRESS` in this fixture's config, so the
+      // cooldown term is unavailable and the answer says so rather than leaving a
+      // caller to infer it from a short `settlementCandidates` list.
+      voidCooldownSeconds: null,
       derivedStatuses: [],
       settlementCandidates: [],
       settledLost: [],
@@ -719,6 +748,7 @@ describe('fetchCategorizedPositions — settlement work across the contest_statu
       claimed?: boolean;
       risk?: string;
       scores?: boolean;
+      startTime?: string | null;
     } = {},
   ) {
     const withScores = overrides.scores !== false;
@@ -749,6 +779,7 @@ describe('fetchCategorizedPositions — settlement work across the contest_statu
           contest_status: contestStatus,
           away_score: withScores ? 110 : null,
           home_score: withScores ? 105 : null,
+          start_time: overrides.startTime ?? null,
         },
       ],
     });
@@ -790,8 +821,12 @@ describe('fetchCategorizedPositions — settlement work across the contest_statu
     expectedSecondBucket: 'active' | 'pendingSettle';
   }> = [
     { status: 'unverified', isSettlementCandidate: false, expectedSecondBucket: 'active' },
-    // Known-incomplete, see above and #79: false is today's behaviour, not the
-    // chain's answer. When #79 lands this row becomes cooldown-dependent.
+    // `#79` HAS LANDED, so this row now answers false for a DIFFERENT reason than
+    // it used to, and the difference matters: `verified` is cooldown-dependent, and
+    // this fixture supplies neither a `start_time` nor a cooldown term, so the
+    // prediction refuses itself. The cooldown-present cases are in the `#79` block
+    // below; leaving this one unexplained would be a test passing for a new reason
+    // under an old comment.
     { status: 'verified', isSettlementCandidate: false, expectedSecondBucket: 'active' },
     { status: 'scored', isSettlementCandidate: true, expectedSecondBucket: 'pendingSettle' },
     { status: 'voided', isSettlementCandidate: true, expectedSecondBucket: 'active' },
@@ -909,5 +944,356 @@ describe('fetchCategorizedPositions — settlement work across the contest_statu
       { speculationId: '1', result: 'void', estimatedPayoutWei6: '100000000' },
     ]);
     expect(result.active).toEqual([]);
+  });
+});
+
+/**
+ * `#79` — an open speculation on a `verified` contest whose void cooldown has
+ * elapsed is settlement work, and `settleSpeculation` voids the contest on the way
+ * through. `ContestStatus.Voided` has one write site reachable only from that
+ * branch, so `voided` is a CONSEQUENCE of settlement: the pre-#79 set caught a
+ * stalled contest's SIBLING speculations and never the first one, which is the
+ * settlement that starts the refund.
+ *
+ * ## Every case here sits where a WRONG TERM disagrees with a right one
+ *
+ * The predicate has three terms — the status, the frozen start time, and the
+ * deployment's cooldown — and a build that drops any one of them is a different
+ * wrong answer:
+ *
+ *  - a build ignoring the cooldown admits every `verified` contest;
+ *  - a build ignoring `start_time` does the same;
+ *  - a build using `>` where the chain uses `>=` refuses the exact boundary;
+ *  - a build reading `contests_effective.effective_start_time` reads past-cooldown
+ *    EARLY, because that view is a bounded `LEAST` over `games.match_time` and
+ *    provider snapshots and is therefore `<=` the chain's frozen value.
+ *
+ * So the boundary is probed at the microsecond, and each missing term has its own
+ * refusal case. Wrong in the "yes" direction advertises work whose transaction
+ * reverts `SpeculationModule__ContestNotFinalized`; wrong in the "no" direction
+ * reproduces the pre-#79 answer. Only one of those is safe, and every refusal here
+ * is in that direction.
+ */
+describe('isSettleableOpenContest — the #79 cooldown prediction', () => {
+  const START = '2026-08-01T12:00:00.000000Z';
+  const SEVEN_DAYS = 604_800;
+  /** The exact instant the chain would accept: `start_time + i_voidCooldown`. */
+  const AT = 1_785_585_600_000_000n + BigInt(SEVEN_DAYS) * 1_000_000n;
+  const terms = (nowMicros: bigint): { seconds: number; nowMicros: bigint } => ({
+    seconds: SEVEN_DAYS,
+    nowMicros,
+  });
+
+  it('agrees with the fixture about what instant START is', () => {
+    // The boundary arithmetic above is a LITERAL, not derived from the parser the
+    // code uses, so this pins the two against each other. Without it a broken
+    // parser would move both sides together and every case below would still pass.
+    expect(Date.parse(START) * 1000).toBe(1_785_585_600_000_000);
+  });
+
+  it.each([
+    ['scored', 'a mirrored fact, so no clock is consulted'],
+    ['voided', 'already voided — settlement assigns void and refunds both sides'],
+  ])('admits %s with NO cooldown term at all (%s)', (status) => {
+    expect(
+      isSettleableOpenContest({ contest_status: status as 'scored', start_time: null }, null),
+    ).toBe(true);
+  });
+
+  it('never admits unverified, cooldown or not', () => {
+    // A speculation cannot be created on an unverified contest, so this is a
+    // defensive control: false even with every other term present.
+    expect(
+      isSettleableOpenContest({ contest_status: 'unverified', start_time: START }, terms(AT)),
+    ).toBe(false);
+  });
+
+  it('admits verified at EXACTLY start_time + cooldown', () => {
+    // `block.timestamp >= contestStartTime + i_voidCooldown` — inclusive, so the
+    // boundary instant itself is settleable. A `>` build fails only here.
+    expect(
+      isSettleableOpenContest({ contest_status: 'verified', start_time: START }, terms(AT)),
+    ).toBe(true);
+  });
+
+  it('refuses verified ONE MICROSECOND before the boundary', () => {
+    expect(
+      isSettleableOpenContest({ contest_status: 'verified', start_time: START }, terms(AT - 1n)),
+    ).toBe(false);
+  });
+
+  it('admits verified one microsecond after the boundary', () => {
+    expect(
+      isSettleableOpenContest({ contest_status: 'verified', start_time: START }, terms(AT + 1n)),
+    ).toBe(true);
+  });
+
+  it('refuses verified when the cooldown term is unavailable, even long past it', () => {
+    // The whole fail-closed rule in one case: a year past the boundary is still
+    // refused when this service could not read the deployment's cooldown.
+    expect(isSettleableOpenContest({ contest_status: 'verified', start_time: START }, null)).toBe(
+      false,
+    );
+  });
+
+  it('refuses verified when start_time is null', () => {
+    // A null means "not verified yet" — the same indexer UPDATE writes this column
+    // and `contest_status` — and `settleSpeculation` reverts `InvalidStartTime` on a
+    // zero start, so refusing agrees with the contract rather than merely hedging.
+    expect(
+      isSettleableOpenContest({ contest_status: 'verified', start_time: null }, terms(AT)),
+    ).toBe(false);
+  });
+
+  it.each([
+    ['2026-02-30T12:00:00Z', 'an impossible day Date.parse silently rolls into March'],
+    ['2026-08-01 12:00:00', 'no zone designator — Date.parse reads the SERVER local time'],
+    ['2026-08-01T12:00:00.1234567Z', 'more precision than timestamptz carries'],
+    ['0', 'a bare digit Date.parse accepts as a year'],
+    ['', 'empty'],
+    ['not a timestamp', 'garbage'],
+  ])('refuses verified on an unparseable start_time: %s (%s)', (startTime) => {
+    // Every one of these is accepted or mangled by `Date.parse`; strict
+    // `parseTimestampMicros` refuses them, which is why the predicate uses it. A
+    // far-future clock means only the parse can produce the false.
+    expect(
+      isSettleableOpenContest({ contest_status: 'verified', start_time: startTime }, terms(AT * 2n)),
+    ).toBe(false);
+  });
+
+  it('reads a non-UTC offset as an instant rather than as a string', () => {
+    // `2026-08-01T08:00:00-04:00` IS `2026-08-01T12:00:00Z`. A string comparison
+    // would order it before the UTC form while being the same instant, and a
+    // zone-blind parse would put it four hours out.
+    const offset = '2026-08-01T08:00:00-04:00';
+    expect(isSettleableOpenContest({ contest_status: 'verified', start_time: offset }, terms(AT))).toBe(true);
+    expect(
+      isSettleableOpenContest({ contest_status: 'verified', start_time: offset }, terms(AT - 1n)),
+    ).toBe(false);
+  });
+});
+
+describe('fetchCategorizedPositions — the #79 prediction, end to end', () => {
+  const START = '2026-08-01T12:00:00+00:00';
+  const SEVEN_DAYS = 604_800;
+  const PAST = new Date('2026-08-20T00:00:00Z');
+  const BEFORE = new Date('2026-08-05T00:00:00Z');
+
+  afterEach(() => {
+    vi.useRealTimers();
+    cooldownMock.readVoidCooldownSeconds.mockResolvedValue(null);
+  });
+
+  function openVerified(startTime: string | null = START): unknown {
+    return makeSupabase({
+      positions: [
+        {
+          // `id` is only read by the COMPLETE keyset walk, which refuses a row
+          // without an immutable identity — so the budget case below needs it.
+          id: 1,
+          speculation_id: 1,
+          user_address: ADDR,
+          position_type: 'upper',
+          risk_amount: '100000000',
+          profit_amount: '90000000',
+          claimed: false,
+          position_created_at: '2026-01-01T00:00:00Z',
+        },
+      ],
+      speculations: [
+        {
+          speculation_id: 1,
+          contest_id: 42,
+          market_type: 'moneyline',
+          line_ticks: 0,
+          speculation_status: 'open',
+          win_side: 'tbd',
+        },
+      ],
+      contests: [
+        {
+          contest_id: 42,
+          away_team: 'Lakers',
+          home_team: 'Celtics',
+          contest_status: 'verified',
+          away_score: null,
+          home_score: null,
+          start_time: startTime,
+        },
+      ],
+    });
+  }
+
+  it('reports a past-cooldown verified contest as settlement work, and keeps the row in active', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(PAST);
+    cooldownMock.readVoidCooldownSeconds.mockResolvedValue(SEVEN_DAYS);
+    supabaseMock.getSupabase.mockReturnValue(openVerified());
+
+    const result = await fetchCategorizedPositions(ADDR);
+
+    expect(result.settlementCandidates.map((p) => p.speculationId)).toEqual(['1']);
+    // Still in `active` too — required, not tidy. A row in NO bucket breaks the MVE
+    // consumer's raw-count-equals-bucket-union check and would vanish from the
+    // own-state snapshot, which builds its positions array from these buckets.
+    expect(result.active).toHaveLength(1);
+    // No payout bucket and no settled loss: settlement here releases funds, it does
+    // not decide this position's outcome. #79 moves no monetary field.
+    expect(result.pendingSettle).toEqual([]);
+    expect(result.claimable).toEqual([]);
+    expect(result.settledLost).toEqual([]);
+    // And the term is served, so a consumer can recompute the boundary itself.
+    expect(result.voidCooldownSeconds).toBe(SEVEN_DAYS);
+  });
+
+  it('does NOT report it before the cooldown has elapsed', async () => {
+    // The discriminating half: same fixture, same configured term, earlier clock. A
+    // build that admitted every `verified` contest passes the case above and fails
+    // only this one.
+    vi.useFakeTimers();
+    vi.setSystemTime(BEFORE);
+    cooldownMock.readVoidCooldownSeconds.mockResolvedValue(SEVEN_DAYS);
+    supabaseMock.getSupabase.mockReturnValue(openVerified());
+
+    const result = await fetchCategorizedPositions(ADDR);
+    expect(result.settlementCandidates).toEqual([]);
+    expect(result.active).toHaveLength(1);
+    expect(result.voidCooldownSeconds).toBe(SEVEN_DAYS);
+  });
+
+  it('serves a null term and refuses the row when the cooldown is unavailable', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(PAST);
+    cooldownMock.readVoidCooldownSeconds.mockResolvedValue(null);
+    supabaseMock.getSupabase.mockReturnValue(openVerified());
+
+    const result = await fetchCategorizedPositions(ADDR);
+    // Exactly the pre-#79 answer, and the served null is what tells a caller that a
+    // short candidate list is a missing term rather than an idle wallet.
+    expect(result.settlementCandidates).toEqual([]);
+    expect(result.active).toHaveLength(1);
+    expect(result.voidCooldownSeconds).toBeNull();
+  });
+
+  it('refuses the row when the contest carries no start_time, term or no term', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(PAST);
+    cooldownMock.readVoidCooldownSeconds.mockResolvedValue(SEVEN_DAYS);
+    supabaseMock.getSupabase.mockReturnValue(openVerified(null));
+
+    const result = await fetchCategorizedPositions(ADDR);
+    expect(result.settlementCandidates).toEqual([]);
+    expect(result.active).toHaveLength(1);
+  });
+
+  it('spends no RPC when no contest is verified', async () => {
+    // The cost gate, asserted on the CALL and not on the answer. Before PR #92's
+    // first blocker this read sat ahead of the empty-wallet return, so EVERY request
+    // paid it - including one that could not have used the term.
+    vi.useFakeTimers();
+    vi.setSystemTime(PAST);
+    cooldownMock.readVoidCooldownSeconds.mockResolvedValue(SEVEN_DAYS);
+    supabaseMock.getSupabase.mockReturnValue(
+      makeSupabase({
+        positions: [{ speculation_id: 1, user_address: ADDR, position_type: 'upper', risk_amount: '1', profit_amount: '1', claimed: false, position_created_at: null }],
+        speculations: [{ speculation_id: 1, contest_id: 42, market_type: 'moneyline', line_ticks: 0, speculation_status: 'open', win_side: 'tbd' }],
+        contests: [{ contest_id: 42, away_team: 'L', home_team: 'C', contest_status: 'scored', away_score: 7, home_score: 6, start_time: START }],
+      }),
+    );
+
+    const result = await fetchCategorizedPositions(ADDR);
+    expect(cooldownMock.readVoidCooldownSeconds).not.toHaveBeenCalled();
+    expect(result.voidCooldownSeconds).toBeNull();
+  });
+
+  it('hands the read a budget bounded by the traversal deadline', async () => {
+    // The other half of that blocker: the RPC must fit INSIDE the complete
+    // traversal's 15,000 ms rather than alongside it, so the budget passed is what
+    // remains, capped at the module's own default. Asserted on the ARGUMENT, because
+    // a read that ignored the budget would still return the right answer here.
+    vi.useFakeTimers();
+    vi.setSystemTime(PAST);
+    cooldownMock.readVoidCooldownSeconds.mockResolvedValue(SEVEN_DAYS);
+    supabaseMock.getSupabase.mockReturnValue(openVerified());
+
+    await fetchCategorizedPositions(ADDR, { complete: true });
+
+    expect(cooldownMock.readVoidCooldownSeconds).toHaveBeenCalledTimes(1);
+    const [arg] = cooldownMock.readVoidCooldownSeconds.mock.calls[0]!;
+    expect(typeof arg?.timeoutMs).toBe('number');
+    expect(arg?.timeoutMs).toBeGreaterThan(0);
+    // Never more than the module default, and never the whole traversal budget.
+    expect(arg?.timeoutMs).toBeLessThanOrEqual(2_500);
+  });
+
+  it('reads start_time from the contests query rather than an effective-start view', async () => {
+    // `#79` forbids `contests_effective.effective_start_time`: it is a bounded
+    // `LEAST` over `games.match_time` and provider snapshots, so it is <= the
+    // chain's frozen value and would read past-cooldown EARLY. This pins that the
+    // column is requested from `contests` — a pushdown a builder mock cannot see, so
+    // it is asserted on the select string itself.
+    vi.useFakeTimers();
+    vi.setSystemTime(PAST);
+    cooldownMock.readVoidCooldownSeconds.mockResolvedValue(SEVEN_DAYS);
+    const selects: string[] = [];
+    supabaseMock.getSupabase.mockReturnValue({
+      from(table: string) {
+        const rows =
+          table === 'contests'
+            ? [
+                {
+                  contest_id: 42,
+                  contest_status: 'verified',
+                  away_team: 'L',
+                  home_team: 'C',
+                  away_score: null,
+                  home_score: null,
+                  start_time: START,
+                },
+              ]
+            : table === 'speculations'
+              ? [
+                  {
+                    speculation_id: 1,
+                    contest_id: 42,
+                    market_type: 'moneyline',
+                    line_ticks: 0,
+                    speculation_status: 'open',
+                    win_side: 'tbd',
+                  },
+                ]
+              : [
+                  {
+                    speculation_id: 1,
+                    user_address: ADDR,
+                    position_type: 'upper',
+                    risk_amount: '100000000',
+                    profit_amount: '90000000',
+                    claimed: false,
+                    position_created_at: null,
+                  },
+                ];
+        const builder: Record<string, unknown> = {
+          select: (s: string) => {
+            if (table === 'contests') selects.push(s);
+            return builder;
+          },
+          eq: () => builder,
+          gt: () => builder,
+          in: () => builder,
+          order: () => builder,
+          limit: () => builder,
+          then: (resolve: (v: { data: unknown[]; error: null }) => void) =>
+            resolve({ data: rows, error: null }),
+        };
+        return builder;
+      },
+    });
+
+    const result = await fetchCategorizedPositions(ADDR);
+    expect(selects).toHaveLength(1);
+    expect(selects[0]).toContain('start_time');
+    expect(selects[0]).not.toContain('effective_start_time');
+    expect(result.settlementCandidates).toHaveLength(1);
   });
 });
