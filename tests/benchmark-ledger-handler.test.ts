@@ -268,6 +268,13 @@ describe('ledger — a filter is required, and the refusal costs nothing', () =>
     ['an unknown market', { participantId: PARTICIPANT, market: 'parlay' }],
     ['a market differing only in case', { participantId: PARTICIPANT, market: 'Spread' }],
     ['a malformed slateDate', { participantId: PARTICIPANT, slateDate: '27-08-2026' }],
+    // Shape-valid, calendar-impossible. Each of these used to pass the regex,
+    // reach Postgres as a 22008 and come back a 500 — on a purely malformed
+    // request. `parseSlateDate`'s own matrix covers the calendar; these three pin
+    // that the HANDLER consults it.
+    ['February 30th', { participantId: PARTICIPANT, slateDate: '2026-02-30' }],
+    ['a leap day in a non-leap year', { participantId: PARTICIPANT, slateDate: '2026-02-29' }],
+    ['year zero', { participantId: PARTICIPANT, slateDate: '0000-01-01' }],
     ['a non-integer limit', { participantId: PARTICIPANT, limit: '25abc' }],
     ['a fractional limit', { participantId: PARTICIPANT, limit: '25.9' }],
     ['a zero limit', { participantId: PARTICIPANT, limit: '0' }],
@@ -357,6 +364,33 @@ describe('ledger — a filter is required, and the refusal costs nothing', () =>
     expect(status).toBe(400);
     expect(body).toMatchObject({ code: 'INVALID_PARAM' });
     expect(String(body.error)).toContain('sport');
+    expect(fake.requests).toHaveLength(0);
+  });
+
+  it('accepts a real leap day — the control the calendar refusals need', async () => {
+    const { status } = await call({ participantId: PARTICIPANT, slateDate: '2024-02-29' });
+    expect(status).toBe(200);
+  });
+
+  /**
+   * The second half of the calendar blocker, and the worse half.
+   *
+   * With the gate unset the handler short-circuits before reading, so an
+   * impossible date used to answer `200` with an empty page — a malformed request
+   * reported as "nothing published", which is the reading a client is least
+   * likely to question. Validation runs BEFORE the gate precisely so this cannot
+   * happen, and this case is what holds that ordering in place: it passes on a
+   * build that validates the calendar and on no other.
+   */
+  it('refuses an impossible date even when the gate is unset, rather than answering 200', async () => {
+    const { status, body, fake } = await call(
+      { participantId: PARTICIPANT, slateDate: '2026-02-30' },
+      undefined,
+      { benchmarkPublicMinSlateDate: undefined },
+    );
+    expect(status).toBe(400);
+    expect(body).toMatchObject({ code: 'INVALID_PARAM' });
+    expect(body.rows).toBeUndefined();
     expect(fake.requests).toHaveLength(0);
   });
 

@@ -109,7 +109,7 @@ import {
   respondToQueryError,
 } from './source.js';
 import { decimalToAmerican, resolveSelectionSide, selectionLabel, sidedLine } from './picks.js';
-import { parseSportParam } from './window.js';
+import { parseSlateDate, parseSportParam } from './window.js';
 import { SPORTS as VALID_SPORTS } from '../../lib/sports.js';
 import { axesOf } from './pick.js';
 
@@ -127,9 +127,6 @@ const ANCHORS = ['participantId', 'gameId', 'slateDate'] as const;
 /** Page size bounds. The default is a card grid's worth; the cap bounds payload. */
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
-
-/** `YYYY-MM-DD`, checked before it reaches PostgREST — a bad date is 22007 otherwise. */
-const SLATE_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 interface LedgerFilters {
   participantId: string | null;
@@ -360,8 +357,12 @@ export async function getBenchmarkLedgerHandler(req: Request, res: Response): Pr
     );
     return;
   }
-  if (filters.slateDate !== null && !SLATE_DATE.test(filters.slateDate)) {
-    bad('Invalid "slateDate". Must be YYYY-MM-DD.', 'INVALID_PARAM');
+  // Shape AND calendar validity, through the shared parser. The regex this
+  // replaced accepted `2026-02-30` and `0000-01-01`, which then reached Postgres
+  // as a 22008 and came back a 500 — and, with the gate unset, a misleading 200
+  // empty page. See `parseSlateDate`.
+  if (filters.slateDate !== null && parseSlateDate(filters.slateDate) === 'invalid') {
+    bad('Invalid "slateDate". Must be a real calendar date in YYYY-MM-DD form.', 'INVALID_PARAM');
     return;
   }
 

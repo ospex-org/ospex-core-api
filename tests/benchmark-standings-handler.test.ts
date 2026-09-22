@@ -1224,6 +1224,31 @@ describe('parameter validation', () => {
   });
 
   /**
+   * Shape is not validity, and this endpoint was answering 500 on the difference.
+   *
+   * Measured against the deployed service on 2026-09-22: `?date=2026-02-30`
+   * returned `500 INTERNAL_ERROR`, because the old check tested only
+   * `/^\d{4}-\d{2}-\d{2}$/`, the string reached Postgres, and `22008` is not one
+   * of the schema-drift codes `source.ts` classifies. A malformed request is a
+   * 400. Now routed through the shared `parseSlateDate`.
+   */
+  it.each([
+    ['February 30th', '2026-02-30'],
+    ['a leap day in a non-leap year', '2026-02-29'],
+    ['month 13', '2026-13-01'],
+    ['year zero', '0000-01-01'],
+  ])('rejects %s with 400 rather than 500', async (_why, date) => {
+    const { status, body } = await run({}, { date });
+    expect(status).toBe(400);
+    expect(body.code).toBe('INVALID_PARAM');
+  });
+
+  it('still accepts a real leap day — the control the four refusals need', async () => {
+    const { status } = await run({}, { date: '2024-02-29' });
+    expect(status).toBe(200);
+  });
+
+  /**
    * `?scoringPolicyVersion=` is malformed, like the empty spelling of the
    * other two params — not "the default". Served as a literal it would be an
    * empty table labelled '', and a 200 that the cache could store.

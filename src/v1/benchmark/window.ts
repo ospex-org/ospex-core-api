@@ -491,6 +491,91 @@ function resolveActiveCohort(
   };
 }
 
+/** The Gregorian rule in full: every 4th year, except centuries, except every 400th. */
+function isLeapYear(year: number): boolean {
+  return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+}
+
+/**
+ * How many days a month has, or `null` if there is no such month.
+ *
+ * Enumerated rather than indexed into a table, and that is a deliberate second
+ * attempt. The first version was `MONTH_LENGTHS[month]` guarded by BOTH an
+ * explicit `month > 12` and a `length === undefined` check for the out-of-range
+ * index — two layers over one question, so neither was individually load-bearing
+ * and a mutant deleting the explicit ceiling SURVIVED the battery: month 13 was
+ * still refused, just by the other layer. That is the `3b-rescue` shape, where
+ * defence in depth makes each layer's own test vacuous.
+ *
+ * Written this way there is exactly one answer per month and no fallback to
+ * shadow it, so every month is separately mutable: drop one from a list and that
+ * month returns `null`, which the caller refuses, which a test sees.
+ */
+function monthLength(year: number, month: number): number | null {
+  if (month === 2) return isLeapYear(year) ? 29 : 28;
+  if (month === 1 || month === 3 || month === 5 || month === 7) return 31;
+  if (month === 8 || month === 10 || month === 12) return 31;
+  if (month === 4 || month === 6 || month === 9 || month === 11) return 30;
+  return null;
+}
+
+/**
+ * `date` / `slateDate` query-param validation, shared by every benchmark endpoint
+ * that takes one.
+ *
+ * ## Shape is not validity, and the gap is a live 500
+ *
+ * Every one of these endpoints used to test `/^\d{4}-\d{2}-\d{2}$/` and pass the
+ * string through. `2026-02-30`, `2026-13-01` and `0000-01-01` are all
+ * shape-valid, so they reached PostgREST, and Postgres refused them with `22008`
+ * — which is not one of the schema-drift codes `source.ts` classifies, so the
+ * answer was `500 INTERNAL_ERROR` on what is purely a malformed request.
+ * Measured against the deployed service on 2026-09-22: `/benchmark/picks` and
+ * `/benchmark/standings` both answer 500 on `date=2026-02-30`, with
+ * `date=2026-08-27` answering 200. So this is a defect in production today,
+ * found on a new endpoint and shared by its two live siblings.
+ *
+ * The second half is worse than the 500. When the publication gate is unset each
+ * handler short-circuits before reading, so the same impossible date answered
+ * `200` with an empty collection — a malformed request reported as "nothing
+ * published", which is the reading a client is least likely to question.
+ *
+ * ## Why this is an explicit calculation and not a `Date` round-trip
+ *
+ * Because `Date` does not refuse an impossible day, it SHIFTS it. Measured:
+ * `new Date('2026-02-30T00:00:00Z')` is 2026-03-02 and
+ * `new Date('2026-02-29T00:00:00Z')` is 2026-03-01 — both perfectly valid
+ * `Date` objects for days that do not exist. So an `isNaN` check catches
+ * `2026-13-01` and silently accepts `2026-02-30`, which is the worse half. A
+ * round-trip comparison does work, and it has to be written exactly right
+ * (zero-padding, four-digit years, and `Date.UTC`'s remapping of years 0-99 into
+ * 1900-1999). A month table plus the Gregorian rule is smaller, total, and has
+ * no remapping to get wrong.
+ *
+ * ## What it accepts, stated as a bound
+ *
+ * Any real calendar date from year 1 onward. Year 0 is refused because there is
+ * no year zero in the era Postgres's `date` uses, so `0000-01-01` is not a date
+ * it can store.
+ *
+ * It deliberately does NOT police how PLAUSIBLE the date is. `1970-01-01` is a
+ * real date, and the honest answer to it is an empty page — that is a true
+ * statement about the ledger. Only an IMPOSSIBLE date is a client bug worth
+ * reporting, and that is the whole line this function draws.
+ */
+export function parseSlateDate(raw: unknown): string | 'invalid' | undefined {
+  if (raw === undefined) return undefined;
+  const value = String(raw).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return 'invalid';
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(5, 7));
+  const day = Number(value.slice(8, 10));
+  if (year < 1) return 'invalid';
+  const length = monthLength(year, month);
+  if (length === null || day < 1 || day > length) return 'invalid';
+  return value;
+}
+
 /** `sport` query-param validation shared by every benchmark endpoint that takes a `sport` filter. */
 export function parseSportParam(raw: unknown): Sport | 'all' | 'invalid' | undefined {
   if (raw === undefined) return undefined;
