@@ -1266,7 +1266,24 @@ describe('the per-market rollup', () => {
     return { size: byKey.size, get: (m: string) => byKey.get(armMarketKey(ARM, m)) };
   }
 
-  /** A second, LOSING moneyline fill: 5 risked, settled `home` against an `upper` taker. */
+  /**
+   * A second, LOSING moneyline fill: 5 risked, the taker on the `lower` side of
+   * the SAME `away` settlement.
+   *
+   * ## Both speculations on one scored contest must agree on the winner
+   *
+   * The first draft settled this one `home` (`winSideValue: '2'`) while the first
+   * fill's settled `away` — two moneyline speculations on contest 41, whose
+   * `CONTEST_SCORES_SET` says away 5 home 3, disagreeing about who won. The
+   * on-chain scorer derives the winner from those same scores, so that history
+   * cannot exist: `predictWinSide('moneyline', 5, 3, 0)` is `away` for both.
+   *
+   * The taker's SIDE is what varies between two fills on one outcome, not the
+   * outcome. So this fill takes `lower` and loses to the same `away` settlement,
+   * which is both a real history and the identical money — `didWin(1, 'away')` is
+   * false either way, so payout 0 and net −5 are unchanged, and so is every
+   * assertion below. Fixture realism, not arithmetic (`3g`).
+   */
   const secondMoneyline = {
     receipt: receipt({
       speculation_id: 90, commitment_hash: '0xcc', tx_hash: '0xtx3',
@@ -1274,12 +1291,13 @@ describe('the per-market rollup', () => {
     }),
     event: event({
       id: 3, speculation_id: 90, commitment_hash: '0xcc', tx_hash: '0xtx3',
+      taker_position_type: 'lower',
       taker_risk_amount: String(5 * USDC), maker_risk_amount: String(4 * USDC),
     }),
     log: [
       matched({ entity_id: 90, tx_hash: '0xtx3', block_number: 102 }, { speculationId: '90', commitmentHash: '0xCC' }),
       created({ entity_id: 90, tx_hash: '0xcreate3', block_number: 91 }, { speculationId: '90' }),
-      settled('2', { entity_id: 90, tx_hash: '0xsettle3', block_number: 202 }, { speculationId: '90' }),
+      settled('1', { entity_id: 90, tx_hash: '0xsettle3', block_number: 202 }, { speculationId: '90' }),
     ],
   };
 
@@ -1328,6 +1346,8 @@ describe('the per-market rollup', () => {
     // +7 on the win, −5 on the loss. A rollup that kept only the first fill
     // would answer 10 and +7; one that kept only the last, 5 and −5.
     expect(ml.netWei6).toBe(BigInt(2 * USDC));
+    // One `away` settlement, two takers on opposite sides — so the record
+    // accumulates across verdicts rather than just across fills.
     expect(ml.record).toMatchObject({ won: 1, lost: 1 });
   });
 
