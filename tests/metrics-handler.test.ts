@@ -61,8 +61,9 @@ function fakeOwnStateHub(stats: {
   wallets: number;
   subscribers: number;
   resyncBroadcastTotal?: number;
+  positionSaturationTotal?: number;
 }): OwnStateHub {
-  const full = { resyncBroadcastTotal: 0, ...stats };
+  const full = { resyncBroadcastTotal: 0, positionSaturationTotal: 0, ...stats };
   return { stats: () => full } as unknown as OwnStateHub;
 }
 
@@ -94,9 +95,19 @@ describe('GET /v1/metrics', () => {
       ownState: { wallets: 0, subscribers: 0, resyncBroadcastTotal: 0 },
       connections: { total: 0, ips: 0, maxTotal: 200, maxPerIp: 16, reservedPerIpOwner: 3 },
     });
-    const body = res.body as { uptimeSeconds: unknown; timestamp: unknown };
+    const body = res.body as {
+      uptimeSeconds: unknown;
+      timestamp: unknown;
+      ownState: Record<string, unknown>;
+    };
     expect(typeof body.uptimeSeconds).toBe('number');
     expect(typeof body.timestamp).toBe('string');
+    // PRESENCE, asserted separately from the value (rule 2b). `toMatchObject`
+    // above cannot see a missing key, and the README documents this counter as
+    // served — the whole defect class is a field that exists in the helper's
+    // return type and the docs and never reaches the response.
+    expect('positionSaturationTotal' in body.ownState).toBe(true);
+    expect(body.ownState['positionSaturationTotal']).toBe(0);
   });
 
   it('reflects live hub stats, held connections, and configured caps', () => {

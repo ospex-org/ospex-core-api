@@ -40,8 +40,15 @@
  * hasn't finished paging through a truncated snapshot — we 400 with
  * `INVALID_CURSOR` pointing them back to the snapshot endpoint.
  *
- * Live phase: hub callbacks write `commitment`, `fill`, `positionStatus`
- * events. Per-subscriber composite cursor advances per delivered resource;
+ * A `degraded` frame is emitted AT MOST ONCE per connection, whichever layer
+ * notices first — the cold-start snapshot, the resume catch-up, or the hub's
+ * live derivation. All three observe the same condition (the actionable set at
+ * its 200-row cap) and the SDK's `degraded` latch additionally suppresses its
+ * `onError` for the rest of the connection, so a repeat would cost error
+ * visibility and buy nothing.
+ *
+ * Live phase: hub callbacks write `commitment`, `fill`, `positionStatus` and —
+ * when the hub's derivation saturates — a single `degraded` event. Per-subscriber composite cursor advances per delivered resource;
  * the wire `id:` is always the freshly-encoded composite. Heartbeat comments
  * keep the connection under the platform idle timeout. Slow-client shedding
  * matches `stream/handler.ts` (forces reconnect on a stuck socket).
@@ -206,6 +213,55 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
   let phase: Phase = 'preReady';
   let aborted = false;
 
+  /**
+   * ONE `degraded` frame per connection, whichever layer notices first.
+   *
+   * Returns true when the caller now owns the emission. Three producers reach
+   * here: the cold-start snapshot's `positionsTruncated`, the resume catch-up's
+   * `saturated`, and the hub's live derivation (`#83`). The first two and part of
+   * the third are one condition — `claimed=false AND risk_amount>0` over the same
+   * 200-row cap — which is why a repeat carries nothing; the hub can ALSO report
+   * exhausting its per-tick maintenance budget, which the snapshot's cap knows
+   * nothing about, and `degradedPending` below is what keeps that reportable
+   * rather than assuming the equivalence holds.
+   *
+   * What the repeat would cost, beyond noise: the SDK de-dupes same-level
+   * statuses anyway, and its `degraded` latch suppresses `onError` for the rest
+   * of the connection, so a redundant frame quietly costs error visibility.
+   *
+   * The consequence worth stating: for every wallet over the cap on polygon
+   * today the cold start already emits this frame, so the hub's new signal
+   * changes no wire byte for any of them. What it adds is the case the old code
+   * could not report at all — a wallet that was complete at connect and crosses
+   * the cap later in the session.
+   *
+   * ## The latch is taken by the WRITE, never by the notification
+   *
+   * A first version consumed it inside `onDegraded` and only then checked the
+   * phase, so a hub signal arriving while the snapshot was still loading — which
+   * happens whenever another subscriber's poller is already live on this wallet
+   * — claimed the latch, wrote nothing, and then silenced the snapshot's own
+   * frame. Reproduced by the reviewer and independently here: a 201-row wallet
+   * served `snapshot` → `ready` with `positionsTruncated: true` on the wire and
+   * no `degraded` at all, where the base served `snapshot` → `degraded` →
+   * `ready`.
+   *
+   * So a preReady notification records `degradedPending` and the pre-ready path
+   * below emits on `positionsTruncated || degradedPending`. That ordering is
+   * safe because everything from the emission check to `ready` runs in one
+   * synchronous block, so no tick can interleave between them. It is also
+   * strictly better than the equivalence the first version assumed: the hub's
+   * phase-B budget can saturate for reasons the snapshot's `hitCap` knows
+   * nothing about, and `degradedPending` is what carries that to the wire.
+   */
+  let degradedSent = false;
+  let degradedPending = false;
+  const emitDegradedOnce = (): boolean => {
+    if (degradedSent) return false;
+    degradedSent = true;
+    return true;
+  };
+
   const sub: OwnStateSubscriber = getOwnStateHub().subscribe(address, {
     onCommitment: (body, ts, id) => {
       if (phase === 'live') {
@@ -246,6 +302,25 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
       } else {
         aborted = true;
       }
+    },
+    onDegraded: (reason) => {
+      // Deliberately NOT `aborted = true`. Every other callback latches the
+      // abort because it carries DATA whose ordering against the snapshot the
+      // handler cannot vouch for; this one carries no row and invalidates
+      // nothing already sent, so forcing a resync would turn a partial view
+      // into a reconnect loop — the exact loop the cold-start `degraded`
+      // emission exists to break.
+      if (phase !== 'live') {
+        // Hold it, do NOT take the latch. The pre-ready path emits the frame in
+        // the documented `degraded` → `ready` order; consuming the latch here
+        // would silence that emission and lose the signal entirely.
+        degradedPending = true;
+        return;
+      }
+      // `emitDegradedOnce` is the SINGLE owner of the latch — an earlier version
+      // also checked `degradedSent` here, which made the helper's own check
+      // unreachable and therefore untestable (found by a surviving mutant).
+      if (emitDegradedOnce()) writeOwnStateEvent(res, 'degraded', { reason });
     },
   });
 
@@ -330,7 +405,7 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
         // first live tick suppresses the transition. By construction
         // the seed cannot disagree with the snapshot.
         getOwnStateHub().seedStatusCache(address, result.seedRows);
-        if (result.body.positionsTruncated) {
+        if (result.body.positionsTruncated || degradedPending) {
           // Snapshot exposed `positionsTruncated:true` — actionable
           // population exceeded the snapshot helper's cap. Emit
           // `degraded` so the SDK / market maker enters quote-hold,
@@ -338,7 +413,9 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
           // row we could observe. This breaks the earlier
           // `positionsTruncated → reconnect → resync → reconnect` loop
           // for wallets at the cap.
-          writeOwnStateEvent(res, 'degraded', { reason: 'positionsTruncated' });
+          if (emitDegradedOnce()) {
+            writeOwnStateEvent(res, 'degraded', { reason: 'positionsTruncated' });
+          }
         }
         getOwnStateHub().beginLive(sub);
         phase = 'live';
@@ -389,12 +466,14 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
           claimableAmount: r.body.claimableAmount,
         })),
       );
-      if (catchupResult.degraded) {
+      if (catchupResult.degraded || degradedPending) {
         // Actionable population saturated during catch-up — same defined
         // terminal state as cold-start positionsTruncated. Emit
         // `degraded` so the SDK reaches `ready` without looping back
         // through resync.
-        writeOwnStateEvent(res, 'degraded', { reason: 'positionsTruncated' });
+        if (emitDegradedOnce()) {
+          writeOwnStateEvent(res, 'degraded', { reason: 'positionsTruncated' });
+        }
       }
       getOwnStateHub().beginLive(sub);
       phase = 'live';
@@ -706,10 +785,13 @@ type DerivePositionStateResultWithFlags = DerivedPositionStateResult;
 
 /**
  * Derive current `positionStatus` for every actionable + recently-cached
- * position in the wallet. Position population matches
- * `loadOwnStateSnapshot` (via `fetchCategorizedPositions` filter) PLUS
- * recently-changed cached keys — so the snapshot and the stream always
- * cover the same population:
+ * position in the wallet. The population is the same FILTER as
+ * `loadOwnStateSnapshot`'s (via `fetchCategorizedPositions`) under the same
+ * 200-row cap, so the two saturate together — but they order that cap
+ * differently (`row_updated_at DESC` here, `position_created_at DESC` there),
+ * so "the same rows" holds only under the cap, or above it while update order
+ * tracks creation order. Measured on polygon 2026-09-22 it does, exactly; that
+ * is a property of the data and `#83` is where it is written down:
  *
  *   1. Query actionable: `claimed=false AND risk_amount>0`, cap 200,
  *      ORDER BY row_updated_at DESC.
@@ -729,15 +811,15 @@ type DerivePositionStateResultWithFlags = DerivedPositionStateResult;
  * health gate. This breaks the infinite-resync loop the
  * earlier `positions_cap_exceeded` path produced for wallets at the cap.
  */
+// A `cachedKeys` option used to sit on this interface (`#83`), mirroring the
+// hub's phase B: a by-id refresh of tracked keys missing from the actionable
+// result. NO CALLER EVER PASSED IT, so the branch was unreachable — and what it
+// contained was a second unordered read under one `.limit(CATCHUP_POSITIONS_LIMIT)`,
+// which over the cap returns an unspecified subset and reported nothing. Deleted
+// rather than fixed, because phase 3 below already covers the same need on the
+// only path that has one: resume catch-up's terminal-since-cursor query, which
+// is keyset-filtered, ordered, AND reports `terminalSaturated`.
 export interface DerivePositionsOptions {
-  /**
-   * Hub-cache keys (`${specId}_${positionType}`) currently tracked. The
-   * helper queries any whose row is missing from the actionable result
-   * (e.g. a position whose claim/transfer-out flipped it out of the
-   * actionable filter) so the next derivation can emit the terminal
-   * transition before the cache entry falls out of tracking.
-   */
-  cachedKeys?: Iterable<string>;
   /**
    * When set, the helper ALSO queries positions whose row_updated_at
    * advanced past this watermark AND that match the terminal filter
@@ -756,7 +838,6 @@ export async function derivePositionsForWallet(
   address: string,
   options: DerivePositionsOptions = {},
 ): Promise<DerivePositionStateResultWithFlags> {
-  const cachedKeys: Iterable<string> = options.cachedKeys ?? [];
   // Phase 1: actionable population.
   const actionableRes = await sb
     .from('positions')
@@ -790,43 +871,7 @@ export async function derivePositionsForWallet(
   }>;
   const saturated = actionable.length >= CATCHUP_POSITIONS_LIMIT;
 
-  // Phase 2: cached keys NOT in the actionable result — re-fetch their
-  // current row so a just-claimed / just-transferred-out transition shows
-  // up before the cache entry falls out of tracking.
-  const actionableKeys = new Set(
-    actionable.map(
-      (p) =>
-        `${String(p.speculation_id)}_${p.position_type === 'upper' ? 0 : 1}`,
-    ),
-  );
-  const staleSpecIds: number[] = [];
-  for (const key of cachedKeys) {
-    if (actionableKeys.has(key)) continue;
-    const specPart = key.slice(0, key.lastIndexOf('_'));
-    const id = Number(specPart);
-    if (Number.isFinite(id)) staleSpecIds.push(id);
-  }
-  let stale: typeof actionable = [];
-  if (staleSpecIds.length > 0) {
-    const staleRes = await sb
-      .from('positions')
-      .select(
-        'speculation_id, user_address, position_type, risk_amount, profit_amount, ' +
-          'claimed, row_updated_at, id',
-      )
-      .eq('network', net)
-      .eq('user_address', address)
-      .in('speculation_id', staleSpecIds)
-      .limit(CATCHUP_POSITIONS_LIMIT);
-    if (staleRes.error) {
-      logger.error(
-        { err: staleRes.error.message, address },
-        'ownState/stream catchup: cached-key refresh query failed',
-      );
-      return { rows: [], saturated, queryFailed: true, terminalSaturated: false };
-    }
-    stale = (staleRes.data ?? []) as unknown as typeof actionable;
-  }
+  // Phase 2 (the cached-key refresh) is gone — see DerivePositionsOptions.
 
   // Phase 3: terminal-since-cursor — recently-claimed or transferred-out
   // rows that left the actionable filter while the client was offline.
@@ -874,10 +919,10 @@ export async function derivePositionsForWallet(
     terminalSaturated = terminalRows.length >= CATCHUP_POSITIONS_LIMIT;
   }
 
-  // Merge into a unique-per-key list (actionable wins on conflict for
-  // its current state, then stale-cache refresh, then terminal-since).
+  // Merge into a unique-per-key list (actionable wins on conflict for its
+  // current state, then terminal-since).
   const positionsByKey = new Map<string, (typeof actionable)[number]>();
-  for (const row of [...actionable, ...stale, ...terminalRows]) {
+  for (const row of [...actionable, ...terminalRows]) {
     const key = `${String(row.speculation_id)}_${row.position_type === 'upper' ? 0 : 1}`;
     if (!positionsByKey.has(key)) positionsByKey.set(key, row);
   }

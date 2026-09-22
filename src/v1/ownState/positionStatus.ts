@@ -83,6 +83,51 @@ export function positionStatusRank(s: PositionStatus): number {
   }
 }
 
+/**
+ * Can this position's derived status still change, or is it finished?
+ *
+ * `true` means NO further transition is reachable, so a live poller may retire
+ * the row from its per-tick work-list. This is what lets the own-state hub cost
+ * a tick against a wallet's UNRESOLVED exposure instead of against its whole
+ * unclaimed history — see `OwnStateHub.reDerivePositionStatuses` (`#83`).
+ *
+ * Two grounds, and the narrowness of the second is the whole point:
+ *
+ *   - `claimed` — the on-chain claim already happened. `claimPosition` cannot
+ *     run twice, and the row has also left the `claimed=false` population.
+ *   - `settledLost` on a CLOSED speculation whose `win_side` is a real side.
+ *     `settleSpeculation` closes a speculation once and writes the authoritative
+ *     side; a loser's payout is zero forever and `claimPosition` reverts.
+ *
+ * Everything else stays live, including three cases that look terminal:
+ *
+ *   - `claimable` and `void` still owe a `claimed` transition, and both carry
+ *     money.
+ *   - `settledLost` while the speculation is still OPEN is a PREDICTION off a
+ *     scored contest, and a score correction can flip it (that is why
+ *     `claimableAmount` and `result` are part of the hub's dedup key). The
+ *     2026-09-18 JsonOdds stale-final incident is the worked example.
+ *   - `settledLost` with `win_side = 'tbd'` on a closed speculation is a
+ *     shouldn't-happen state the derivation handles defensively. If it is an
+ *     indexer artifact rather than truth, the real side arriving later turns
+ *     the row claimable, so freezing it would drop a money event.
+ *
+ * What the caller still owes: this predicate is about the DERIVATION, not about
+ * the row. Anything that touches the `positions` row itself — a claim, a
+ * secondary-market transfer — bumps `row_updated_at` and therefore re-enters a
+ * recency-ordered window at its head, so a retired row is still re-derived when
+ * it moves. A reorg that rewrites a closed speculation is out of scope here and
+ * covered by the `recovery_runs` resync watcher instead.
+ */
+export function isTerminalForever(
+  status: PositionStatus,
+  speculation: Pick<SpeculationInput, 'speculationStatus' | 'winSide'>,
+): boolean {
+  if (status === 'claimed') return true;
+  if (status !== 'settledLost') return false;
+  return speculation.speculationStatus === 'closed' && speculation.winSide !== 'tbd';
+}
+
 export interface PositionStatusEventBody {
   address: string;
   speculationId: string;

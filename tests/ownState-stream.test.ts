@@ -942,3 +942,223 @@ describe('GET /v1/stream/own-state — live deltas', () => {
     expect(decoded.k).toBe('live');
   });
 });
+
+/**
+ * The hub's live-derivation saturation signal on the wire (`#83`).
+ *
+ * Three properties, and each has a mutant it is the only case to kill: the
+ * signal is NOT an abort (a `degraded` during preReady must not become a
+ * resync), it DOES reach the wire in the live phase, and it lands AT MOST ONCE
+ * per connection whichever layer noticed first.
+ */
+describe('GET /v1/stream/own-state — hub saturation reaches the wire once', () => {
+  /** Hub that hands the handler's callbacks back to the test. */
+  class CapturingHub extends OwnStateHub {
+    captured: Parameters<InstanceType<typeof OwnStateHub>['subscribe']>[1] | undefined;
+    /** When set, fire `onDegraded` synchronously inside `subscribe` (preReady). */
+    degradeAtSubscribe = false;
+    subscribe(
+      address: string,
+      cb: Parameters<InstanceType<typeof OwnStateHub>['subscribe']>[1],
+    ): ReturnType<InstanceType<typeof OwnStateHub>['subscribe']> {
+      this.captured = cb;
+      const sub = super.subscribe(address, cb);
+      if (this.degradeAtSubscribe) cb.onDegraded('positionsTruncated');
+      return sub;
+    }
+  }
+
+  function installCapturing(degradeAtSubscribe = false): CapturingHub {
+    const hub = new CapturingHub({
+      getClient: () => emptyClient(),
+      getNetwork: () => 'polygon',
+      pollMs: 1e9,
+      resyncMs: 1e9,
+    });
+    hub.degradeAtSubscribe = degradeAtSubscribe;
+    __setOwnStateHubForTest(hub);
+    return hub;
+  }
+
+  it('does not turn a preReady saturation signal into a resync', async () => {
+    // Every OTHER hub callback latches `aborted` during preReady, because it
+    // carries a row whose ordering against the snapshot the handler cannot
+    // vouch for. This one carries no row. If it aborted, an over-cap wallet
+    // would resync on its first tick forever — the exact loop the cold-start
+    // `degraded` emission was introduced to break.
+    installCapturing(true);
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+    await flushTicks(64);
+    const ev = events(res);
+    expect(ev.find((e) => e.event === 'resync')).toBeUndefined();
+    expect(ev.find((e) => e.event === 'ready')).toBeDefined();
+    expect(res.writableEnded).toBe(false);
+    // The frame ordering is preserved too: nothing was written ahead of the
+    // snapshot, which is where the documented grammar puts `degraded`.
+    expect(ev[0]?.event).toBe('snapshot');
+  });
+
+  it('writes one degraded frame when the hub saturates in the live phase', async () => {
+    // The case the old code could not report at all: a wallet complete at
+    // connect whose population crosses the cap later in the session. The
+    // snapshot below is NOT truncated, so this frame can only come from the hub.
+    const hub = installCapturing();
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+    await flushTicks(64);
+    expect(events(res).find((e) => e.event === 'degraded')).toBeUndefined();
+    expect(events(res).find((e) => e.event === 'ready')).toBeDefined();
+
+    hub.captured?.onDegraded('positionsTruncated');
+    hub.captured?.onDegraded('positionsTruncated');
+
+    const ev = events(res);
+    const degraded = ev.filter((e) => e.event === 'degraded');
+    expect(degraded).toHaveLength(1);
+    expect((degraded[0] as { data: { reason: string } }).data.reason).toBe('positionsTruncated');
+    // After `ready`, which is what makes it durable for the SDK: its `degraded`
+    // latch is only cleared by a fresh `ready` or a reconnect.
+    const readyIdx = ev.findIndex((e) => e.event === 'ready');
+    expect(ev.findIndex((e) => e.event === 'degraded')).toBeGreaterThan(readyIdx);
+    expect(ev.find((e) => e.event === 'resync')).toBeUndefined();
+  });
+
+  it('does not repeat the frame the truncated cold start already sent', async () => {
+    // Both layers observe ONE condition — the actionable set at its 200-row cap
+    // — so the second frame carries no information, and it is not free: the
+    // SDK's `degraded` latch suppresses `onError` for the rest of the
+    // connection, so a repeat would cost error visibility.
+    //
+    // This is also why merging this change moves no wire byte for any wallet
+    // over the cap on polygon today: their cold start already sends it.
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: [],
+      pendingSettle: [],
+      claimable: [],
+      hitCap: true,
+      derivedStatuses: [],
+    });
+    const hub = installCapturing();
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+    await flushTicks(64);
+    expect(events(res).filter((e) => e.event === 'degraded')).toHaveLength(1);
+
+    // Prove the signal REACHED the handler (rule 3b-reach). Without this the
+    // count below is satisfied by the cold-start frame alone, so a captured
+    // callback that never existed would read as a working suppression.
+    expect(hub.captured).toBeDefined();
+    hub.captured!.onDegraded('positionsTruncated');
+
+    expect(events(res).filter((e) => e.event === 'degraded')).toHaveLength(1);
+  });
+});
+
+/**
+ * Review blocker B1: a hub signal arriving while the snapshot is still loading
+ * must not consume the once-per-connection latch.
+ *
+ * The first version of `onDegraded` took the latch and only then checked the
+ * phase, so a preReady signal wrote nothing and then silenced the snapshot's own
+ * frame. That window is not exotic — it is every connection to a wallet that
+ * already has a live poller, which is precisely the multi-subscriber case the
+ * hub exists to serve. The reviewer reproduced it with a 201-row wallet: head
+ * served `snapshot` -> `ready` with `positionsTruncated: true` on the wire, base
+ * served `snapshot` -> `degraded` -> `ready`.
+ */
+describe('GET /v1/stream/own-state — a preReady saturation signal is held, not swallowed', () => {
+  class PreReadyDegradingHub extends OwnStateHub {
+    subscribe(
+      address: string,
+      cb: Parameters<InstanceType<typeof OwnStateHub>['subscribe']>[1],
+    ): ReturnType<InstanceType<typeof OwnStateHub>['subscribe']> {
+      const sub = super.subscribe(address, cb);
+      // Synchronously, before the handler's snapshot await — the same position in
+      // the lifecycle a tick from another subscriber's poller occupies.
+      cb.onDegraded('positionsTruncated');
+      return sub;
+    }
+  }
+
+  function install(): void {
+    __setOwnStateHubForTest(
+      new PreReadyDegradingHub({
+        getClient: () => emptyClient(),
+        getNetwork: () => 'polygon',
+        pollMs: 1e9,
+        resyncMs: 1e9,
+      }),
+    );
+  }
+
+  it('still emits the truncated snapshot its own degraded frame, exactly once', async () => {
+    // THE regression. Both producers fire on this connection; the frame must
+    // appear once, before `ready`, and must not be lost to the latch.
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: [],
+      pendingSettle: [],
+      claimable: [],
+      hitCap: true,
+      derivedStatuses: [],
+    });
+    install();
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+    await flushTicks(64);
+
+    const names = events(res).map((e) => e.event);
+    expect(names).toEqual(['snapshot', 'degraded', 'ready']);
+    // And the wire still says so in the snapshot body, which is the field the
+    // market maker's durable latch actually reads.
+    const snap = events(res).find((e) => e.event === 'snapshot') as {
+      data: { positionsTruncated: boolean };
+    };
+    expect(snap.data.positionsTruncated).toBe(true);
+    expect(events(res).find((e) => e.event === 'resync')).toBeUndefined();
+  });
+
+  it('emits it even when the snapshot itself is COMPLETE', async () => {
+    // The half that is genuinely new information rather than a duplicate. The
+    // hub's phase-B budget can saturate for reasons the snapshot's `hitCap`
+    // knows nothing about, so a preReady signal on an untruncated snapshot has
+    // to reach the wire — holding it in `degradedPending` is what does that.
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: [],
+      pendingSettle: [],
+      claimable: [],
+      hitCap: false,
+      derivedStatuses: [],
+    });
+    install();
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+    await flushTicks(64);
+
+    const names = events(res).map((e) => e.event);
+    expect(names).toEqual(['snapshot', 'degraded', 'ready']);
+    const snap = events(res).find((e) => e.event === 'snapshot') as {
+      data: { positionsTruncated: boolean };
+    };
+    // PIN the fixture state (rule 3i-conditional): if this ever became true the
+    // case above would be the one running and this one would prove nothing.
+    expect(snap.data.positionsTruncated).toBe(false);
+  });
+
+  it('holds it on the resume path too, ahead of ready', async () => {
+    // Same window, the other pre-ready branch. Resume takes a different code
+    // path to the same emission, and N branches are N properties.
+    install();
+    const res = makeRes();
+    getOwnStateStreamHandler(
+      makeReq({ query: { cursor: liveCursor() } }),
+      res as unknown as Response,
+    );
+    await flushTicks(64);
+
+    const names = events(res).map((e) => e.event);
+    expect(names.filter((n) => n === 'degraded')).toHaveLength(1);
+    expect(names.indexOf('degraded')).toBeLessThan(names.indexOf('ready'));
+    expect(names).not.toContain('resync');
+  });
+});
