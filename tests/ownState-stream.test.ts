@@ -34,9 +34,29 @@ const positionFetchMock = vi.hoisted(() => ({
 }));
 vi.mock('../src/lib/supabase.js', () => supabaseMock);
 vi.mock('../src/lib/env.js', () => envMock);
+/**
+ * The real `enumerationLimitOf` (rule 3e), because the snapshot's fallback branches
+ * on it — and a helper that makes a truncated cold start by REFUSING the complete
+ * enumeration, which is what truncation means after `#76`. A `hitCap: true` alone
+ * no longer reaches the wire.
+ */
+const positionFetchActual = await vi.importActual<typeof import('../src/v1/utils/positionFetch.js')>(
+  '../src/v1/utils/positionFetch.js',
+);
 vi.mock('../src/v1/utils/positionFetch.js', () => ({
   fetchCategorizedPositions: positionFetchMock.fetchCategorizedPositions,
+  enumerationLimitOf: (err: unknown) => positionFetchActual.enumerationLimitOf(err),
 }));
+
+/** Answer the capped read with `result` and refuse the complete one. */
+function refuseCompleteThen(result: unknown): void {
+  positionFetchMock.fetchCategorizedPositions.mockImplementation(
+    (_addr: string, options?: { complete?: boolean }) =>
+      options?.complete === true
+        ? Promise.reject(new positionFetchActual.PositionEnumerationLimitError('pages', 'over budget'))
+        : Promise.resolve(result),
+  );
+}
 
 const { getOwnStateStreamHandler, __resetOwnStateStreamMetrics } = await import(
   '../src/v1/ownState/stream.js'
@@ -364,7 +384,7 @@ describe('GET /v1/stream/own-state — cold start (no cursor)', () => {
     // 200-actionable-position cap reaches a DEFINED terminal state instead
     // of resync-looping. The stream emits `event: degraded` so the
     // SDK / market maker enters quote-hold, then proceeds to `ready`.
-    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+    refuseCompleteThen({
       active: [],
       pendingSettle: [],
       claimable: [],
@@ -1032,7 +1052,7 @@ describe('GET /v1/stream/own-state — hub saturation reaches the wire once', ()
     //
     // This is also why merging this change moves no wire byte for any wallet
     // over the cap on polygon today: their cold start already sends it.
-    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+    refuseCompleteThen({
       active: [],
       pendingSettle: [],
       claimable: [],
@@ -1095,7 +1115,7 @@ describe('GET /v1/stream/own-state — a preReady saturation signal is held, not
   it('still emits the truncated snapshot its own degraded frame, exactly once', async () => {
     // THE regression. Both producers fire on this connection; the frame must
     // appear once, before `ready`, and must not be lost to the latch.
-    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+    refuseCompleteThen({
       active: [],
       pendingSettle: [],
       claimable: [],
@@ -1277,6 +1297,11 @@ describe('GET /v1/stream/own-state — the seed states its own coverage', () => 
     // own join reaches the cache verbatim. Without this the seed arrives live and
     // the first tick pays for the retirement — affordable at 200 keys, not at the
     // 635 the market maker's own wallet holds.
+    // Resolves the COMPLETE read, deliberately: this case is about the seed's own
+    // coverage flag reaching the cache, so it must take the complete path rather
+    // than the fallback. (An edit script converted this to `refuseCompleteThen`
+    // by accident, and the suite stayed green — the case would have been testing
+    // the fallback while its name said coverage. Rule 3g-silentsetup.)
     positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
       active: [],
       pendingSettle: [],

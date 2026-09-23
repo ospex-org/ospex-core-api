@@ -33,8 +33,12 @@
  *     cursor. The SDK MUST NOT emit `ready` for trading until paging
  *     completes.
  *
- *   - `positionsTruncated`: position visibility is incomplete because
- *     `fetchCategorizedPositions` hit its 200-row cap. The SDK does
+ *   - `positionsTruncated`: position visibility is incomplete because one of
+ *     the two position reads ran out of BUDGET — the complete enumeration out
+ *     of pages or time, or the claimed-since paging out of pages (`#76`). It is
+ *     no longer a 200-row cap: the actionable read is a bounded complete
+ *     traversal and the claimed read pages its keyset, so `false` means the
+ *     wallet's whole position population is in this body. The SDK does
  *     NOT keep paging the snapshot for this — `cursor.p` is preserved
  *     (or sentinel on cold start) but the snapshot does not have a
  *     mechanism to drain unseen positions. Consumers enter degraded /
@@ -87,6 +91,7 @@ import {
   type OwnerCommitmentBody,
 } from './enrich.js';
 import {
+  enumerationLimitOf,
   fetchCategorizedPositions,
   type ClaimablePosition,
   type DerivedPositionStatus,
@@ -138,8 +143,12 @@ interface OwnStateSnapshotBody {
    */
   truncated: boolean;
   /**
-   * Positions truncation discriminant. True when
-   * `fetchCategorizedPositions` hit its 200-row cap. The SDK does NOT
+   * Positions truncation discriminant. True when a position read ran out of
+   * BUDGET (`#76`): the complete enumeration refused on pages or time and the
+   * snapshot fell back to the capped read, or the claimed-since paging spent
+   * `CLAIMED_MAX_PAGES`. `false` is now a statement about the POPULATION rather
+   * than about a cap — no polygon wallet comes within three orders of magnitude
+   * of either budget. The SDK does NOT
    * page the snapshot for this — there's no analog to commitments'
    * `?cursor=` paging on the actionable-positions filter. Instead the
    * stream cold-start treats `positionsTruncated: true` as a degraded
@@ -175,7 +184,25 @@ interface ClaimedPositionRow {
 
 const POSITION_TYPE_TO_INT: Record<'upper' | 'lower', 0 | 1> = { upper: 0, lower: 1 };
 
+/**
+ * Page SIZE for the claimed-since-cursor read, and the number of pages one
+ * snapshot will spend on it (`#76`).
+ *
+ * It used to be a single read under this limit, with a full page reported as
+ * `positionsTruncated`. Now it pages the keyset it was already ordered by, so a
+ * full page means "ask again" rather than "give up".
+ *
+ * 16 pages is a BACKSTOP, not an expectation. The population is the rows this
+ * wallet has claimed since the subscriber's cursor, which is empty on a cold
+ * start and a delta on a resume; the largest claimed population on polygon is 594
+ * rows TOTAL (2026-09-23), so the budget is ~5× the worst wallet's entire claimed
+ * history and any real delta is one page. Time is bounded by the same number
+ * rather than by a second deadline mechanism: 16 reads at the ~70 ms per statement
+ * measured against production is ~1.1 s worst case, on a path taken once per
+ * connect.
+ */
 const CLAIMED_PAGE_CAP = 200;
+const CLAIMED_MAX_PAGES = 16;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Helper — pure(ish) load, no express coupling
@@ -377,54 +404,68 @@ export async function loadOwnStateSnapshot(
   const truncatedCommitments = phase1Saturated || phase2Saturated;
 
   // ── Positions (delivered on every page; never paginated within snapshot) ──
-  // Re-use the categorized fetcher. The raw query inside the helper caps
-  // at 200; `hitCap` surfaces the raw-cap signal because counting
-  // post-filtered categorized rows under-detects truncation when the
-  // helper filters lost positions below the cap.
+  //
+  // COMPLETE, with a bounded fallback (`#76`). This read used to be the capped
+  // default — 200 rows by `position_created_at DESC` — and `hitCap` reported the
+  // saturation. Three of eight polygon wallets exceed that cap, the largest being
+  // the market maker's own maker wallet, so `positionsTruncated` was asserted on
+  // every connect and the MM's quote hold never lifted.
+  //
+  // The complete mode is a bounded keyset traversal over the immutable `id`,
+  // strictly descending, with one deadline for the whole traversal wired to an
+  // `AbortSignal`, every raw row validated against a non-advancing page, and a
+  // typed refusal when it runs out of pages or time — see
+  // `fetchCategorizedPositions`. `/v1/positions/:address` has used it since `#84`.
+  //
+  // EXHAUSTION FALLS BACK, IT DOES NOT ERROR, and that is not a preference. The
+  // SDK reconnects on a `resync` frame with `attempt = 0; continue;` and no
+  // backoff (`ownState/subscribe.ts`), the SSE route carries no read rate limit,
+  // and the cursor is cleared on resync — so a past-budget wallet answered with a
+  // 500 becomes an immediate reconnect loop, each iteration paying another full
+  // snapshot. The fallback re-reads CAPPED rather than serving an empty list,
+  // because the answer has to carry rows for the connection to be worth anything:
+  // that is exactly the old behaviour, now reached only when completeness is
+  // unaffordable rather than always.
   let active: PositionBase[];
   let pendingSettle: PendingSettlePosition[];
   let claimable: ClaimablePosition[];
   let positionsHitCap: boolean;
   let derivedStatuses: DerivedPositionStatus[];
   try {
-    const categorized = await fetchCategorizedPositions(address);
+    const categorized = await fetchCategorizedPositions(address, { complete: true });
     active = categorized.active;
     pendingSettle = categorized.pendingSettle;
     claimable = categorized.claimable;
-    positionsHitCap = categorized.hitCap;
+    positionsHitCap = false;
     derivedStatuses = categorized.derivedStatuses;
   } catch (err) {
-    logger.error({ err: formatError(err) }, 'ownState/snapshot: position categorization failed');
-    return {
-      ok: false,
-      status: 500,
-      error: { error: 'Failed to load own-state.', code: 'INTERNAL_ERROR' },
-    };
-  }
-
-  // Claimed-since-cursor: only when recovering. Keyset matches the
-  // commitments terminal-query rule — `live` floors by overlap; any
-  // recovery-paging continuation is strict (the floor was already applied
-  // at recovery-initial time, and progress has advanced past it).
-  let claimedRows: ClaimedPositionRow[] = [];
-  if (isRecovering) {
-    const claimedKeyset = isInitialRecovery
-      ? watermarkLiveKeysetOr(cursor!.p)
-      : watermarkKeysetOr(cursor!.p);
-    const claimedRes = await sb
-      .from('positions')
-      .select(POSITION_CLAIMED_COLUMNS)
-      .eq('network', config.network)
-      .eq('user_address', address)
-      .eq('claimed', true)
-      .or(claimedKeyset)
-      .order('row_updated_at', { ascending: true })
-      .order('id', { ascending: true })
-      .limit(CLAIMED_PAGE_CAP);
-    if (claimedRes.error) {
+    const limit = enumerationLimitOf(err);
+    if (limit === null) {
+      logger.error({ err: formatError(err) }, 'ownState/snapshot: position categorization failed');
+      return {
+        ok: false,
+        status: 500,
+        error: { error: 'Failed to load own-state.', code: 'INTERNAL_ERROR' },
+      };
+    }
+    logger.warn(
+      { address, limit },
+      'ownState/snapshot: complete position enumeration exceeded its budget — serving the capped read',
+    );
+    try {
+      const capped = await fetchCategorizedPositions(address);
+      active = capped.active;
+      pendingSettle = capped.pendingSettle;
+      claimable = capped.claimable;
+      // TRUE regardless of `capped.hitCap`: the complete traversal refusing is
+      // itself proof that the population is past the cap, and a fallback answer is
+      // partial whether or not this second read happens to fill its own 200 rows.
+      positionsHitCap = true;
+      derivedStatuses = capped.derivedStatuses;
+    } catch (fallbackErr) {
       logger.error(
-        { err: claimedRes.error.message },
-        'ownState/snapshot: claimed positions query failed',
+        { err: formatError(fallbackErr) },
+        'ownState/snapshot: capped fallback after enumeration limit also failed',
       );
       return {
         ok: false,
@@ -432,12 +473,87 @@ export async function loadOwnStateSnapshot(
         error: { error: 'Failed to load own-state.', code: 'INTERNAL_ERROR' },
       };
     }
-    claimedRows = (claimedRes.data ?? []) as unknown as ClaimedPositionRow[];
   }
 
-  // `positionsTruncated` derives from the helper's raw-cap signal (NOT the
-  // post-filtered count) plus the claimed-since query hitting its own cap.
-  const positionsTruncated = positionsHitCap || claimedRows.length >= CLAIMED_PAGE_CAP;
+  // Claimed-since-cursor: only when recovering. Keyset matches the
+  // commitments terminal-query rule — `live` floors by overlap; any
+  // recovery-paging continuation is strict (the floor was already applied
+  // at recovery-initial time, and progress has advanced past it).
+  //
+  // PAGED (`#76`). One read under `CLAIMED_PAGE_CAP` used to be the whole answer,
+  // and a full page was reported as `positionsTruncated`. The read was already
+  // ordered `(row_updated_at, id)` ASC under a keyset, so paging it is advancing
+  // that keyset past the last row of the previous page — the same continuation
+  // `watermarkKeysetOr` already builds for the caller's own paging. A full page now
+  // means "ask again" instead of "give up", and only the page BUDGET is truncation.
+  let claimedRows: ClaimedPositionRow[] = [];
+  let claimedTruncated = false;
+  if (isRecovering) {
+    let claimedKeyset = isInitialRecovery
+      ? watermarkLiveKeysetOr(cursor!.p)
+      : watermarkKeysetOr(cursor!.p);
+    for (let page = 0; ; page += 1) {
+      if (page >= CLAIMED_MAX_PAGES) {
+        // Out of budget with a full page behind us, so there may be more. Same
+        // answer as every other bound on this path: say so on the wire and keep the
+        // rows we have. NOT an error — see the positions fallback above for why an
+        // error here is a reconnect loop.
+        logger.warn(
+          { address, pages: page, rows: claimedRows.length },
+          'ownState/snapshot: claimed-since paging exceeded its budget',
+        );
+        claimedTruncated = true;
+        break;
+      }
+      const claimedRes = await sb
+        .from('positions')
+        .select(POSITION_CLAIMED_COLUMNS)
+        .eq('network', config.network)
+        .eq('user_address', address)
+        .eq('claimed', true)
+        .or(claimedKeyset)
+        .order('row_updated_at', { ascending: true })
+        .order('id', { ascending: true })
+        .limit(CLAIMED_PAGE_CAP);
+      if (claimedRes.error) {
+        logger.error(
+          { err: claimedRes.error.message },
+          'ownState/snapshot: claimed positions query failed',
+        );
+        return {
+          ok: false,
+          status: 500,
+          error: { error: 'Failed to load own-state.', code: 'INTERNAL_ERROR' },
+        };
+      }
+      const rows = (claimedRes.data ?? []) as unknown as ClaimedPositionRow[];
+      claimedRows = claimedRows.concat(rows);
+      if (rows.length < CLAIMED_PAGE_CAP) break;
+      const last = rows[rows.length - 1]!;
+      const next = { s: last.row_updated_at, i: String(last.id) };
+      const advanced = watermarkKeysetOr(next);
+      if (advanced === claimedKeyset) {
+        // The keyset did not move, so the next read would return this page again.
+        // Only reachable if the ordering and the continuation disagree, which is
+        // the one failure mode a keyset loop can turn into an infinite one — the
+        // positions traversal validates the same property per row.
+        logger.error(
+          { address, pages: page + 1 },
+          'ownState/snapshot: claimed-since keyset did not advance',
+        );
+        claimedTruncated = true;
+        break;
+      }
+      claimedKeyset = advanced;
+    }
+  }
+
+  // `positionsTruncated` is now a statement about BUDGETS rather than about caps:
+  // the complete traversal fell back, or the claimed paging ran out of pages.
+  // A wallet whose whole population fits inside both budgets — every polygon
+  // wallet today, by three orders of magnitude — reports `false`, which is what
+  // `#76` is for and what lets the market maker's quote hold lift.
+  const positionsTruncated = positionsHitCap || claimedTruncated;
 
   const positions: OwnerPosition[] = [
     ...active.map((p): OwnerPosition => ({ status: 'active', ...p })),
