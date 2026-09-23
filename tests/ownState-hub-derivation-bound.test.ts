@@ -870,3 +870,183 @@ describe('reDerivePositionStatuses — discovery coverage is not assumed', () =>
     expect(rec.degradeds).toEqual(['positionsTruncated']);
   });
 });
+
+// ── what makes a discarded write harmless, and a retirement safe at scale ──
+
+describe('reDerivePositionStatuses — the emission loop, pinned', () => {
+  it('delivers every emission to EVERY subscriber, even when one stops accepting', async () => {
+    // The hub advances `statusCache` BEFORE the subscriber callback, and the
+    // handler's write is discarded silently once the response has ended
+    // (`writeEvent` returns on `res.writableEnded`). I filed `#94` on the reading
+    // that this loses rows for a surviving subscriber on the same poller.
+    //
+    // PROBED, AND IT DOES NOT. The loop is
+    //   for (const e of emissions) { cache.set(e); for (const sub of subs) deliver(e) }
+    // so every subscriber receives every emission in the SAME iteration. A
+    // subscriber can only miss a row if its OWN response ended, and then it is
+    // being torn down: its `'close'` handler unsubscribes, the last subscriber
+    // leaving destroys the poller AND its cache, and a reconnect re-seeds from a
+    // fresh snapshot that also delivers the rows. `#94` was closed as not
+    // reachable rather than fixed.
+    //
+    // This test exists because that safety is a property of the LOOP ORDER, which
+    // nothing else asserts. Deliver-per-subscriber-across-all-emissions — a
+    // plausible refactor — would make `#94` real, and this goes red first.
+    const sb = positionTables(buildTables(6, Object.fromEntries(
+      Array.from({ length: 6 }, (_, i) => [i + 1, { specStatus: 'closed' as const, winSide: 'away' }]),
+    )));
+    const hub = makeHub(sb);
+
+    // A accepts three events and then discards, exactly as a shed socket does.
+    const aTook: string[] = [];
+    hub.subscribe(ADDRESS, {
+      onCommitment: () => undefined,
+      onFill: () => undefined,
+      onResync: () => undefined,
+      onDegraded: () => undefined,
+      onPositionStatus: (_body, _ts, id) => {
+        if (aTook.length < 3) aTook.push(id);
+      },
+    });
+    // B is healthy, on the SAME poller.
+    const bTook: string[] = [];
+    hub.subscribe(ADDRESS, {
+      onCommitment: () => undefined,
+      onFill: () => undefined,
+      onResync: () => undefined,
+      onDegraded: () => undefined,
+      onPositionStatus: (_body, _ts, id) => {
+        bTook.push(id);
+      },
+    });
+
+    await hub.pollWallet(ADDRESS);
+
+    // SETUP FIRST: A really did stop accepting partway through a multi-row
+    // emission, or there is nothing for B's completeness to be robust against.
+    expect(aTook).toHaveLength(3);
+    expect(bTook).toHaveLength(6);
+    expect([...bTook].sort()).toEqual(['1', '2', '3', '4', '5', '6']);
+
+    // And the cache is now correct for B: a second tick with nothing changed
+    // emits nothing, which is the same statement as "B is not owed anything".
+    const before = bTook.length;
+    await hub.pollWallet(ADDRESS);
+    expect(bTook).toHaveLength(before);
+  });
+
+  it('keeps delivering to a sibling when one subscriber THROWS', async () => {
+    // The other half of `#94`: a callback that throws is logged and the cache has
+    // already advanced. Same answer, same reason — the sibling was served in the
+    // same iteration, before and after the throw.
+    const sb = positionTables(buildTables(4, Object.fromEntries(
+      Array.from({ length: 4 }, (_, i) => [i + 1, { specStatus: 'closed' as const, winSide: 'away' }]),
+    )));
+    const hub = makeHub(sb);
+    hub.subscribe(ADDRESS, {
+      onCommitment: () => undefined,
+      onFill: () => undefined,
+      onResync: () => undefined,
+      onDegraded: () => undefined,
+      onPositionStatus: () => {
+        throw new Error('consumer blew up');
+      },
+    });
+    const bTook: string[] = [];
+    hub.subscribe(ADDRESS, {
+      onCommitment: () => undefined,
+      onFill: () => undefined,
+      onResync: () => undefined,
+      onDegraded: () => undefined,
+      onPositionStatus: (_body, _ts, id) => {
+        bTook.push(id);
+      },
+    });
+
+    await hub.pollWallet(ADDRESS);
+
+    expect([...bTook].sort()).toEqual(['1', '2', '3', '4']);
+  });
+});
+
+describe('reDerivePositionStatuses — retirement at population scale', () => {
+  it('retires the finished rows and keeps maintaining every live kind behind the window', async () => {
+    // Adopted from the maintainer's external reviewer on PR #96, because it covers
+    // the main hazard of the retirement flag — OVER-retiring — at a scale and in a
+    // mixture the per-branch cases cannot. Four live kinds sit behind the recency
+    // window among 635 finished rows, and the flag comes from the REAL producer
+    // rather than from the test.
+    //
+    // The last assertion is the one worth having: phase B's work-list SHRINKS as
+    // two of the four become terminal during the session, which proves retirement
+    // is dynamic and not merely seeded.
+    const tables = buildTables(635, {
+      // Every row closed against this position's side => settledLost, finished.
+      ...Object.fromEntries(
+        Array.from({ length: 635 }, (_, i) => [i + 1, { specStatus: 'closed' as const, winSide: 'home' }]),
+      ),
+      // The four live kinds take the OLDEST-updated ids, so they sit BEHIND the
+      // recency window and phase B is the only phase that can reach them. (In
+      // this fixture `row_updated_at` descends as `id` ascends, so high ids are
+      // old — the reviewer's version put them low because every row there shared
+      // one timestamp and the id tiebreak decided the window.)
+      // 632: closed WINNER — owes a claim, and carries money.
+      632: { specStatus: 'closed', winSide: 'away' },
+      // 633: open with a scored contest — a PREDICTED loser a correction can flip.
+      633: { specStatus: 'open', winSide: 'tbd', contestStatus: 'scored', awayScore: 3, homeScore: 9 },
+      // 634: voided — a refund that still owes a claim.
+      634: { specStatus: 'closed', winSide: 'void' },
+      // 635: closed but the side is still unresolved — the defensive `tbd` case.
+      635: { specStatus: 'closed', winSide: 'tbd' },
+    });
+    const sb = positionTables(tables);
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+
+    // Seed from the real deriving helper's own answer, keyed the way it keys.
+    hub.seedStatusCache(
+      ADDRESS,
+      Array.from({ length: 635 }, (_, i) => {
+        const id = i + 1;
+        const live = id >= 632;
+        return {
+          key: `${String(id)}_0`,
+          status: (id === 632 ? 'claimable' : id === 634 ? 'void' : 'settledLost') as 'claimable',
+          sourceUpdatedAt: stampFor(id),
+          result: (id === 632 ? 'won' : id === 634 ? 'void' : 'lost') as 'won',
+          // A winner pays risk + profit (10000 + 15000); a void pays the stake
+          // back (10000). Seeding one value for both makes the void row emit on
+          // tick 1 on a payload difference and blunts the assertions below.
+          ...(id === 632 ? { claimableAmount: '25000' } : {}),
+          ...(id === 634 ? { claimableAmount: '10000' } : {}),
+          terminal: !live,
+        };
+      }),
+    );
+
+    await hub.pollWallet(ADDRESS);
+
+    // SETUP FIRST (rule 3g-silentsetup): the four live keys are exactly the ones
+    // phase B asks about, and the 631 finished ones cost nothing.
+    expect(phaseBIdLists(sb.queries)).toEqual([[632, 633, 634, 635]]);
+
+    // Two of the four reach a terminal state; the other two stay live.
+    tables.positions.find((p) => p.id === 632)!['claimed'] = true;
+    tables.positions.find((p) => p.id === 634)!['claimed'] = true;
+    await hub.pollWallet(ADDRESS);
+
+    expect(rec.statuses.filter((s) => s.id === '632' || s.id === '634').map((s) => s.status)).toEqual([
+      'claimed',
+      'claimed',
+    ]);
+
+    // THE assertion: the work-list shrank — retirement is dynamic, not just
+    // seeded. It takes the NEXT tick to show, because phase B's id list is built
+    // from the cache BEFORE the derivation that discovers the terminal state and
+    // writes the retirement. Asserting it on the same tick that emitted the claim
+    // would fail for that reason rather than for a broken retirement.
+    const before = sb.queries.length;
+    await hub.pollWallet(ADDRESS);
+    expect(phaseBIdLists(sb.queries.slice(before))).toEqual([[633, 635]]);
+  });
+});
