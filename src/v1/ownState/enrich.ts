@@ -169,6 +169,21 @@ export async function fetchCommitmentEnrichment(
   //
   // The two reads stay parallel WITHIN a chunk, which is what the original
   // `Promise.all` bought.
+  //
+  // ⚠ WHAT THIS DOES NOT BOUND, because the distinction is the whole point and a
+  // reviewer found it on the round that added the chunking: bounding the ID LIST
+  // bounds the REQUEST, not the RESPONSE. The contests read is keyed on
+  // `contest_id` and is therefore one row per id, so a 199-id chunk cannot answer
+  // with more than 199 rows. The SPECULATIONS read is keyed on `contest_id` too but
+  // is one-to-MANY — a single contest carries a speculation per market and line — so
+  // its answer FANS OUT beneath a bounded input and can still cross the server's
+  // 1,000-row maximum. Measured with one contest and 1,001 tuples: the last
+  // commitment is served with `speculationId: null`.
+  //
+  // That is inherited, it predates this change, and it degrades an OPTIONAL field
+  // rather than dropping a row — so it is filed rather than fixed here (`#101`).
+  // The general rule it teaches is worth more than the instance: ask whether a join
+  // is 1:1 or 1:many before believing that chunking its input made it safe.
   for (let start = 0; start < contestIds.length; start += ENRICH_ID_CHUNK) {
     const slice = contestIds.slice(start, start + ENRICH_ID_CHUNK);
     const [contestRes, specRes] = await Promise.all([
