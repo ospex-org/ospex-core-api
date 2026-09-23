@@ -42,8 +42,10 @@
  *
  * A `degraded` frame is emitted AT MOST ONCE per connection, whichever layer
  * notices first — the cold-start snapshot, the resume catch-up, or the hub's
- * live derivation. All three observe the same condition (the actionable set at
- * its 200-row cap) and the SDK's `degraded` latch additionally suppresses its
+ * live maintenance budget. The first two observe the same condition (this
+ * connection's own seed read at its 200-row cap); the hub's is a different one
+ * and always was (`#83`), which is why `degradedPending` exists rather than an
+ * assumed equivalence. The SDK's `degraded` latch additionally suppresses its
  * `onError` for the rest of the connection, so a repeat would cost error
  * visibility and buy nothing.
  *
@@ -219,22 +221,26 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
    *
    * Returns true when the caller now owns the emission. Three producers reach
    * here: the cold-start snapshot's `positionsTruncated`, the resume catch-up's
-   * `saturated`, and the hub's live derivation (`#83`). The first two and part of
-   * the third are one condition — `claimed=false AND risk_amount>0` over the same
-   * 200-row cap — which is why a repeat carries nothing; the hub can ALSO report
-   * exhausting its per-tick maintenance budget, which the snapshot's cap knows
-   * nothing about, and `degradedPending` below is what keeps that reportable
-   * rather than assuming the equivalence holds.
+   * `saturated`, and the hub's live maintenance budget (`#83`). The first two are
+   * one condition — this connection's own seed read of
+   * `claimed=false AND risk_amount>0` at its 200-row cap — which is why a repeat
+   * between THEM carries nothing. The hub's is a third, independent condition,
+   * and `degradedPending` below is what keeps it reportable rather than assuming
+   * an equivalence. Assuming one was a review blocker twice: once as a latch
+   * consumed by an observer, and once as a coverage relaxation (`#97`).
    *
    * What the repeat would cost, beyond noise: the SDK de-dupes same-level
    * statuses anyway, and its `degraded` latch suppresses `onError` for the rest
    * of the connection, so a redundant frame quietly costs error visibility.
    *
    * The consequence worth stating: for every wallet over the cap on polygon
-   * today the cold start already emits this frame, so the hub's new signal
-   * changes no wire byte for any of them. What it adds is the case the old code
-   * could not report at all — a wallet that was complete at connect and crosses
-   * the cap later in the session.
+   * today the cold start already emits this frame, so the hub's signal changes no
+   * wire byte for any of them. Since `#97` the hub's signal is ONLY its per-tick
+   * maintenance budget — 51 live keys against 400 on the worst wallet measured —
+   * so in practice the frame on the wire is the snapshot's, and it says the thing
+   * that is actually true: this connection's book is missing rows. A wallet that
+   * was complete at connect and grows past 200 actionable rows later is no longer
+   * a degradation at all; the live drain delivers the new rows.
    *
    * ## The latch is taken by the WRITE, never by the notification
    *
@@ -798,8 +804,10 @@ type DerivePositionStateResultWithFlags = DerivedPositionStateResult;
  * 200-row cap, so the two saturate together — but they order that cap
  * differently (`row_updated_at DESC` here, `position_created_at DESC` there),
  * so "the same rows" holds only under the cap, or above it while update order
- * tracks creation order. Measured on polygon 2026-09-22 it does, exactly; that
- * is a property of the data and `#83` is where it is written down:
+ * tracks creation order. Re-measured on polygon 2026-09-23: it no longer does.
+ * On the largest wallet 5 of the 200 keys in the recency window are absent from
+ * the creation-order window, which is what a day of settlement churn moves —
+ * `#76` is where the two reads become complete and the question stops existing.
  *
  *   1. Query actionable: `claimed=false AND risk_amount>0`, cap 200,
  *      ORDER BY row_updated_at DESC.
@@ -1172,7 +1180,12 @@ async function catchUpPositions(
   };
 }
 
-/** Mirrors `STATUS_DERIVATION_LIMIT` in hub.ts + `POSITION_QUERY_LIMIT` in positionFetch.ts. */
+/**
+ * Mirrors `POSITION_QUERY_LIMIT` in positionFetch.ts — the other read that
+ * enumerates a wallet's actionable set to SEED a connection, and the other one
+ * `#76` has to make complete. It no longer mirrors anything in hub.ts: the hub's
+ * live discovery is a keyset drain with no population cap (`#97`).
+ */
 const CATCHUP_POSITIONS_LIMIT = 200;
 
 // Floor `(s, i)` by the recovery overlap window — used to catch a slow
