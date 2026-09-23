@@ -58,9 +58,9 @@ function refuseCompleteThen(result: unknown): void {
   );
 }
 
-const { getOwnStateStreamHandler, __resetOwnStateStreamMetrics } = await import(
-  '../src/v1/ownState/stream.js'
-);
+const { getOwnStateStreamHandler, __resetOwnStateStreamMetrics, derivePositionsForWallet } =
+  await import('../src/v1/ownState/stream.js');
+const { getSupabase } = await import('../src/lib/supabase.js');
 const { OwnStateHub, __setOwnStateHubForTest } = await import('../src/v1/ownState/hub.js');
 const { __resetConnections, acquire, configureConnectionCaps } = await import('../src/v1/stream/connections.js');
 const {
@@ -1322,5 +1322,207 @@ describe('GET /v1/stream/own-state — the seed states its own coverage', () => 
       ['1_0', true],
       ['2_0', false],
     ]);
+  });
+});
+
+/**
+ * `derivePositionsForWallet` — the RESUME leg's two position traversals (`#76` B1).
+ *
+ * Both were one 200-row read. The cold start went complete first, which made the
+ * gap worse than it looked: a wallet recovered completely at connect and then, on
+ * an ordinary reconnect with the cursor it had been given, seeded only 200 keys and
+ * re-asserted `degraded`. The rows the cap omitted fell out of the hub's cache, so
+ * a speculation settling without touching its position row reached nobody. The
+ * reviewer reproduced that end to end; these assert the MECHANISM — what the reads
+ * ASK FOR — because nothing in this suite pinned the cap, which is how it shipped.
+ */
+describe('derivePositionsForWallet — the resume leg pages both reads (#76)', () => {
+  interface Recorded { table: string; method: string; args: unknown[] }
+
+  /** Answers by call order and RECORDS every builder call with its arguments. */
+  function recordingClient(pages: Array<{ data: unknown[] | null; error: unknown }>): {
+    client: ReturnType<typeof getSupabase>;
+    calls: Recorded[];
+  } {
+    const calls: Recorded[] = [];
+    let idx = 0;
+    const make = (table: string): Record<string, unknown> => {
+      const b: Record<string, unknown> = {};
+      for (const m of ['select', 'eq', 'gt', 'lt', 'in', 'or', 'order', 'limit']) {
+        b[m] = (...args: unknown[]): unknown => {
+          calls.push({ table, method: m, args });
+          return b;
+        };
+      }
+      b['then'] = (resolve: (v: unknown) => void): void => {
+        resolve(pages[Math.min(idx++, pages.length - 1)]!);
+      };
+      return b;
+    };
+    return {
+      client: { from: (table: string) => make(table) } as unknown as ReturnType<typeof getSupabase>,
+      calls,
+    };
+  }
+
+  const posRow = (id: number): Record<string, unknown> => ({
+    speculation_id: id,
+    user_address: ADDRESS,
+    position_type: 'upper',
+    risk_amount: '10000',
+    profit_amount: '15000',
+    claimed: false,
+    row_updated_at: `2026-05-29T12:00:${String(id % 60).padStart(2, '0')}.000Z`,
+    id,
+  });
+  const full = (from: number): Record<string, unknown>[] =>
+    Array.from({ length: 199 }, (_, i) => posRow(from - i));
+
+  it('pages the actionable read by the IMMUTABLE id, descending and strictly', async () => {
+    // Two full pages then a short one. The continuation must be `lt('id', …)` from
+    // the last row of the previous page — NOT an offset, and NOT `row_updated_at`:
+    // paging a traversal by a mutable ordering key is `#97`'s displacement hazard
+    // one scope in, where a row that moves between pages is skipped or repeated.
+    const { client, calls } = recordingClient([
+      { data: full(500), error: null },
+      { data: full(301), error: null },
+      { data: [posRow(102)], error: null },
+      { data: [], error: null },   // speculations
+      { data: [], error: null },   // contests
+    ]);
+    const result = await derivePositionsForWallet(client, 'polygon', ADDRESS);
+
+    const posCalls = calls.filter((c) => c.table === 'positions');
+    expect(posCalls.filter((c) => c.method === 'limit').map((c) => c.args[0])).toEqual([
+      199, 199, 199,
+    ]);
+    // Page 1 has no continuation; pages 2 and 3 continue from the previous last row.
+    expect(posCalls.filter((c) => c.method === 'lt').map((c) => c.args)).toEqual([
+      ['id', '302'],
+      ['id', '103'],
+    ]);
+    expect(posCalls.filter((c) => c.method === 'order').map((c) => c.args)).toEqual([
+      ['id', { ascending: false }],
+      ['id', { ascending: false }],
+      ['id', { ascending: false }],
+    ]);
+    // …and nothing was truncated, which is the whole point: 399 rows, no signal.
+    expect(result.saturated).toBe(false);
+    expect(result.queryFailed).toBe(false);
+  });
+
+  it('reports saturation only when the actionable paging runs out of PAGES', async () => {
+    // The boundary from the only side that can reach it: 64 full pages. A bound that
+    // never binds is not a bound, and a bound that binds early is the cap again.
+    //
+    // Every page must ADVANCE, and that is not decoration — the first version of
+    // this case repeated one page and stopped after two reads, because the
+    // non-advancing guard fired before the budget could (rule 3b: a case aimed at
+    // one gate caught by another). A page factory keeps the keyset moving so the
+    // budget is the only thing left that can stop the loop.
+    let top = 100000;
+    const { client, calls } = recordingClient(
+      Array.from({ length: 70 }, () => {
+        const page = { data: full(top), error: null };
+        top -= 199;
+        return page;
+      }),
+    );
+    const result = await derivePositionsForWallet(client, 'polygon', ADDRESS);
+    expect(calls.filter((c) => c.table === 'positions' && c.method === 'limit')).toHaveLength(64);
+    expect(result.saturated).toBe(true);
+  });
+
+  it('stops the actionable paging when a page does not advance the keyset', async () => {
+    // The one way a keyset loop becomes infinite. Two IDENTICAL pages: the second
+    // one's first row is not below the previous page's last id, so it stops and says
+    // so rather than spending 64 reads on the same rows.
+    const same = full(500);
+    const { client, calls } = recordingClient([
+      { data: same, error: null },
+      { data: same, error: null },
+      { data: [], error: null },
+      { data: [], error: null },
+    ]);
+    const result = await derivePositionsForWallet(client, 'polygon', ADDRESS);
+    expect(calls.filter((c) => c.table === 'positions' && c.method === 'limit')).toHaveLength(2);
+    expect(result.saturated).toBe(true);
+  });
+
+  it('pages the terminal-since read ASCENDING from the floored cursor', async () => {
+    // Ascending is not cosmetic. The covered set becomes a contiguous PREFIX from
+    // the cursor, so a budget-limited answer is "everything up to here" rather than
+    // "the newest N with a hole underneath" — and the handler advances the response
+    // cursor over what it emits.
+    const claimedRow = (id: number): Record<string, unknown> => ({
+      ...posRow(id),
+      claimed: true,
+      row_updated_at: `2026-05-29T13:00:${String(id % 60).padStart(2, '0')}.000Z`,
+    });
+    const { client, calls } = recordingClient([
+      { data: [], error: null },                                            // actionable, short
+      { data: Array.from({ length: 199 }, (_, i) => claimedRow(i + 1)), error: null },
+      { data: [claimedRow(200)], error: null },
+      { data: [], error: null },
+      { data: [], error: null },
+    ]);
+    const since = { s: '2026-05-29T12:00:00.000Z', i: '7' };
+    const result = await derivePositionsForWallet(client, 'polygon', ADDRESS, {
+      recentTerminalSince: since,
+    });
+
+    const orders = calls
+      .filter((c) => c.table === 'positions' && c.method === 'order')
+      .map((c) => c.args);
+    // The actionable read is id DESC; both terminal reads are (ts, id) ASC.
+    expect(orders).toEqual([
+      ['id', { ascending: false }],
+      ['row_updated_at', { ascending: true }],
+      ['id', { ascending: true }],
+      ['row_updated_at', { ascending: true }],
+      ['id', { ascending: true }],
+    ]);
+    // The second terminal read continues from the LAST ROW of the first, not from
+    // the cursor again — the defect that makes a paged read re-read page one.
+    const terminalExprs = calls
+      .filter((c) => c.table === 'positions' && c.method === 'or')
+      .map((c) => String(c.args[0]));
+    expect(terminalExprs).toHaveLength(2);
+    expect(terminalExprs[1]).toContain('row_updated_at.gt.2026-05-29T13:00:19.000Z');
+    expect(terminalExprs[1]).toContain('id.gt.199');
+    expect(terminalExprs[0]).not.toBe(terminalExprs[1]);
+    expect(result.terminalSaturated).toBe(false);
+  });
+
+  it('reports terminal saturation only when THAT paging runs out of pages', async () => {
+    // The timestamp has to advance with the id, or the continuation repeats and the
+    // non-advancing guard fires before the budget.
+    const claimedRow = (id: number): Record<string, unknown> => ({
+      ...posRow(id),
+      claimed: true,
+      row_updated_at: new Date(Date.parse('2026-05-29T13:00:00.000Z') + id * 1000).toISOString(),
+    });
+    // Advancing pages for the same reason as the case above: a repeated page stops
+    // on the non-advancing guard, not on the budget.
+    let base = 1;
+    const { client, calls } = recordingClient([
+      { data: [], error: null },
+      ...Array.from({ length: 70 }, () => {
+        const page = {
+          data: Array.from({ length: 199 }, (_, i) => claimedRow(base + i)),
+          error: null,
+        };
+        base += 199;
+        return page;
+      }),
+    ]);
+    const result = await derivePositionsForWallet(client, 'polygon', ADDRESS, {
+      recentTerminalSince: { s: '2026-05-29T12:00:00.000Z', i: '0' },
+    });
+    // 1 actionable read + 64 terminal reads.
+    expect(calls.filter((c) => c.table === 'positions' && c.method === 'limit')).toHaveLength(65);
+    expect(result.terminalSaturated).toBe(true);
+    // And the actionable half is NOT implicated — the two budgets are separate.
+    expect(result.saturated).toBe(false);
   });
 });

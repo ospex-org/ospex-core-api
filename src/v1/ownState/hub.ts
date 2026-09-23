@@ -331,9 +331,10 @@ const POSITION_DERIVATION_COLUMNS =
 // The phase-A discovery cap this file used to carry (`STATUS_DERIVATION_LIMIT
 // = 200`) is GONE, and `scanPositionRows` documents why: a window ordered by a
 // mutable key can be displaced, so discovery is a keyset cursor instead and has
-// no population cap to saturate. `POSITION_QUERY_LIMIT` (positionFetch.ts) and
-// `CATCHUP_POSITIONS_LIMIT` (stream.ts) are unchanged — they bound the SEED,
-// which is a different question and still `#76`'s.
+// no population cap to saturate. The SEED's caps were a different question and
+// they are `#76`'s: `POSITION_QUERY_LIMIT` (positionFetch.ts) and the resume leg's
+// two reads (stream.ts) all became bounded traversals there, so no 200-row cap is
+// left anywhere on the own-state path.
 
 /**
  * Phase-B budget: how many cached `speculation_id`s one tick refreshes, and in
