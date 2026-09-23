@@ -253,15 +253,6 @@ interface WalletPoller {
    * documenting a permanent survivor for it.
    */
   saturationNotified: WeakSet<OwnStateSubscriber>;
-  /**
-   * Whether the seeded cache is believed to cover the wallet's whole actionable
-   * population. `'capped'` until a caller says otherwise.
-   *
-   * This is the ONLY thing that relaxes phase A's saturation rule, and it is a
-   * claim the handler makes on the strength of a complete read — not something
-   * the hub can verify, which is why it is named for its provenance.
-   */
-  seedCoverage: 'capped' | 'complete';
   polling: boolean;
 }
 
@@ -369,7 +360,6 @@ export class OwnStateHub {
         statusCache: new Map(),
         saturationSignalled: false,
         saturationNotified: new WeakSet(),
-        seedCoverage: 'capped',
         polling: false,
         // Timer is deliberately NOT started here — the handler calls
         // `beginLive(sub)` after seeding the status cache. Starting the
@@ -443,14 +433,6 @@ export class OwnStateHub {
    *
    * `fetchCategorizedPositions` computes the flag from the join it already did,
    * so this costs nothing and removes the tick-1 spike entirely.
-   *
-   * ## `coverage`, and what it licenses
-   *
-   * `'complete'` asserts that these entries are EVERY actionable position the
-   * wallet has, not a capped page of them. It licenses one thing: phase A may
-   * stop treating a full page as saturation on its own (see
-   * `reDerivePositionStatuses`). Default `'capped'` keeps the conservative rule,
-   * so a caller that does not know stays safe.
    */
   seedStatusCache(
     address: string,
@@ -463,14 +445,9 @@ export class OwnStateHub {
       /** `isTerminalForever` over the deriving join. Absent ⇒ assumed live. */
       terminal?: boolean | undefined;
     }>,
-    options: { coverage?: 'capped' | 'complete' } = {},
   ): void {
     const state = this.pollers.get(address.toLowerCase());
     if (!state) return;
-    // Monotonic: a complete seed cannot be walked back to capped by a later
-    // partial re-seed, because the keys a complete seed established stay in the
-    // cache and phase A's window still discovers anything new.
-    if (options.coverage === 'complete') state.seedCoverage = 'complete';
     for (const e of entries) {
       state.statusCache.set(e.key, {
         status: e.status,
@@ -697,34 +674,39 @@ export class OwnStateHub {
       row_updated_at: string;
       id: string | number;
     }>;
-    // Saturation means "there may be actionable rows I have never seen", and a
-    // full page is only EVIDENCE of that, not the thing itself.
+    // A FULL PAGE IS SATURATION, AND A COMPLETE SEED DOES NOT CHANGE THAT.
     //
-    // With a CAPPED seed the two are indistinguishable, so a full page is the
-    // answer and the conservative reading is the right one. With a COMPLETE seed
-    // they come apart: every row beyond the window is already in the cache and
-    // phase B maintains it, so the only way coverage can be lost is a row
-    // arriving that the cache has never held. Such a row carries
-    // `row_updated_at = now`, so it enters at the HEAD of this window — which
-    // means a full page containing no unknown key proves nothing was missed,
-    // and a full page containing one means there may be more beyond it.
+    // A relaxation was tried and WITHDRAWN: given a seed known to cover the whole
+    // actionable population, suppress the signal when a full page contains only
+    // keys the cache already holds. The reasoning was that a row the cache has
+    // never held carries `row_updated_at = now` and therefore enters at the HEAD
+    // of this window, so a full page of known keys proves nothing was missed.
     //
-    // Without this, `#76`'s complete snapshot would deliver a complete view and
-    // the first tick would still report it partial, permanently: the frame
-    // latches per subscriber and the SDK has no in-connection event that clears
-    // a live-phase `degraded`. Completeness has to be believed by the layer that
-    // reports partiality, or it buys nothing.
-    const pageFull = actionable.length >= STATUS_DERIVATION_LIMIT;
-    const sawUnknownKey =
-      state.seedCoverage === 'complete' &&
-      actionable.some(
-        (p) =>
-          !state.statusCache.has(
-            `${String(p.speculation_id)}_${p.position_type === 'upper' ? 0 : 1}`,
-          ),
-      );
-    const actionableSaturated =
-      pageFull && (state.seedCoverage === 'capped' || sawUnknownKey);
+    // That is false, and the counterexample is worth keeping because it is cheap
+    // to hit: a new row enters at the head AT ITS WRITE, not at the later poll's
+    // READ. Let one position arrive, then let 200 already-known positions take
+    // newer `row_updated_at` values before the next tick. The new row is now
+    // below the window's floor; phase A cannot see it, and phase B never asks,
+    // because phase B only maintains keys the cache already holds. Reproduced end
+    // to end through the real snapshot and SSE handler from 199 actionable rows,
+    // a shape that fits inside today's cap: the row was never emitted, no
+    // `degraded` frame was written, and the saturation counter stayed at zero.
+    // That is the defect class `#83` closed, reopened by its own fix.
+    //
+    // The general form, because it caught me twice in one arc: AN INVARIANT THAT
+    // HOLDS AT WRITE TIME IS NOT AN INVARIANT AT READ TIME unless nothing can
+    // reorder the rows in between — and `row_updated_at` is precisely the thing
+    // that reorders them.
+    //
+    // A sound relaxation needs a bounded PROOF that discovery skipped nothing,
+    // and no proof is available from this page alone: it takes a second read — a
+    // count of the actionable set, or a keyset probe above the highest id the
+    // cache has seen, which needs an overlap because ids are assigned in order
+    // and committed out of it. That mechanism, its per-tick cost and its
+    // false-alarm ordering are `#97`. Until it lands the conservative rule
+    // stands, and `#76`'s complete snapshot cannot ship either — it would be
+    // reported partial for ever.
+    const actionableSaturated = actionable.length >= STATUS_DERIVATION_LIMIT;
     // Phase B — MAINTENANCE of cached keys that are NOT in phase A's result.
     // These are positions the subscriber already holds whose status may have
     // transitioned (just claimed; stake just transferred out), so their current

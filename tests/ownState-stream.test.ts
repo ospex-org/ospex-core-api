@@ -1174,7 +1174,6 @@ describe('GET /v1/stream/own-state — a preReady saturation signal is held, not
 describe('GET /v1/stream/own-state — the seed states its own coverage', () => {
   interface SeedCall {
     entries: Array<{ key: string; terminal?: boolean | undefined }>;
-    options: { coverage?: string } | undefined;
   }
 
   function installCapturingSeed(): SeedCall[] {
@@ -1183,10 +1182,9 @@ describe('GET /v1/stream/own-state — the seed states its own coverage', () => 
       seedStatusCache(
         address: string,
         entries: Parameters<InstanceType<typeof OwnStateHub>['seedStatusCache']>[1],
-        options?: Parameters<InstanceType<typeof OwnStateHub>['seedStatusCache']>[2],
       ): void {
-        calls.push({ entries: entries as SeedCall['entries'], options });
-        super.seedStatusCache(address, entries, options);
+        calls.push({ entries: entries as SeedCall['entries'] });
+        super.seedStatusCache(address, entries);
       }
     }
     __setOwnStateHubForTest(
@@ -1200,11 +1198,7 @@ describe('GET /v1/stream/own-state — the seed states its own coverage', () => 
     return calls;
   }
 
-  it('claims `complete` on a cold start the capped read covered whole', async () => {
-    // `hitCap: false` means the 200-row read returned the entire actionable
-    // population, so the seed IS complete. That is true today, with no change to
-    // the read — #76's second half changes the READ and this line then reports
-    // the completeness that follows.
+  it('seeds the cold-start derivation through to the hub', async () => {
     positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
       active: [],
       pendingSettle: [],
@@ -1219,26 +1213,6 @@ describe('GET /v1/stream/own-state — the seed states its own coverage', () => 
 
     expect(events(res).map((e) => e.event)).toEqual(['snapshot', 'ready']);
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.options).toEqual({ coverage: 'complete' });
-  });
-
-  it('claims `capped` when the read hit its cap', async () => {
-    // The discriminating half. Same code path, same call, one flag different —
-    // and the hub's conservative saturation rule depends entirely on this.
-    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
-      active: [],
-      pendingSettle: [],
-      claimable: [],
-      hitCap: true,
-      derivedStatuses: [],
-    });
-    const calls = installCapturingSeed();
-    const res = makeRes();
-    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
-    await flushTicks(64);
-
-    expect(calls).toHaveLength(1);
-    expect(calls[0]!.options).toEqual({ coverage: 'capped' });
   });
 
   it('forwards retirement and coverage from the RESUME catch-up too', async () => {
@@ -1296,9 +1270,6 @@ describe('GET /v1/stream/own-state — the seed states its own coverage', () => 
     expect(events(res).find((e) => e.event === 'ready')).toBeDefined();
     expect(calls).toHaveLength(1);
     expect(calls[0]!.entries.map((e) => [e.key, e.terminal])).toEqual([['101_0', true]]);
-    // One actionable row is far under the 200-row catch-up cap, so the catch-up
-    // covered the whole population and says so.
-    expect(calls[0]!.options).toEqual({ coverage: 'complete' });
   });
 
   it('forwards each row\'s retirement flag from the deriving read', async () => {
