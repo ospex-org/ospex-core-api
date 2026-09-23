@@ -176,7 +176,13 @@ describe('fetchCommitmentEnrichment', () => {
     const tables: string[] = [];
     const make = (table: string): unknown => {
       const b: Record<string, unknown> = {};
-      for (const m of ['select', 'eq', 'in']) b[m] = (): unknown => b;
+      // `gt`/`order`/`limit` are here for the speculations DRAIN (`#101`), whose
+      // terminal is `.limit(...)`. A builder that stops at `in` throws
+      // "query.order is not a function", which reads as a broken mock rather than
+      // as the read having changed shape.
+      for (const m of ['select', 'eq', 'in', 'gt', 'order', 'limit']) {
+        b[m] = (): unknown => b;
+      }
       b['then'] = (resolve: (v: unknown) => void): void =>
         resolve(byTable[table] ?? { data: [], error: null });
       return b;
@@ -211,6 +217,7 @@ describe('fetchCommitmentEnrichment', () => {
         ins.push({ table, ids });
         return b;
       };
+      for (const m of ['gt', 'order', 'limit']) b[m] = (): unknown => b;
       b['then'] = (resolve: (v: unknown) => void): void =>
         resolve({ data: [], error: null });
       return b;
