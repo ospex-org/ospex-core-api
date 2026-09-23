@@ -43,12 +43,46 @@ type Row = Record<string, string | number | boolean | null>;
 type Tables = Record<string, Row[]>;
 type Query = { table: string; select: string; filters: Array<[string,string,unknown]>; or?: string; orders: Array<[string,boolean]>; limit?: number; signal?: AbortSignal; rows?: number };
 type Reply = { data: Row[] | null; error: { message: string } | null };
+/**
+ * Ordering and comparison the way Postgres would, and the hottest function in this
+ * file by a wide margin: the page-budget case filters and sorts a 12,736-row table
+ * once per page for 64 pages, so `cmp` runs tens of millions of times and its
+ * constant factor IS that test's runtime.
+ *
+ * It used to build up to FOUR BigInts per numeric comparison —
+ * `BigInt(String(a)) < BigInt(String(b)) ? -1 : BigInt(String(a)) > BigInt(String(b))`
+ * — which put that one case at 4,787ms against vitest's 5,000ms default timeout. A
+ * 213ms margin on this machine is no margin at all on a slower one, and the
+ * reviewer of PR #102 hit the timeout on theirs (on the BASE commit too — it is not
+ * a #102 regression). Now it builds at most two, and skips BigInt entirely when both
+ * operands are short decimal integers.
+ *
+ * The 15-digit bound is the load-bearing part: 10^15 < 2^53, so a Number comparison
+ * of two such values is exact. `risk_amount`/`profit_amount` are uint256 as decimal
+ * strings and DO exceed it, which is why the BigInt path stays rather than being
+ * replaced — the fast path must not be allowed to swallow them. Anything that is not
+ * a plain non-negative integer string (a sign, a decimal point, an empty string)
+ * fails the test and falls through, so the fast path can only ever agree with the
+ * slow one.
+ */
+const TIME_KEY = /(_at|_time)$/;
+const NUM_KEY = /^(id|speculation_id|contest_id|risk_amount|profit_amount)$/;
+/** <= 15 digits is < 2^53, so Number compares these exactly. */
+const SAFE_DIGITS = /^\d{1,15}$/;
 function cmp(key: string, a: unknown, b: unknown): number {
   if (a === b) return 0;
   if (a == null) return -1;
   if (b == null) return 1;
-  if (/(_at|_time)$/.test(key)) return compareIsoTimestamptz(String(a), String(b));
-  if (/^(id|speculation_id|contest_id|risk_amount|profit_amount)$/.test(key)) return BigInt(String(a)) < BigInt(String(b)) ? -1 : BigInt(String(a)) > BigInt(String(b)) ? 1 : 0;
+  if (TIME_KEY.test(key)) return compareIsoTimestamptz(String(a), String(b));
+  if (NUM_KEY.test(key)) {
+    const sa = String(a); const sb = String(b);
+    if (SAFE_DIGITS.test(sa) && SAFE_DIGITS.test(sb)) {
+      const na = Number(sa); const nb = Number(sb);
+      return na < nb ? -1 : na > nb ? 1 : 0;
+    }
+    const x = BigInt(sa); const y = BigInt(sb);
+    return x < y ? -1 : x > y ? 1 : 0;
+  }
   return String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0;
 }
 function split(expr: string): string[] {
@@ -169,11 +203,35 @@ it('real complete deadline refusal returns safe partial cold SSE (even below the
   expect(refused).toBe(true);expect(events(r).map(e=>e.event)).toEqual(['snapshot','degraded','ready']);
   const snap=events(r)[0]!.data;expect((snap.positions as unknown[]).length).toBe(20);expect(snap.positionsTruncated).toBe(true);expect(decodeOwnStateCursor(String(snap.cursor)).p).toEqual({s:'1970-01-01T00:00:00.000Z',i:'0'});expect(r.writableEnded).toBe(false);r.end();
 });
+/**
+ * The one case here that legitimately does real work: 64 full pages is 64*199 =
+ * 12,736 rows by construction, because the drain only continues while a page is FULL,
+ * so the budget cannot be reached with fewer.
+ *
+ * It carries an EXPLICIT timeout rather than leaning on vitest's 5,000ms default,
+ * because the default is an arbitrary number that happens to sit near this case's
+ * honest cost. Measured on this machine, whole suite in parallel: 4,787ms before the
+ * `cmp` fix above and 2,257ms after (778ms with this file run alone — the spread is
+ * machine contention, which is precisely why a 5,000ms line is the wrong instrument).
+ * The PR #102 reviewer hit the default on their hardware, on the BASE commit as well
+ * as this branch.
+ *
+ * The global `testTimeout` is deliberately NOT raised: that would relax the implicit
+ * bound on all 1,488 tests to fix one, and every other test in the repo should stay
+ * fast enough that 5,000ms is a real signal. A slow machine now reports THIS case's
+ * actual assertion — the page count — instead of a timeout that says nothing about it.
+ *
+ * Note what does NOT bound this case: the production traversal's own
+ * `COMPLETE_DEADLINE_MS` (15s) cannot fire here, because `vi.useFakeTimers()` freezes
+ * `Date.now()`. That mechanism is a rival explanation for "it fell back", and it has
+ * its own case above which advances the clock deliberately — so the two are separable
+ * rather than both satisfied at once (rule 3b-rescue).
+ */
 it('real page-budget refusal falls back after exactly 64 position pages',async()=>{
   if(BASE)return;const db=database(fixture(64*199));mocks.getSupabase.mockReturnValue(db);const out=await loadOwnStateSnapshot(ADDRESS,null,Date.now());
   expect(out.ok).toBe(true);if(!out.ok)throw new Error(JSON.stringify(out));expect(out.body.positions).toHaveLength(200);expect(out.body.positionsTruncated).toBe(true);
   expect(db.queries.filter(q=>q.table==='positions'&&q.limit===199)).toHaveLength(64);expect(db.queries.filter(q=>q.table==='positions'&&q.limit===200)).toHaveLength(1);
-});
+},20_000);
 it('ordinary complete database failure is not disguised as a budget fallback',async()=>{
   const db=database(fixture(20),(q,r)=>q.table==='positions'?{data:null,error:{message:'review database failure'}}:r);mocks.getSupabase.mockReturnValue(db);const out=await loadOwnStateSnapshot(ADDRESS,null,Date.now());
   expect(out.ok).toBe(false);if(out.ok)throw new Error('expected failure');expect(out.status).toBe(500);expect(db.queries.filter(q=>q.table==='positions')).toHaveLength(1);
