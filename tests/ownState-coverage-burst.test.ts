@@ -303,3 +303,80 @@ it('reports partial coverage when a new row is displaced by updates to already-k
   console.log('COVERAGE_BURST', JSON.stringify({snapshotRows: result.active.length, actualActionable: t.positions.filter(p => p.risk_amount !== '0').length, missingKey: '201_0', missingKeyEmitted: wire.some(e => e.event === 'positionStatus' && (e.data as any).speculationId === '201'), degradedFrames: wire.filter(e => e.event === 'degraded'), saturation: hub.stats().positionSaturationTotal, readLimits: queries.map(q=>q.limit), open: !res.writableEnded}));
   expect(wire.filter(e => e.event === 'degraded').map(e => e.data)).toEqual([]);
 });
+
+/**
+ * B1's RECOVERY AXIS, end to end — the reviewer's three cases from the PR #99
+ * review, kept verbatim except for the log label.
+ *
+ * The cursor used to be acknowledged by the READ: the drain advanced
+ * `positionsTip` the moment rows came back, and the maintenance page and both
+ * parent joins run after it. A position arriving during a transient outage in any
+ * of those three was therefore never delivered, never cached, and — once its
+ * stamp fell outside the overlap — unreachable, with the connection still open
+ * and no `degraded`, `resync` or error frame. Reproduced here before fixing:
+ * `ids: ['1','3']` / `['3']` / `['3']`, identical to their run.
+ *
+ * These are the cases that a `DESC LIMIT 200` window passed for free — it
+ * re-read every row every tick, so a transient failure healed itself — and that
+ * a cursor only passes when the tip is committed after the derivation. That is
+ * why they are here and not only in the hub-level file: the property is about what
+ * reaches the SOCKET across six polls, and the hub-level cases assert the cursor
+ * (`the discovery cursor is acknowledged by the WORK`).
+ */
+for (const failure of ['maintenance', 'speculations', 'contests'] as const) {
+  it(`B1: retains discovery through ${failure} failure until recovery`, async () => {
+    const t = tablesFor(1);
+    let broken = false;
+    let errors = 0;
+    const sb = positionTables(t, (q, _n, reply) => {
+      const selected = failure === 'maintenance'
+        ? q.table === 'positions' && q.joins.length > 0
+        : q.table === failure;
+      if (broken && selected) { errors++; return { data: null, error: { message: `review-${failure}-outage` } }; }
+      return reply;
+    });
+    supabaseMock.getSupabase.mockReturnValue(sb);
+    const result = await actualPositionFetch.fetchCategorizedPositions(ADDRESS);
+    expect(result.hitCap).toBe(false);
+    expect(result.active).toHaveLength(1);
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue(result);
+    supabaseMock.getSupabase.mockImplementation(() => emptyClient());
+    const hub = new OwnStateHub({ getClient: () => hubClient(sb), getNetwork: () => 'polygon', pollMs: 1e9 });
+    __setOwnStateHubForTest(hub);
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+    await flushTicks(128);
+    expect(events(res).map(e => e.event)).toEqual(['snapshot', 'ready']);
+    expect((events(res)[0]!.data as any).positionsTruncated).toBe(false);
+    await hub.pollWallet(ADDRESS);
+    const qstart = sb.queries.length;
+    broken = true;
+    // A transfer out makes key 1 require maintenance on BOTH base and head.
+    if (failure === 'maintenance') t.positions[0]!.risk_amount = '0';
+    for (let ms = 1000; ms <= 40000; ms += 1500) {
+      vi.setSystemTime(NOW + ms);
+      if (ms === 1000) addRow(t, 2, new Date(NOW + ms).toISOString());
+      if (ms === 40000) addRow(t, 3, new Date(NOW + ms).toISOString());
+      await hub.pollWallet(ADDRESS);
+    }
+    expect(errors).toBeGreaterThan(0);
+    expect(t.positions).toHaveLength(3);
+    broken = false;
+    for (let ms = 41500; ms <= 46000; ms += 1500) {
+      vi.setSystemTime(NOW + ms);
+      await hub.pollWallet(ADDRESS);
+    }
+    const wire = events(res);
+    const ids = wire.filter(e => e.event === 'positionStatus').map(e => (e.data as any).speculationId);
+    const health = wire.filter(e => e.event === 'degraded' || e.event === 'resync');
+    console.log('B1_RECOVERY', JSON.stringify({failure, errors, ids, health, open:!res.writableEnded,
+      actionable: t.positions.filter(p => p.risk_amount !== '0').length, 
+      discoveryFloors: sb.queries.slice(qstart).filter(q=>q.table==='positions' && q.or).map(q=>q.or),
+    }));
+    expect(ids, 'new row 2 must be delivered after transient join/maintenance failure').toContain('2');
+    expect(ids).toContain('3');
+    expect(health).toEqual([]);
+    expect(res.writableEnded).toBe(false);
+    res.end();
+  });
+}

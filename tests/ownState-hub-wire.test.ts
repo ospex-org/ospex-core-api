@@ -67,13 +67,47 @@ function row(id: number, stamp: string): Record<string, unknown> {
   };
 }
 
+/**
+ * The parents the derivation needs. Present deliberately: a fake that answered
+ * `[]` for `speculations` would leave every discovered row UNRESOLVED, which now
+ * holds the discovery cursor — so the tip assertions below would be measuring an
+ * orphan skip rather than a cursor, and would report the tip as never advancing
+ * for a reason that has nothing to do with the URL.
+ */
+function parentsFor(rows: Array<Record<string, unknown>>, table: string): unknown[] {
+  return rows.map((r) =>
+    table === 'speculations'
+      ? {
+          speculation_id: r['speculation_id'],
+          contest_id: r['speculation_id'],
+          network: 'polygon',
+          market_type: 'moneyline',
+          line_ticks: 0,
+          speculation_status: 'open',
+          win_side: 'tbd',
+          row_updated_at: r['row_updated_at'],
+        }
+      : {
+          contest_id: r['speculation_id'],
+          network: 'polygon',
+          contest_status: 'unverified',
+          away_score: null,
+          home_score: null,
+          row_updated_at: r['row_updated_at'],
+        },
+  );
+}
+
 async function drive(rows: Array<Record<string, unknown>>): Promise<{
   statuses: string[];
 }> {
   fake = await startFakePostgrest((req) => {
     const table = req.path.replace('/rest/v1/', '');
-    if (table !== 'positions') return { body: [] };
-    return { body: applyFilters(rows, req.params) };
+    if (table === 'positions') return { body: applyFilters(rows, req.params) };
+    if (table === 'speculations' || table === 'contests') {
+      return { body: applyFilters(parentsFor(rows, table), req.params) };
+    }
+    return { body: [] };
   });
   const client: SupabaseClient = createClient(fake.url, 'test-key');
   const hub = new OwnStateHub({ getClient: () => client, getNetwork: () => 'polygon' });
@@ -131,7 +165,9 @@ describe('OwnStateHub positions discovery — the request on the wire', () => {
     const stamp = `${new Date(NOW + 60_000).toISOString().replace('000Z', '')}13737+00:00`;
     const rows = [row(7, stamp)];
     const { statuses } = await drive(rows);
-    expect(statuses).toEqual([]); // no speculation in the fake ⇒ orphan skip
+    // Derived, not skipped — which is what makes the tip assertion below a
+    // statement about the cursor rather than about an unresolved row.
+    expect(statuses).toEqual(['7']);
 
     const positions = fake.requests.filter((r) => r.path.endsWith('/positions'));
     expect(positions[0]!.params.get('select')).toContain('id');
@@ -150,6 +186,7 @@ describe('OwnStateHub positions discovery — the request on the wire', () => {
     });
     await hub.pollWallet(ADDRESS);
     await hub.pollWallet(ADDRESS);
+    expectReached(fake, 2);
     const asked = fake.requests
       .filter((r) => r.path.endsWith('/positions'))
       .map((r) => r.params.get('or')!);

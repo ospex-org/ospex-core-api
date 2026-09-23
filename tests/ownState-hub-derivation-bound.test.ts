@@ -592,6 +592,154 @@ describe('reDerivePositionStatuses — phase A discovery is a keyset drain', () 
   });
 });
 
+describe('reDerivePositionStatuses — the discovery cursor is acknowledged by the WORK', () => {
+  /**
+   * Review blocker B1 on `#97`, and it is `3f-latch` one level out: a cursor is a
+   * claim-check, and an earlier version let the READ take it. The drain advanced
+   * `positionsTip` the moment rows came back; the maintenance page and both parent
+   * joins run AFTER it and can all fail, and on that path the drained rows had
+   * neither been emitted nor entered the cache — so maintenance could not recover
+   * them either, because maintenance is keyed on what the cache already holds.
+   *
+   * The reviewer reproduced it end to end (see `ownState-coverage-burst.test.ts`,
+   * which carries their three cases). These pin the MECHANISM: the cursor itself,
+   * read off the next tick's query, which the end-to-end cases can only show
+   * indirectly through a missing frame.
+   *
+   * Enumerated over all three failure boundaries rather than sampled, because the
+   * defect is "a read that happens after the cursor moves" and there are exactly
+   * three of those (rule 3d-enumerated). Adding a fourth read to the derivation
+   * means adding it here.
+   */
+  const BOUNDARIES = [
+    ['maintenance', (q: Query) => q.table === 'positions' && q.joins.length > 0],
+    ['speculations', (q: Query) => q.table === 'speculations'],
+    ['contests', (q: Query) => q.table === 'contests'],
+  ] as const;
+
+  for (const [name, selects] of BOUNDARIES) {
+    it(`holds the cursor when the ${name} read fails, and delivers on recovery`, async () => {
+      const tables = buildTables(1);
+      let broken = false;
+      let refusals = 0;
+      const sb = positionTables(tables, (q, _n, reply) => {
+        if (broken && selects(q)) {
+          refusals += 1;
+          return { data: null, error: { message: `review-${name}-outage` } };
+        }
+        return reply;
+      });
+      const hub = makeHub(sb);
+      const rec = subscribeRecording(hub);
+      // Seeded, non-frozen and stamped in the past, so the MAINTENANCE read is
+      // actually issued — without a cached key that phase never runs and the
+      // first boundary is unreachable (rule 3b: the case has to be able to fail).
+      seedAll(hub, [1]);
+
+      await hub.pollWallet(ADDRESS);
+      const floors = (): Array<string | undefined> =>
+        sb.queries.filter((q) => q.table === 'positions' && q.or !== undefined).map((q) => q.or);
+      const floorBefore = floors().slice(-1)[0];
+
+      // A new position arrives while the downstream read is failing.
+      broken = true;
+      pushRow(tables, 2, laterStamp(1));
+      await hub.pollWallet(ADDRESS);
+      await hub.pollWallet(ADDRESS);
+
+      // SETUP FIRST (rule 3g-silentsetup): the outage really happened, or this is
+      // a test of nothing.
+      expect(refusals, `${name}: the injected failure never fired`).toBeGreaterThan(0);
+      expect(rec.statuses.map((s) => s.id)).toEqual([]);
+      // THE MECHANISM: the cursor did not move over rows nothing processed.
+      expect(floors().slice(-1)[0], `${name}: cursor advanced past unprocessed rows`).toBe(
+        floorBefore,
+      );
+
+      // …and when the read recovers, the row is still reachable.
+      broken = false;
+      await hub.pollWallet(ADDRESS);
+      expect(rec.statuses.map((s) => s.id)).toEqual(['2']);
+      // The RECOVERING tick asks with the held floor — it is the tick that finally
+      // processes the row, and the commit is the last thing it does — so the moved
+      // floor shows up on the one after it. Asserting it any earlier fails against
+      // a correct build, which is worth pinning in both directions.
+      expect(floors().slice(-1)[0]).toBe(floorBefore);
+      await hub.pollWallet(ADDRESS);
+      expect(floors().slice(-1)[0]).not.toBe(floorBefore);
+      expect(rec.statuses.map((s) => s.id)).toEqual(['2']);
+      // Not a degraded and not a resync: nothing was lost, the tick just retried.
+      expect(rec.degradeds).toEqual([]);
+      expect(rec.resyncs).toEqual([]);
+    });
+  }
+
+  it('holds the cursor when a drained row cannot be joined to its speculation', async () => {
+    // The same rule one layer in, and the reason it is not merely defensive: a
+    // parent join that comes back SHORT is indistinguishable from an orphan here,
+    // and both mean the row was read and not processed. `fk_position_speculation`
+    // — `(network, speculation_id)` REFERENCES `speculations` — is what makes a
+    // real orphan impossible AND what stops this from stalling: the parent exists,
+    // so a retry resolves it.
+    const tables = buildTables(1);
+    pushRow(tables, 2, laterStamp(1));
+    const sb = positionTables(tables);
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    // Remove the parent the drained row needs, and ONLY that one.
+    tables.speculations = tables.speculations.filter((s) => Number(s['speculation_id']) !== 2);
+
+    await hub.pollWallet(ADDRESS);
+    const floors = (): Array<string | undefined> =>
+      sb.queries.filter((q) => q.table === 'positions' && q.or !== undefined).map((q) => q.or);
+    const held = floors().slice(-1)[0];
+    expect(rec.statuses).toEqual([]);
+
+    await hub.pollWallet(ADDRESS);
+    expect(floors().slice(-1)[0]).toBe(held);
+
+    // Put it back — the FK guarantees this is the real state of affairs — and the
+    // row derives and is delivered.
+    tables.speculations.push({
+      speculation_id: 2,
+      contest_id: 2,
+      network: 'polygon',
+      market_type: 'moneyline',
+      line_ticks: 0,
+      speculation_status: 'open',
+      win_side: 'tbd',
+      row_updated_at: laterStamp(1),
+    } satisfies Row);
+    await hub.pollWallet(ADDRESS);
+    expect(rec.statuses.map((s) => s.id)).toEqual(['2']);
+  });
+
+  it('advances the cursor when the work SUCCEEDS, which is the other half', async () => {
+    // Negative control for the three cases above (rule 5). A build that simply
+    // never advanced the cursor would satisfy every "holds" assertion and would be
+    // a different, worse defect: the drain would re-read and re-derive the same
+    // rows for ever.
+    const tables = buildTables(0);
+    pushRow(tables, 1, laterStamp(1));
+    const sb = positionTables(tables);
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+
+    await hub.pollWallet(ADDRESS);
+    await hub.pollWallet(ADDRESS);
+
+    const floors = sb.queries
+      .filter((q) => q.table === 'positions' && q.or !== undefined)
+      .map((q) => q.or);
+    expect(rec.statuses.map((s) => s.id)).toEqual(['1']);
+    expect(floors[1]).not.toBe(floors[0]);
+    const movedFloor = new Date(Date.parse(laterStamp(1)) - 30_000).toISOString();
+    expect(floors[1]).toBe(
+      `row_updated_at.gt.${movedFloor},and(row_updated_at.eq.${movedFloor},id.gt.0)`,
+    );
+  });
+});
+
 describe('reDerivePositionStatuses — phase B maintains tracked keys deterministically', () => {
   it('delivers a transition the drain cannot see, because the position row never moved', async () => {
     // The acceptance case from `#83`, restated for `#97`: the transition happens

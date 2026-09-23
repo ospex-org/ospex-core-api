@@ -255,8 +255,10 @@ interface WalletPoller {
   fills: ResourceTipState;
   /**
    * DISCOVERY cursor for `positions` (`#97`): the `(row_updated_at, id)` of the
-   * newest row phase A has read. Advances only over rows actually read, so a
-   * failed query or an exhausted page budget cannot skip one.
+   * newest row phase A has DERIVED. Advances only over rows that reached
+   * `statusCache`, so neither a failed query, nor an exhausted page budget, nor a
+   * failure in the maintenance page or either parent join can skip one — the
+   * caller commits it and only on success (`#97` B1).
    *
    * A bare {@link Tip} rather than a {@link ResourceTipState} because there is
    * no `emitted` map to carry: commitments and fills dedup POSITIONALLY on
@@ -642,8 +644,12 @@ export class OwnStateHub {
    * back in — sets `row_updated_at = now()` through
    * `trg_positions_row_updated_at` (`update_row_updated_at`, BEFORE UPDATE FOR EACH
    * ROW, plus the column's `DEFAULT now()` on INSERT), so it lands above the tip
-   * and the next drain reads it. The tip advances only over rows actually read, so
-   * an error or a page budget cannot skip one.
+   * and the next drain reads it. The tip advances only over rows that were
+   * DERIVED — not merely read — so nothing downstream of the drain can skip one
+   * either. An earlier version of this said "actually read", and that word was the
+   * defect: the maintenance page and both parent joins run after the drain, and a
+   * failure in any of them left the drained rows uncached with the cursor already
+   * past them. See the acknowledgement note in `reDerivePositionStatuses`.
    *
    * Three assumptions, stated because each one is a way this can be wrong:
    *
@@ -709,7 +715,7 @@ export class OwnStateHub {
   private async scanPositionRows(
     address: string,
     state: WalletPoller,
-  ): Promise<PositionDerivationRow[] | null> {
+  ): Promise<{ rows: PositionDerivationRow[]; tip: Tip } | null> {
     const sb = this.deps.getClient();
     const net = this.deps.getNetwork();
     const tip = state.positionsTip;
@@ -758,8 +764,9 @@ export class OwnStateHub {
         break;
       }
     }
+    // DELIBERATELY does not write `state.positionsTip`. The caller commits it, and
+    // only after the rows have been DERIVED — see `reDerivePositionStatuses`.
     if (afterTip(cmp, tip)) {
-      state.positionsTip = cmp;
       if (!exhausted) {
         // Forward progress was made and there is more above it; the next tick
         // continues from here. Not saturation and not a wire event: nothing is
@@ -781,7 +788,11 @@ export class OwnStateHub {
       );
       this.resyncWallet(state, 'overlap_window_too_large');
     }
-    return rows;
+    // The tip the caller may commit, already made monotone here so there is ONE
+    // place that decides it. A quiet tick returns the tip unchanged rather than
+    // the floor, which is what stops a tick that read nothing from walking the
+    // cursor backwards by one overlap every time.
+    return { rows, tip: afterTip(cmp, tip) ? cmp : tip };
   }
 
   /**
@@ -891,15 +902,54 @@ export class OwnStateHub {
     address: string,
     state: WalletPoller,
   ): Promise<void> {
-    const sb = this.deps.getClient();
-    const net = this.deps.getNetwork();
     // Phase A — DISCOVERY, as a keyset drain. Same filter as the snapshot's
     // `fetchCategorizedPositions`, so the two cover the same population; the
     // snapshot enumerates it and this reads the delta.
-    // NOT the actionable SET — the actionable DELTA. Everything downstream that
-    // used to reason about a population now reasons about what changed.
-    const discovered = await this.scanPositionRows(address, state);
-    if (discovered === null) return; // read failed; logged, tip unmoved, retry next tick
+    const discovery = await this.scanPositionRows(address, state);
+    if (discovery === null) return; // read failed; logged, tip unmoved, retry next tick
+
+    // THE CURSOR IS ACKNOWLEDGED BY THE WORK, NOT BY THE READ.
+    //
+    // An earlier version of this advanced `positionsTip` inside the scan, the
+    // moment the rows came back. Reading is not processing: the maintenance page
+    // and the two parent joins all happen AFTER the drain and all of them can
+    // fail, and on that path the drained rows have neither been emitted nor
+    // entered `statusCache` — so maintenance cannot recover them either, because
+    // maintenance is keyed on what the cache already holds. The reviewer
+    // reproduced it end to end through the real snapshot helper, handler and hub:
+    // a position arriving during a transient join outage was never delivered,
+    // the connection stayed open, and no `degraded`, `resync` or error frame was
+    // written. Once its stamp fell outside the overlap it was unreachable.
+    //
+    // This is `3f-latch` one level out — "a once-only latch must be taken by the
+    // ACTION, never by the notification" — and a cursor is exactly that latch: a
+    // claim-check the reader takes on behalf of an actor that may never run. The
+    // sibling scans do not have the hole because they EMIT as they read, so their
+    // action precedes their acknowledgement by construction; this one has to split
+    // read from act, because the derivation needs the parent joins first.
+    //
+    // So the tip moves only when every drained row has been DERIVED into the
+    // cache. A tick that fails re-reads the same rows next time, which costs
+    // nothing: the status cache makes the re-derivation a no-op.
+    if (await this.derivePositionDelta(address, state, discovery.rows)) {
+      state.positionsTip = discovery.tip;
+    }
+  }
+
+  /**
+   * Derive and emit over the drained delta plus the maintenance work-list.
+   *
+   * Returns **true only when every discovered row reached `statusCache`**, which
+   * is what licenses the caller to advance the discovery cursor past them. Every
+   * early exit here is a row that was read and not processed.
+   */
+  private async derivePositionDelta(
+    address: string,
+    state: WalletPoller,
+    discovered: PositionDerivationRow[],
+  ): Promise<boolean> {
+    const sb = this.deps.getClient();
+    const net = this.deps.getNetwork();
     // Phase B — MAINTENANCE of cached keys that are NOT in phase A's result.
     // These are positions the subscriber already holds whose status may have
     // transitioned (just claimed; stake just transferred out), so their current
@@ -974,7 +1024,7 @@ export class OwnStateHub {
           { err: staleRes.error.message, address },
           'ownStateHub positionStatus: cached-key refresh query failed',
         );
-        return;
+        return false;
       }
       const page = (staleRes.data ?? []) as unknown as PositionDerivationRow[];
       if (page.length > legalMax) {
@@ -1012,8 +1062,10 @@ export class OwnStateHub {
     const positions = [...positionsByKey.values()];
     if (positions.length === 0) {
       // No actionable rows and no cached keys to refresh — wallet is empty
-      // or fully terminal. Nothing to emit.
-      return;
+      // or fully terminal. Nothing to emit, and nothing was read either: this is
+      // only reachable when the drain returned zero rows, so the tip the caller
+      // then commits is the one it already had.
+      return true;
     }
     const specIds = [...new Set(positions.map((p) => Number(p.speculation_id)))];
     const specsById = new Map<
@@ -1042,7 +1094,7 @@ export class OwnStateHub {
           { err: specRes.error.message, address },
           'ownStateHub positionStatus: speculations join failed',
         );
-        return;
+        return false;
       }
       for (const s of (specRes.data ?? []) as unknown as Array<{
         speculation_id: number;
@@ -1084,7 +1136,7 @@ export class OwnStateHub {
           { err: contestRes.error.message, address },
           'ownStateHub positionStatus: contests join failed',
         );
-        return;
+        return false;
       }
       for (const c of (contestRes.data ?? []) as unknown as Array<{
         contest_id: number;
@@ -1118,10 +1170,27 @@ export class OwnStateHub {
       nextCacheEntry: StatusCacheEntry;
     }
     const emissions: PendingEmission[] = [];
+    let unresolved = 0;
 
     for (const row of positions) {
       const spec = specsById.get(Number(row.speculation_id));
-      if (!spec) continue; // orphan — defensive skip
+      if (!spec) {
+        // Counted rather than merely skipped: a row that was READ and never
+        // DERIVED holds the discovery cursor — see the note at the end of this
+        // method. Only a DISCOVERED row holds it, though. A maintenance row that
+        // does not resolve is re-fetched from the cache on the next tick anyway,
+        // and letting it hold the cursor would give a maintenance-side anomaly the
+        // power to stall discovery, which is a worse failure than the one this
+        // guard exists for.
+        if (
+          discoveredKeys.has(
+            `${String(row.speculation_id)}_${row.position_type === 'upper' ? 0 : 1}`,
+          )
+        ) {
+          unresolved += 1;
+        }
+        continue;
+      }
       const contest = spec.contest_id != null ? contestsById.get(spec.contest_id) ?? null : null;
       const positionType: 0 | 1 = row.position_type === 'upper' ? 0 : 1;
       const sourceUpdatedAt = maxIsoTimestamptz(
@@ -1233,6 +1302,22 @@ export class OwnStateHub {
         }
       }
     }
+    // An UNRESOLVED row is a row that was read and not processed, so it holds the
+    // cursor exactly as a failed read does. The only way to reach this while
+    // `fk_position_speculation` holds — `(network, speculation_id)` REFERENCES
+    // `speculations`, so a positions row cannot outlive its parent — is a parent
+    // join that came back SHORT rather than failing, which is indistinguishable
+    // from an orphan at this layer and is equally a reason to retry. The FK is
+    // also what stops this from stalling: the parent exists, so the next tick
+    // resolves it.
+    if (unresolved > 0) {
+      logger.warn(
+        { address, unresolved, discovered: discovered.length },
+        'ownStateHub positionStatus: discovered rows could not be joined to a speculation — holding the cursor',
+      );
+      return false;
+    }
+    return true;
   }
 
   // ── per-resource scans ────────────────────────────────────────────────
