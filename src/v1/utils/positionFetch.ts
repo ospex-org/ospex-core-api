@@ -76,6 +76,7 @@ import type { MarketType, WinSide } from '../../lib/speculation.js';
 import { loadConfig } from '../../lib/env.js';
 import {
   derivePositionStatus,
+  isTerminalForever,
   type PositionStatus,
 } from '../ownState/positionStatus.js';
 import { maxIsoTimestamptz } from '../ownState/timestamps.js';
@@ -232,6 +233,19 @@ export interface DerivedPositionStatus {
    * the status itself is unchanged.
    */
   result: 'won' | 'lost' | 'push' | 'void' | undefined;
+  /**
+   * `true` when this row's derived status can never change again —
+   * `isTerminalForever` over the SAME join that produced `status`.
+   *
+   * Here rather than at the consumer because only this module holds the
+   * speculation row the predicate needs. A caller seeding the own-state hub
+   * would otherwise have to re-read `speculations` to learn what this read
+   * already knew, or seed every key as live and let the first tick work it out
+   * — and on a wallet whose population exceeds the hub's per-tick maintenance
+   * budget, "let the first tick work it out" is a tick that reports saturation
+   * for rows it was about to retire.
+   */
+  terminal: boolean;
   /**
    * wei6 claimable amount when the position has a non-zero payout
    * (pendingSettle won/push, claimable, void). Same payload-dedup
@@ -776,6 +790,11 @@ export async function fetchCategorizedPositions(
       sourceUpdatedAt,
       result: derivedBody.result,
       claimableAmount: derivedBody.claimableAmount,
+      // Free: both terms are already bound here for the derivation above.
+      terminal: isTerminalForever(derivedBody.status, {
+        speculationStatus: spec.speculation_status,
+        winSide: spec.win_side,
+      }),
     });
 
     const team = contest

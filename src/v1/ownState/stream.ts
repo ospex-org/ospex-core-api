@@ -89,6 +89,7 @@ import {
 } from './cursor.js';
 import {
   derivePositionStatus,
+  isTerminalForever,
   type ContestInput,
   type PositionStatusEventBody,
   type SpeculationInput,
@@ -404,7 +405,15 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
         // populates the cache with the post-transition status, and the
         // first live tick suppresses the transition. By construction
         // the seed cannot disagree with the snapshot.
-        getOwnStateHub().seedStatusCache(address, result.seedRows);
+        // `positionsTruncated: false` means the capped read returned the whole
+        // actionable population, so this seed IS complete — a statement of what
+        // the read established, not a new capability. For a wallet over the cap
+        // it stays `capped` and the hub keeps its conservative saturation rule.
+        // `#76`'s second half changes the READ; this line then reports the
+        // completeness that follows, with no further wiring.
+        getOwnStateHub().seedStatusCache(address, result.seedRows, {
+          coverage: result.body.positionsTruncated ? 'capped' : 'complete',
+        });
         if (result.body.positionsTruncated || degradedPending) {
           // Snapshot exposed `positionsTruncated:true` — actionable
           // population exceeded the snapshot helper's cap. Emit
@@ -464,7 +473,9 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
           sourceUpdatedAt: r.sourceUpdatedAt,
           result: r.body.result,
           claimableAmount: r.body.claimableAmount,
+          terminal: r.terminal,
         })),
+        { coverage: catchupResult.degraded ? 'capped' : 'complete' },
       );
       if (catchupResult.degraded || degradedPending) {
         // Actionable population saturated during catch-up — same defined
@@ -760,6 +771,12 @@ export interface DerivedPositionRow {
   sourceUpdatedAt: string;
   id: string;
   idBig: bigint;
+  /**
+   * `isTerminalForever` over this row's join — the resume-path twin of
+   * `DerivedPositionStatus.terminal`. Carried so the hub's cache can retire the
+   * key at SEED time instead of spending a first tick on it (`#76`).
+   */
+  terminal: boolean;
 }
 
 export interface DerivedPositionStateResult {
@@ -1067,6 +1084,10 @@ export async function derivePositionsForWallet(
       sourceUpdatedAt,
       id: String(row.id),
       idBig,
+      terminal: isTerminalForever(body.status, {
+        speculationStatus: spec.speculation_status,
+        winSide: spec.win_side,
+      }),
     });
   }
   rows.sort((a, b) => {

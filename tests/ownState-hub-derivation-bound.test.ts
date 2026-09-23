@@ -687,3 +687,180 @@ describe('reDerivePositionStatuses — a full legal page is not a truncated one'
     expect(hub.stats().positionSaturationTotal).toBe(1);
   });
 });
+
+// ── #76 foundation: a seed that carries retirement and coverage ───────────
+
+describe('seedStatusCache — the seed carries what the deriving read already knew', () => {
+  /** 205 rows, so ids 201..205 sit outside phase A's window and land in phase B. */
+  function tables(): Tables {
+    return buildTables(205, {
+      205: { specStatus: 'closed', winSide: 'home' }, // upper loses ⇒ settledLost
+    });
+  }
+
+  it('retires a terminal key at SEED time, so phase B never asks for it', async () => {
+    // The flag comes from `fetchCategorizedPositions`, which computed it over the
+    // same join that produced the status. Before this, the seed arrived live and
+    // the FIRST TICK had to retire it — affordable at 200 seeded keys and not at
+    // 635, where the stale set exceeds phase B's budget and the tick reports
+    // saturation for rows it was about to retire.
+    const sb = positionTables(tables());
+    const hub = makeHub(sb);
+    subscribeRecording(hub);
+    seedAll(hub, Array.from({ length: 204 }, (_, i) => i + 1));
+    hub.seedStatusCache(ADDRESS, [
+      { key: '205_0', status: 'settledLost', sourceUpdatedAt: stampFor(205), result: 'lost', terminal: true },
+    ]);
+
+    await hub.pollWallet(ADDRESS);
+
+    expect(phaseBIdLists(sb.queries).flat()).not.toContain(205);
+  });
+
+  it('keeps asking when the deriving read said the key is still live', async () => {
+    // The negative control for the same field. Identical fixture, identical
+    // status, `terminal: false` — so only the flag decides, and a build that
+    // ignored it would pass the case above and fail here.
+    const sb = positionTables(tables());
+    const hub = makeHub(sb);
+    subscribeRecording(hub);
+    seedAll(hub, Array.from({ length: 204 }, (_, i) => i + 1));
+    hub.seedStatusCache(ADDRESS, [
+      { key: '205_0', status: 'settledLost', sourceUpdatedAt: stampFor(205), result: 'lost', terminal: false },
+    ]);
+
+    await hub.pollWallet(ADDRESS);
+
+    expect(phaseBIdLists(sb.queries).flat()).toContain(205);
+  });
+
+  it('treats an omitted flag as live, so an unaware caller keeps the old behaviour', async () => {
+    const sb = positionTables(tables());
+    const hub = makeHub(sb);
+    subscribeRecording(hub);
+    seedAll(hub, Array.from({ length: 205 }, (_, i) => i + 1));
+
+    await hub.pollWallet(ADDRESS);
+
+    expect(phaseBIdLists(sb.queries).flat()).toContain(205);
+  });
+});
+
+describe('reDerivePositionStatuses — a COMPLETE seed is believed', () => {
+  /**
+   * The rule under test: saturation is "there may be a row I have never seen",
+   * and a full phase-A page is only evidence of that. Under a capped seed the
+   * two are the same thing. Under a complete one they come apart, and this is
+   * what makes `#76`'s complete snapshot worth delivering — otherwise the view
+   * is complete and the first tick still reports it partial, permanently.
+   */
+  function seedComplete(hub: InstanceType<typeof OwnStateHub>, ids: number[]): void {
+    hub.seedStatusCache(
+      ADDRESS,
+      ids.map((id) => ({
+        key: `${String(id)}_0`,
+        status: 'active' as const,
+        sourceUpdatedAt: stampFor(id),
+      })),
+      { coverage: 'complete' },
+    );
+  }
+
+  it('does not call a full page saturation when every key in it is known', async () => {
+    const sb = positionTables(buildTables(250));
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    seedComplete(hub, Array.from({ length: 250 }, (_, i) => i + 1));
+
+    await hub.pollWallet(ADDRESS);
+
+    // SETUP FIRST (rule 3g-silentsetup): the page really was full, so the silence
+    // below is the new rule and not a small fixture.
+    const phaseA = sb.queries.filter((q) => q.table === 'positions')[0]!;
+    expect(phaseA.limit).toBe(200);
+    expect(rec.degradeds).toEqual([]);
+    expect(hub.stats().positionSaturationTotal).toBe(0);
+  });
+
+  it('DOES call it saturation when the full page carries a key it has never held', async () => {
+    // A row the cache has never seen means coverage is no longer established —
+    // and because a new row enters at the HEAD of the recency window, a full page
+    // carrying one is evidence that there may be more beyond it.
+    const sb = positionTables(buildTables(250));
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    // Complete over 249 of the 250: key 1 (the most recently updated, so
+    // certainly inside the window) was never seeded.
+    seedComplete(hub, Array.from({ length: 249 }, (_, i) => i + 2));
+
+    await hub.pollWallet(ADDRESS);
+
+    expect(rec.degradeds).toEqual(['positionsTruncated']);
+  });
+
+  it('keeps the conservative rule for a capped seed', async () => {
+    // Unchanged behaviour, and the negative control for the whole relaxation: a
+    // caller that does not claim completeness must not get the benefit of it.
+    const sb = positionTables(buildTables(250));
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    seedAll(hub, Array.from({ length: 250 }, (_, i) => i + 1));
+
+    await hub.pollWallet(ADDRESS);
+
+    expect(rec.degradeds).toEqual(['positionsTruncated']);
+  });
+
+  it('still reports phase B exceeding its budget under a complete seed', async () => {
+    // Completeness licenses exactly ONE relaxation. The maintenance budget is a
+    // different bound and it still speaks — otherwise `coverage: 'complete'`
+    // would be a way to silence every signal on this path.
+    const sb = positionTables(buildTables(10));
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    seedComplete(hub, Array.from({ length: 500 }, (_, i) => i + 1));
+
+    await hub.pollWallet(ADDRESS);
+
+    expect(rec.degradeds).toEqual(['positionsTruncated']);
+  });
+
+  it('survives the 635-key cold start that made this change necessary', async () => {
+    // THE regression, at the real size of the market maker's own wallet. A
+    // complete seed of 635 keys, every one of them a settled loser on a closed
+    // speculation — 554 of maker-a's rows are exactly that. Measured on the code
+    // before this change: 4 phase-B pages, 400 of 435 keys covered,
+    // `positionsTruncated` signalled and latched.
+    const t: Tables = { positions: [], speculations: [], contests: [] };
+    for (let id = 1; id <= 635; id += 1) {
+      const one = buildTables(1, { 1: { specStatus: 'closed', winSide: 'home' } });
+      t.positions.push({ ...one.positions[0]!, id, speculation_id: id, row_updated_at: stampFor(id), position_created_at: stampFor(id) });
+      t.speculations.push({ ...one.speculations[0]!, speculation_id: id, contest_id: id, row_updated_at: stampFor(id) });
+      t.contests.push({ ...one.contests[0]!, contest_id: id, row_updated_at: stampFor(id) });
+    }
+    const sb = positionTables(t);
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    hub.seedStatusCache(
+      ADDRESS,
+      Array.from({ length: 635 }, (_, i) => ({
+        key: `${String(i + 1)}_0`,
+        status: 'settledLost' as const,
+        sourceUpdatedAt: stampFor(i + 1),
+        result: 'lost' as const,
+        terminal: true,
+      })),
+      { coverage: 'complete' },
+    );
+
+    await hub.pollWallet(ADDRESS);
+
+    // No phase-B query at all: every seeded key was retired at seed time, so
+    // there is no stale set to page through and no budget to exceed.
+    expect(phaseBIdLists(sb.queries)).toEqual([]);
+    expect(rec.degradeds).toEqual([]);
+    expect(hub.stats().positionSaturationTotal).toBe(0);
+    // And nothing was emitted: the seed already matched the derivation.
+    expect(rec.statuses).toEqual([]);
+  });
+});

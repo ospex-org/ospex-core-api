@@ -253,6 +253,15 @@ interface WalletPoller {
    * documenting a permanent survivor for it.
    */
   saturationNotified: WeakSet<OwnStateSubscriber>;
+  /**
+   * Whether the seeded cache is believed to cover the wallet's whole actionable
+   * population. `'capped'` until a caller says otherwise.
+   *
+   * This is the ONLY thing that relaxes phase A's saturation rule, and it is a
+   * claim the handler makes on the strength of a complete read — not something
+   * the hub can verify, which is why it is named for its provenance.
+   */
+  seedCoverage: 'capped' | 'complete';
   polling: boolean;
 }
 
@@ -360,6 +369,7 @@ export class OwnStateHub {
         statusCache: new Map(),
         saturationSignalled: false,
         saturationNotified: new WeakSet(),
+        seedCoverage: 'capped',
         polling: false,
         // Timer is deliberately NOT started here — the handler calls
         // `beginLive(sub)` after seeding the status cache. Starting the
@@ -416,6 +426,31 @@ export class OwnStateHub {
    * the seed will be treated as "newly observed" on the first tick and
    * emit unconditionally — which, during a same-tick preReady race,
    * trips the abort signal and forces a resync.
+   *
+   * ## `terminal`, and why the seed carries it
+   *
+   * A seeded entry used to arrive live, because the seed carried a derived
+   * status but not the speculation row `isTerminalForever` needs, so the first
+   * tick had to retire it. That is fine while the seed is capped at 200 and
+   * costs one tick of work. It is NOT fine once the seed is complete: 635
+   * seeded keys minus the 200 in phase A's recency window is 435 live stale
+   * keys against a 400-key budget, so the first tick after a complete cold
+   * start would report saturation for rows it was about to retire. Measured on
+   * the merged code before this change: 635 seeded keys → 4 phase-B pages, 400
+   * of 435 keys covered, `positionsTruncated` signalled, and by tick 2 the
+   * retirement had reduced it to one page. The signal is latched per
+   * subscriber, so a transient mechanism produced a permanent frame.
+   *
+   * `fetchCategorizedPositions` computes the flag from the join it already did,
+   * so this costs nothing and removes the tick-1 spike entirely.
+   *
+   * ## `coverage`, and what it licenses
+   *
+   * `'complete'` asserts that these entries are EVERY actionable position the
+   * wallet has, not a capped page of them. It licenses one thing: phase A may
+   * stop treating a full page as saturation on its own (see
+   * `reDerivePositionStatuses`). Default `'capped'` keeps the conservative rule,
+   * so a caller that does not know stays safe.
    */
   seedStatusCache(
     address: string,
@@ -425,20 +460,28 @@ export class OwnStateHub {
       sourceUpdatedAt: string;
       result?: 'won' | 'lost' | 'push' | 'void' | undefined;
       claimableAmount?: string | undefined;
+      /** `isTerminalForever` over the deriving join. Absent ⇒ assumed live. */
+      terminal?: boolean | undefined;
     }>,
+    options: { coverage?: 'capped' | 'complete' } = {},
   ): void {
     const state = this.pollers.get(address.toLowerCase());
     if (!state) return;
+    // Monotonic: a complete seed cannot be walked back to capped by a later
+    // partial re-seed, because the keys a complete seed established stay in the
+    // cache and phase A's window still discovers anything new.
+    if (options.coverage === 'complete') state.seedCoverage = 'complete';
     for (const e of entries) {
       state.statusCache.set(e.key, {
         status: e.status,
         sourceUpdatedAt: e.sourceUpdatedAt,
         result: e.result,
         claimableAmount: e.claimableAmount,
-        // Deliberately not derived from `e.status` alone: `settledLost` freezes
-        // only on a CLOSED speculation and the seed does not carry one. The
-        // first tick reads the speculation row and retires it then.
-        frozen: false,
+        // NOT derivable from `e.status` alone — `settledLost` retires only on a
+        // CLOSED speculation — so it is the deriving read's answer or nothing.
+        // A caller that omits it gets the old behaviour: live until the first
+        // tick reads the speculation row and retires it.
+        frozen: e.terminal ?? false,
       });
     }
   }
@@ -654,7 +697,34 @@ export class OwnStateHub {
       row_updated_at: string;
       id: string | number;
     }>;
-    const actionableSaturated = actionable.length >= STATUS_DERIVATION_LIMIT;
+    // Saturation means "there may be actionable rows I have never seen", and a
+    // full page is only EVIDENCE of that, not the thing itself.
+    //
+    // With a CAPPED seed the two are indistinguishable, so a full page is the
+    // answer and the conservative reading is the right one. With a COMPLETE seed
+    // they come apart: every row beyond the window is already in the cache and
+    // phase B maintains it, so the only way coverage can be lost is a row
+    // arriving that the cache has never held. Such a row carries
+    // `row_updated_at = now`, so it enters at the HEAD of this window — which
+    // means a full page containing no unknown key proves nothing was missed,
+    // and a full page containing one means there may be more beyond it.
+    //
+    // Without this, `#76`'s complete snapshot would deliver a complete view and
+    // the first tick would still report it partial, permanently: the frame
+    // latches per subscriber and the SDK has no in-connection event that clears
+    // a live-phase `degraded`. Completeness has to be believed by the layer that
+    // reports partiality, or it buys nothing.
+    const pageFull = actionable.length >= STATUS_DERIVATION_LIMIT;
+    const sawUnknownKey =
+      state.seedCoverage === 'complete' &&
+      actionable.some(
+        (p) =>
+          !state.statusCache.has(
+            `${String(p.speculation_id)}_${p.position_type === 'upper' ? 0 : 1}`,
+          ),
+      );
+    const actionableSaturated =
+      pageFull && (state.seedCoverage === 'capped' || sawUnknownKey);
     // Phase B — MAINTENANCE of cached keys that are NOT in phase A's result.
     // These are positions the subscriber already holds whose status may have
     // transitioned (just claimed; stake just transferred out), so their current
