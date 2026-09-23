@@ -889,9 +889,15 @@ describe('reDerivePositionStatuses — the emission loop, pinned', () => {
     // fresh snapshot that also delivers the rows. `#94` was closed as not
     // reachable rather than fixed.
     //
-    // This test exists because that safety is a property of the LOOP ORDER, which
-    // nothing else asserts. Deliver-per-subscriber-across-all-emissions — a
-    // plausible refactor — would make `#94` real, and this goes red first.
+    // WHAT THIS PINS, stated after a reviewer corrected an earlier overclaim
+    // here. It is NOT the loop's nesting order: transposing to
+    // subscriber-first — cache every emission, then fan out per subscriber —
+    // passes all 25 cases in this file, measured rather than assumed. What it
+    // pins is the pair of properties that actually make a discarded write
+    // harmless: COMPLETE FAN-OUT (every subscriber receives every emission of the
+    // tick) and EXCEPTION ISOLATION (see the sibling case below). A refactor that
+    // made delivery early-terminating would break one of those and go red here;
+    // one that merely reordered the loops would not, and should not.
     const sb = positionTables(buildTables(6, Object.fromEntries(
       Array.from({ length: 6 }, (_, i) => [i + 1, { specStatus: 'closed' as const, winSide: 'away' }]),
     )));
@@ -1003,7 +1009,18 @@ describe('reDerivePositionStatuses — retirement at population scale', () => {
     const hub = makeHub(sb);
     const rec = subscribeRecording(hub);
 
-    // Seed from the real deriving helper's own answer, keyed the way it keys.
+    // The seed is HANDWRITTEN, deliberately: this is a hub-consumer test, and
+    // what it exercises is what the hub does with the flag rather than how the
+    // flag is computed. An earlier version of this comment claimed the seed came
+    // from the real deriving helper, which it does not — the test supplied the
+    // value it said the producer had produced (rule 3i, in a comment).
+    //
+    // The producer's own computation is covered where it belongs, against the
+    // real helper over a real relational double: `positions-bounded.test.ts`,
+    // "marks each derived status terminal or live from the SAME join that derived
+    // it". A build that dropped `isTerminalForever` there escapes THIS case and
+    // dies in that one — confirmed by mutation, and by the reviewer
+    // independently.
     hub.seedStatusCache(
       ADDRESS,
       Array.from({ length: 635 }, (_, i) => {
