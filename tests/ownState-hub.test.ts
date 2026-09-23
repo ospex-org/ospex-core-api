@@ -453,14 +453,19 @@ describe('OwnStateHub.pollWallet — single tick emits per resource', () => {
     // with them for window slots, and a spec transition on it surfaces.
     //
     // NARROWED (`#83`): this comment used to say the filter "guarantees
-    // they're always queried". It does not — the filter narrows the
-    // population and `.limit(STATUS_DERIVATION_LIMIT)` still truncates what
-    // is left, so above 200 ACTIONABLE rows the oldest-updated actives are
-    // cut. This fixture is one row and cannot see that; the case that can is
-    // `ownState-hub-derivation-bound.test.ts`, which measures the drop and the
-    // signal that now reports it. Kept here because what it does pin — that
-    // the claimed rows no longer crowd the window — is still true and still
-    // worth a test.
+    // they're always queried". It did not — the filter narrowed the population
+    // and a 200-row recency window still truncated what was left, so above 200
+    // ACTIONABLE rows the oldest-updated actives were cut.
+    //
+    // THE WINDOW IS GONE (`#97`): discovery is a keyset drain with no population
+    // cap, and a spec transition on a row the drain cannot see (its position row
+    // never moved) is phase B's job, by identity. So there is no window to crowd
+    // any more, and what this case pins is one step down from where it started —
+    // that the derivation UNIFIES the two populations at all, i.e. a spec-driven
+    // transition on an actionable row emits while unrelated claimed rows exist.
+    // The cases that own the bound are in
+    // `ownState-hub-derivation-bound.test.ts`, against a double that enforces
+    // filters, order and limit; this file's double enforces none of them.
     const oldActive = {
       speculation_id: 101,
       user_address: ADDRESS,

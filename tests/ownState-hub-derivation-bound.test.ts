@@ -1,6 +1,7 @@
 /**
- * `OwnStateHub.reDerivePositionStatuses` — the bound on the live derivation, and
- * whether saturating it is observable (`ospex-core-api#83`).
+ * `OwnStateHub.reDerivePositionStatuses` — the bound on the live derivation,
+ * whether saturating it is observable (`ospex-core-api#83`), and whether its
+ * discovery half can be displaced (`#97`).
  *
  * ## Why this file exists separately from `ownState-hub.test.ts`
  *
@@ -20,15 +21,26 @@
  * recorded `queries`, so a chunk size, an `ORDER BY` and an `IN` list are
  * probed at the call rather than inferred from the answer — rule 3i).
  *
- * ## Fixture rule, and it is load-bearing
+ * ## Two fixture rules, both load-bearing
  *
- * `row_updated_at` descends as `id` ASCENDS: position 1 is the most recently
- * updated and position N the least. So the retained window under the real order
- * (`row_updated_at DESC, id DESC`) is ids 1..200, and under an id-only order it
- * would be the disjoint N..N-199. A fixture with one shared timestamp — which is
- * what `scaleTables` builds — cannot tell those apart, because the id tiebreak
- * decides everything (rule 3g-both: the input has to sit where the two candidate
- * rules disagree).
+ * **1. `row_updated_at` descends as `id` ASCENDS** — position 1 is the most
+ * recently updated and position N the least. Written for the recency window
+ * `#97` deleted (the retained set was ids 1..200 under `row_updated_at DESC, id
+ * DESC` and the disjoint N..N-199 under an id-only order, and a fixture with one
+ * shared timestamp cannot tell those apart — rule 3g-both). It still earns its
+ * keep: it makes id order and timestamp order disagree, so a drain that ordered
+ * by the wrong column returns a different set rather than the same one.
+ *
+ * **2. `buildTables` stamps into the PAST and is therefore INVISIBLE to the
+ * drain.** The poller's tip starts at `subscribe()` time, which the frozen clock
+ * pins at `NOW`, so a fixture row at `NOW − 60s` is below the 30s overlap floor
+ * and a case that wants its rows DISCOVERED must use `liveTables` /
+ * `laterStamp` / `stampBefore(<30)`, while a case that wants them MAINTAINED
+ * seeds the cache instead. That split is the design, not an artefact: the
+ * pre-existing population belongs to the handler's seed and the delta belongs to
+ * the drain. A case that seeds nothing and stamps nothing forward asserts
+ * against an empty tick, which is why several of these cases assert their setup
+ * before their behaviour (rule 3g-silentsetup).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -128,6 +140,35 @@ function laterStamp(minutes: number): string {
   return `${new Date(NOW + minutes * 60_000).toISOString().replace('Z', '')}456+00:00`;
 }
 
+/**
+ * A stamp `seconds` BEFORE the poller's tip.
+ *
+ * The tip is `new Date().toISOString()` at `subscribe()`, which the frozen clock
+ * pins at exactly `NOW`, so this is the axis the discovery drain's overlap floor
+ * sits on: `stampBefore(10)` is inside a 30s overlap and `stampBefore(60)` is
+ * outside it. `stampFor` is minutes-scaled and therefore always outside.
+ */
+function stampBefore(seconds: number): string {
+  return `${new Date(NOW - seconds * 1000).toISOString().replace('Z', '')}456+00:00`;
+}
+
+/**
+ * `count` actionable positions stamped ABOVE the poller's tip, so the discovery
+ * drain reaches them on the first poll.
+ *
+ * `buildTables` stamps minutes into the PAST, which is the right default and the
+ * shape of the pre-existing population the handler's seed carries — invisible to
+ * a cursor that starts at connect time, by design. This is the other population:
+ * rows that arrived since. Before `#97` every case could rely on phase A's
+ * recency window reaching back over the whole fixture, so the distinction did not
+ * exist and every fixture row was implicitly discoverable.
+ */
+function liveTables(count: number, overrides: Record<number, PositionSpec> = {}): Tables {
+  const tables = buildTables(count, overrides);
+  for (const row of tables.positions) row['row_updated_at'] = laterStamp(Number(row['id']));
+  return tables;
+}
+
 /** Append one actionable position (plus its parents) at `stamp`. */
 function pushRow(tables: Tables, id: number, stamp: string): void {
   const one = buildTables(1);
@@ -185,10 +226,14 @@ function subscribeRecording(hub: InstanceType<typeof OwnStateHub>): Recorded & {
   return { ...rec, sub, statuses: rec.statuses, degradeds: rec.degradeds, resyncs: rec.resyncs };
 }
 
-function makeHub(sb: ReturnType<typeof positionTables>): InstanceType<typeof OwnStateHub> {
+function makeHub(
+  sb: ReturnType<typeof positionTables>,
+  deps: { pollLimit?: number; maxForwardPages?: number; overlapMs?: number } = {},
+): InstanceType<typeof OwnStateHub> {
   return new OwnStateHub({
     getClient: () => hubClient(sb),
     getNetwork: () => 'polygon',
+    ...deps,
   });
 }
 
@@ -215,73 +260,320 @@ function seedAll(hub: InstanceType<typeof OwnStateHub>, ids: number[], status = 
   );
 }
 
-// ── phase A: the cap, and that saturating it is observable ───────────────
+// ── phase A: the drain, and that it cannot be displaced ──────────────────
 
-describe('reDerivePositionStatuses — phase A discovery is capped, and says so', () => {
-  it('derives only the 200 most-recently-updated rows and reports saturation', async () => {
+/**
+ * These cases replace a describe block named "phase A discovery is capped, and
+ * says so", whose three cap cases went with the cap (`#97`). What they asserted
+ * is recorded here so the deletion is legible rather than silent:
+ *
+ *   - `derives only the 200 most-recently-updated rows and reports saturation` —
+ *     250 rows in, ids 1..200 reached, 201..250 not, one `positionsTruncated`;
+ *   - `is silent at 199 rows and speaks at exactly 200` — the `>=` boundary;
+ *   - `signals ONCE across repeated ticks, not once per tick` — the latch.
+ *
+ * The first two described a behaviour that was the defect: a population over 200
+ * was reported partial for ever, and the 50 rows it could not see were not
+ * merely unreported but unreachable. The third moved to the phase-B budget,
+ * which is the only saturation phase left, and the latch is unchanged.
+ */
+describe('reDerivePositionStatuses — phase A discovery is a keyset drain', () => {
+  it('asks for the actionable delta ascending from its tip, one page', async () => {
+    // The QUERY, not the answer — the predicate IS the mechanism (rule 3i).
     const sb = positionTables(buildTables(250));
     const hub = makeHub(sb);
-    const rec = subscribeRecording(hub);
+    subscribeRecording(hub);
 
     await hub.pollWallet(ADDRESS);
 
-    // The query, not the answer: this is the whole mechanism under test.
     const phaseA = sb.queries.filter((q) => q.table === 'positions')[0]!;
-    expect(phaseA.limit).toBe(200);
+    const floor = new Date(NOW - 30_000).toISOString();
+    expect(phaseA.or).toBe(
+      `row_updated_at.gt.${floor},and(row_updated_at.eq.${floor},id.gt.0)`,
+    );
     expect(phaseA.orders).toEqual([
-      ['row_updated_at', { ascending: false }],
-      ['id', { ascending: false }],
+      ['row_updated_at', { ascending: true }],
+      ['id', { ascending: true }],
     ]);
-
-    // With no seed every observed key is new, so the emit count IS the number
-    // of rows the derivation reached.
-    expect(rec.statuses).toHaveLength(200);
-    const reached = new Set(rec.statuses.map((s) => Number(s.id)));
-    expect(reached.has(1)).toBe(true);
-    expect(reached.has(200)).toBe(true);
-    // Ids 201..250 are the OLDEST-updated. Under an id-only order they would be
-    // the ones KEPT, so their absence is what proves the recency window.
-    expect(reached.has(201)).toBe(false);
-    expect(reached.has(250)).toBe(false);
-
-    // And the defect this issue is about: the 50 it could not see are reported.
-    expect(rec.degradeds).toEqual(['positionsTruncated']);
-    expect(hub.stats().positionSaturationTotal).toBe(1);
-    // Not a resync. The view is still ordered and still delivering; asking the
-    // client to reconnect would not widen it.
-    expect(rec.resyncs).toEqual([]);
+    expect(phaseA.limit).toBe(500);
+    // Still the actionable filter, unchanged: the drain reads the same
+    // population the snapshot enumerates.
+    expect(phaseA.eq).toEqual(
+      expect.arrayContaining([
+        ['network', 'polygon'],
+        ['user_address', ADDRESS],
+        ['claimed', false],
+      ]),
+    );
+    expect(phaseA.gt).toEqual([['risk_amount', 0]]);
   });
 
-  it('is silent at 199 rows and speaks at exactly 200', async () => {
-    // The boundary, both sides, because `>= CAP` and `> CAP` differ by exactly
-    // this case and nothing else in the file distinguishes them.
-    for (const [count, expected] of [
-      [199, [] as string[]],
-      [200, ['positionsTruncated']],
-    ] as const) {
+  it('does not report saturation at any population, where the window used to', async () => {
+    // The deleted cap, from both sides of where it used to sit. 250 rows was one
+    // `positionsTruncated`; 700 was another. Neither is now — and the negative
+    // control that keeps this from passing on a build that cannot signal AT ALL
+    // is in the phase-B block: the budget still speaks at 401 keys.
+    for (const count of [199, 200, 250, 700]) {
       const sb = positionTables(buildTables(count));
       const hub = makeHub(sb);
       const rec = subscribeRecording(hub);
       await hub.pollWallet(ADDRESS);
-      expect(rec.statuses, `count=${String(count)}`).toHaveLength(count);
-      expect(rec.degradeds, `count=${String(count)}`).toEqual(expected);
+      expect(rec.degradeds, `count=${String(count)}`).toEqual([]);
+      expect(hub.stats().positionSaturationTotal, `count=${String(count)}`).toBe(0);
+      expect(rec.resyncs, `count=${String(count)}`).toEqual([]);
     }
   });
 
-  it('signals ONCE across repeated ticks, not once per tick', async () => {
-    // A saturated wallet saturates on every tick. Unlatched this is 2,400 wire
-    // events and log lines per hour per wallet; the market maker would also
-    // re-run its cancel sweep on each one.
-    const sb = positionTables(buildTables(250));
+  it('delivers a row inside the overlap and not one outside it', async () => {
+    // The bound, stated as the pair where the two candidate rules disagree
+    // (rule 3g-both). `now()` is TRANSACTION START, so a write can land a row
+    // stamped before the tip; the overlap is what covers that, and its width is
+    // what decides how stale a stamp may be. A single assertion on the inside
+    // row would pass against a build with no floor at all.
+    const tables = buildTables(0);
+    pushRow(tables, 10, stampBefore(10)); //  inside  a 30s overlap
+    pushRow(tables, 60, stampBefore(60)); // outside a 30s overlap
+    const sb = positionTables(tables);
     const hub = makeHub(sb);
     const rec = subscribeRecording(hub);
 
     await hub.pollWallet(ADDRESS);
+
+    expect(rec.statuses.map((s) => s.id)).toEqual(['10']);
+  });
+
+  it('advances its tip only over rows it read, and re-floors from there', async () => {
+    // Tip monotonicity, asserted at the CALL: a tick that read nothing must ask
+    // the same question next time, and a tick that read something must ask from
+    // the row it read. A tip advanced to "now" on an empty tick would skip every
+    // row stamped in between.
+    const tables = buildTables(0);
+    const sb = positionTables(tables);
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+
     await hub.pollWallet(ADDRESS);
+    const first = sb.queries.filter((q) => q.table === 'positions')[0]!.or;
+    await hub.pollWallet(ADDRESS);
+    const second = sb.queries.filter((q) => q.table === 'positions')[1]!.or;
+    expect(second).toBe(first); // nothing read ⇒ nothing moved
+
+    pushRow(tables, 7, laterStamp(5));
+    await hub.pollWallet(ADDRESS);
+    const third = sb.queries.filter((q) => q.table === 'positions')[2]!.or;
+    expect(third).toBe(first); // the row was read on THIS tick, so the floor is still the old one
+    await hub.pollWallet(ADDRESS);
+    const fourth = sb.queries.filter((q) => q.table === 'positions')[3]!.or;
+    const movedFloor = new Date(Date.parse(laterStamp(5)) - 30_000).toISOString();
+    expect(fourth).toBe(
+      `row_updated_at.gt.${movedFloor},and(row_updated_at.eq.${movedFloor},id.gt.0)`,
+    );
+    expect(rec.statuses.map((s) => s.id)).toEqual(['7']);
+  });
+
+  it('pages a drain larger than one page, and loses nothing across the pages', async () => {
+    // The page limit cuts the NEWEST rows, not the oldest, which is the whole
+    // reason a cursor cannot be displaced where a `DESC` window can. Three pages
+    // of two, all six rows delivered, ascending.
+    const tables = buildTables(0);
+    for (let n = 1; n <= 6; n += 1) pushRow(tables, n, laterStamp(n));
+    const sb = positionTables(tables);
+    const hub = makeHub(sb, { pollLimit: 2 });
+    const rec = subscribeRecording(hub);
+
     await hub.pollWallet(ADDRESS);
 
-    expect(rec.degradeds).toEqual(['positionsTruncated']);
-    expect(hub.stats().positionSaturationTotal).toBe(1);
+    expect(rec.statuses.map((s) => s.id)).toEqual(['1', '2', '3', '4', '5', '6']);
+    expect(sb.queries.filter((q) => q.table === 'positions')).toHaveLength(4);
+  });
+
+  it('resyncs when the overlap window alone outruns the page budget', async () => {
+    // The livelock guard, and it is the same condition and the same answer as
+    // `pollCommitments` / `pollFills`: if one tick cannot get past its own
+    // overlap floor, the tip never advances and every later tick re-reads the
+    // same prefix. Forced with a 1-row page and a 1-page budget.
+    const tables = buildTables(0);
+    pushRow(tables, 1, stampBefore(20));
+    pushRow(tables, 2, stampBefore(19));
+    const sb = positionTables(tables);
+    const hub = makeHub(sb, { pollLimit: 1, maxForwardPages: 1 });
+    const rec = subscribeRecording(hub);
+
+    await hub.pollWallet(ADDRESS);
+
+    expect(rec.resyncs).toEqual(['overlap_window_too_large']);
+    // Not a degraded: the view is not partial, the tick could not make progress.
+    expect(rec.degradeds).toEqual([]);
+  });
+
+  it('keeps going forward when the drain fills its budget ABOVE the tip', async () => {
+    // The other side of the same condition, and it must NOT resync: rows above
+    // the tip mean the tip advanced, so the next tick continues from there. A
+    // build that treated any unexhausted drain as the livelock would turn every
+    // burst into a reconnect.
+    //
+    // The budget here is 2 rows against 1 row inside the overlap, which is the
+    // arithmetic that decides it: the drain re-reads its own overlap window out
+    // of the SAME page budget, so progress needs a budget strictly greater than
+    // the number of rows in that window. Production is 500 × 20 = 10,000 against
+    // a whole-wallet population of 621 — the drain's result set is a subset of
+    // the actionable set, so it cannot fill that budget at all until one wallet
+    // holds more than 10,000 actionable rows. The sibling case above forces the
+    // other outcome by making the budget 1.
+    const tables = buildTables(0);
+    for (const n of [1, 2, 3]) pushRow(tables, n, laterStamp(n));
+    const sb = positionTables(tables);
+    const hub = makeHub(sb, { pollLimit: 1, maxForwardPages: 2 });
+    const rec = subscribeRecording(hub);
+
+    await hub.pollWallet(ADDRESS);
+    expect(rec.resyncs).toEqual([]);
+    expect(rec.statuses.map((s) => s.id)).toEqual(['1', '2']);
+
+    await hub.pollWallet(ADDRESS);
+    expect(rec.resyncs).toEqual([]);
+    expect(rec.statuses.map((s) => s.id)).toEqual(['1', '2', '3']);
+  });
+
+  it('delivers a 700-row burst in one tick, under the real page budget', async () => {
+    // The bulk-stamp case, which is not hypothetical: `ospex-indexer` migrations
+    // 025 and 026 each stamped every eligible positions row with one `now()`, and
+    // any future positions-touching migration does the same. Every row lands
+    // above every subscriber's tip at once, so the drain reads the wallet's whole
+    // population on that tick and nothing afterwards — bounded, once, and with no
+    // degraded frame, where the 200-row window would have reported truncation for
+    // ever afterwards.
+    const tables = buildTables(0);
+    for (let n = 1; n <= 700; n += 1) pushRow(tables, n, laterStamp(n));
+    const sb = positionTables(tables);
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+
+    await hub.pollWallet(ADDRESS);
+
+    expect(rec.statuses).toHaveLength(700);
+    expect(rec.degradeds).toEqual([]);
+    expect(rec.resyncs).toEqual([]);
+    // 500 then 200: paged, and the second page is short so the drain exhausts.
+    expect(sb.queries.filter((q) => q.table === 'positions')).toHaveLength(2);
+  });
+
+  it('discovers a row that RE-ENTERS the actionable set under an old id', async () => {
+    // The case that decides the mechanism. `#97` weighed a keyset probe above
+    // the highest id the cache has seen; `rpc_position_matched_pair`'s accumulate
+    // branch takes a transferred-out row's `risk_amount` from 0 back to positive,
+    // and `INSERT … ON CONFLICT DO UPDATE` consumes sequence values so ids are
+    // sparse — so the row re-enters the population under an id BELOW the
+    // watermark and an id probe cannot see it. Every entry is an UPDATE, so the
+    // trigger stamps it, so a timestamp cursor can.
+    const tables = buildTables(0);
+    pushRow(tables, 1, laterStamp(1));
+    pushRow(tables, 2, laterStamp(2));
+    const sb = positionTables(tables);
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    // id 1 is out of the population: transferred out, risk 0.
+    tables.positions[0]!['risk_amount'] = '0';
+
+    await hub.pollWallet(ADDRESS);
+    expect(rec.statuses.map((s) => s.id)).toEqual(['2']);
+
+    // …and back in, at the same id, stamped now.
+    tables.positions[0]!['risk_amount'] = '10000';
+    tables.positions[0]!['row_updated_at'] = laterStamp(9);
+    await hub.pollWallet(ADDRESS);
+
+    expect(rec.statuses.map((s) => s.id)).toEqual(['2', '1']);
+  });
+
+
+  it('admits a row stamped EXACTLY at the overlap floor', async () => {
+    // The floor is `(ts > floor) OR (ts = floor AND id > 0)`, and the second half
+    // is not decoration: `rpc_position_matched_pair` stamps its maker and taker
+    // rows with one `now()`, so rows sharing an instant are the normal case, and
+    // the instant that matters is the boundary one. A strict tuple comparison
+    // against a synthetic id would drop every row at exactly the floor.
+    const tables = buildTables(0);
+    const atFloor = `${new Date(NOW - 30_000).toISOString().replace('Z', '')}000+00:00`;
+    pushRow(tables, 1, atFloor);
+    const sb = positionTables(tables);
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+
+    await hub.pollWallet(ADDRESS);
+
+    // SETUP: the fixture sits ON the boundary, not near it (rule 3g).
+    const floorAsked = /row_updated_at\.gt\.([^,]+),/.exec(
+      sb.queries.filter((q) => q.table === 'positions')[0]!.or!,
+    )![1]!;
+    expect(Date.parse(atFloor)).toBe(Date.parse(floorAsked));
+    expect(rec.statuses.map((s) => s.id)).toEqual(['1']);
+  });
+
+  it('bails the whole tick when the drain read fails, and does not move the tip', async () => {
+    // A failed read must not look like an empty one. If it did, every non-frozen
+    // cached key would be "not in phase A's result" and the tick would re-fetch
+    // the entire work-list by identity on a wallet whose upstream is already
+    // failing — and a tip advanced past rows nobody read would skip them for good.
+    const tables = buildTables(5);
+    let failNext = true;
+    const sb = positionTables(tables, (q, _n, reply) => {
+      if (q.table === 'positions' && failNext) {
+        failNext = false;
+        return { data: null, error: { message: 'PGRST500 upstream said no' } };
+      }
+      return reply;
+    });
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    seedAll(hub, [1, 2, 3, 4, 5]);
+
+    await hub.pollWallet(ADDRESS);
+
+    // One read, and nothing after it: no phase-B page, no speculations join, no
+    // contests join, no emission.
+    expect(sb.queries).toHaveLength(1);
+    expect(rec.statuses).toEqual([]);
+    expect(rec.resyncs).toEqual([]);
+
+    // …and the next tick asks the SAME question, because the tip never moved.
+    await hub.pollWallet(ADDRESS);
+    const asked = sb.queries.filter((q) => q.table === 'positions').map((q) => q.or);
+    expect(asked[1]).toBe(asked[0]);
+  });
+
+  it('recognises a tip that advanced by MICROSECONDS inside one millisecond', async () => {
+    // `compareIsoTimestamptz` rather than `Date.parse` in `afterTip`. The floor is
+    // millisecond-grained either way, so a coarse comparison loses no rows — it
+    // loses the answer to "did the tip advance", which is what separates "there is
+    // more above the tip" from "this tick could not get past its own overlap". The
+    // discriminating shape: the later row carries a LOWER id, so the id tiebreak
+    // cannot rescue a millisecond comparison.
+    // The budget is two rows and one page, so tick 2 reads BOTH rows and comes
+    // back full — unexhausted, with the tip advanced by microseconds only. That
+    // is the one state where the two comparisons disagree about what to do.
+    const ms = new Date(NOW + 60_000).toISOString().replace('000Z', '');
+    const tables = buildTables(0);
+    pushRow(tables, 9, `${ms}000456+00:00`);
+    const sb = positionTables(tables);
+    const hub = makeHub(sb, { pollLimit: 2, maxForwardPages: 1 });
+    const rec = subscribeRecording(hub);
+
+    await hub.pollWallet(ADDRESS);
+    expect(rec.statuses.map((s) => s.id)).toEqual(['9']);
+
+    // Same millisecond, 333µs later, id 5 — which sorts AFTER id 9 by timestamp
+    // and BEFORE it by id.
+    pushRow(tables, 5, `${ms}000789+00:00`);
+    await hub.pollWallet(ADDRESS);
+
+    // SETUP: the two stamps really are inside one millisecond, or this case is
+    // about something else entirely.
+    expect(Date.parse(`${ms}000456+00:00`)).toBe(Date.parse(`${ms}000789+00:00`));
+    expect(rec.statuses.map((s) => s.id)).toEqual(['9', '5']);
+    // The tick was unexhausted (one row, one page), and the tip DID advance, so
+    // there is nothing to resync about.
+    expect(rec.resyncs).toEqual([]);
   });
 
   it('starts a fresh poller once the last subscriber leaves', () => {
@@ -300,18 +592,210 @@ describe('reDerivePositionStatuses — phase A discovery is capped, and says so'
   });
 });
 
-// ── phase B: maintenance of tracked keys ─────────────────────────────────
+describe('reDerivePositionStatuses — the discovery cursor is acknowledged by the WORK', () => {
+  /**
+   * Review blocker B1 on `#97`, and it is `3f-latch` one level out: a cursor is a
+   * claim-check, and an earlier version let the READ take it. The drain advanced
+   * `positionsTip` the moment rows came back; the maintenance page and both parent
+   * joins run AFTER it and can all fail, and on that path the drained rows had
+   * neither been emitted nor entered the cache — so maintenance could not recover
+   * them either, because maintenance is keyed on what the cache already holds.
+   *
+   * The reviewer reproduced it end to end (see `ownState-coverage-burst.test.ts`,
+   * which carries their three cases). These pin the MECHANISM: the cursor itself,
+   * read off the next tick's query, which the end-to-end cases can only show
+   * indirectly through a missing frame.
+   *
+   * Enumerated over all three failure boundaries rather than sampled, because the
+   * defect is "a read that happens after the cursor moves" and there are exactly
+   * three of those (rule 3d-enumerated). Adding a fourth read to the derivation
+   * means adding it here.
+   */
+  const BOUNDARIES = [
+    ['maintenance', (q: Query) => q.table === 'positions' && q.joins.length > 0],
+    ['speculations', (q: Query) => q.table === 'speculations'],
+    ['contests', (q: Query) => q.table === 'contests'],
+  ] as const;
+
+  for (const [name, selects] of BOUNDARIES) {
+    it(`holds the cursor when the ${name} read fails, and delivers on recovery`, async () => {
+      const tables = buildTables(1);
+      let broken = false;
+      let refusals = 0;
+      const sb = positionTables(tables, (q, _n, reply) => {
+        if (broken && selects(q)) {
+          refusals += 1;
+          return { data: null, error: { message: `review-${name}-outage` } };
+        }
+        return reply;
+      });
+      const hub = makeHub(sb);
+      const rec = subscribeRecording(hub);
+      // Seeded, non-frozen and stamped in the past, so the MAINTENANCE read is
+      // actually issued — without a cached key that phase never runs and the
+      // first boundary is unreachable (rule 3b: the case has to be able to fail).
+      seedAll(hub, [1]);
+
+      await hub.pollWallet(ADDRESS);
+      const floors = (): Array<string | undefined> =>
+        sb.queries.filter((q) => q.table === 'positions' && q.or !== undefined).map((q) => q.or);
+      const floorBefore = floors().slice(-1)[0];
+
+      // A new position arrives while the downstream read is failing.
+      broken = true;
+      pushRow(tables, 2, laterStamp(1));
+      await hub.pollWallet(ADDRESS);
+      await hub.pollWallet(ADDRESS);
+
+      // SETUP FIRST (rule 3g-silentsetup): the outage really happened, or this is
+      // a test of nothing.
+      expect(refusals, `${name}: the injected failure never fired`).toBeGreaterThan(0);
+      expect(rec.statuses.map((s) => s.id)).toEqual([]);
+      // THE MECHANISM: the cursor did not move over rows nothing processed.
+      expect(floors().slice(-1)[0], `${name}: cursor advanced past unprocessed rows`).toBe(
+        floorBefore,
+      );
+
+      // …and when the read recovers, the row is still reachable.
+      broken = false;
+      await hub.pollWallet(ADDRESS);
+      expect(rec.statuses.map((s) => s.id)).toEqual(['2']);
+      // The RECOVERING tick asks with the held floor — it is the tick that finally
+      // processes the row, and the commit is the last thing it does — so the moved
+      // floor shows up on the one after it. Asserting it any earlier fails against
+      // a correct build, which is worth pinning in both directions.
+      expect(floors().slice(-1)[0]).toBe(floorBefore);
+      await hub.pollWallet(ADDRESS);
+      expect(floors().slice(-1)[0]).not.toBe(floorBefore);
+      expect(rec.statuses.map((s) => s.id)).toEqual(['2']);
+      // Not a degraded and not a resync: nothing was lost, the tick just retried.
+      expect(rec.degradeds).toEqual([]);
+      expect(rec.resyncs).toEqual([]);
+    });
+  }
+
+  it('holds the cursor when a drained row cannot be joined to its speculation', async () => {
+    // The same rule one layer in, and the reason it is not merely defensive: a
+    // parent join that comes back SHORT is indistinguishable from an orphan here,
+    // and both mean the row was read and not processed. `fk_position_speculation`
+    // — `(network, speculation_id)` REFERENCES `speculations` — is what makes a
+    // real orphan impossible AND what stops this from stalling: the parent exists,
+    // so a retry resolves it.
+    const tables = buildTables(1);
+    pushRow(tables, 2, laterStamp(1));
+    const sb = positionTables(tables);
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    // Remove the parent the drained row needs, and ONLY that one.
+    tables.speculations = tables.speculations.filter((s) => Number(s['speculation_id']) !== 2);
+
+    await hub.pollWallet(ADDRESS);
+    const floors = (): Array<string | undefined> =>
+      sb.queries.filter((q) => q.table === 'positions' && q.or !== undefined).map((q) => q.or);
+    const held = floors().slice(-1)[0];
+    expect(rec.statuses).toEqual([]);
+
+    await hub.pollWallet(ADDRESS);
+    expect(floors().slice(-1)[0]).toBe(held);
+
+    // Put it back — the FK guarantees this is the real state of affairs — and the
+    // row derives and is delivered.
+    tables.speculations.push({
+      speculation_id: 2,
+      contest_id: 2,
+      network: 'polygon',
+      market_type: 'moneyline',
+      line_ticks: 0,
+      speculation_status: 'open',
+      win_side: 'tbd',
+      row_updated_at: laterStamp(1),
+    } satisfies Row);
+    await hub.pollWallet(ADDRESS);
+    expect(rec.statuses.map((s) => s.id)).toEqual(['2']);
+  });
+
+  it('does NOT hold the cursor when a MAINTENANCE row cannot be joined, only a discovered one', async () => {
+    // The other half of the case above, and the reviewer asked for it by name: the
+    // hold is narrowed to DISCOVERED rows on purpose. A maintenance row that does
+    // not resolve is re-fetched from the cache on the next tick regardless, so
+    // letting it hold the cursor would give a maintenance-side anomaly the power to
+    // stall discovery — a worse failure than the one the guard exists for.
+    //
+    // Without this case the narrowing is untested in the direction that matters:
+    // every assertion in the sibling case is satisfied by a build that holds the
+    // cursor for ANY unresolved row (rule 5 — pair "X is refused" with "Y is
+    // accepted"). The mutant that drops the `discoveredKeys` condition survives
+    // the whole file until this exists.
+    const tables = buildTables(1);
+    pushRow(tables, 2, laterStamp(1));
+    const sb = positionTables(tables);
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    // Key 1 is cached, live and stamped in the past, so it is MAINTENANCE's row and
+    // not the drain's. Key 2 is above the tip, so it is the drain's.
+    seedAll(hub, [1]);
+    // Remove the MAINTENANCE row's parent, and only that one.
+    tables.speculations = tables.speculations.filter((s) => Number(s['speculation_id']) !== 1);
+
+    await hub.pollWallet(ADDRESS);
+
+    const floors = (): Array<string | undefined> =>
+      sb.queries.filter((q) => q.table === 'positions' && q.or !== undefined).map((q) => q.or);
+    // SETUP FIRST (rule 3g-silentsetup): maintenance really did ask for key 1, so
+    // the unresolved row really was in this tick's derivation.
+    expect(phaseBIdLists(sb.queries).flat()).toContain(1);
+    // The discovered row is delivered…
+    expect(rec.statuses.map((s) => s.id)).toEqual(['2']);
+
+    // …and the cursor MOVED, which is the whole point: discovery is not stalled by
+    // an anomaly on the maintenance side.
+    await hub.pollWallet(ADDRESS);
+    const moved = new Date(Date.parse(laterStamp(1)) - 30_000).toISOString();
+    expect(floors().slice(-1)[0]).toBe(
+      `row_updated_at.gt.${moved},and(row_updated_at.eq.${moved},id.gt.0)`,
+    );
+    expect(floors()[0]).not.toBe(floors().slice(-1)[0]);
+    expect(rec.resyncs).toEqual([]);
+    expect(rec.degradeds).toEqual([]);
+  });
+
+  it('advances the cursor when the work SUCCEEDS, which is the other half', async () => {
+    // Negative control for the three cases above (rule 5). A build that simply
+    // never advanced the cursor would satisfy every "holds" assertion and would be
+    // a different, worse defect: the drain would re-read and re-derive the same
+    // rows for ever.
+    const tables = buildTables(0);
+    pushRow(tables, 1, laterStamp(1));
+    const sb = positionTables(tables);
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+
+    await hub.pollWallet(ADDRESS);
+    await hub.pollWallet(ADDRESS);
+
+    const floors = sb.queries
+      .filter((q) => q.table === 'positions' && q.or !== undefined)
+      .map((q) => q.or);
+    expect(rec.statuses.map((s) => s.id)).toEqual(['1']);
+    expect(floors[1]).not.toBe(floors[0]);
+    const movedFloor = new Date(Date.parse(laterStamp(1)) - 30_000).toISOString();
+    expect(floors[1]).toBe(
+      `row_updated_at.gt.${movedFloor},and(row_updated_at.eq.${movedFloor},id.gt.0)`,
+    );
+  });
+});
 
 describe('reDerivePositionStatuses — phase B maintains tracked keys deterministically', () => {
-  it('delivers a transition on a row OUTSIDE the recency window, via the by-id refresh', async () => {
-    // The acceptance case from the issue: >200 actionable rows, and the
-    // transition happens on a row the recency window cannot see. Here the
-    // subscriber was told about every row (the `#76` end state), so phase B owes
-    // the event — and delivers it.
+  it('delivers a transition the drain cannot see, because the position row never moved', async () => {
+    // The acceptance case from `#83`, restated for `#97`: the transition happens
+    // on a parent, so `positions.row_updated_at` does not move and the discovery
+    // drain returns NOTHING. Phase B owes the event — and delivers it.
+    //
+    // Under the old phase A this case had to reach for a row outside the 200-row
+    // recency window to be attributable to phase B. It no longer does, and that
+    // is the point: the drain sees CHANGED POSITION ROWS, so a parent-driven
+    // transition is phase B's by construction rather than by fixture size.
     const tables = buildTables(250, {
-      // 250 is the OLDEST-updated row, so it is outside phase A's window. Its
-      // speculation settles on the winning side: active -> claimable, which is
-      // money.
       250: { specStatus: 'closed', winSide: 'away' },
     });
     const sb = positionTables(tables);
@@ -321,12 +805,11 @@ describe('reDerivePositionStatuses — phase B maintains tracked keys determinis
 
     await hub.pollWallet(ADDRESS);
 
-    // SETUP FIRST (rule 3g-silentsetup). Phase A asked for 200 of the 250 rows
-    // by recency, and 250 is the oldest-updated, so the window cannot hold it —
-    // which is what makes the delivery below attributable to phase B and not to
-    // "the fixture was small enough".
+    // SETUP FIRST (rule 3g-silentsetup). The drain read nothing — every fixture
+    // row is stamped minutes before the tip — so a delivery below is phase B's
+    // and cannot be "the fixture was small enough".
     const phaseA = sb.queries.filter((q) => q.table === 'positions')[0]!;
-    expect(phaseA.limit).toBe(200);
+    expect(phaseA.or).toContain('row_updated_at.gt.');
     expect(tables.positions).toHaveLength(250);
     expect(phaseBIdLists(sb.queries).flat()).toContain(250);
 
@@ -348,9 +831,15 @@ describe('reDerivePositionStatuses — phase B maintains tracked keys determinis
     await hub.pollWallet(ADDRESS);
 
     const lists = phaseBIdLists(sb.queries);
-    // 250 seeded keys, 200 of them inside phase A's window -> 50 stale.
-    expect(lists).toHaveLength(1);
-    expect(lists[0]).toEqual(Array.from({ length: 50 }, (_, i) => 201 + i));
+    // 250 seeded keys and a drain that returned nothing, so all 250 are phase
+    // B's: three pages of 100/100/50. Under the old phase A the first 200 were
+    // subtracted by the recency window and this was one page of 50 — the whole
+    // live work-list now lands here, which is the number `#97` moved and the
+    // reason the seed's `terminal` flag went from an optimisation to a
+    // requirement.
+    expect(lists).toHaveLength(3);
+    expect(lists.map((l) => l.length)).toEqual([100, 100, 50]);
+    expect(lists.flat()).toEqual(Array.from({ length: 250 }, (_, i) => i + 1));
     for (const q of phaseBQueries(sb.queries)) {
       expect(q.orders).toEqual([['id', { ascending: true }]]);
       const ids = (q.joins.find(([c]) => c === 'speculation_id')?.[1] ?? []) as number[];
@@ -361,19 +850,20 @@ describe('reDerivePositionStatuses — phase B maintains tracked keys determinis
     }
   });
 
-  it('reports its own budget, at a population where phase A is NOT saturated', async () => {
-    // rule 3b: with >200 actionable rows phase A's cap fires too, so a test
-    // built that way cannot tell which bound spoke. Here the TABLE holds 10
-    // rows — phase A is nowhere near its cap — and the CACHE holds the rest, so
-    // the phase-B budget is the only thing that can produce a signal.
+  it('reports its own budget, and is silent one key below it', async () => {
+    // The boundary, both sides, and it is the only saturation the derivation has
+    // left. It is also the negative control for deleting phase A's cap: a build
+    // that lost the ability to signal AT ALL passes the phase-A cases above and
+    // fails here.
+    //
+    // The table holds 10 rows and the CACHE holds the rest, so the phase-B budget
+    // is the only thing that can produce a signal (rule 3b). The 10 table rows are
+    // stamped before the tip, so the drain subtracts nothing from the work-list —
+    // which is why these numbers are 400/401 where the window-era version of this
+    // case needed 410/500.
     for (const [seeded, expected] of [
-      // 410 seeded, 10 of them inside phase A's result -> exactly 400 stale,
-      // which four pages of 100 cover completely. Nothing is missed, so nothing
-      // is reported: the negative control, and the only case that separates
-      // `> budget` from `>= budget`.
-      [410, [] as string[]],
-      // 500 seeded -> 490 stale, of which 90 go uncovered.
-      [500, ['positionsTruncated']],
+      [400, [] as string[]],
+      [401, ['positionsTruncated']],
     ] as const) {
       const sb = positionTables(buildTables(10));
       const hub = makeHub(sb);
@@ -389,9 +879,9 @@ describe('reDerivePositionStatuses — phase B maintains tracked keys determinis
   });
 
   it('refuses to exceed its page budget, and reports that instead of truncating', async () => {
-    // 700 actionable rows: 200 inside phase A's window, 500 stale keys against a
-    // 4 x 100 budget. The 100 uncovered keys are exactly what the old single
-    // `.limit(200)` returned an unspecified subset of, silently.
+    // 700 seeded keys against a 4 × 100 budget. The 300 uncovered keys are exactly
+    // what the old single `.limit(200)` returned an unspecified subset of,
+    // silently.
     const sb = positionTables(buildTables(700));
     const hub = makeHub(sb);
     const rec = subscribeRecording(hub);
@@ -402,9 +892,82 @@ describe('reDerivePositionStatuses — phase B maintains tracked keys determinis
     const lists = phaseBIdLists(sb.queries);
     expect(lists).toHaveLength(4);
     expect(lists.map((l) => l.length)).toEqual([100, 100, 100, 100]);
-    // The covered prefix is specified: ids 201..600, ascending.
-    expect(lists.flat()).toEqual(Array.from({ length: 400 }, (_, i) => 201 + i));
+    // The covered prefix is specified: ids 1..400, ascending.
+    expect(lists.flat()).toEqual(Array.from({ length: 400 }, (_, i) => i + 1));
     expect(rec.degradeds).toEqual(['positionsTruncated']);
+  });
+
+  it('lists a two-sided speculation ONCE, so the sentinel keeps its margin', async () => {
+    // The work-list is keyed per POSITION and the read is keyed per SPECULATION.
+    // Listing one speculation twice costs a chunk slot and doubles that chunk's
+    // `legalMax`, which raises the bar the illegal row has to clear and blunts the
+    // only check that can prove the uniqueness assumption wrong (B3's sentinel).
+    // Phase A used to hide this by returning both rows; with a delta it does not.
+    const tables = buildTables(1);
+    tables.positions.push({
+      ...tables.positions[0]!,
+      id: 2,
+      position_type: 'lower',
+    } satisfies Row);
+    const sb = positionTables(tables);
+    const hub = makeHub(sb);
+    subscribeRecording(hub);
+    hub.seedStatusCache(ADDRESS, [
+      { key: '1_0', status: 'active', sourceUpdatedAt: stampFor(1) },
+      { key: '1_1', status: 'active', sourceUpdatedAt: stampFor(1) },
+    ]);
+
+    await hub.pollWallet(ADDRESS);
+
+    const lists = phaseBIdLists(sb.queries);
+    expect(lists).toEqual([[1]]);
+    expect(phaseBQueries(sb.queries)[0]!.limit).toBe(3);
+  });
+
+  it('costs the same per tick at ten times the history', async () => {
+    // `.claude/rules/production-cost-review.md`: assert the per-tick COST, not
+    // just the result, and assert it at two history sizes. The live delta is one
+    // row and the live work-list is two keys in both runs; everything else is
+    // finished history, which is what grows and what must not be paid for.
+    const measure = async (history: number): Promise<{ queries: number; rows: number }> => {
+      const finished: Record<number, PositionSpec> = {};
+      for (let id = 3; id <= history; id += 1) {
+        finished[id] = { specStatus: 'closed', winSide: 'home', contestStatus: 'scored', awayScore: 1, homeScore: 7 };
+      }
+      const tables = buildTables(history, finished);
+      const sb = positionTables(tables);
+      const hub = makeHub(sb);
+      subscribeRecording(hub);
+      hub.seedStatusCache(
+        ADDRESS,
+        Array.from({ length: history }, (_, i) => ({
+          key: `${String(i + 1)}_0`,
+          status: (i < 2 ? 'active' : 'settledLost') as 'active',
+          sourceUpdatedAt: stampFor(i + 1),
+          // The finished rows arrive retired, which is what `#96` bought and what
+          // keeps this measurement flat.
+          terminal: i >= 2,
+        })),
+      );
+
+      await hub.pollWallet(ADDRESS);
+      const before = sb.queries.length;
+      const rowsBefore = sb.queries.reduce((n, q) => n + (q.rowsReturned ?? 0), 0);
+      // …then one row changes, and the SECOND tick is the one measured.
+      tables.positions[0]!['row_updated_at'] = laterStamp(1);
+      await hub.pollWallet(ADDRESS);
+      return {
+        queries: sb.queries.length - before,
+        rows: sb.queries.reduce((n, q) => n + (q.rowsReturned ?? 0), 0) - rowsBefore,
+      };
+    };
+
+    const small = await measure(40);
+    const large = await measure(400);
+    expect(large).toEqual(small);
+    // And the absolute numbers, so a regression that inflates BOTH is visible:
+    // the drain, one phase-B chunk, the speculations join and the contests join.
+    expect(small.queries).toBe(4);
   });
 });
 
@@ -549,21 +1112,26 @@ describe('reDerivePositionStatuses — a finished position is retired from the w
   });
 });
 
-// ── review round 1: three blockers, three pins ───────────────────────────
-
 describe('reDerivePositionStatuses — the saturation signal reaches every connection', () => {
+  /**
+   * 401 non-frozen cached keys against a 400-key phase-B budget: one key over,
+   * on every tick. These two cases were anchored on phase A's 200-row cap until
+   * `#97` deleted it; the budget is the saturation that is left, and the latch
+   * behaviour under test never depended on which phase raised it.
+   */
+  const overBudget = 401;
+
   it('tells a subscriber that joined a poller ALREADY latched, and does not re-tell the first', async () => {
     // Review blocker B2. The poller outlives the connection that first
     // saturated it, so a per-POLLER latch on delivery meant a later subscriber
     // was silenced by a signal sent to someone else. The reviewer's shape: the
-    // first subscriber saturates, the population falls below the cap, a second
-    // subscriber connects on a COMPLETE view, and the population grows again.
-    // The second connection has to hear about that, and the first must not hear
-    // it twice.
-    const tables = buildTables(250);
-    const sb = positionTables(tables);
+    // first subscriber saturates, a second subscriber connects on a view that was
+    // complete at the time, and the derivation saturates again. The second
+    // connection has to hear about that, and the first must not hear it twice.
+    const sb = positionTables(buildTables(10));
     const hub = makeHub(sb);
     const first = subscribeRecording(hub);
+    seedAll(hub, Array.from({ length: overBudget }, (_, i) => i + 1));
 
     await hub.pollWallet(ADDRESS);
     expect(first.degradeds).toEqual(['positionsTruncated']);
@@ -589,7 +1157,7 @@ describe('reDerivePositionStatuses — the saturation signal reaches every conne
   it('retries a subscriber whose onDegraded threw, instead of marking it told', async () => {
     // The same lesson B1 taught the handler, applied here: mark it sent when it
     // was actually sent. A consumer callback that throws has not been told.
-    const sb = positionTables(buildTables(250));
+    const sb = positionTables(buildTables(10));
     const hub = makeHub(sb);
     let calls = 0;
     const seen: string[] = [];
@@ -604,6 +1172,7 @@ describe('reDerivePositionStatuses — the saturation signal reaches every conne
         seen.push(reason);
       },
     });
+    seedAll(hub, Array.from({ length: overBudget }, (_, i) => i + 1));
 
     await hub.pollWallet(ADDRESS);
     expect(calls).toBe(1);
@@ -761,40 +1330,48 @@ describe('seedStatusCache — the seed carries what the deriving read already kn
 
 describe('reDerivePositionStatuses — discovery coverage is not assumed', () => {
   /**
-   * A relaxation was tried here and withdrawn under review: with a seed known to
-   * cover the whole actionable population, suppress the signal when a full page
-   * contains only known keys. The cases that used to sit in this block asserted
-   * that relaxation. They were STATIC — a complete seed, one poll, nothing moving
-   * — and a static fixture cannot see the hole, which is about what happens
-   * BETWEEN polls.
+   * A relaxation was tried in `#96` and withdrawn under review: with a seed known
+   * to cover the whole actionable population, suppress the saturation signal when
+   * a full recency page contains only known keys. The cases that shipped with it
+   * were STATIC — a complete seed, one poll, nothing moving — and a static fixture
+   * cannot see the hole, which is entirely about what happens BETWEEN polls. They
+   * were replaced by the counterexample, kept as a regression guard.
    *
-   * What replaces them is the counterexample itself, kept as a regression guard.
+   * `#97` answers that counterexample, so the guard has been REWRITTEN rather than
+   * deleted, and its previous expectations are quoted below where they changed.
+   * Both cases still change the fixture between polls, which is the property the
+   * withdrawn version lacked.
    */
 
-  it('reports a new row displaced out of the recency window by churn on known keys', async () => {
-    // THE counterexample. 199 actionable rows — inside today's cap, so this is
-    // not a hypothetical about `#76`'s future seed. One new position arrives, and
+  it('DELIVERS a new row that churn on known keys pushed out of the recency window', async () => {
+    // THE counterexample, inverted. 199 actionable rows — inside the old cap, so
+    // this never depended on `#76`'s future seed. One new position arrives, and
     // then 200 already-known positions take newer `row_updated_at` values before
-    // the next tick. The new row entered at the head AT ITS WRITE and is below the
-    // window's floor at the READ; phase A cannot see it, and phase B never asks,
-    // because phase B only maintains keys the cache already holds.
+    // the next tick. Under the recency window the new row entered at the head AT
+    // ITS WRITE and was below the window's floor at the READ, so phase A could not
+    // see it and phase B never asked; the tick reported a full page and the row was
+    // never delivered.
     //
-    // WHAT THIS TEST IS FOR: the conservative rule satisfies it by reporting a
-    // full page, so it passes today for a reason broader than the scenario. It is
-    // here so that a future relaxation of that rule goes RED and has to answer the
-    // scenario deliberately — by DELIVERING the row (a keyset probe above the
-    // highest id the cache has seen) or by PROVING nothing was skipped (a count of
-    // the actionable set). Suppressing the signal without either is the hole.
+    // WHAT CHANGED, quoted from the version this replaces:
+    //     expect(rec.statuses.some((s) => s.id === '201')).toBe(false);
+    //     expect(rec.degradeds).toEqual(['positionsTruncated']);
+    //     expect(hub.stats().positionSaturationTotal).toBe(1);
+    // Both of those were labelled "current behaviour", and the block comment said
+    // a relaxation must answer this scenario by DELIVERING the row or by PROVING
+    // nothing was skipped. A keyset drain delivers it: ascending from the tip, key
+    // 201 sorts BEFORE the 200 rows that displaced it, and a page limit cuts the
+    // newest rows rather than the oldest.
     const tables = buildTables(199);
     const sb = positionTables(tables);
     const hub = makeHub(sb);
     const rec = subscribeRecording(hub);
     seedAll(hub, Array.from({ length: 199 }, (_, i) => i + 1));
 
-    // A tick with nothing moving and a page that is NOT full: no signal, and the
-    // control that proves the fixture starts clean.
+    // A tick with nothing moving: no signal, no delivery, and the control that
+    // proves the fixture starts clean.
     await hub.pollWallet(ADDRESS);
     expect(rec.degradeds).toEqual([]);
+    expect(rec.statuses).toEqual([]);
 
     // One key transfers its stake out and one new key arrives, so the population
     // stays at 199 actionable while the cache legitimately tracks 200 identities.
@@ -817,29 +1394,43 @@ describe('reDerivePositionStatuses — discovery coverage is not assumed', () =>
 
     await hub.pollWallet(ADDRESS);
 
-    // SETUP FIRST (rule 3g-silentsetup): the window really is full of known keys
-    // and the new row really is outside it, or the assertions below are about a
-    // different situation than the one named.
-    const phaseA = sb.queries.filter((q) => q.table === 'positions').slice(-1)[0]!;
-    expect(phaseA.limit).toBe(200);
+    // SETUP FIRST (rule 3g-silentsetup): the displacement really happened, or the
+    // assertion below is about a different situation than the one named. 200 rows
+    // carry a stamp NEWER than key 201's, which is what put it outside a 200-row
+    // recency window and is the whole scenario.
+    const newerThan201 = tables.positions.filter(
+      (p) => String(p['row_updated_at']) > laterStamp(2),
+    );
+    expect(newerThan201).toHaveLength(200);
     expect(tables.positions.filter((p) => p['risk_amount'] !== '0')).toHaveLength(201);
-    expect(rec.statuses.some((s) => s.id === '201')).toBe(false);
 
-    // Current behaviour: the gap is reported. A relaxation that stops reporting it
-    // must deliver key 201 instead — see the block comment.
-    expect(rec.degradeds).toEqual(['positionsTruncated']);
-    expect(hub.stats().positionSaturationTotal).toBe(1);
+    // Delivered, in one tick, with no degraded frame and no saturation episode.
+    expect(rec.statuses.some((s) => s.id === '201')).toBe(true);
+    expect(rec.degradeds).toEqual([]);
+    expect(hub.stats().positionSaturationTotal).toBe(0);
+    // And delivered in its own place in the order — key 201's stamp is older than
+    // the 200 that displaced it, so it comes FIRST. That ordering is what makes a
+    // mid-tick disconnect safe: the cursor cannot advance past an undelivered
+    // earlier-source event.
+    const tickStatuses = rec.statuses.slice(-201);
+    expect(tickStatuses[0]!.id).toBe('201');
   });
 
   it('keeps the whole population off phase B when the seed says it is finished', async () => {
     // The payoff of the retirement flag, at the size of the market maker's own
-    // wallet. 635 keys seeded as settled losers on closed speculations — 554 of
-    // maker-a's rows are exactly that. Before the flag reached the seed, the first
-    // tick spent all four phase-B pages, covered 400 of 435 stale keys and latched
-    // a signal it was about to stop needing.
+    // wallet. 635 keys seeded as settled losers on closed speculations — 570 of
+    // maker-a's 621 actionable rows are exactly that. Before the flag reached the
+    // seed, the first tick spent all four phase-B pages, covered 400 of 435 stale
+    // keys and latched a signal it was about to stop needing.
     //
-    // The page is still full, so the conservative rule still reports the cap. What
-    // this pins is the MAINTENANCE cost: zero phase-B queries, not four.
+    // WHAT CHANGED, quoted from the version this replaces:
+    //     // Reported, because a full page is still saturation until `#97` can
+    //     // prove otherwise. That is why `#76`'s complete snapshot waits on `#97`.
+    //     expect(rec.degradeds).toEqual(['positionsTruncated']);
+    // This is the case `#76` is blocked on, so it is the one that had to change:
+    // a seed that covers the whole population now produces a tick that reads the
+    // delta, maintains the live keys, and says nothing. The maintenance-cost
+    // assertion is unchanged — zero phase-B queries, not four.
     const t: Tables = { positions: [], speculations: [], contests: [] };
     for (let id = 1; id <= 635; id += 1) {
       const one = buildTables(1, { 1: { specStatus: 'closed', winSide: 'home' } });
@@ -865,9 +1456,43 @@ describe('reDerivePositionStatuses — discovery coverage is not assumed', () =>
 
     expect(phaseBIdLists(sb.queries)).toEqual([]);
     expect(rec.statuses).toEqual([]);
-    // Reported, because a full page is still saturation until `#97` can prove
-    // otherwise. That is why `#76`'s complete snapshot waits on `#97`.
-    expect(rec.degradeds).toEqual(['positionsTruncated']);
+    expect(rec.degradeds).toEqual([]);
+    expect(hub.stats().positionSaturationTotal).toBe(0);
+    // One statement for the whole tick: the drain, which read nothing. No spec or
+    // contest join either, because there was nothing to join.
+    expect(sb.queries).toHaveLength(1);
+    expect(sb.queries[0]!.rowsReturned).toBe(0);
+  });
+
+  it('still reports a capped SEED, because that is the snapshot leg and it is unchanged', async () => {
+    // The negative control the issue asks for: a wallet whose seed was capped must
+    // keep the conservative treatment. It does, and NOT from here — the hub cannot
+    // know what the snapshot read, and after `#97` it no longer guesses from its
+    // own page being full. The signal comes from `positionsTruncated`, minted in
+    // `snapshot.ts` when the seed's own actionable read hits its cap and emitted by
+    // the handler before `ready`; `tests/ownState-stream.test.ts` pins that frame.
+    //
+    // What this case pins is the half that lives here: an incomplete cache means
+    // phase B maintains only what it was told about, and the hub adds no second
+    // signal of its own. Key 500 exists, is actionable, was never seeded, and its
+    // speculation settles without touching the position row — so nothing delivers
+    // it, and nothing claims otherwise.
+    const tables = buildTables(500, { 500: { specStatus: 'closed', winSide: 'away' } });
+    const sb = positionTables(tables);
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    // A capped seed: the 200 the snapshot would have returned.
+    seedAll(hub, Array.from({ length: 200 }, (_, i) => i + 1));
+
+    await hub.pollWallet(ADDRESS);
+
+    expect(rec.statuses).toEqual([]);
+    expect(rec.degradeds).toEqual([]);
+    // …and the moment the row is touched, the drain does deliver it, which is why
+    // an incomplete cache degrades gracefully rather than permanently.
+    tables.positions[499]!['row_updated_at'] = laterStamp(1);
+    await hub.pollWallet(ADDRESS);
+    expect(rec.statuses).toEqual([{ id: '500', status: 'claimable' }]);
   });
 });
 
@@ -898,7 +1523,7 @@ describe('reDerivePositionStatuses — the emission loop, pinned', () => {
     // tick) and EXCEPTION ISOLATION (see the sibling case below). A refactor that
     // made delivery early-terminating would break one of those and go red here;
     // one that merely reordered the loops would not, and should not.
-    const sb = positionTables(buildTables(6, Object.fromEntries(
+    const sb = positionTables(liveTables(6, Object.fromEntries(
       Array.from({ length: 6 }, (_, i) => [i + 1, { specStatus: 'closed' as const, winSide: 'away' }]),
     )));
     const hub = makeHub(sb);
@@ -945,7 +1570,7 @@ describe('reDerivePositionStatuses — the emission loop, pinned', () => {
     // The other half of `#94`: a callback that throws is logged and the cache has
     // already advanced. Same answer, same reason — the sibling was served in the
     // same iteration, before and after the throw.
-    const sb = positionTables(buildTables(4, Object.fromEntries(
+    const sb = positionTables(liveTables(4, Object.fromEntries(
       Array.from({ length: 4 }, (_, i) => [i + 1, { specStatus: 'closed' as const, winSide: 'away' }]),
     )));
     const hub = makeHub(sb);
