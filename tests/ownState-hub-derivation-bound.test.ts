@@ -123,6 +123,19 @@ function buildTables(count: number, overrides: Record<number, PositionSpec> = {}
   return tables;
 }
 
+/** A stamp strictly NEWER than any `stampFor` value, for inter-poll churn. */
+function laterStamp(minutes: number): string {
+  return `${new Date(NOW + minutes * 60_000).toISOString().replace('Z', '')}456+00:00`;
+}
+
+/** Append one actionable position (plus its parents) at `stamp`. */
+function pushRow(tables: Tables, id: number, stamp: string): void {
+  const one = buildTables(1);
+  tables.positions.push({ ...one.positions[0]!, id, speculation_id: id, row_updated_at: stamp, position_created_at: stamp });
+  tables.speculations.push({ ...one.speculations[0]!, speculation_id: id, contest_id: id, row_updated_at: stamp });
+  tables.contests.push({ ...one.contests[0]!, contest_id: id, row_updated_at: stamp });
+}
+
 const DERIVED: ReadonlySet<string> = new Set(['positions', 'speculations', 'contests']);
 
 /**
@@ -685,5 +698,175 @@ describe('reDerivePositionStatuses — a full legal page is not a truncated one'
 
     expect(rec.degradeds).toEqual(['positionsTruncated']);
     expect(hub.stats().positionSaturationTotal).toBe(1);
+  });
+});
+
+// ── #76 foundation: a seed that carries retirement and coverage ───────────
+
+describe('seedStatusCache — the seed carries what the deriving read already knew', () => {
+  /** 205 rows, so ids 201..205 sit outside phase A's window and land in phase B. */
+  function tables(): Tables {
+    return buildTables(205, {
+      205: { specStatus: 'closed', winSide: 'home' }, // upper loses ⇒ settledLost
+    });
+  }
+
+  it('retires a terminal key at SEED time, so phase B never asks for it', async () => {
+    // The flag comes from `fetchCategorizedPositions`, which computed it over the
+    // same join that produced the status. Before this, the seed arrived live and
+    // the FIRST TICK had to retire it — affordable at 200 seeded keys and not at
+    // 635, where the stale set exceeds phase B's budget and the tick reports
+    // saturation for rows it was about to retire.
+    const sb = positionTables(tables());
+    const hub = makeHub(sb);
+    subscribeRecording(hub);
+    seedAll(hub, Array.from({ length: 204 }, (_, i) => i + 1));
+    hub.seedStatusCache(ADDRESS, [
+      { key: '205_0', status: 'settledLost', sourceUpdatedAt: stampFor(205), result: 'lost', terminal: true },
+    ]);
+
+    await hub.pollWallet(ADDRESS);
+
+    expect(phaseBIdLists(sb.queries).flat()).not.toContain(205);
+  });
+
+  it('keeps asking when the deriving read said the key is still live', async () => {
+    // The negative control for the same field. Identical fixture, identical
+    // status, `terminal: false` — so only the flag decides, and a build that
+    // ignored it would pass the case above and fail here.
+    const sb = positionTables(tables());
+    const hub = makeHub(sb);
+    subscribeRecording(hub);
+    seedAll(hub, Array.from({ length: 204 }, (_, i) => i + 1));
+    hub.seedStatusCache(ADDRESS, [
+      { key: '205_0', status: 'settledLost', sourceUpdatedAt: stampFor(205), result: 'lost', terminal: false },
+    ]);
+
+    await hub.pollWallet(ADDRESS);
+
+    expect(phaseBIdLists(sb.queries).flat()).toContain(205);
+  });
+
+  it('treats an omitted flag as live, so an unaware caller keeps the old behaviour', async () => {
+    const sb = positionTables(tables());
+    const hub = makeHub(sb);
+    subscribeRecording(hub);
+    seedAll(hub, Array.from({ length: 205 }, (_, i) => i + 1));
+
+    await hub.pollWallet(ADDRESS);
+
+    expect(phaseBIdLists(sb.queries).flat()).toContain(205);
+  });
+});
+
+describe('reDerivePositionStatuses — discovery coverage is not assumed', () => {
+  /**
+   * A relaxation was tried here and withdrawn under review: with a seed known to
+   * cover the whole actionable population, suppress the signal when a full page
+   * contains only known keys. The cases that used to sit in this block asserted
+   * that relaxation. They were STATIC — a complete seed, one poll, nothing moving
+   * — and a static fixture cannot see the hole, which is about what happens
+   * BETWEEN polls.
+   *
+   * What replaces them is the counterexample itself, kept as a regression guard.
+   */
+
+  it('reports a new row displaced out of the recency window by churn on known keys', async () => {
+    // THE counterexample. 199 actionable rows — inside today's cap, so this is
+    // not a hypothetical about `#76`'s future seed. One new position arrives, and
+    // then 200 already-known positions take newer `row_updated_at` values before
+    // the next tick. The new row entered at the head AT ITS WRITE and is below the
+    // window's floor at the READ; phase A cannot see it, and phase B never asks,
+    // because phase B only maintains keys the cache already holds.
+    //
+    // WHAT THIS TEST IS FOR: the conservative rule satisfies it by reporting a
+    // full page, so it passes today for a reason broader than the scenario. It is
+    // here so that a future relaxation of that rule goes RED and has to answer the
+    // scenario deliberately — by DELIVERING the row (a keyset probe above the
+    // highest id the cache has seen) or by PROVING nothing was skipped (a count of
+    // the actionable set). Suppressing the signal without either is the hole.
+    const tables = buildTables(199);
+    const sb = positionTables(tables);
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    seedAll(hub, Array.from({ length: 199 }, (_, i) => i + 1));
+
+    // A tick with nothing moving and a page that is NOT full: no signal, and the
+    // control that proves the fixture starts clean.
+    await hub.pollWallet(ADDRESS);
+    expect(rec.degradeds).toEqual([]);
+
+    // One key transfers its stake out and one new key arrives, so the population
+    // stays at 199 actionable while the cache legitimately tracks 200 identities.
+    tables.positions[0]!['risk_amount'] = '0';
+    tables.positions[0]!['row_updated_at'] = laterStamp(1);
+    pushRow(tables, 200, laterStamp(1));
+    await hub.pollWallet(ADDRESS);
+    expect(rec.statuses.some((s) => s.id === '200')).toBe(true);
+    expect(rec.degradeds).toEqual([]);
+
+    // BETWEEN polls: the unseen key 201 arrives, and THEN all 200 known keys take
+    // newer timestamps — including the zero-risk key coming back.
+    pushRow(tables, 201, laterStamp(2));
+    for (const p of tables.positions) {
+      if (Number(p['id']) <= 200) {
+        p['risk_amount'] = '11000';
+        p['row_updated_at'] = laterStamp(3);
+      }
+    }
+
+    await hub.pollWallet(ADDRESS);
+
+    // SETUP FIRST (rule 3g-silentsetup): the window really is full of known keys
+    // and the new row really is outside it, or the assertions below are about a
+    // different situation than the one named.
+    const phaseA = sb.queries.filter((q) => q.table === 'positions').slice(-1)[0]!;
+    expect(phaseA.limit).toBe(200);
+    expect(tables.positions.filter((p) => p['risk_amount'] !== '0')).toHaveLength(201);
+    expect(rec.statuses.some((s) => s.id === '201')).toBe(false);
+
+    // Current behaviour: the gap is reported. A relaxation that stops reporting it
+    // must deliver key 201 instead — see the block comment.
+    expect(rec.degradeds).toEqual(['positionsTruncated']);
+    expect(hub.stats().positionSaturationTotal).toBe(1);
+  });
+
+  it('keeps the whole population off phase B when the seed says it is finished', async () => {
+    // The payoff of the retirement flag, at the size of the market maker's own
+    // wallet. 635 keys seeded as settled losers on closed speculations — 554 of
+    // maker-a's rows are exactly that. Before the flag reached the seed, the first
+    // tick spent all four phase-B pages, covered 400 of 435 stale keys and latched
+    // a signal it was about to stop needing.
+    //
+    // The page is still full, so the conservative rule still reports the cap. What
+    // this pins is the MAINTENANCE cost: zero phase-B queries, not four.
+    const t: Tables = { positions: [], speculations: [], contests: [] };
+    for (let id = 1; id <= 635; id += 1) {
+      const one = buildTables(1, { 1: { specStatus: 'closed', winSide: 'home' } });
+      t.positions.push({ ...one.positions[0]!, id, speculation_id: id, row_updated_at: stampFor(id), position_created_at: stampFor(id) });
+      t.speculations.push({ ...one.speculations[0]!, speculation_id: id, contest_id: id, row_updated_at: stampFor(id) });
+      t.contests.push({ ...one.contests[0]!, contest_id: id, row_updated_at: stampFor(id) });
+    }
+    const sb = positionTables(t);
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    hub.seedStatusCache(
+      ADDRESS,
+      Array.from({ length: 635 }, (_, i) => ({
+        key: `${String(i + 1)}_0`,
+        status: 'settledLost' as const,
+        sourceUpdatedAt: stampFor(i + 1),
+        result: 'lost' as const,
+        terminal: true,
+      })),
+    );
+
+    await hub.pollWallet(ADDRESS);
+
+    expect(phaseBIdLists(sb.queries)).toEqual([]);
+    expect(rec.statuses).toEqual([]);
+    // Reported, because a full page is still saturation until `#97` can prove
+    // otherwise. That is why `#76`'s complete snapshot waits on `#97`.
+    expect(rec.degradeds).toEqual(['positionsTruncated']);
   });
 });

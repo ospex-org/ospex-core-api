@@ -1162,3 +1162,140 @@ describe('GET /v1/stream/own-state — a preReady saturation signal is held, not
     expect(names).not.toContain('resync');
   });
 });
+
+/**
+ * The handler tells the hub what its read established (`#76`).
+ *
+ * Asserted at the CALL rather than through the hub's later behaviour (rule 3i):
+ * the seam is one argument, and a build that dropped it would still poll
+ * correctly for every wallet under the cap — which is every wallet these tests
+ * would otherwise exercise.
+ */
+describe('GET /v1/stream/own-state — the seed states its own coverage', () => {
+  interface SeedCall {
+    entries: Array<{ key: string; terminal?: boolean | undefined }>;
+  }
+
+  function installCapturingSeed(): SeedCall[] {
+    const calls: SeedCall[] = [];
+    class SeedSpyHub extends OwnStateHub {
+      seedStatusCache(
+        address: string,
+        entries: Parameters<InstanceType<typeof OwnStateHub>['seedStatusCache']>[1],
+      ): void {
+        calls.push({ entries: entries as SeedCall['entries'] });
+        super.seedStatusCache(address, entries);
+      }
+    }
+    __setOwnStateHubForTest(
+      new SeedSpyHub({
+        getClient: () => emptyClient(),
+        getNetwork: () => 'polygon',
+        pollMs: 1e9,
+        resyncMs: 1e9,
+      }),
+    );
+    return calls;
+  }
+
+  it('seeds the cold-start derivation through to the hub', async () => {
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: [],
+      pendingSettle: [],
+      claimable: [],
+      hitCap: false,
+      derivedStatuses: [],
+    });
+    const calls = installCapturingSeed();
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+    await flushTicks(64);
+
+    expect(events(res).map((e) => e.event)).toEqual(['snapshot', 'ready']);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('forwards retirement and coverage from the RESUME catch-up too', async () => {
+    // N branches are N properties (rule 3i-install). The resume path builds its
+    // seed entries by hand rather than passing `derivedStatuses` through, so the
+    // cold-start cases above say nothing about it — measured: a mutant replacing
+    // `terminal: r.terminal` with `false` survived the whole suite.
+    //
+    // Fixture: one position on a CLOSED speculation the other side won, so the
+    // derivation says `settledLost` and `isTerminalForever` says retired.
+    const lostPosition = {
+      speculation_id: 101,
+      user_address: ADDRESS,
+      position_type: 'upper',
+      risk_amount: '1000000',
+      profit_amount: '500000',
+      claimed: false,
+      row_updated_at: '2026-05-29T15:45:00.000Z',
+      id: 7,
+    };
+    const specClosedLost = {
+      speculation_id: 101,
+      contest_id: 42,
+      market_type: 'moneyline',
+      line_ticks: null,
+      speculation_status: 'closed',
+      win_side: 'home', // upper is away, so this side lost
+      row_updated_at: '2026-05-29T15:00:00.000Z',
+    };
+    const contestScored = {
+      contest_id: 42,
+      contest_status: 'scored',
+      away_score: 3,
+      home_score: 9,
+      row_updated_at: '2026-05-29T15:00:00.000Z',
+    };
+    supabaseMock.getSupabase.mockImplementation(() =>
+      sequencedClient([
+        { data: [], error: null }, // commitments catchup
+        { data: [], error: null }, // fills catchup
+        { data: [lostPosition], error: null }, // actionable positions
+        { data: [], error: null }, // terminal-since-cursor
+        { data: [specClosedLost], error: null },
+        { data: [contestScored], error: null },
+      ]),
+    );
+    const calls = installCapturingSeed();
+    const res = makeRes();
+    getOwnStateStreamHandler(
+      makeReq({ query: { cursor: liveCursor() } }),
+      res as unknown as Response,
+    );
+    await flushTicks(64);
+
+    expect(events(res).find((e) => e.event === 'ready')).toBeDefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.entries.map((e) => [e.key, e.terminal])).toEqual([['101_0', true]]);
+  });
+
+  it('forwards each row\'s retirement flag from the deriving read', async () => {
+    // `seedRows` IS `derivedStatuses`, so the flag the helper computed over its
+    // own join reaches the cache verbatim. Without this the seed arrives live and
+    // the first tick pays for the retirement — affordable at 200 keys, not at the
+    // 635 the market maker's own wallet holds.
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: [],
+      pendingSettle: [],
+      claimable: [],
+      hitCap: false,
+      derivedStatuses: [
+        { key: '1_0', status: 'settledLost', sourceUpdatedAt: NOW_ISO, result: 'lost', claimableAmount: undefined, terminal: true },
+        { key: '2_0', status: 'active', sourceUpdatedAt: NOW_ISO, result: undefined, claimableAmount: undefined, terminal: false },
+      ],
+    });
+    const calls = installCapturingSeed();
+    const res = makeRes();
+    getOwnStateStreamHandler(makeReq(), res as unknown as Response);
+    await flushTicks(64);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.entries.map((e) => [e.key, e.terminal])).toEqual([
+      ['1_0', true],
+      ['2_0', false],
+    ]);
+  });
+});

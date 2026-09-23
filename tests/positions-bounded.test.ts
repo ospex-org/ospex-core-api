@@ -110,6 +110,42 @@ describe('bounded complete positions enumeration', () => {
     expect(result.pendingSettle).toHaveLength(count);
   });
 
+  it('marks each derived status terminal or live from the SAME join that derived it', async () => {
+    // `#76`. The own-state hub retires a terminal key from its per-tick
+    // work-list, and only this module holds the speculation row
+    // `isTerminalForever` needs — so the flag is computed here or the consumer
+    // has to re-read `speculations` to learn what this read already knew.
+    //
+    // Asserted on the REAL helper. Every other test of this field mocks
+    // `fetchCategorizedPositions` and supplies `derivedStatuses` itself, which
+    // cannot see whether the helper computes the flag at all (rule 3i).
+    const tables = scaleTables(3);
+    // 1: closed speculation, the opposing side won -> settledLost, and
+    //    `claimPosition` reverts forever. Retired.
+    tables.speculations[0]!['speculation_status'] = 'closed';
+    tables.speculations[0]!['win_side'] = 'home';
+    // 2: closed and WON -> claimable. Still owes a `claimed` transition and is
+    //    carrying money, so NOT retired. The discriminating sibling: same
+    //    `speculation_status`, opposite answer.
+    tables.speculations[1]!['speculation_status'] = 'closed';
+    tables.speculations[1]!['win_side'] = 'away';
+    // 3: open, contest scored, this side predicted to lose -> settledLost as a
+    //    PREDICTION. A score correction flips it, so NOT retired. Same derived
+    //    STATUS as row 1 and the opposite flag, which is the pair that proves the
+    //    speculation term is read rather than the status alone.
+    tables.contests[2]!['home_score'] = 9;
+    const sb = positionTables(tables);
+    db.getSupabase.mockReturnValue(sb);
+
+    const result = await fetchCategorizedPositions(ADDRESS);
+
+    const byKey = new Map(result.derivedStatuses.map((d) => [d.key, d]));
+    expect([...byKey.keys()].sort()).toEqual(['1_0', '2_0', '3_0']);
+    expect(byKey.get('1_0')).toMatchObject({ status: 'settledLost', terminal: true });
+    expect(byKey.get('2_0')).toMatchObject({ status: 'claimable', terminal: false });
+    expect(byKey.get('3_0')).toMatchObject({ status: 'settledLost', terminal: false });
+  });
+
   it('retains the default own-state 200-row cap and raw hitCap even when all 200 rows are filtered losers', async () => {
     const tables = scaleTables(401);
     for (const c of tables.contests) c.home_score = 9;

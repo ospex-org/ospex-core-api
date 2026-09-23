@@ -89,6 +89,7 @@ import {
 } from './cursor.js';
 import {
   derivePositionStatus,
+  isTerminalForever,
   type ContestInput,
   type PositionStatusEventBody,
   type SpeculationInput,
@@ -464,6 +465,7 @@ export function getOwnStateStreamHandler(req: Request, res: Response): void {
           sourceUpdatedAt: r.sourceUpdatedAt,
           result: r.body.result,
           claimableAmount: r.body.claimableAmount,
+          terminal: r.terminal,
         })),
       );
       if (catchupResult.degraded || degradedPending) {
@@ -760,6 +762,12 @@ export interface DerivedPositionRow {
   sourceUpdatedAt: string;
   id: string;
   idBig: bigint;
+  /**
+   * `isTerminalForever` over this row's join — the resume-path twin of
+   * `DerivedPositionStatus.terminal`. Carried so the hub's cache can retire the
+   * key at SEED time instead of spending a first tick on it (`#76`).
+   */
+  terminal: boolean;
 }
 
 export interface DerivedPositionStateResult {
@@ -1067,6 +1075,10 @@ export async function derivePositionsForWallet(
       sourceUpdatedAt,
       id: String(row.id),
       idBig,
+      terminal: isTerminalForever(body.status, {
+        speculationStatus: spec.speculation_status,
+        winSide: spec.win_side,
+      }),
     });
   }
   rows.sort((a, b) => {

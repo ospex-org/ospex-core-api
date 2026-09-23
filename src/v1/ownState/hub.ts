@@ -416,6 +416,23 @@ export class OwnStateHub {
    * the seed will be treated as "newly observed" on the first tick and
    * emit unconditionally — which, during a same-tick preReady race,
    * trips the abort signal and forces a resync.
+   *
+   * ## `terminal`, and why the seed carries it
+   *
+   * A seeded entry used to arrive live, because the seed carried a derived
+   * status but not the speculation row `isTerminalForever` needs, so the first
+   * tick had to retire it. That is fine while the seed is capped at 200 and
+   * costs one tick of work. It is NOT fine once the seed is complete: 635
+   * seeded keys minus the 200 in phase A's recency window is 435 live stale
+   * keys against a 400-key budget, so the first tick after a complete cold
+   * start would report saturation for rows it was about to retire. Measured on
+   * the merged code before this change: 635 seeded keys → 4 phase-B pages, 400
+   * of 435 keys covered, `positionsTruncated` signalled, and by tick 2 the
+   * retirement had reduced it to one page. The signal is latched per
+   * subscriber, so a transient mechanism produced a permanent frame.
+   *
+   * `fetchCategorizedPositions` computes the flag from the join it already did,
+   * so this costs nothing and removes the tick-1 spike entirely.
    */
   seedStatusCache(
     address: string,
@@ -425,6 +442,8 @@ export class OwnStateHub {
       sourceUpdatedAt: string;
       result?: 'won' | 'lost' | 'push' | 'void' | undefined;
       claimableAmount?: string | undefined;
+      /** `isTerminalForever` over the deriving join. Absent ⇒ assumed live. */
+      terminal?: boolean | undefined;
     }>,
   ): void {
     const state = this.pollers.get(address.toLowerCase());
@@ -435,10 +454,11 @@ export class OwnStateHub {
         sourceUpdatedAt: e.sourceUpdatedAt,
         result: e.result,
         claimableAmount: e.claimableAmount,
-        // Deliberately not derived from `e.status` alone: `settledLost` freezes
-        // only on a CLOSED speculation and the seed does not carry one. The
-        // first tick reads the speculation row and retires it then.
-        frozen: false,
+        // NOT derivable from `e.status` alone — `settledLost` retires only on a
+        // CLOSED speculation — so it is the deriving read's answer or nothing.
+        // A caller that omits it gets the old behaviour: live until the first
+        // tick reads the speculation row and retires it.
+        frozen: e.terminal ?? false,
       });
     }
   }
@@ -654,6 +674,38 @@ export class OwnStateHub {
       row_updated_at: string;
       id: string | number;
     }>;
+    // A FULL PAGE IS SATURATION, AND A COMPLETE SEED DOES NOT CHANGE THAT.
+    //
+    // A relaxation was tried and WITHDRAWN: given a seed known to cover the whole
+    // actionable population, suppress the signal when a full page contains only
+    // keys the cache already holds. The reasoning was that a row the cache has
+    // never held carries `row_updated_at = now` and therefore enters at the HEAD
+    // of this window, so a full page of known keys proves nothing was missed.
+    //
+    // That is false, and the counterexample is worth keeping because it is cheap
+    // to hit: a new row enters at the head AT ITS WRITE, not at the later poll's
+    // READ. Let one position arrive, then let 200 already-known positions take
+    // newer `row_updated_at` values before the next tick. The new row is now
+    // below the window's floor; phase A cannot see it, and phase B never asks,
+    // because phase B only maintains keys the cache already holds. Reproduced end
+    // to end through the real snapshot and SSE handler from 199 actionable rows,
+    // a shape that fits inside today's cap: the row was never emitted, no
+    // `degraded` frame was written, and the saturation counter stayed at zero.
+    // That is the defect class `#83` closed, reopened by its own fix.
+    //
+    // The general form, because it caught me twice in one arc: AN INVARIANT THAT
+    // HOLDS AT WRITE TIME IS NOT AN INVARIANT AT READ TIME unless nothing can
+    // reorder the rows in between — and `row_updated_at` is precisely the thing
+    // that reorders them.
+    //
+    // A sound relaxation needs a bounded PROOF that discovery skipped nothing,
+    // and no proof is available from this page alone: it takes a second read — a
+    // count of the actionable set, or a keyset probe above the highest id the
+    // cache has seen, which needs an overlap because ids are assigned in order
+    // and committed out of it. That mechanism, its per-tick cost and its
+    // false-alarm ordering are `#97`. Until it lands the conservative rule
+    // stands, and `#76`'s complete snapshot cannot ship either — it would be
+    // reported partial for ever.
     const actionableSaturated = actionable.length >= STATUS_DERIVATION_LIMIT;
     // Phase B — MAINTENANCE of cached keys that are NOT in phase A's result.
     // These are positions the subscriber already holds whose status may have
