@@ -1081,7 +1081,12 @@ export class OwnStateHub {
         row_updated_at: string;
       }
     >();
-    if (specIds.length > 0) {
+      // CHUNKED, because an `.in(...)` list is not a bound (`#76` B2). PostgREST's
+      // documented default response maximum is 1,000 rows, so a longer list SUCCEEDS
+      // with fewer rows — no error, no signal — and a position whose parent is absent
+      // from the answer is dropped by the orphan skip below. Paging the positions and
+      // not their parents just moves the cap one join along.
+    for (let start = 0; start < specIds.length; start += STALE_REFRESH_CHUNK) {
       const specRes = await sb
         .from('speculations')
         .select(
@@ -1089,7 +1094,7 @@ export class OwnStateHub {
             'win_side, row_updated_at',
         )
         .eq('network', net)
-        .in('speculation_id', specIds);
+        .in('speculation_id', specIds.slice(start, start + STALE_REFRESH_CHUNK));
       if (specRes.error) {
         logger.error(
           { err: specRes.error.message, address },
@@ -1126,12 +1131,17 @@ export class OwnStateHub {
         row_updated_at: string;
       }
     >();
-    if (contestIds.length > 0) {
+      // CHUNKED, because an `.in(...)` list is not a bound (`#76` B2). PostgREST's
+      // documented default response maximum is 1,000 rows, so a longer list SUCCEEDS
+      // with fewer rows — no error, no signal — and a position whose parent is absent
+      // from the answer is dropped by the orphan skip below. Paging the positions and
+      // not their parents just moves the cap one join along.
+    for (let start = 0; start < contestIds.length; start += STALE_REFRESH_CHUNK) {
       const contestRes = await sb
         .from('contests')
         .select('contest_id, contest_status, away_score, home_score, row_updated_at')
         .eq('network', net)
-        .in('contest_id', contestIds);
+        .in('contest_id', contestIds.slice(start, start + STALE_REFRESH_CHUNK));
       if (contestRes.error) {
         logger.error(
           { err: contestRes.error.message, address },

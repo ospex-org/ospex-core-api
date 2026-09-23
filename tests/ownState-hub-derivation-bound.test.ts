@@ -1692,3 +1692,29 @@ describe('reDerivePositionStatuses — retirement at population scale', () => {
     expect(phaseBIdLists(sb.queries.slice(before))).toEqual([[633, 635]]);
   });
 });
+
+describe('reDerivePositionStatuses — the parent joins are bounded too (#76 B2)', () => {
+  it('chunks the hub\'s speculations and contests joins at 100 ids', async () => {
+    // The hub's pair, which the reviewer did not flag and which has the same defect:
+    // its `IN` list is built from the discovery drain's rows plus the maintenance
+    // work-list, and the drain's own budget is 10,000 rows.
+    const tables = buildTables(0);
+    for (let n = 1; n <= 250; n += 1) pushRow(tables, n, laterStamp(n));
+    const sb = positionTables(tables);
+    const hub = makeHub(sb);
+    subscribeRecording(hub);
+
+    await hub.pollWallet(ADDRESS);
+
+    const specIns = sb.queries
+      .filter((q) => q.table === 'speculations')
+      .map((q) => (q.joins.find(([c]) => c === 'speculation_id')?.[1] ?? []) as number[]);
+    expect(specIns.map((l) => l.length)).toEqual([100, 100, 50]);
+    const seen = specIns.flat();
+    expect(new Set(seen).size).toBe(250);
+    const contestIns = sb.queries
+      .filter((q) => q.table === 'contests')
+      .map((q) => (q.joins.find(([c]) => c === 'contest_id')?.[1] ?? []) as number[]);
+    expect(contestIns.map((l) => l.length)).toEqual([100, 100, 50]);
+  });
+});

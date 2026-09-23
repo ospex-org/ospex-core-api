@@ -1526,3 +1526,109 @@ describe('derivePositionsForWallet — the resume leg pages both reads (#76)', (
     expect(result.saturated).toBe(false);
   });
 });
+
+describe('parent joins are bounded too (#76 B2)', () => {
+  /**
+   * An `.in(...)` list is not a bound. PostgREST's documented default response
+   * maximum is 1,000 rows, so a longer list SUCCEEDS with fewer rows — no error and
+   * no signal — and a position whose parent is missing from the answer is dropped by
+   * the orphan skip. Paging the positions and not their parents just moves the cap
+   * one join along, which is what the reviewer reproduced with 1,001 distinct
+   * speculations: the resume leg derived 1,000 keys, omitted a live one, sent `ready`
+   * with no degradation, and never delivered that position's `claimable`.
+   *
+   * These assert the CHUNK SIZE at the call, which is the mechanism. The end-to-end
+   * consequence is `tests/ownState-resume-complete.test.ts`.
+   *
+   * Enumerated rather than sampled: four unbounded `.in(...)` reads existed on the
+   * positions path — the resume leg's two and the HUB's two, the latter reachable
+   * whenever one tick's discovery drain returns more than 1,000 changed rows against
+   * its 10,000-row page budget. `positionFetch.ts`'s complete mode already chunked
+   * both of its own. Adding a fifth parent read means adding it here.
+   */
+  it('chunks the resume leg\'s speculations and contests joins at 199 ids', async () => {
+    const posRow = (id: number): Record<string, unknown> => ({
+      speculation_id: id,
+      user_address: ADDRESS,
+      position_type: 'upper',
+      risk_amount: '10000',
+      profit_amount: '15000',
+      claimed: false,
+      row_updated_at: `2026-05-29T12:00:00.000Z`,
+      id,
+    });
+    const calls: Array<{ table: string; method: string; args: unknown[] }> = [];
+    let idx = 0;
+    // 450 distinct positions ⇒ 450 distinct speculation ids ⇒ three chunks.
+    const pages: Array<{ data: unknown[]; error: null }> = [
+      { data: Array.from({ length: 199 }, (_, i) => posRow(450 - i)), error: null },
+      { data: Array.from({ length: 199 }, (_, i) => posRow(251 - i)), error: null },
+      { data: Array.from({ length: 52 }, (_, i) => posRow(52 - i)), error: null },
+    ];
+    const client = {
+      from: (table: string) => {
+        const b: Record<string, unknown> = {};
+        for (const m of ['select', 'eq', 'gt', 'lt', 'in', 'or', 'order', 'limit']) {
+          b[m] = (...args: unknown[]): unknown => {
+            calls.push({ table, method: m, args });
+            return b;
+          };
+        }
+        b['then'] = (resolve: (v: unknown) => void): void => {
+          if (table === 'positions') {
+            resolve(pages[idx++] ?? { data: [], error: null });
+            return;
+          }
+          if (table === 'speculations') {
+            // Answer the ids that were ASKED FOR, each with its own contest, so the
+            // CONTESTS join downstream is actually exercised. An empty answer here
+            // leaves `contestIds` empty and the sibling join never runs — which is
+            // how the mutant on it survived the first version of this case
+            // (rule 3d-sibling: the convention has to be checked on both fields).
+            const asked = (calls
+              .filter((c) => c.table === 'speculations' && c.method === 'in')
+              .slice(-1)[0]?.args[1] ?? []) as number[];
+            resolve({
+              data: asked.map((id) => ({
+                speculation_id: id,
+                contest_id: id,
+                market_type: 'moneyline',
+                line_ticks: 0,
+                speculation_status: 'open',
+                win_side: 'tbd',
+                row_updated_at: '2026-05-29T12:00:00.000Z',
+              })),
+              error: null,
+            });
+            return;
+          }
+          resolve({ data: [], error: null });
+        };
+        return b;
+      },
+    } as unknown as ReturnType<typeof getSupabase>;
+
+    await derivePositionsForWallet(client, 'polygon', ADDRESS);
+
+    // SETUP FIRST (rule 3g-silentsetup): 450 distinct parents, or there is nothing
+    // for a chunk boundary to be about.
+    const specIns = calls.filter((c) => c.table === 'speculations' && c.method === 'in');
+    expect(specIns.map((c) => (c.args[1] as unknown[]).length)).toEqual([199, 199, 52]);
+    // No slice may exceed the chunk, which is the property that keeps every read
+    // under PostgREST's default maximum.
+    for (const c of specIns) expect((c.args[1] as unknown[]).length).toBeLessThanOrEqual(199);
+    // …and the union is every id exactly once: a chunk loop that dropped or repeated
+    // a slice would still pass a size assertion.
+    const seen = specIns.flatMap((c) => c.args[1] as number[]);
+    expect(new Set(seen).size).toBe(450);
+    expect(seen).toHaveLength(450);
+
+    // THE SIBLING, and it is not optional: the contests join is a second `.in(...)`
+    // in the same function with the same hazard, and a case that checks only the
+    // first leaves a mutant on the second alive (measured — it did).
+    const contestIns = calls.filter((c) => c.table === 'contests' && c.method === 'in');
+    expect(contestIns.map((c) => (c.args[1] as unknown[]).length)).toEqual([199, 199, 52]);
+    const contestsSeen = contestIns.flatMap((c) => c.args[1] as number[]);
+    expect(new Set(contestsSeen).size).toBe(450);
+  });
+});

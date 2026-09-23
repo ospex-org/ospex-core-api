@@ -192,6 +192,50 @@ describe('fetchCommitmentEnrichment', () => {
     };
   }
 
+  it('chunks both parent reads, so a long id list cannot be silently short', async () => {
+    // `#76` B2, on the commitments family. An `.in(...)` list is not a bound:
+    // PostgREST's documented default response maximum is 1,000 rows, so a longer
+    // list SUCCEEDS with fewer rows — no error, no signal. Here the list is the
+    // distinct contests across up to `ownStateSnapshotMaxCommitments` (5,000)
+    // commitment rows, and the contest population grows with the season, so this is
+    // a bound that gets crossed rather than one that cannot be. A short answer does
+    // not drop the commitment — it serves it with EMPTY team strings and an
+    // unresolved speculation tuple, which is milder than the positions case and
+    // still wrong.
+    const ins: Array<{ table: string; ids: unknown[] }> = [];
+    const make = (table: string): unknown => {
+      const b: Record<string, unknown> = {};
+      b['select'] = (): unknown => b;
+      b['eq'] = (): unknown => b;
+      b['in'] = (_col: string, ids: unknown[]): unknown => {
+        ins.push({ table, ids });
+        return b;
+      };
+      b['then'] = (resolve: (v: unknown) => void): void =>
+        resolve({ data: [], error: null });
+      return b;
+    };
+    const sb = { from: (tbl: string): unknown => make(tbl) };
+    // 450 commitments on 450 distinct contests ⇒ three chunks of 199/199/52.
+    const rows = Array.from({ length: 450 }, (_, i) =>
+      commitmentRow({ contest_id: i + 1 }) as never,
+    );
+    await fetchCommitmentEnrichment(sb as never, 'polygon', rows);
+
+    // SETUP FIRST (rule 3g-silentsetup): 450 distinct ids reached the function, or a
+    // chunk boundary has nothing to be about.
+    const contestIns = ins.filter((c) => c.table === 'contests');
+    const specIns = ins.filter((c) => c.table === 'speculations');
+    expect(contestIns.map((c) => c.ids.length)).toEqual([199, 199, 52]);
+    // BOTH reads, not just the first: they are siblings in one `Promise.all` and a
+    // case that checks one leaves a mutant on the other alive.
+    expect(specIns.map((c) => c.ids.length)).toEqual([199, 199, 52]);
+    // …and each id exactly once, which a loop that dropped or repeated a slice would
+    // fail while still passing the size assertion.
+    const seen = contestIns.flatMap((c) => c.ids as number[]);
+    expect(new Set(seen).size).toBe(450);
+  });
+
   it('builds the contest + speculation-tuple maps from the two batch queries', async () => {
     const { sb } = mockSb({
       contests: {
