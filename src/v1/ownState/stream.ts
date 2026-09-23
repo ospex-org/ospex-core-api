@@ -830,7 +830,7 @@ type DerivePositionStateResultWithFlags = DerivedPositionStateResult;
 // A `cachedKeys` option used to sit on this interface (`#83`), mirroring the
 // hub's phase B: a by-id refresh of tracked keys missing from the actionable
 // result. NO CALLER EVER PASSED IT, so the branch was unreachable — and what it
-// contained was a second unordered read under one `.limit(CATCHUP_POSITIONS_LIMIT)`,
+// contained was a second unordered read under one 200-row cap,
 // which over the cap returns an unspecified subset and reported nothing. Deleted
 // rather than fixed, because phase 3 below already covers the same need on the
 // only path that has one: resume catch-up's terminal-since-cursor query, which
@@ -854,28 +854,24 @@ export async function derivePositionsForWallet(
   address: string,
   options: DerivePositionsOptions = {},
 ): Promise<DerivePositionStateResultWithFlags> {
-  // Phase 1: actionable population.
-  const actionableRes = await sb
-    .from('positions')
-    .select(
-      'speculation_id, user_address, position_type, risk_amount, profit_amount, ' +
-        'claimed, row_updated_at, id',
-    )
-    .eq('network', net)
-    .eq('user_address', address)
-    .eq('claimed', false)
-    .gt('risk_amount', 0)
-    .order('row_updated_at', { ascending: false })
-    .order('id', { ascending: false })
-    .limit(CATCHUP_POSITIONS_LIMIT);
-  if (actionableRes.error) {
-    logger.error(
-      { err: actionableRes.error.message, address },
-      'ownState/stream catchup: actionable positions query failed',
-    );
-    return { rows: [], saturated: false, queryFailed: true, terminalSaturated: false };
-  }
-  const actionable = (actionableRes.data ?? []) as unknown as Array<{
+  // Phase 1: actionable population, PAGED TO COMPLETION (`#76` B1).
+  //
+  // This was one 200-row read ordered `row_updated_at DESC`. The cold start went
+  // complete first, which made the gap worse than it looked: a wallet recovered
+  // completely at connect and then, on an ordinary reconnect with the cursor it
+  // was given, seeded only 200 keys and re-asserted `degraded`. Everything the cap
+  // omitted then fell out of the hub's cache, so a parent-driven transition on one
+  // of those rows — a speculation settling without touching the position row —
+  // reached nobody. Reproduced end to end by the reviewer and here: 300 rows cold,
+  // 200 on resume, the tail position's `claimable` never delivered.
+  //
+  // Pages by the IMMUTABLE `id`, descending, strictly — NOT by `row_updated_at`.
+  // Paging a traversal by a mutable ordering key is `#97`'s displacement hazard one
+  // scope in: a row whose timestamp changes between two pages can be skipped by the
+  // boundary or returned twice. `fetchCategorizedPositions`' complete mode made the
+  // same choice for the same reason, and this mirrors it deliberately rather than
+  // inventing a third traversal shape.
+  type CatchupPositionRow = {
     speculation_id: string | number;
     user_address: string;
     position_type: 'upper' | 'lower';
@@ -884,8 +880,71 @@ export async function derivePositionsForWallet(
     claimed: boolean;
     row_updated_at: string;
     id: string | number;
-  }>;
-  const saturated = actionable.length >= CATCHUP_POSITIONS_LIMIT;
+  };
+  const actionable: CatchupPositionRow[] = [];
+  let saturated = false;
+  let beforeId: bigint | undefined;
+  for (let page = 0; ; page += 1) {
+    if (page >= CATCHUP_POSITION_MAX_PAGES) {
+      // Out of budget with a full page behind us. Same answer as every other bound
+      // on this path: report it and keep the rows. The handler turns it into
+      // `degraded`, never an error — the SDK retries a `resync` with no backoff.
+      logger.warn(
+        { address, pages: page, rows: actionable.length },
+        'ownState/stream catchup: actionable paging exceeded its budget',
+      );
+      saturated = true;
+      break;
+    }
+    let query = sb
+      .from('positions')
+      .select(
+        'speculation_id, user_address, position_type, risk_amount, profit_amount, ' +
+          'claimed, row_updated_at, id',
+      )
+      .eq('network', net)
+      .eq('user_address', address)
+      .eq('claimed', false)
+      .gt('risk_amount', 0);
+    if (beforeId !== undefined) query = query.lt('id', beforeId.toString());
+    const actionableRes = await query
+      .order('id', { ascending: false })
+      .limit(CATCHUP_POSITION_PAGE_SIZE);
+    if (actionableRes.error) {
+      logger.error(
+        { err: actionableRes.error.message, address },
+        'ownState/stream catchup: actionable positions query failed',
+      );
+      return { rows: [], saturated: false, queryFailed: true, terminalSaturated: false };
+    }
+    const rows = (actionableRes.data ?? []) as unknown as CatchupPositionRow[];
+    // Validate EVERY row rather than only the last cursor: a repeated, overlapping
+    // or out-of-order page must stop the loop instead of spinning it or
+    // advertising a coverage it does not have.
+    for (const row of rows) {
+      let id: bigint;
+      try {
+        id = BigInt(String(row.id));
+      } catch {
+        logger.error(
+          { address, id: String(row.id) },
+          'ownState/stream catchup: unparseable position id',
+        );
+        return { rows: [], saturated: false, queryFailed: true, terminalSaturated: false };
+      }
+      if (beforeId !== undefined && id >= beforeId) {
+        logger.error(
+          { address, id: String(row.id) },
+          'ownState/stream catchup: non-advancing keyset page',
+        );
+        saturated = true;
+        break;
+      }
+      beforeId = id;
+      actionable.push(row);
+    }
+    if (saturated || rows.length < CATCHUP_POSITION_PAGE_SIZE) break;
+  }
 
   // Phase 2 (the cached-key refresh) is gone — see DerivePositionsOptions.
 
@@ -895,7 +954,7 @@ export async function derivePositionsForWallet(
   // `recentTerminalSince=undefined` because the snapshot already delivered
   // the wallet's actionable view and there's no prior cursor to compare
   // against.
-  let terminalRows: typeof actionable = [];
+  let terminalRows: CatchupPositionRow[] = [];
   let terminalSaturated = false;
   if (options.recentTerminalSince) {
     // Apply the same `(row_updated_at, id) > floor(cursor.p)` keyset +
@@ -908,31 +967,60 @@ export async function derivePositionsForWallet(
     // PostgREST `.or()` expression — supabase-js chains, but using a
     // single DNF expression with nested `or(...)` inside `and(...)` is
     // the same pattern the fills catch-up uses for sided keyset.
-    const floored = floorBaseWatermark(options.recentTerminalSince);
-    const keyset = `row_updated_at.gt.${floored.s},and(row_updated_at.eq.${floored.s},id.gt.${floored.i})`;
-    const terminalExpr =
-      `and(claimed.eq.true,or(${keyset})),and(risk_amount.eq.0,or(${keyset}))`;
-    const terminalRes = await sb
-      .from('positions')
-      .select(
-        'speculation_id, user_address, position_type, risk_amount, profit_amount, ' +
-          'claimed, row_updated_at, id',
-      )
-      .eq('network', net)
-      .eq('user_address', address)
-      .or(terminalExpr)
-      .order('row_updated_at', { ascending: false })
-      .order('id', { ascending: false })
-      .limit(CATCHUP_POSITIONS_LIMIT);
-    if (terminalRes.error) {
-      logger.error(
-        { err: terminalRes.error.message, address },
-        'ownState/stream catchup: terminal-since-cursor query failed',
-      );
-      return { rows: [], saturated, queryFailed: true, terminalSaturated: false };
+    // PAGED, and ASCENDING where this used to be one descending capped read
+    // (`#76` B1). Ascending is not cosmetic: the covered set becomes a contiguous
+    // PREFIX from the cursor, so a budget-limited answer is "everything up to
+    // here" rather than "the newest N with a hole underneath" — and the handler
+    // advances the response cursor over what it emits.
+    let floored = floorBaseWatermark(options.recentTerminalSince);
+    for (let page = 0; ; page += 1) {
+      if (page >= CATCHUP_POSITION_MAX_PAGES) {
+        logger.warn(
+          { address, pages: page, rows: terminalRows.length },
+          'ownState/stream catchup: terminal-since paging exceeded its budget',
+        );
+        terminalSaturated = true;
+        break;
+      }
+      const keyset = `row_updated_at.gt.${floored.s},and(row_updated_at.eq.${floored.s},id.gt.${floored.i})`;
+      const terminalExpr =
+        `and(claimed.eq.true,or(${keyset})),and(risk_amount.eq.0,or(${keyset}))`;
+      const terminalRes = await sb
+        .from('positions')
+        .select(
+          'speculation_id, user_address, position_type, risk_amount, profit_amount, ' +
+            'claimed, row_updated_at, id',
+        )
+        .eq('network', net)
+        .eq('user_address', address)
+        .or(terminalExpr)
+        .order('row_updated_at', { ascending: true })
+        .order('id', { ascending: true })
+        .limit(CATCHUP_POSITION_PAGE_SIZE);
+      if (terminalRes.error) {
+        logger.error(
+          { err: terminalRes.error.message, address },
+          'ownState/stream catchup: terminal-since-cursor query failed',
+        );
+        return { rows: [], saturated, queryFailed: true, terminalSaturated: false };
+      }
+      const rows = (terminalRes.data ?? []) as unknown as CatchupPositionRow[];
+      terminalRows = terminalRows.concat(rows);
+      if (rows.length < CATCHUP_POSITION_PAGE_SIZE) break;
+      const last = rows[rows.length - 1]!;
+      const next = { s: last.row_updated_at, i: String(last.id) };
+      if (next.s === floored.s && next.i === floored.i) {
+        // The continuation did not move, so the next read would repeat this page.
+        // The one way a keyset loop becomes infinite; reported, not spun.
+        logger.error(
+          { address, pages: page + 1 },
+          'ownState/stream catchup: terminal-since keyset did not advance',
+        );
+        terminalSaturated = true;
+        break;
+      }
+      floored = next;
     }
-    terminalRows = (terminalRes.data ?? []) as unknown as typeof actionable;
-    terminalSaturated = terminalRows.length >= CATCHUP_POSITIONS_LIMIT;
   }
 
   // Merge into a unique-per-key list (actionable wins on conflict for its
@@ -961,7 +1049,12 @@ export async function derivePositionsForWallet(
       row_updated_at: string;
     }
   >();
-  if (specIds.length > 0) {
+    // CHUNKED, because an `.in(...)` list is not a bound (`#76` B2). PostgREST's
+    // documented default response maximum is 1,000 rows, so a longer list SUCCEEDS
+    // with fewer rows — no error, no signal — and a position whose parent is absent
+    // from the answer is dropped by the orphan skip below. Paging the positions and
+    // not their parents just moves the cap one join along.
+  for (let start = 0; start < specIds.length; start += CATCHUP_POSITION_PAGE_SIZE) {
     const specRes = await sb
       .from('speculations')
       .select(
@@ -969,7 +1062,7 @@ export async function derivePositionsForWallet(
           'win_side, row_updated_at',
       )
       .eq('network', net)
-      .in('speculation_id', specIds);
+      .in('speculation_id', specIds.slice(start, start + CATCHUP_POSITION_PAGE_SIZE));
     if (specRes.error) {
       logger.error(
         { err: specRes.error.message, address },
@@ -1008,12 +1101,17 @@ export async function derivePositionsForWallet(
       row_updated_at: string;
     }
   >();
-  if (contestIds.length > 0) {
+    // CHUNKED, because an `.in(...)` list is not a bound (`#76` B2). PostgREST's
+    // documented default response maximum is 1,000 rows, so a longer list SUCCEEDS
+    // with fewer rows — no error, no signal — and a position whose parent is absent
+    // from the answer is dropped by the orphan skip below. Paging the positions and
+    // not their parents just moves the cap one join along.
+  for (let start = 0; start < contestIds.length; start += CATCHUP_POSITION_PAGE_SIZE) {
     const contestRes = await sb
       .from('contests')
       .select('contest_id, contest_status, away_score, home_score, row_updated_at')
       .eq('network', net)
-      .in('contest_id', contestIds);
+      .in('contest_id', contestIds.slice(start, start + CATCHUP_POSITION_PAGE_SIZE));
     if (contestRes.error) {
       logger.error(
         { err: contestRes.error.message, address },
@@ -1181,12 +1279,28 @@ async function catchUpPositions(
 }
 
 /**
- * Mirrors `POSITION_QUERY_LIMIT` in positionFetch.ts — the other read that
- * enumerates a wallet's actionable set to SEED a connection, and the other one
- * `#76` has to make complete. It no longer mirrors anything in hub.ts: the hub's
- * live discovery is a keyset drain with no population cap (`#97`).
+ * Page SIZE and page BUDGET for the resume leg's two position traversals (`#76`).
+ *
+ * This was `CATCHUP_POSITIONS_LIMIT = 200`, a single capped read on each — the
+ * third and fourth of the four 200-row caps that stood between a wallet and a
+ * complete own-state view. `POSITION_QUERY_LIMIT` and `CLAIMED_PAGE_CAP` became
+ * traversals in the snapshot; these two are the same change on the resume leg, and
+ * leaving them out is what let a complete cold start become partial again on an
+ * ordinary reconnect.
+ *
+ * Deliberately NOT the `CATCHUP_PAGE` / `CATCHUP_MAX_PAGES` pair at the top of this
+ * file: those bound the commitments and fills catch-up, a different resource with a
+ * different population. 199 rows per page mirrors `COMPLETE_PAGE_SIZE` in
+ * positionFetch.ts instead, so the two ACTIONABLE traversals ask for the same shape,
+ * and 64 pages mirrors `COMPLETE_MAX_PAGES`: 12,673 rows, against a largest actionable population of
+ * 621 and a largest claimed population of 594 on polygon (2026-09-23). Exhausting
+ * it is `saturated` / `terminalSaturated`, which the handler turns into
+ * `degraded` — never an error, because the SDK retries a `resync` with no backoff
+ * and the SSE route carries no read rate limit, so erroring on this path is a
+ * reconnect loop that pays for a fresh recovery each time round.
  */
-const CATCHUP_POSITIONS_LIMIT = 200;
+const CATCHUP_POSITION_PAGE_SIZE = 199;
+const CATCHUP_POSITION_MAX_PAGES = 64;
 
 // Floor `(s, i)` by the recovery overlap window — used to catch a slow
 // writer tx whose row_updated_at predates the cursor's timestamp. Mirrors

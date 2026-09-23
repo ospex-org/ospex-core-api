@@ -33,8 +33,19 @@ const positionFetchMock = vi.hoisted(() => ({
 
 vi.mock('../src/lib/supabase.js', () => supabaseMock);
 vi.mock('../src/lib/env.js', () => envMock);
+/**
+ * `enumerationLimitOf` and the error class come from the REAL module, not from a
+ * hand-written stand-in (rule 3e: where the library exposes the predicate you are
+ * about to model, call it). The snapshot's fallback path branches on that
+ * predicate, so a fake that answered differently would make every budget-refusal
+ * case below pass for the wrong reason.
+ */
+const positionFetchActual = await vi.importActual<typeof import('../src/v1/utils/positionFetch.js')>(
+  '../src/v1/utils/positionFetch.js',
+);
 vi.mock('../src/v1/utils/positionFetch.js', () => ({
   fetchCategorizedPositions: positionFetchMock.fetchCategorizedPositions,
+  enumerationLimitOf: (err: unknown) => positionFetchActual.enumerationLimitOf(err),
 }));
 
 const { ownStateSnapshotHandler } = await import('../src/v1/ownState/snapshot.js');
@@ -838,7 +849,7 @@ describe('GET /v1/own-state/snapshot — overlap floor + paging regressions', ()
   // Invariant: positions truncation surfaces via `positionsTruncated` flag,
   // and the p watermark is preserved (or sentinel on cold start) so the
   // The own-state stream catches every position transition the snapshot couldn't.
-  it('positions categorized count at the 200 cap → positionsTruncated=true + p preserved', async () => {
+  it('complete enumeration refusing its budget → positionsTruncated=true + p preserved', async () => {
     // Build a 200-position categorized set (cap proxy).
     const buildActive = (n: number) =>
       Array.from({ length: n }, (_, i) => ({
@@ -852,13 +863,27 @@ describe('GET /v1/own-state/snapshot — overlap floor + paging regressions', ()
         riskAmountUSDC: 1,
         profitAmountUSDC: 1,
       }));
-    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
-      active: buildActive(200),
-      pendingSettle: [],
-      claimable: [],
-      hitCap: true, // raw-cap signal from helper — what `positionsTruncated` derives from
-      derivedStatuses: [],
-    });
+    // `#76`: truncation is a BUDGET refusal now, not a 200-row cap. The complete
+    // traversal refuses, the snapshot falls back to the capped read rather than
+    // erroring — a 500 here is a reconnect loop, because the SDK retries a `resync`
+    // with no backoff — and THAT is what sets `positionsTruncated`. A `hitCap: true`
+    // on its own no longer means anything to this handler.
+    positionFetchMock.fetchCategorizedPositions.mockImplementation(
+      (_addr: string, options?: { complete?: boolean }) => {
+        if (options?.complete === true) {
+          return Promise.reject(
+            new positionFetchActual.PositionEnumerationLimitError('pages', 'over budget'),
+          );
+        }
+        return Promise.resolve({
+          active: buildActive(200),
+          pendingSettle: [],
+          claimable: [],
+          hitCap: true,
+          derivedStatuses: [],
+        });
+      },
+    );
     const inputP = { s: '2026-05-29T10:00:00.000Z', i: '0' };
     const cursor = encodeOwnStateCursor({
       t: 'own-state',
@@ -1065,7 +1090,7 @@ describe('GET /v1/own-state/snapshot — overlap floor + paging regressions', ()
     expect(new Set(allHashes).size).toBe(allHashes.length);
   });
 
-  it('cold start with positions at cap → positionsTruncated=true + p watermark = sentinel', async () => {
+  it('cold start whose enumeration refuses → positionsTruncated=true + p watermark = sentinel', async () => {
     const buildActive = (n: number) =>
       Array.from({ length: n }, (_, i) => ({
         positionId: `A_x_${i}`,
@@ -1078,13 +1103,27 @@ describe('GET /v1/own-state/snapshot — overlap floor + paging regressions', ()
         riskAmountUSDC: 1,
         profitAmountUSDC: 1,
       }));
-    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
-      active: buildActive(200),
-      pendingSettle: [],
-      claimable: [],
-      hitCap: true, // raw-cap signal from helper — what `positionsTruncated` derives from
-      derivedStatuses: [],
-    });
+    // `#76`: truncation is a BUDGET refusal now, not a 200-row cap. The complete
+    // traversal refuses, the snapshot falls back to the capped read rather than
+    // erroring — a 500 here is a reconnect loop, because the SDK retries a `resync`
+    // with no backoff — and THAT is what sets `positionsTruncated`. A `hitCap: true`
+    // on its own no longer means anything to this handler.
+    positionFetchMock.fetchCategorizedPositions.mockImplementation(
+      (_addr: string, options?: { complete?: boolean }) => {
+        if (options?.complete === true) {
+          return Promise.reject(
+            new positionFetchActual.PositionEnumerationLimitError('deadline', 'over budget'),
+          );
+        }
+        return Promise.resolve({
+          active: buildActive(200),
+          pendingSettle: [],
+          claimable: [],
+          hitCap: true,
+          derivedStatuses: [],
+        });
+      },
+    );
     const { client } = makeSupabase([
       { data: [], error: null },                          // active
       { data: null, error: null },                        // max commitments
@@ -1167,5 +1206,271 @@ describe('GET /v1/own-state/snapshot — overlap floor + paging regressions', ()
     // p.s = .000200 (the microsecond-later one), NOT .000100.
     expect(decoded.p.s).toBe('2026-05-29T15:00:00.000200Z');
     expect(decoded.p.i).toBe('0');
+  });
+});
+
+describe('GET /v1/own-state/snapshot — position visibility is complete, or says it is not (#76)', () => {
+  /**
+   * `#76`'s remaining half. The snapshot used to call the CAPPED fetcher — 200
+   * rows by `position_created_at DESC` — and report `positionsTruncated` whenever
+   * that saturated. Three of eight polygon wallets exceed it, the largest being
+   * the market maker's own maker wallet, so the quote hold never lifted.
+   *
+   * Two reads had to change and both are here: the actionable read now uses the
+   * bounded complete traversal, and the claimed-since read pages the keyset it was
+   * already ordered by. `positionsTruncated` stops meaning "at a cap" and starts
+   * meaning "out of budget", which is a condition no polygon wallet reaches by
+   * three orders of magnitude.
+   *
+   * `#97` is why this can ship: the live derivation no longer contradicts a
+   * complete seed, so a `positionsTruncated: false` at connect is not overwritten
+   * by a degraded frame 1.5 seconds later.
+   */
+  const claimedRow = (id: number, stamp: string): Record<string, unknown> => ({
+    speculation_id: id,
+    position_type: 'upper',
+    risk_amount: '10000',
+    profit_amount: '15000',
+    claimed: true,
+    claimed_at: stamp,
+    position_created_at: stamp,
+    id,
+    row_updated_at: stamp,
+  });
+
+  it('asks for the COMPLETE enumeration, and serves 300 actionable rows untruncated', async () => {
+    // More than 200 unclaimed, which is what the acceptance asks for and what the
+    // capped read could not do. The assertion is split deliberately: the OPTION at
+    // the call (rule 3i — the complete flag is the mechanism) and the row count on
+    // the wire.
+    const active = Array.from({ length: 300 }, (_, i) => ({
+      positionId: `A_x_${i}`,
+      speculationId: `${i}`,
+      positionType: 0 as const,
+      team: 't',
+      opponent: 'o',
+      market: 'moneyline' as const,
+      oddsDecimal: 2,
+      riskAmountUSDC: 1,
+      profitAmountUSDC: 1,
+    }));
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active,
+      pendingSettle: [],
+      claimable: [],
+      hitCap: false,
+      enumeration: { complete: true, pageSize: 199, pages: 2, positionCount: 300 },
+      derivedStatuses: [],
+    });
+    const { client } = makeSupabase([{ data: [], error: null }]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await ownStateSnapshotHandler(makeReq(), res as unknown as Response);
+
+    expect(positionFetchMock.fetchCategorizedPositions).toHaveBeenCalledWith(ADDRESS, {
+      complete: true,
+    });
+    const body = res.body as { positions: unknown[]; positionsTruncated: boolean };
+    expect(body.positions).toHaveLength(300);
+    expect(body.positionsTruncated).toBe(false);
+  });
+
+  it('serves the CAPPED rows and reports truncation when the enumeration refuses', async () => {
+    // The fallback, and the reason it is a fallback rather than a 500: the SDK
+    // retries a `resync` with `attempt = 0` and no backoff, and the SSE route has
+    // no read rate limit, so erroring here is a reconnect loop that pays for a
+    // fresh snapshot each time. Both halves are asserted — the rows ARE served,
+    // and the answer says it is partial.
+    const capped = Array.from({ length: 200 }, (_, i) => ({
+      positionId: `A_x_${i}`,
+      speculationId: `${i}`,
+      positionType: 0 as const,
+      team: 't',
+      opponent: 'o',
+      market: 'moneyline' as const,
+      oddsDecimal: 2,
+      riskAmountUSDC: 1,
+      profitAmountUSDC: 1,
+    }));
+    for (const limit of ['pages', 'deadline'] as const) {
+      positionFetchMock.fetchCategorizedPositions.mockReset();
+      positionFetchMock.fetchCategorizedPositions.mockImplementation(
+        (_addr: string, options?: { complete?: boolean }) =>
+          options?.complete === true
+            ? Promise.reject(new positionFetchActual.PositionEnumerationLimitError(limit, 'over budget'))
+            : Promise.resolve({
+                active: capped,
+                pendingSettle: [],
+                claimable: [],
+                hitCap: true,
+                derivedStatuses: [],
+              }),
+      );
+      const { client } = makeSupabase([{ data: [], error: null }]);
+      supabaseMock.getSupabase.mockReturnValue(client);
+      const res = makeRes();
+      await ownStateSnapshotHandler(makeReq(), res as unknown as Response);
+
+      expect(res.statusCode, `limit=${limit}`).toBe(200);
+      const body = res.body as { positions: unknown[]; positionsTruncated: boolean };
+      expect(body.positions, `limit=${limit}`).toHaveLength(200);
+      expect(body.positionsTruncated, `limit=${limit}`).toBe(true);
+      // Both calls happened, in order: complete first, capped second.
+      expect(positionFetchMock.fetchCategorizedPositions.mock.calls.map((c) => c[1])).toEqual([
+        { complete: true },
+        undefined,
+      ]);
+    }
+  });
+
+  it('500s when the enumeration fails for a reason that is NOT a budget', async () => {
+    // The negative control for the fallback (rule 5). A build that treated every
+    // failure as a budget refusal would serve a capped answer over a broken
+    // database and call it merely truncated.
+    positionFetchMock.fetchCategorizedPositions.mockReset();
+    positionFetchMock.fetchCategorizedPositions.mockRejectedValue(new Error('PGRST500 upstream'));
+    const { client } = makeSupabase([{ data: [], error: null }]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await ownStateSnapshotHandler(makeReq(), res as unknown as Response);
+
+    expect(res.statusCode).toBe(500);
+    // …and it did NOT fall back: one call, not two.
+    expect(positionFetchMock.fetchCategorizedPositions).toHaveBeenCalledTimes(1);
+  });
+
+  it('PAGES the claimed-since read past 200 rows, advancing the keyset each time', async () => {
+    // More than 200 CLAIMED, the second cap `#76` names. The old read took one page
+    // and called a full page truncation; this one continues from the last row.
+    positionFetchMock.fetchCategorizedPositions.mockReset();
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: [], pendingSettle: [], claimable: [], hitCap: false, derivedStatuses: [],
+    });
+    const pageOne = Array.from({ length: 200 }, (_, i) =>
+      claimedRow(i + 1, `2026-05-29T12:00:${String(i % 60).padStart(2, '0')}.000Z`),
+    );
+    const pageTwo = [claimedRow(201, '2026-05-29T12:30:00.000Z')];
+    const { client, calls } = makeSupabase([
+      { data: [], error: null },   // active commitments
+      { data: [], error: null },   // terminal commitments
+      { data: pageOne, error: null },
+      { data: pageTwo, error: null },
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const cursor = encodeOwnStateCursor({
+      t: 'own-state',
+      v: OWN_STATE_CURSOR_VERSION,
+      c: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      f: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      p: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      k: 'live',
+    });
+    const res = makeRes();
+    await ownStateSnapshotHandler(
+      makeReq({ query: { cursor } }),
+      res as unknown as Response,
+    );
+
+    // The QUERIES, not just the answer: two claimed reads, and the second one's
+    // keyset is built from the LAST ROW of the first, not from the cursor again.
+    const claimedKeysets = calls
+      .filter((c) => c.table === 'positions' && c.method === 'or')
+      .map((c) => String(c.args[0]));
+    expect(claimedKeysets).toHaveLength(2);
+    expect(claimedKeysets[1]).toBe(
+      'row_updated_at.gt.2026-05-29T12:00:19.000Z,and(row_updated_at.eq.2026-05-29T12:00:19.000Z,id.gt.200)',
+    );
+    expect(claimedKeysets[0]).not.toBe(claimedKeysets[1]);
+
+    const body = res.body as { positions: Array<{ status: string }>; positionsTruncated: boolean };
+    expect(body.positions.filter((p) => p.status === 'claimed')).toHaveLength(201);
+    // A full first page is no longer truncation — only the page budget is.
+    expect(body.positionsTruncated).toBe(false);
+  });
+
+  it('reports truncation when the claimed paging runs out of pages', async () => {
+    // The budget, from the only side that can reach it: 16 full pages. Same answer
+    // as the positions fallback — say so on the wire, keep the rows, do not error.
+    positionFetchMock.fetchCategorizedPositions.mockReset();
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: [], pendingSettle: [], claimable: [], hitCap: false, derivedStatuses: [],
+    });
+    let seq = 0;
+    const fullPage = (): Record<string, unknown>[] => {
+      seq += 1;
+      return Array.from({ length: 200 }, (_, i) =>
+        claimedRow(seq * 1000 + i, `2026-05-29T${String(12 + seq).padStart(2, '0')}:00:${String(i % 60).padStart(2, '0')}.000Z`),
+      );
+    };
+    const responses = [
+      { data: [], error: null },
+      { data: [], error: null },
+      ...Array.from({ length: 20 }, () => ({ data: fullPage(), error: null })),
+    ];
+    const { client, calls } = makeSupabase(responses);
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const cursor = encodeOwnStateCursor({
+      t: 'own-state',
+      v: OWN_STATE_CURSOR_VERSION,
+      c: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      f: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      p: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      k: 'live',
+    });
+    const res = makeRes();
+    await ownStateSnapshotHandler(
+      makeReq({ query: { cursor } }),
+      res as unknown as Response,
+    );
+
+    // Exactly the budget, not one more: a bound that does not bind is not a bound.
+    const claimedReads = calls.filter((c) => c.table === 'positions' && c.method === 'or').length;
+    expect(claimedReads).toBe(16);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { positions: unknown[]; positionsTruncated: boolean };
+    expect(body.positionsTruncated).toBe(true);
+    // The rows it did read are still served — 16 pages of 200.
+    expect(body.positions).toHaveLength(3200);
+  });
+
+  it('stops paging when the claimed keyset cannot advance', async () => {
+    // The one way a keyset loop becomes an infinite one: the continuation and the
+    // ordering disagree, so the next read would return the same page. Forced here
+    // by answering two IDENTICAL full pages; the guard reports truncation instead
+    // of spending the whole budget on the same rows.
+    positionFetchMock.fetchCategorizedPositions.mockReset();
+    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+      active: [], pendingSettle: [], claimable: [], hitCap: false, derivedStatuses: [],
+    });
+    const identical = Array.from({ length: 200 }, (_, i) =>
+      claimedRow(i + 1, '2026-05-29T12:00:00.000Z'),
+    );
+    // Same last row every time ⇒ the same continuation keyset every time.
+    const { client, calls } = makeSupabase([
+      { data: [], error: null },
+      { data: [], error: null },
+      { data: identical, error: null },
+      { data: identical, error: null },
+      { data: identical, error: null },
+    ]);
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const cursor = encodeOwnStateCursor({
+      t: 'own-state',
+      v: OWN_STATE_CURSOR_VERSION,
+      c: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      f: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      p: { s: '2026-05-29T10:00:00.000Z', i: '0' },
+      k: 'live',
+    });
+    const res = makeRes();
+    await ownStateSnapshotHandler(
+      makeReq({ query: { cursor } }),
+      res as unknown as Response,
+    );
+
+    // Two reads: the first page, then the one whose continuation repeated it.
+    const claimedReads = calls.filter((c) => c.table === 'positions' && c.method === 'or').length;
+    expect(claimedReads).toBe(2);
+    expect((res.body as { positionsTruncated: boolean }).positionsTruncated).toBe(true);
   });
 });

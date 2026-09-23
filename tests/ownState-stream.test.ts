@@ -34,13 +34,33 @@ const positionFetchMock = vi.hoisted(() => ({
 }));
 vi.mock('../src/lib/supabase.js', () => supabaseMock);
 vi.mock('../src/lib/env.js', () => envMock);
+/**
+ * The real `enumerationLimitOf` (rule 3e), because the snapshot's fallback branches
+ * on it — and a helper that makes a truncated cold start by REFUSING the complete
+ * enumeration, which is what truncation means after `#76`. A `hitCap: true` alone
+ * no longer reaches the wire.
+ */
+const positionFetchActual = await vi.importActual<typeof import('../src/v1/utils/positionFetch.js')>(
+  '../src/v1/utils/positionFetch.js',
+);
 vi.mock('../src/v1/utils/positionFetch.js', () => ({
   fetchCategorizedPositions: positionFetchMock.fetchCategorizedPositions,
+  enumerationLimitOf: (err: unknown) => positionFetchActual.enumerationLimitOf(err),
 }));
 
-const { getOwnStateStreamHandler, __resetOwnStateStreamMetrics } = await import(
-  '../src/v1/ownState/stream.js'
-);
+/** Answer the capped read with `result` and refuse the complete one. */
+function refuseCompleteThen(result: unknown): void {
+  positionFetchMock.fetchCategorizedPositions.mockImplementation(
+    (_addr: string, options?: { complete?: boolean }) =>
+      options?.complete === true
+        ? Promise.reject(new positionFetchActual.PositionEnumerationLimitError('pages', 'over budget'))
+        : Promise.resolve(result),
+  );
+}
+
+const { getOwnStateStreamHandler, __resetOwnStateStreamMetrics, derivePositionsForWallet } =
+  await import('../src/v1/ownState/stream.js');
+const { getSupabase } = await import('../src/lib/supabase.js');
 const { OwnStateHub, __setOwnStateHubForTest } = await import('../src/v1/ownState/hub.js');
 const { __resetConnections, acquire, configureConnectionCaps } = await import('../src/v1/stream/connections.js');
 const {
@@ -364,7 +384,7 @@ describe('GET /v1/stream/own-state — cold start (no cursor)', () => {
     // 200-actionable-position cap reaches a DEFINED terminal state instead
     // of resync-looping. The stream emits `event: degraded` so the
     // SDK / market maker enters quote-hold, then proceeds to `ready`.
-    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+    refuseCompleteThen({
       active: [],
       pendingSettle: [],
       claimable: [],
@@ -1032,7 +1052,7 @@ describe('GET /v1/stream/own-state — hub saturation reaches the wire once', ()
     //
     // This is also why merging this change moves no wire byte for any wallet
     // over the cap on polygon today: their cold start already sends it.
-    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+    refuseCompleteThen({
       active: [],
       pendingSettle: [],
       claimable: [],
@@ -1095,7 +1115,7 @@ describe('GET /v1/stream/own-state — a preReady saturation signal is held, not
   it('still emits the truncated snapshot its own degraded frame, exactly once', async () => {
     // THE regression. Both producers fire on this connection; the frame must
     // appear once, before `ready`, and must not be lost to the latch.
-    positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
+    refuseCompleteThen({
       active: [],
       pendingSettle: [],
       claimable: [],
@@ -1277,6 +1297,11 @@ describe('GET /v1/stream/own-state — the seed states its own coverage', () => 
     // own join reaches the cache verbatim. Without this the seed arrives live and
     // the first tick pays for the retirement — affordable at 200 keys, not at the
     // 635 the market maker's own wallet holds.
+    // Resolves the COMPLETE read, deliberately: this case is about the seed's own
+    // coverage flag reaching the cache, so it must take the complete path rather
+    // than the fallback. (An edit script converted this to `refuseCompleteThen`
+    // by accident, and the suite stayed green — the case would have been testing
+    // the fallback while its name said coverage. Rule 3g-silentsetup.)
     positionFetchMock.fetchCategorizedPositions.mockResolvedValue({
       active: [],
       pendingSettle: [],
@@ -1297,5 +1322,313 @@ describe('GET /v1/stream/own-state — the seed states its own coverage', () => 
       ['1_0', true],
       ['2_0', false],
     ]);
+  });
+});
+
+/**
+ * `derivePositionsForWallet` — the RESUME leg's two position traversals (`#76` B1).
+ *
+ * Both were one 200-row read. The cold start went complete first, which made the
+ * gap worse than it looked: a wallet recovered completely at connect and then, on
+ * an ordinary reconnect with the cursor it had been given, seeded only 200 keys and
+ * re-asserted `degraded`. The rows the cap omitted fell out of the hub's cache, so
+ * a speculation settling without touching its position row reached nobody. The
+ * reviewer reproduced that end to end; these assert the MECHANISM — what the reads
+ * ASK FOR — because nothing in this suite pinned the cap, which is how it shipped.
+ */
+describe('derivePositionsForWallet — the resume leg pages both reads (#76)', () => {
+  interface Recorded { table: string; method: string; args: unknown[] }
+
+  /** Answers by call order and RECORDS every builder call with its arguments. */
+  function recordingClient(pages: Array<{ data: unknown[] | null; error: unknown }>): {
+    client: ReturnType<typeof getSupabase>;
+    calls: Recorded[];
+  } {
+    const calls: Recorded[] = [];
+    let idx = 0;
+    const make = (table: string): Record<string, unknown> => {
+      const b: Record<string, unknown> = {};
+      for (const m of ['select', 'eq', 'gt', 'lt', 'in', 'or', 'order', 'limit']) {
+        b[m] = (...args: unknown[]): unknown => {
+          calls.push({ table, method: m, args });
+          return b;
+        };
+      }
+      b['then'] = (resolve: (v: unknown) => void): void => {
+        resolve(pages[Math.min(idx++, pages.length - 1)]!);
+      };
+      return b;
+    };
+    return {
+      client: { from: (table: string) => make(table) } as unknown as ReturnType<typeof getSupabase>,
+      calls,
+    };
+  }
+
+  const posRow = (id: number): Record<string, unknown> => ({
+    speculation_id: id,
+    user_address: ADDRESS,
+    position_type: 'upper',
+    risk_amount: '10000',
+    profit_amount: '15000',
+    claimed: false,
+    row_updated_at: `2026-05-29T12:00:${String(id % 60).padStart(2, '0')}.000Z`,
+    id,
+  });
+  const full = (from: number): Record<string, unknown>[] =>
+    Array.from({ length: 199 }, (_, i) => posRow(from - i));
+
+  it('pages the actionable read by the IMMUTABLE id, descending and strictly', async () => {
+    // Two full pages then a short one. The continuation must be `lt('id', …)` from
+    // the last row of the previous page — NOT an offset, and NOT `row_updated_at`:
+    // paging a traversal by a mutable ordering key is `#97`'s displacement hazard
+    // one scope in, where a row that moves between pages is skipped or repeated.
+    const { client, calls } = recordingClient([
+      { data: full(500), error: null },
+      { data: full(301), error: null },
+      { data: [posRow(102)], error: null },
+      { data: [], error: null },   // speculations
+      { data: [], error: null },   // contests
+    ]);
+    const result = await derivePositionsForWallet(client, 'polygon', ADDRESS);
+
+    const posCalls = calls.filter((c) => c.table === 'positions');
+    expect(posCalls.filter((c) => c.method === 'limit').map((c) => c.args[0])).toEqual([
+      199, 199, 199,
+    ]);
+    // Page 1 has no continuation; pages 2 and 3 continue from the previous last row.
+    expect(posCalls.filter((c) => c.method === 'lt').map((c) => c.args)).toEqual([
+      ['id', '302'],
+      ['id', '103'],
+    ]);
+    expect(posCalls.filter((c) => c.method === 'order').map((c) => c.args)).toEqual([
+      ['id', { ascending: false }],
+      ['id', { ascending: false }],
+      ['id', { ascending: false }],
+    ]);
+    // …and nothing was truncated, which is the whole point: 399 rows, no signal.
+    expect(result.saturated).toBe(false);
+    expect(result.queryFailed).toBe(false);
+  });
+
+  it('reports saturation only when the actionable paging runs out of PAGES', async () => {
+    // The boundary from the only side that can reach it: 64 full pages. A bound that
+    // never binds is not a bound, and a bound that binds early is the cap again.
+    //
+    // Every page must ADVANCE, and that is not decoration — the first version of
+    // this case repeated one page and stopped after two reads, because the
+    // non-advancing guard fired before the budget could (rule 3b: a case aimed at
+    // one gate caught by another). A page factory keeps the keyset moving so the
+    // budget is the only thing left that can stop the loop.
+    let top = 100000;
+    const { client, calls } = recordingClient(
+      Array.from({ length: 70 }, () => {
+        const page = { data: full(top), error: null };
+        top -= 199;
+        return page;
+      }),
+    );
+    const result = await derivePositionsForWallet(client, 'polygon', ADDRESS);
+    expect(calls.filter((c) => c.table === 'positions' && c.method === 'limit')).toHaveLength(64);
+    expect(result.saturated).toBe(true);
+  });
+
+  it('stops the actionable paging when a page does not advance the keyset', async () => {
+    // The one way a keyset loop becomes infinite. Two IDENTICAL pages: the second
+    // one's first row is not below the previous page's last id, so it stops and says
+    // so rather than spending 64 reads on the same rows.
+    const same = full(500);
+    const { client, calls } = recordingClient([
+      { data: same, error: null },
+      { data: same, error: null },
+      { data: [], error: null },
+      { data: [], error: null },
+    ]);
+    const result = await derivePositionsForWallet(client, 'polygon', ADDRESS);
+    expect(calls.filter((c) => c.table === 'positions' && c.method === 'limit')).toHaveLength(2);
+    expect(result.saturated).toBe(true);
+  });
+
+  it('pages the terminal-since read ASCENDING from the floored cursor', async () => {
+    // Ascending is not cosmetic. The covered set becomes a contiguous PREFIX from
+    // the cursor, so a budget-limited answer is "everything up to here" rather than
+    // "the newest N with a hole underneath" — and the handler advances the response
+    // cursor over what it emits.
+    const claimedRow = (id: number): Record<string, unknown> => ({
+      ...posRow(id),
+      claimed: true,
+      row_updated_at: `2026-05-29T13:00:${String(id % 60).padStart(2, '0')}.000Z`,
+    });
+    const { client, calls } = recordingClient([
+      { data: [], error: null },                                            // actionable, short
+      { data: Array.from({ length: 199 }, (_, i) => claimedRow(i + 1)), error: null },
+      { data: [claimedRow(200)], error: null },
+      { data: [], error: null },
+      { data: [], error: null },
+    ]);
+    const since = { s: '2026-05-29T12:00:00.000Z', i: '7' };
+    const result = await derivePositionsForWallet(client, 'polygon', ADDRESS, {
+      recentTerminalSince: since,
+    });
+
+    const orders = calls
+      .filter((c) => c.table === 'positions' && c.method === 'order')
+      .map((c) => c.args);
+    // The actionable read is id DESC; both terminal reads are (ts, id) ASC.
+    expect(orders).toEqual([
+      ['id', { ascending: false }],
+      ['row_updated_at', { ascending: true }],
+      ['id', { ascending: true }],
+      ['row_updated_at', { ascending: true }],
+      ['id', { ascending: true }],
+    ]);
+    // The second terminal read continues from the LAST ROW of the first, not from
+    // the cursor again — the defect that makes a paged read re-read page one.
+    const terminalExprs = calls
+      .filter((c) => c.table === 'positions' && c.method === 'or')
+      .map((c) => String(c.args[0]));
+    expect(terminalExprs).toHaveLength(2);
+    expect(terminalExprs[1]).toContain('row_updated_at.gt.2026-05-29T13:00:19.000Z');
+    expect(terminalExprs[1]).toContain('id.gt.199');
+    expect(terminalExprs[0]).not.toBe(terminalExprs[1]);
+    expect(result.terminalSaturated).toBe(false);
+  });
+
+  it('reports terminal saturation only when THAT paging runs out of pages', async () => {
+    // The timestamp has to advance with the id, or the continuation repeats and the
+    // non-advancing guard fires before the budget.
+    const claimedRow = (id: number): Record<string, unknown> => ({
+      ...posRow(id),
+      claimed: true,
+      row_updated_at: new Date(Date.parse('2026-05-29T13:00:00.000Z') + id * 1000).toISOString(),
+    });
+    // Advancing pages for the same reason as the case above: a repeated page stops
+    // on the non-advancing guard, not on the budget.
+    let base = 1;
+    const { client, calls } = recordingClient([
+      { data: [], error: null },
+      ...Array.from({ length: 70 }, () => {
+        const page = {
+          data: Array.from({ length: 199 }, (_, i) => claimedRow(base + i)),
+          error: null,
+        };
+        base += 199;
+        return page;
+      }),
+    ]);
+    const result = await derivePositionsForWallet(client, 'polygon', ADDRESS, {
+      recentTerminalSince: { s: '2026-05-29T12:00:00.000Z', i: '0' },
+    });
+    // 1 actionable read + 64 terminal reads.
+    expect(calls.filter((c) => c.table === 'positions' && c.method === 'limit')).toHaveLength(65);
+    expect(result.terminalSaturated).toBe(true);
+    // And the actionable half is NOT implicated — the two budgets are separate.
+    expect(result.saturated).toBe(false);
+  });
+});
+
+describe('parent joins are bounded too (#76 B2)', () => {
+  /**
+   * An `.in(...)` list is not a bound. PostgREST's documented default response
+   * maximum is 1,000 rows, so a longer list SUCCEEDS with fewer rows — no error and
+   * no signal — and a position whose parent is missing from the answer is dropped by
+   * the orphan skip. Paging the positions and not their parents just moves the cap
+   * one join along, which is what the reviewer reproduced with 1,001 distinct
+   * speculations: the resume leg derived 1,000 keys, omitted a live one, sent `ready`
+   * with no degradation, and never delivered that position's `claimable`.
+   *
+   * These assert the CHUNK SIZE at the call, which is the mechanism. The end-to-end
+   * consequence is `tests/ownState-resume-complete.test.ts`.
+   *
+   * Enumerated rather than sampled: four unbounded `.in(...)` reads existed on the
+   * positions path — the resume leg's two and the HUB's two, the latter reachable
+   * whenever one tick's discovery drain returns more than 1,000 changed rows against
+   * its 10,000-row page budget. `positionFetch.ts`'s complete mode already chunked
+   * both of its own. Adding a fifth parent read means adding it here.
+   */
+  it('chunks the resume leg\'s speculations and contests joins at 199 ids', async () => {
+    const posRow = (id: number): Record<string, unknown> => ({
+      speculation_id: id,
+      user_address: ADDRESS,
+      position_type: 'upper',
+      risk_amount: '10000',
+      profit_amount: '15000',
+      claimed: false,
+      row_updated_at: `2026-05-29T12:00:00.000Z`,
+      id,
+    });
+    const calls: Array<{ table: string; method: string; args: unknown[] }> = [];
+    let idx = 0;
+    // 450 distinct positions ⇒ 450 distinct speculation ids ⇒ three chunks.
+    const pages: Array<{ data: unknown[]; error: null }> = [
+      { data: Array.from({ length: 199 }, (_, i) => posRow(450 - i)), error: null },
+      { data: Array.from({ length: 199 }, (_, i) => posRow(251 - i)), error: null },
+      { data: Array.from({ length: 52 }, (_, i) => posRow(52 - i)), error: null },
+    ];
+    const client = {
+      from: (table: string) => {
+        const b: Record<string, unknown> = {};
+        for (const m of ['select', 'eq', 'gt', 'lt', 'in', 'or', 'order', 'limit']) {
+          b[m] = (...args: unknown[]): unknown => {
+            calls.push({ table, method: m, args });
+            return b;
+          };
+        }
+        b['then'] = (resolve: (v: unknown) => void): void => {
+          if (table === 'positions') {
+            resolve(pages[idx++] ?? { data: [], error: null });
+            return;
+          }
+          if (table === 'speculations') {
+            // Answer the ids that were ASKED FOR, each with its own contest, so the
+            // CONTESTS join downstream is actually exercised. An empty answer here
+            // leaves `contestIds` empty and the sibling join never runs — which is
+            // how the mutant on it survived the first version of this case
+            // (rule 3d-sibling: the convention has to be checked on both fields).
+            const asked = (calls
+              .filter((c) => c.table === 'speculations' && c.method === 'in')
+              .slice(-1)[0]?.args[1] ?? []) as number[];
+            resolve({
+              data: asked.map((id) => ({
+                speculation_id: id,
+                contest_id: id,
+                market_type: 'moneyline',
+                line_ticks: 0,
+                speculation_status: 'open',
+                win_side: 'tbd',
+                row_updated_at: '2026-05-29T12:00:00.000Z',
+              })),
+              error: null,
+            });
+            return;
+          }
+          resolve({ data: [], error: null });
+        };
+        return b;
+      },
+    } as unknown as ReturnType<typeof getSupabase>;
+
+    await derivePositionsForWallet(client, 'polygon', ADDRESS);
+
+    // SETUP FIRST (rule 3g-silentsetup): 450 distinct parents, or there is nothing
+    // for a chunk boundary to be about.
+    const specIns = calls.filter((c) => c.table === 'speculations' && c.method === 'in');
+    expect(specIns.map((c) => (c.args[1] as unknown[]).length)).toEqual([199, 199, 52]);
+    // No slice may exceed the chunk, which is the property that keeps every read
+    // under PostgREST's default maximum.
+    for (const c of specIns) expect((c.args[1] as unknown[]).length).toBeLessThanOrEqual(199);
+    // …and the union is every id exactly once: a chunk loop that dropped or repeated
+    // a slice would still pass a size assertion.
+    const seen = specIns.flatMap((c) => c.args[1] as number[]);
+    expect(new Set(seen).size).toBe(450);
+    expect(seen).toHaveLength(450);
+
+    // THE SIBLING, and it is not optional: the contests join is a second `.in(...)`
+    // in the same function with the same hazard, and a case that checks only the
+    // first leaves a mutant on the second alive (measured — it did).
+    const contestIns = calls.filter((c) => c.table === 'contests' && c.method === 'in');
+    expect(contestIns.map((c) => (c.args[1] as unknown[]).length)).toEqual([199, 199, 52]);
+    const contestsSeen = contestIns.flatMap((c) => c.args[1] as number[]);
+    expect(new Set(contestsSeen).size).toBe(450);
   });
 });

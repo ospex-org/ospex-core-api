@@ -133,6 +133,9 @@ function specTupleKey(
  * rows' distinct `contest_id`s). The returned maps are consumed by
  * {@link toOwnerCommitmentBody} so per-row mapping does no IO.
  */
+/** Ids per parent read — see the note inside. */
+const ENRICH_ID_CHUNK = 199;
+
 export async function fetchCommitmentEnrichment(
   sb: SbClient,
   network: string,
@@ -152,39 +155,71 @@ export async function fetchCommitmentEnrichment(
   ];
   if (contestIds.length === 0) return { contestById, speculationIdByTuple };
 
-  const [contestRes, specRes] = await Promise.all([
-    sb
-      .from('contests')
-      .select('contest_id, away_team, home_team, sport_slug')
-      .eq('network', network)
-      .in('contest_id', contestIds),
-    sb
-      .from('speculations')
-      .select('speculation_id, contest_id, speculation_scorer, line_ticks')
-      .eq('network', network)
-      .in('contest_id', contestIds),
-  ]);
-  if (contestRes.error) {
-    throw new Error(`fetchCommitmentEnrichment contests: ${contestRes.error.message}`);
-  }
-  if (specRes.error) {
-    throw new Error(`fetchCommitmentEnrichment speculations: ${specRes.error.message}`);
-  }
+  // CHUNKED, same reason as the position parent joins (`#76` B2): PostgREST's
+  // documented default response maximum is 1,000 rows, so an `.in(...)` over a
+  // longer list SUCCEEDS with fewer rows — no error and no signal. Here the id list
+  // is the distinct contests across up to `ownStateSnapshotMaxCommitments` (5,000)
+  // commitment rows, and the contest population grows monotonically with the
+  // season, so this is a bound that will be crossed rather than one that cannot be.
+  //
+  // The consequence is milder than the positions one and worth stating rather than
+  // implying: a missing contest leaves a commitment with EMPTY team/sport strings
+  // and a missing speculation tuple leaves its `speculationId` unresolved — served,
+  // not dropped. Still wrong, and the fix is the same three lines.
+  //
+  // The two reads stay parallel WITHIN a chunk, which is what the original
+  // `Promise.all` bought.
+  //
+  // ⚠ WHAT THIS DOES NOT BOUND, because the distinction is the whole point and a
+  // reviewer found it on the round that added the chunking: bounding the ID LIST
+  // bounds the REQUEST, not the RESPONSE. The contests read is keyed on
+  // `contest_id` and is therefore one row per id, so a 199-id chunk cannot answer
+  // with more than 199 rows. The SPECULATIONS read is keyed on `contest_id` too but
+  // is one-to-MANY — a single contest carries a speculation per market and line — so
+  // its answer FANS OUT beneath a bounded input and can still cross the server's
+  // 1,000-row maximum. Measured with one contest and 1,001 tuples: the last
+  // commitment is served with `speculationId: null`.
+  //
+  // That is inherited, it predates this change, and it degrades an OPTIONAL field
+  // rather than dropping a row — so it is filed rather than fixed here (`#101`).
+  // The general rule it teaches is worth more than the instance: ask whether a join
+  // is 1:1 or 1:many before believing that chunking its input made it safe.
+  for (let start = 0; start < contestIds.length; start += ENRICH_ID_CHUNK) {
+    const slice = contestIds.slice(start, start + ENRICH_ID_CHUNK);
+    const [contestRes, specRes] = await Promise.all([
+      sb
+        .from('contests')
+        .select('contest_id, away_team, home_team, sport_slug')
+        .eq('network', network)
+        .in('contest_id', slice),
+      sb
+        .from('speculations')
+        .select('speculation_id, contest_id, speculation_scorer, line_ticks')
+        .eq('network', network)
+        .in('contest_id', slice),
+    ]);
+    if (contestRes.error) {
+      throw new Error(`fetchCommitmentEnrichment contests: ${contestRes.error.message}`);
+    }
+    if (specRes.error) {
+      throw new Error(`fetchCommitmentEnrichment speculations: ${specRes.error.message}`);
+    }
 
-  for (const c of (contestRes.data ?? []) as unknown as ContestLiteRow[]) {
-    contestById.set(String(c.contest_id), {
-      awayTeam: c.away_team ?? '',
-      homeTeam: c.home_team ?? '',
-      sport: c.sport_slug ?? '',
-    });
-  }
-  for (const s of (specRes.data ?? []) as unknown as SpeculationTupleRow[]) {
-    const key = specTupleKey(
-      s.contest_id != null ? String(s.contest_id) : '',
-      s.speculation_scorer,
-      s.line_ticks,
-    );
-    if (key != null) speculationIdByTuple.set(key, String(s.speculation_id));
+    for (const c of (contestRes.data ?? []) as unknown as ContestLiteRow[]) {
+      contestById.set(String(c.contest_id), {
+        awayTeam: c.away_team ?? '',
+        homeTeam: c.home_team ?? '',
+        sport: c.sport_slug ?? '',
+      });
+    }
+    for (const s of (specRes.data ?? []) as unknown as SpeculationTupleRow[]) {
+      const key = specTupleKey(
+        s.contest_id != null ? String(s.contest_id) : '',
+        s.speculation_scorer,
+        s.line_ticks,
+      );
+      if (key != null) speculationIdByTuple.set(key, String(s.speculation_id));
+    }
   }
 
   return { contestById, speculationIdByTuple };
