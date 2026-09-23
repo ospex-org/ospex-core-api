@@ -714,6 +714,51 @@ describe('reDerivePositionStatuses — the discovery cursor is acknowledged by t
     expect(rec.statuses.map((s) => s.id)).toEqual(['2']);
   });
 
+  it('does NOT hold the cursor when a MAINTENANCE row cannot be joined, only a discovered one', async () => {
+    // The other half of the case above, and the reviewer asked for it by name: the
+    // hold is narrowed to DISCOVERED rows on purpose. A maintenance row that does
+    // not resolve is re-fetched from the cache on the next tick regardless, so
+    // letting it hold the cursor would give a maintenance-side anomaly the power to
+    // stall discovery — a worse failure than the one the guard exists for.
+    //
+    // Without this case the narrowing is untested in the direction that matters:
+    // every assertion in the sibling case is satisfied by a build that holds the
+    // cursor for ANY unresolved row (rule 5 — pair "X is refused" with "Y is
+    // accepted"). The mutant that drops the `discoveredKeys` condition survives
+    // the whole file until this exists.
+    const tables = buildTables(1);
+    pushRow(tables, 2, laterStamp(1));
+    const sb = positionTables(tables);
+    const hub = makeHub(sb);
+    const rec = subscribeRecording(hub);
+    // Key 1 is cached, live and stamped in the past, so it is MAINTENANCE's row and
+    // not the drain's. Key 2 is above the tip, so it is the drain's.
+    seedAll(hub, [1]);
+    // Remove the MAINTENANCE row's parent, and only that one.
+    tables.speculations = tables.speculations.filter((s) => Number(s['speculation_id']) !== 1);
+
+    await hub.pollWallet(ADDRESS);
+
+    const floors = (): Array<string | undefined> =>
+      sb.queries.filter((q) => q.table === 'positions' && q.or !== undefined).map((q) => q.or);
+    // SETUP FIRST (rule 3g-silentsetup): maintenance really did ask for key 1, so
+    // the unresolved row really was in this tick's derivation.
+    expect(phaseBIdLists(sb.queries).flat()).toContain(1);
+    // The discovered row is delivered…
+    expect(rec.statuses.map((s) => s.id)).toEqual(['2']);
+
+    // …and the cursor MOVED, which is the whole point: discovery is not stalled by
+    // an anomaly on the maintenance side.
+    await hub.pollWallet(ADDRESS);
+    const moved = new Date(Date.parse(laterStamp(1)) - 30_000).toISOString();
+    expect(floors().slice(-1)[0]).toBe(
+      `row_updated_at.gt.${moved},and(row_updated_at.eq.${moved},id.gt.0)`,
+    );
+    expect(floors()[0]).not.toBe(floors().slice(-1)[0]);
+    expect(rec.resyncs).toEqual([]);
+    expect(rec.degradeds).toEqual([]);
+  });
+
   it('advances the cursor when the work SUCCEEDS, which is the other half', async () => {
     // Negative control for the three cases above (rule 5). A build that simply
     // never advanced the cursor would satisfy every "holds" assertion and would be
