@@ -22,7 +22,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { expectReached, type CapturedRequest, type FakePostgrest, type FakeReply } from './helpers/fakePostgrest.js';
 import {
   MAKER_A,
@@ -45,6 +45,21 @@ import {
 const fakes: FakePostgrest[] = [];
 const servers: Server[] = [];
 const clients: Client[] = [];
+
+/**
+ * The first import of the app is the expensive one: every module behind
+ * `buildApp` is transformed before it can run. Whichever case came first used
+ * to carry that cost inside its own time limit. Measured in a Linux container
+ * on Node 20.19 with the whole suite running beside it, that case took 4.0 to
+ * 5.3 seconds against the 5 second default, and timed out in one run of four.
+ *
+ * So the cost is paid here, once, under a limit of its own. The default limit
+ * on every case is left as it is, so that it measures the case.
+ */
+beforeAll(async () => {
+  await import('../src/app.js');
+  vi.resetModules();
+}, 60_000);
 
 afterEach(async () => {
   for (const client of clients.splice(0)) await client.close().catch(() => undefined);
