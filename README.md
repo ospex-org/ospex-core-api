@@ -864,9 +864,12 @@ Streamable HTTP, stateless, no sign-in. There are no sessions: every request is 
 |---|---|
 | `POST /mcp` with a JSON-RPC request | `200`, `application/json` |
 | `POST /mcp` with a notification only | `202`, no body |
-| `GET`, `DELETE` or any other method on `/mcp` | `405`, `Allow: POST` |
+| `POST /mcp` with a JSON list, of any length | `400`. One message per request, sent as an object |
+| `POST /mcp` with a body sent compressed | `415`. Nothing is inflated |
+| `GET`, `DELETE` or any other method on `/mcp`, except a CORS preflight | `405`, `Allow: POST` |
+| `OPTIONS /mcp`, a CORS preflight | `204`, answered by the app's CORS layer before the route, and not counted by the request limit |
 
-A client must send `Content-Type: application/json` and an `Accept` header naming both `application/json` and `text/event-stream`, or the request is refused with `415` or `406`. That is the protocol's rule, and it bites hand-written `curl` more than it bites clients.
+A client must send `Content-Type: application/json` and an `Accept` header naming both `application/json` and `text/event-stream`, or the request is refused with `415` or `406`. That is the protocol's rule, and it bites hand-written `curl` more than it bites clients. Send the Content-Type header once: a request that carries it more than once is served only if its first copy, and all its copies joined by a comma, each name JSON, and is otherwise refused with `400` or `415`.
 
 The protocol versions served are the ones the MCP SDK in `package.json` implements. A client that asks for a newer one is answered with the newest this server has.
 
@@ -878,15 +881,19 @@ The endpoint offers no sign-in and nothing for a client to discover one from: th
 |---|---|---|
 | `list_markets` | `window_hours` (1 to 168, default 48), `sport` (optional) | The verified games starting in the window, the lines that exist on-chain for each, and the prices posted on both sides of every line |
 | `prepare_order` | `contest_id`, `market`, `side`, `risk_usdc`, `line` (optional) | A preview of the order, a take link, and the identifiers `get_order_status` takes |
-| `get_order_status` | `commitment_hash`, `taker_address` (optional) | The quote's status, what has been taken from it, and its fills |
+| `get_order_status` | `commitment_hash`, `taker_address` (optional) | The quote's status, what has been taken from it, what is left on it, and its fills |
 
-Every tool answers with one block of text and no structured content. Every tool is annotated read-only.
+Every tool answers with one block of text and no structured content. Every tool is annotated read-only. An argument a tool does not have is refused, not ignored.
+
+**A fill is somebody's, not necessarily the caller's.** Without `taker_address`, `get_order_status` lists the fills of every wallet that took the quote, and says so. A quote that reads "filled" was taken by someone. Whether one person's order went through is answered by a fill by that person's address, made after the order was prepared. `taker_address` lists one wallet's fills, and a preview says when it was prepared. Both times are given to the second.
+
+**"Open" is about the quote.** It says the quote has not been filled, cancelled or expired. `get_order_status` says what is left on a quote only when the contest, the start and the quote itself pass the checks `prepare_order` makes on them, and says which one failed when one does. It does not say `prepare_order` would offer that quote: that also takes an open line on-chain and a funded maker, and `prepare_order` chooses among a side's quotes itself. A quote its maker took off the book reads "withdrawn", not "cancelled": it is not cancelled on-chain.
 
 **Prices are the taker's.** A quote records the price its maker posted. The person taking it gets the complement: a quote posted at 2.05 pays its taker 205/105, shown as 1.95. A lower posted price is a better price for the taker.
 
 **Sides are the taker's too.** A quote records the side its maker holds, and taking it puts the taker on the other one. So the quotes listed under "Under 7.0" are the ones whose makers hold the Over.
 
-**`side`** is `over` or `under` for a total. For a moneyline or a spread it is a team's name, or `away` or `home`. A name is matched on whole words and has to fit exactly one of the two teams.
+**`side`** is `over` or `under` for a total. For a moneyline or a spread it is a team's name, or `away` or `home`. A name is matched on whole words and has to fit exactly one of the two teams. It is given by itself: `Phillies`, not `Phillies -1.5` and not `Phillies (home)`. The line goes in `line`.
 
 **`line`** is needed only when a game has more than one line in the market with a quote on that side. A total is named by its number of points. A spread is named by the handicap of the side being backed, so the home team's `+1.5` and the away team's `-1.5` are the same line.
 
@@ -895,22 +902,24 @@ Every tool answers with one block of text and no structured content. Every tool 
 In this order, stopping at the first that fails:
 
 1. The amount is more than zero, has at most six decimal places, and is at most 1,000,000 USDC.
-2. The contest exists and its status is `verified`.
-3. The contest has not started. The start is `matchTime`, the conservative start bound the contest endpoints serve. A contest whose start cannot be read is refused, not treated as upcoming.
+2. The contest exists, its status is `verified`, and it has a start time on-chain.
+3. The contest is more than two minutes from its start. The start is `matchTime`, the conservative start bound the contest endpoints serve. A contest whose start cannot be read is refused, not treated as upcoming.
 4. The side named is a side of the market.
 5. The market has an open line on-chain. A quote on a line that has no speculation yet is never offered: taking it would create the line, and creating a line costs both parties a fee.
 6. The line, if one was named, is one of those lines.
 7. A quote can be taken on that side.
 
-Checks 2 and 3 are made here because the chain does not make them when a quote is taken on an existing line. A quote's own expiry is the only guard against time that the contract applies.
+Before 2, a `contest_id` that is not the digits of a 64-bit id is refused without a read, and so is every call when the service has no scorer addresses. Between 4 and 5 the open quotes on the contest are read. If there are more of them than one call reads (see "What one call costs"), the order is refused: the best price cannot be found in part of a book.
 
-A quote is offered when it is open, visible on the book, not invalidated by its maker's nonce floor, carries its signature and every signed field, has at least one whole lot of maker risk left, and has more than two minutes before it expires.
+Check 3 is made here because the contract does not make it. The contract refuses a take once a contest is scored or voided, or is past its void cooldown, which is counted from the start. It does not refuse a take because the game has started, so from the start until the first of those a quote's own expiry is the only time limit the contract applies to it. `list_markets` leaves out a game by the same two-minute rule, so that nothing is listed that would be refused here for its start, and says how many it left out.
 
-**Which quote.** Among the quotes that can fill the whole amount, the one with the best price. If none can, the one that fills the most of it. The first rule is why the best-priced quote is not always chosen: a few cents left at a better price would otherwise take every order and fill almost none of it.
+A quote is offered when all of this holds: it is open, visible on the book, and not invalidated by its maker's nonce floor; it carries its signature, and its contest, scorer, line, side, price, expiry and amounts are present and well-formed, with the price inside 101 to 10100; its hash has the shape of a hash; the line it is filed under is the line its signed fields name; the amount it was signed for is a whole number of lots; at least one whole lot of maker risk is left; and it has more than two minutes before it expires.
+
+**Which quote.** Among the quotes that can fill the whole amount, the one with the best price. If none can, the one that fills the most of it. The first rule is why the best-priced quote is not always chosen: a few cents left at a better price would otherwise take every order and fill almost none of it. When a better price was passed over for being too small, and it shows as a different price at two decimals, the preview says what it is and how much it takes, rounded down to the cent. One order takes one quote, so that is for the reader to ask for, not something the order can have.
 
 **When no quote can fill the amount**, the order is prepared for the most one quote can take, the preview says so, and the link carries the smaller amount. The contract refuses a request larger than a quote has left instead of filling part of it, so a link carrying the larger amount would fail.
 
-**Maker funding** is read from the funding snapshot the `fillability` field uses. A quote whose maker is known to be short of the fill is passed over. When the snapshot is missing or more than two minutes old, the quote is offered and the preview says the funds were not confirmed.
+**Maker funding** is read from the funding snapshot the `fillability` field uses. A quote whose maker is known to be short of the fill is passed over. When the snapshot is missing or more than two minutes old, the quote is offered and the preview says the funds were not confirmed. Funding is read for at most 100 makers on a side, the makers of its best-priced quotes; a quote whose maker is past that cut is offered the same way, with the funds not confirmed.
 
 ### The amounts
 
@@ -925,9 +934,9 @@ taker wins    = maker risk
 
 So a taker can pay slightly less than they asked to risk, and never more. Asked to risk 2 USDC against a quote posted at 2.05, the fill is 1.904700, the taker pays 1.999935 and wins 1.904700.
 
-A preview shows the amounts to the cent, and the exact amounts beside them whenever the two differ. The displayed price is rounded to two decimals and is a label: nothing is computed from it.
+A preview shows the amounts to the cent, and the exact amounts beside them whenever the two differ. The amount paid is rounded half up to the cent and the amount won is rounded down, so the headline does not show a larger win than the chain pays. The displayed price is rounded to two decimals and is a label: nothing is computed from it.
 
-`tests/fixtures/take-math-vectors.json` holds 367 worked cases, produced by the match preview builder in `@ospex/sdk`. The arithmetic here is tested against them, and against 211,263 more from the same builder when it was written, with no disagreement.
+`tests/fixtures/take-math-vectors.json` holds 367 worked cases, produced by the match preview builder in `@ospex/sdk`. The test suite compares the arithmetic here against every one of them.
 
 ### The take link
 
@@ -941,7 +950,11 @@ The link carries the whole order. Nothing about it is kept on this side, so a li
 
 ### What a preview cannot promise
 
-A preview is built from this service's database, which mirrors the chain a few seconds behind it. Between the preview and the transaction a quote can be taken by someone else, cancelled, or expire, and the maker's funds can move. Any of those makes the transaction fail. It costs gas and nothing else: the contract either fills at the posted price or reverts.
+A preview is built from this service's database, which mirrors the chain a few seconds behind it. Between the preview and the transaction a quote can be taken by someone else until less is left than the order asks for, be cancelled on-chain or invalidated by its maker's nonce floor, or expire, and the maker's funds can fall short of the fill. Any of those makes the transaction fail. It costs gas and nothing else: the contract either fills at the posted price or reverts.
+
+**A maker withdrawing a quote from the book does not make the transaction fail.** Withdrawing through this API hides the quote and does not cancel it on-chain, so the contract still fills it, at the posted price, for anyone who holds the signed quote, until it expires, is cancelled on-chain, or its maker raises the nonce floor past it. With hidden-row redaction on, which is the default, this API stops serving the signed quote once it is withdrawn. Either way, until it is filled, expires, is cancelled on-chain or falls under its maker's nonce floor, `get_order_status` reports it as withdrawn.
+
+**A game starting does not make the transaction fail either.** The contract does not look at the start, so a link prepared before a game can be used after it has begun, for as long as its quote has not expired, and the contract will fill it at the price posted before the game. The two-minute rule narrows that gap and cannot close it. The preview names the start as the deadline when a quote expires later than its game starts, and the page behind the link has to check the start again before it builds a transaction.
 
 The page behind the link is where the chain is read directly, and where the taker's own balance and allowance are checked. This endpoint does not know who the taker is.
 
@@ -950,11 +963,10 @@ The page behind the link is where the chain is read directly, and where the take
 | Limit | Value |
 |---|---|
 | Requests | 600 a minute for each caller address, counted apart from the REST read limit |
-| Tool calls in one request | 1. Any more in a batch are answered with a JSON-RPC error |
-| Request body | 1 MiB. Larger is refused with `413` |
-| Messages in a batch | 100. More is refused with `400` |
+| Messages in one request | 1, sent as an object. A JSON list is refused with `400` |
+| Request body | 1 MiB, not compressed. Larger is refused with `413`, as soon as it is known to be larger |
 | Time for one tool call | 20 seconds, then it is answered with an error |
-| Games listed by `list_markets` | 25 by start time. When the window holds more, the answer says how many |
+| Games listed by `list_markets` | 25 by start time, less any within two minutes of their start. When the window holds more, or a game was left out, the answer says how many |
 | Prices shown for one side | 3, best first |
 | Fills listed by `get_order_status` | 1,000. At that number the answer says there may be more |
 
@@ -965,20 +977,26 @@ The request limit is keyed on the caller's address. A hosted assistant calls fro
 | Call | Database reads | Grows with |
 |---|---|---|
 | Handshake, tool list | 0 | nothing |
-| `list_markets` | 3: the contests in the window, the lines under them, the open quotes on them | games in the window, up to 25 |
-| `prepare_order` | 4: the contest, its lines, its open quotes, the funding of the makers on one side | open quotes on one contest |
+| `list_markets` | 3: the contests in the window, the lines under them, the open quotes on them | games in the window, up to 25, and the open quotes on them |
+| `prepare_order` | 4: the contest, its lines, its open quotes, the funding of the makers on one side | open quotes on one contest, and up to 100 makers on one side |
 | `get_order_status` | 3: the quote, its fills, its contest | fills on one quote, up to 1,000 |
 
-None of them grows with how much history the database holds. The open-quote read is paged: one read for every 999 open quotes on the contests asked for, up to 8, and an answer that ran out of pages says the book is incomplete instead of showing part of it as all of it.
+Each read is keyed by a window of start times, a set of contest ids, a set of maker addresses or one hash, and each is bounded: 25 contests, 1,000 fills, 8 pages of 999 open quotes, the funding of the 100 best-priced makers on a side (a maker past that is not known to be short, and the preview says funds were not confirmed), and for lines the 1,000 rows the database server answers one read with. The open-quote read is paged, one read for every 999 open quotes on the contests asked for. When it runs out of pages `list_markets` says the book is incomplete and `prepare_order` refuses, so part of a book is never shown or searched as all of it. Outside the reads, the hashing that grows is one hash for each line read, not for each quote.
+
+A read that passes its tool's 20 seconds is answered for and not cancelled: it runs on until the database answers or the connection fails.
+
+An open quote that cannot be read exactly is left out of the book and logged, and the rest are served.
 
 ### Errors
 
-A failure reaches a client in one of three shapes, depending on where it happened.
+A failure reaches a client in one of five shapes, depending on where it happened.
 
 | Where | Shape |
 |---|---|
-| In a tool: bad arguments, a read that failed, a call past its deadline | `200`, a tool result with `isError: true` and a sentence saying what to do |
-| In the protocol: a body that is not JSON-RPC, a missing header, a batch too long | `4xx`, a JSON-RPC error with `id: null` |
+| In a tool: a value the tool cannot use, a read that failed, a call past its deadline | `200`, a tool result with `isError: true` and a sentence saying what to do |
+| Before a tool: a tool that does not exist, arguments its schema does not accept | `200`, a tool result with `isError: true` and the protocol library's message, which names the tool or the argument |
+| In the protocol: a body that is not JSON-RPC, a missing header, a JSON list, a compressed body | `4xx`, a JSON-RPC error with `id: null` |
+| Inside the endpoint, before a tool: the server could not be built or connected | `500`, a JSON-RPC error with `id: null` and no cause |
 | Before the endpoint: the request limit | `429`, a JSON-RPC error with `id: null` |
 
 A tool that has nothing to offer has not failed. "No game in the window", "no quote on that side" and "that game has started" are answers, and come back without `isError`.
@@ -987,9 +1005,9 @@ What went wrong inside the service is written to the log and not to the client. 
 
 ### Logging
 
-One line for each request, written when the response closes: the status, whether the client was answered before it left, how long it took, the JSON-RPC methods the request carried, and the protocol version and user agent the client sent. On a handshake, also the client's name and the protocol version it asked for. One line for each tool call: the tool, whether it answered with an error, and how long it took.
+One line for each `POST`, written when the response closes: the status, whether the client was answered before it left, how long it took, the JSON-RPC method the request carried, and the protocol version and user agent the client sent. On a handshake, also the client's name and the protocol version it asked for. A request refused for its method (`405`) or by the request limit (`429`) writes no such line. One line for each tool call that reaches a tool: the tool, whether it answered with an error, and how long it took. A call refused before that, for a tool that does not exist or arguments the schema does not accept, writes the request line alone.
 
-Arguments are not logged. A contest id, a commitment hash or a wallet address a caller passes in does not reach the log.
+Those two lines carry no arguments. A warning or an error is about something, and names it. In `prepare_order`, a contest whose start cannot be read or whose book is too large is named by its id. A row dropped from the book is named by its hash. A read that failed is logged with the database's own message.
 
 ### Trying it
 
@@ -1090,7 +1108,7 @@ Set via `heroku config:set <var>=<value> --app ospex-core-api`. Mirrors `.env.ex
 - `BENCHMARK_HEADLINE_BASIS` — optional, default `marginAdjusted.gameLevel`. Which CLV figure the standings payload names as its headline; one of `marginAdjusted.gameLevel` / `marginAdjusted.perPick` / `economic.gameLevel` / `economic.perPick`, boot-fatal otherwise. All four ship regardless
 - `BENCHMARK_STANDINGS_WINDOW_DAYS` — optional, default `60`; **boot-fatal outside [1, 400]**
 - `BENCHMARK_STATS_MAX_AGE_SECONDS` — optional, default `172800` (48h); **boot-fatal outside [3600, 2592000]**
-- `MCP_TAKE_LINK_BASE_URL` — optional, default `https://ospex.org`. The origin `prepare_order` builds its take links on; **boot-fatal unless it is an `https` origin with no path** (or `http` on `localhost` / `127.0.0.1`). `/mcp` needs no other setting, but it reads lines and quotes through the scorer addresses above and answers "not configured" without them
+- `MCP_TAKE_LINK_BASE_URL` — optional, default `https://ospex.org`. The origin `prepare_order` builds its take links on; **boot-fatal unless it is an `https` origin with no path** (or `http` on `localhost` / `127.0.0.1`). `/mcp` needs no other setting, but `list_markets` and `prepare_order` read lines and quotes through the scorer addresses above and answer "not configured" without them; `get_order_status` answers without naming the game
 - `OWN_STATE_SNAPSHOT_MAX_COMMITMENTS` — optional, default `5000`. Per-page commitments cap for `GET /v1/own-state/snapshot`; **boot-fatal outside [100, 50000]**. SDK pages with `?cursor=` until the response carries `truncated: false`
 
 The stream-auth challenge store is **in-memory, per-process**. A challenge minted on one dyno cannot be consumed on another — fine for the current single-dyno Heroku deployment, but horizontal scale-out requires moving challenges to Redis/Postgres or running with sticky routing first. The endpoint-level `503 NOT_READY` checks are deliberately separate from `/readyz` (next section) — `/readyz` keeps the meaning "the always-required dependencies are reachable", and stream-auth is opt-in at the operator level.
@@ -1105,9 +1123,11 @@ curl -s "$URL/healthz"            # 200 + service / network / chainId
 curl -s "$URL/readyz"              # 200 only when supabase.connected, contestsView.present and commitments.configured
 curl -s "$URL/v1/protocol/info"    # mainnet contract addresses
 curl -s "$URL/v1/contests"         # paginated list (empty until indexer ingests data)
-curl -s -o /dev/null -w '%{http_code}
-' "$URL/mcp"   # 405: the connector is mounted and takes POST
-curl -s -X POST "$URL/mcp" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \n  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'   # three tools
+curl -s -o /dev/null -w '%{http_code}\n' "$URL/mcp"   # 405: the connector is mounted and takes POST
+curl -s -X POST "$URL/mcp" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'   # three tools
 ```
 
 `/readyz` checks the always-required dependencies: Supabase reachability, presence of the `contests_effective` view, and EIP-712 relay env config for `POST /v1/commitments`. The view is reported as its own `contestsView: { present, error? }` block rather than folded into `supabase` — it is created by a migration in the protocol indexer's schema, so it can be missing while Postgres is perfectly healthy, and every contest-shaped read depends on it. A PostgREST "relation not found" response therefore reports `supabase.connected: true` and `contestsView.present: false`, and readiness fails on the second term.
@@ -1129,7 +1149,7 @@ src/
   server.ts            # boot: load config, build the app, listen
   app.ts               # the Express app: middleware, /mcp, /healthz, /readyz, /v1, 404
   mcp/                 # POST /mcp — the connector
-    router.ts          #   the route: one server and transport per request, 405 for the rest
+    router.ts          #   the route: one message per request, a server and transport for each
     server.ts          #   the three tools, their schemas, the per-call deadline
     tools/             #   list_markets, prepare_order, get_order_status
     book.ts            #   which quotes can be taken, and which one to take (pure)

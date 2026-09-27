@@ -93,8 +93,9 @@ const POLL_GAP_COHERENCE_TOLERANCE_MS = 1000;
  * UTC dyno than on a developer machine -- and therefore to a different public
  * verdict.
  *
- * core-api carries no zod dependency, so the scorer's
- * `z.string().datetime({ offset: true })` is reimplemented here. That makes
+ * The scorer's `z.string().datetime({ offset: true })` is reimplemented here,
+ * written before core-api took zod on for the /mcp tools' argument schemas.
+ * It stays, because its parity with the scorer was measured. That makes
  * ACCEPT-SET PARITY something to measure, not assume: a first attempt was more
  * permissive than the scorer (lowercase `t`/`z`, and nonexistent calendar dates
  * that Date.parse silently normalises), and a second over-corrected and would

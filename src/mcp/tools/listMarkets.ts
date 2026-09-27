@@ -2,10 +2,11 @@
  * `list_markets` — the games starting soon, their lines, and the prices a
  * reader could take on each side.
  *
- * Three reads per call, whatever the size of the history behind them: the
- * contests in the window, the speculations under those contests, and the open
- * quotes on them. The contest read is capped at {@link MAX_CONTESTS}; a window
- * holding more says so instead of showing part of it as the whole.
+ * Three reads per call: the contests in the window, the speculations under
+ * those contests, and the open quotes on them. The open-quote read is paged,
+ * so it is one request while fewer than 999 quotes are open on those contests
+ * and at most 8 past that. The contest read is capped at {@link MAX_CONTESTS};
+ * a window holding more says so instead of showing part of it as the whole.
  */
 
 import { logger } from '../../lib/logger.js';
@@ -13,7 +14,7 @@ import { SPORTS, isSport } from '../../lib/sports.js';
 import { fetchOpenBook } from '../../v1/commitments.js';
 import { buildContestListItems, fetchContestListRows } from '../../v1/contests.js';
 import { parseTimestampMicros } from '../../v1/utils/gameTime.js';
-import { buildBookLines, priceLevels, type BookLine } from '../book.js';
+import { TAKE_MARGIN_MICROS, buildBookLines, priceLevels, type BookLine } from '../book.js';
 import {
   NOT_CONFIGURED,
   READ_FAILED,
@@ -23,8 +24,17 @@ import {
   type ToolAnswer,
   type ToolContext,
 } from '../context.js';
-import { formatOddsTick, formatUsdcCents, takerOddsTick } from '../takeMath.js';
-import { backingLabel, formatEastern, formatEasternMs, lineHeading, matchupLabel, sidesOf } from '../words.js';
+import { formatOddsTick, formatUsdcCentsDown, takerOddsTick } from '../takeMath.js';
+import {
+  backingLabel,
+  formatEastern,
+  formatEasternMs,
+  lineHeading,
+  matchupLabel,
+  sidesOf,
+  teamsOf,
+  type Teams,
+} from '../words.js';
 
 export const DEFAULT_WINDOW_HOURS = 48;
 export const MAX_WINDOW_HOURS = 168;
@@ -43,7 +53,7 @@ export interface ListMarketsArgs {
   sport: string | undefined;
 }
 
-function renderLine(line: BookLine, teams: { away: string; home: string }): string[] {
+function renderLine(line: BookLine, teams: Teams): string[] {
   const out = [`   ${lineHeading(line.market, line.lineTicks)}`];
   for (const side of sidesOf(line.market)) {
     const label = backingLabel(line.market, side, line.lineTicks, teams);
@@ -55,7 +65,7 @@ function renderLine(line: BookLine, teams: { away: string; home: string }): stri
     const prices = levels
       .map(
         (level) =>
-          `${formatOddsTick(takerOddsTick(level.makerOddsTick))} (up to ${formatUsdcCents(level.maxTakerRisk)} USDC)`,
+          `${formatOddsTick(takerOddsTick(level.makerOddsTick))} (up to ${formatUsdcCentsDown(level.maxTakerRisk)} USDC)`,
       )
       .join(', ');
     out.push(`     ${label}: ${prices}`);
@@ -91,7 +101,7 @@ export async function listMarkets(args: ListMarketsArgs, ctx: ToolContext): Prom
     return refusal([READ_FAILED]);
   }
 
-  const window = `the next ${String(args.windowHours)} hours`;
+  const window = args.windowHours === 1 ? 'the next hour' : `the next ${String(args.windowHours)} hours`;
   const scope = sport === null ? '' : ` ${sport.toUpperCase()}`;
   const asOf = formatEasternMs(ctx.nowMs);
   if (read.rows.length === 0) {
@@ -117,14 +127,25 @@ export async function listMarkets(args: ListMarketsArgs, ctx: ToolContext): Prom
   const out: string[] = [];
   let shown = 0;
   let withQuotes = 0;
+  let tooClose = 0;
 
   for (const contest of contests) {
+    // The read asked for verified contests only. prepare_order checks the same
+    // two things on the row it reads, and so does this.
+    if (contest.status !== 'verified' || contest.chainStartTime === '') continue;
     // The read already bounded the start by the window. A start that cannot
-    // be read here cannot be shown as upcoming, so the game is left out.
+    // be read here cannot be shown as upcoming, so the game is left out. So is
+    // one too close to its start for prepare_order to take, so that nothing is
+    // listed here that would be refused there; those are counted, and the
+    // answer says how many.
     const startMicros = parseTimestampMicros(contest.matchTime);
-    if (startMicros === null || startMicros <= nowMicros) continue;
+    if (startMicros === null) continue;
+    if (startMicros - nowMicros <= TAKE_MARGIN_MICROS) {
+      tooClose += 1;
+      continue;
+    }
 
-    const teams = { away: contest.awayTeam, home: contest.homeTeam };
+    const teams = teamsOf(contest);
     const lines = buildBookLines(contest.contestId, contest.speculations, book.commitments, ctx.scorers, nowMicros);
     shown += 1;
     if (lines.some((line) => sidesOf(line.market).some((side) => line.quotes[side].length > 0))) withQuotes += 1;
@@ -134,7 +155,7 @@ export async function listMarkets(args: ListMarketsArgs, ctx: ToolContext): Prom
       `${String(shown)}. ${matchupLabel(teams)} — ${contest.sport.toUpperCase()} — ` +
         `${formatEastern(contest.matchTime) ?? contest.matchTime} — contest_id ${contest.contestId}`,
     );
-    out.push(`   ${contest.awayTeam} is the away team, ${contest.homeTeam} is the home team.`);
+    out.push(`   ${teams.away} is the away team, ${teams.home} is the home team.`);
     if (lines.length === 0) {
       out.push('   No line exists on-chain for this game yet.');
       continue;
@@ -142,31 +163,55 @@ export async function listMarkets(args: ListMarketsArgs, ctx: ToolContext): Prom
     for (const line of lines) out.push(...renderLine(line, teams));
   }
 
+  const leftOut =
+    tooClose === 0
+      ? null
+      : `${String(tooClose)} ${tooClose === 1 ? 'game that starts' : 'games that start'} within two minutes ` +
+        `${tooClose === 1 ? 'is' : 'are'} left out: that is too close to the start to prepare an order.`;
+
+  const later = read.total - read.rows.length;
   if (shown === 0) {
+    // When the read was cut short, the rest of the window's games were not
+    // read, so "none" would be a claim about games nobody looked at.
+    if (later > 0) {
+      return answer([
+        `None of the first ${String(read.rows.length)}${scope} games in ${window} can be bet on now.`,
+        ...(leftOut === null ? [] : [leftOut]),
+        `${String(later)} more ${later === 1 ? 'game' : 'games'} in the window ${later === 1 ? 'was' : 'were'} not read. ` +
+          'Ask for one sport or a shorter window to see them.',
+      ]);
+    }
     return answer([
       `No${scope} games are open for betting on Ospex in ${window}.`,
-      'A game appears here once its contest is verified on-chain.',
+      leftOut ?? 'A game appears here once its contest is verified on-chain.',
     ]);
   }
 
   const head = [
     `Ospex: ${String(shown)}${scope} ${shown === 1 ? 'game' : 'games'} in ${window}` +
       `${asOf === null ? '' : `, as of ${asOf}`}.`,
-    'Prices are decimal odds for the person taking the quote. Amounts are USDC, and "up to" is the most one order can risk at that price.',
+    'Prices are decimal odds for the person taking the quote, rounded to two places. Amounts are USDC, and "up to" is the most one order can risk at that price.',
   ];
-  if (withQuotes === 0) head.push('No quotes are posted on any of these games right now.');
+  const incomplete = !book.complete || read.specRows.length >= SPECULATION_READ_CEILING;
+  // Part of a book that shows no quote is not a book with none.
+  if (withQuotes === 0 && !incomplete) head.push('No quotes are posted on any of these games right now.');
 
   const notes: string[] = [];
-  if (read.total > read.rows.length) {
+  if (leftOut !== null) notes.push(leftOut);
+  // Whether the cap was reached is a fact about the read. How many are shown
+  // is what the reader counts.
+  if (later > 0) {
     notes.push(
-      `Showing the first ${String(read.rows.length)} of ${String(read.total)} games by start time. ` +
+      `Showing the first ${String(shown)} of ${String(read.total)} games by start time. ` +
         'Ask for one sport or a shorter window to see the rest.',
     );
   }
-  if (!book.complete || read.specRows.length >= SPECULATION_READ_CEILING) {
+  if (incomplete) {
     notes.push('The book was too large to read completely, so some lines or quotes may be missing.');
   }
-  notes.push('Listing prices places nothing. prepare_order turns one of them into a preview and a link.');
+  notes.push(
+    'Listing prices places nothing. prepare_order turns one of them into a preview with the amounts paid and won, and a link.',
+  );
 
   return answer([...head, ...out, '', ...notes]);
 }

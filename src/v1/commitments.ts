@@ -555,10 +555,27 @@ export const OPEN_BOOK_MAX_PAGES = 8;
 /** Contest ids one drain accepts. Bounds the length of the `IN` list. */
 export const OPEN_BOOK_MAX_CONTESTS = 100;
 
+/**
+ * True when a numeric column arrived holding every one of its digits.
+ *
+ * The database answers these columns as JSON numbers. A number is exact up to
+ * 2^53, and past that it has already been rounded on the way in. A quote is
+ * signed over the exact amount and nonce, so one that arrived rounded is not a
+ * quote this reader can describe.
+ */
+function arrivedExact(value: unknown): boolean {
+  if (value === null || value === undefined) return true;
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value >= 0;
+  return typeof value === 'string' && /^\d+$/.test(value);
+}
+
 export type OpenBookRead =
   | {
       ok: true;
-      /** Visible open quotes only; a row the public mapper redacts is dropped. */
+      /**
+       * Visible open quotes only. A row the public mapper redacts is dropped,
+       * and so is a row whose amounts or nonce did not arrive exact.
+       */
       commitments: CommitmentBody[];
       /** False when the page budget ran out before the end was reached. */
       complete: boolean;
@@ -623,6 +640,17 @@ export async function fetchOpenBook(
       }
       afterHash = row.commitment_hash;
 
+      // Dropped, not fatal: the rest of the book is still served. The nonce is
+      // checked with the amounts because it is signed with them, and a take
+      // built from a rounded nonce fails.
+      if (!arrivedExact(row.risk_amount) || !arrivedExact(row.filled_risk_amount) || !arrivedExact(row.nonce)) {
+        logger.warn(
+          { commitmentHash: row.commitment_hash },
+          'commitments: open book row carries a number that did not arrive exact — dropped',
+        );
+        continue;
+      }
+
       const body = commitmentRowToPublicBody(row, nowMs);
       if ('redacted' in body) {
         logger.warn(
@@ -648,7 +676,8 @@ export async function fetchOpenBook(
  * Funding snapshots for a set of makers, keyed by lowercased address. The read
  * behind the advisory `fillability` field, for callers that are not the list
  * handler. A failed read answers an empty map: funding is then unknown for
- * every maker, never assumed present.
+ * every maker, never assumed present. So does a snapshot that cannot be read
+ * as a number.
  */
 export async function fetchMakerBacking(
   sb: ReturnType<typeof getSupabase>,
@@ -656,8 +685,17 @@ export async function fetchMakerBacking(
   makers: string[],
   nowMs: number,
 ): Promise<Map<string, { backing: bigint; fresh: boolean }>> {
-  const snapshots = await fetchMakerFunding(sb, network, makers);
   const out = new Map<string, { backing: bigint; fresh: boolean }>();
+  let snapshots: Map<string, MakerFundingSnapshot>;
+  try {
+    snapshots = await fetchMakerFunding(sb, network, makers);
+  } catch (err) {
+    logger.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      'commitments: maker_funding snapshot could not be read — funding unknown',
+    );
+    return out;
+  }
   for (const [maker, snapshot] of snapshots) {
     const ageMs = nowMs - snapshot.updatedAtMs;
     out.set(maker, {

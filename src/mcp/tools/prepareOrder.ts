@@ -9,20 +9,34 @@
  * ## Checks, in order
  *
  *   1. the amount is a positive USDC amount with at most six decimals
- *   2. the contest exists and is `verified`
- *   3. the contest has not started
+ *   2. the contest exists and is `verified`, with a start on-chain
+ *   3. the contest does not start within {@link TAKE_MARGIN_MICROS}
  *   4. the side named is a side of that market
  *   5. the market has an open line on-chain
  *   6. the line, if named, is one of those lines
  *   7. a quote can be taken on that side for that amount
  *
- * The contract makes none of checks 2 and 3 when a quote is taken on an
- * existing line: a quote's own expiry is its only guard against time. So they
- * are made here, and the start is read from the conservative start bound the
- * contest listing serves.
+ * Three refusals sit between them. Before 2, a contest id that is not the
+ * digits of a 64-bit id is refused without a read, and so is every call when
+ * the service has no scorer addresses. Between 4 and 5 the open quotes are
+ * read, and a book too large to read whole is refused: its best price cannot
+ * be found in part of it.
+ *
+ * The contract refuses a take once a contest is scored or voided, or is past
+ * its void cooldown, which is counted from the start. It does not refuse a
+ * take because the game has started, so check 3 is made here, against the
+ * conservative start bound the contest listing serves. The margin is the one
+ * a quote's expiry gets, for the same reason: a reader needs time to open the
+ * link, confirm, and be mined.
+ *
+ * A margin narrows the gap and cannot close it. A link prepared three minutes
+ * before the start is still a link after it, and the contract would fill it.
+ * The page behind the link has to look at the start again.
  *
  * Four reads per call: the contest, its speculations, its open quotes, and the
- * funding snapshots of the makers on the chosen side.
+ * funding snapshots of the makers on the chosen side. The open-quote read is
+ * paged, so it is one request while fewer than 999 quotes are open on the
+ * contest and at most 8 past that.
  */
 
 import { logger } from '../../lib/logger.js';
@@ -30,7 +44,7 @@ import type { MarketType } from '../../lib/speculation.js';
 import { fetchMakerBacking, fetchOpenBook } from '../../v1/commitments.js';
 import { fetchContestListItem } from '../../v1/contests.js';
 import { parseTimestampMicros } from '../../v1/utils/gameTime.js';
-import { buildBookLines, chooseQuote, type BookLine } from '../book.js';
+import { TAKE_MARGIN_MICROS, buildBookLines, chooseQuote, type BookLine } from '../book.js';
 import {
   NOT_CONFIGURED,
   READ_FAILED,
@@ -43,14 +57,17 @@ import {
 import {
   formatOddsTick,
   formatUsdcCents,
+  formatUsdcCentsDown,
   formatUsdcExact,
   formatUsdcShort,
   isWholeCents,
   parseUsdc,
+  takerOddsTick,
 } from '../takeMath.js';
 import {
   backingLabel,
   formatEastern,
+  formatEasternMs,
   formatHandicap,
   formatLine,
   handicapFor,
@@ -58,6 +75,7 @@ import {
   parseLine,
   pushSentence,
   resolveSide,
+  teamsOf,
   type Side,
   type Teams,
 } from '../words.js';
@@ -71,6 +89,14 @@ export interface PrepareOrderArgs {
 }
 
 const CONTEST_ID_PATTERN = /^\d{1,20}$/;
+/** The largest id the database's 64-bit column holds. One past it is an error there, not a miss. */
+const MAX_CONTEST_ID = 9_223_372_036_854_775_807n;
+/**
+ * Makers whose funding one call reads. A maker past this many is not known
+ * to be short, so its quote can still be offered, with the preview saying the
+ * funds were not confirmed.
+ */
+export const MAX_FUNDING_MAKERS = 100;
 const NOTHING_PLACED = 'No order was prepared, and nothing was placed.';
 
 /** A line as a caller on `side` would name it. */
@@ -94,15 +120,18 @@ function amountProblem(reason: string): string {
   }
 }
 
+/**
+ * Every form these sentences tell a caller to pass is one `resolveSide` takes:
+ * `away`, `home`, `over`, `under`, or a team's name with nothing added to it.
+ */
 function sideProblem(reason: string, market: MarketType, teams: Teams): string {
-  if (market === 'total') return 'For a total, side is over or under.';
-  if (reason === 'both_teams_match') {
-    return `That name fits both teams. Say ${teams.away} (away) or ${teams.home} (home).`;
-  }
+  if (market === 'total') return 'For a total, side is over or under, by itself.';
+  const either = `Pass away for ${teams.away}, or home for ${teams.home}.`;
+  if (reason === 'both_teams_match') return `That name fits both teams. ${either}`;
   if (reason === 'not_a_side_of_this_market') {
-    return `Over and under are sides of a total. For a ${market}, side is ${teams.away} (away) or ${teams.home} (home).`;
+    return `Over and under are sides of a total. For a ${market}, side is a team. ${either}`;
   }
-  return `That is not one of the teams in this game. Side is ${teams.away} (away) or ${teams.home} (home).`;
+  return `side was not read as one of the two teams. Pass a team's name by itself, with nothing after it. ${either}`;
 }
 
 export async function prepareOrder(args: PrepareOrderArgs, ctx: ToolContext): Promise<ToolAnswer> {
@@ -110,7 +139,7 @@ export async function prepareOrder(args: PrepareOrderArgs, ctx: ToolContext): Pr
   if (!amount.ok) return refusal([amountProblem(amount.reason), NOTHING_PLACED]);
 
   const contestId = args.contestId.trim();
-  if (!CONTEST_ID_PATTERN.test(contestId)) {
+  if (!CONTEST_ID_PATTERN.test(contestId) || BigInt(contestId) > MAX_CONTEST_ID) {
     return refusal(['contest_id must be the number list_markets shows for the game.', NOTHING_PLACED]);
   }
   const canonicalId = BigInt(contestId).toString();
@@ -126,10 +155,13 @@ export async function prepareOrder(args: PrepareOrderArgs, ctx: ToolContext): Pr
     return refusal([`There is no contest ${canonicalId} on Ospex.`, NOTHING_PLACED]);
   }
 
-  const teams: Teams = { away: contest.awayTeam, home: contest.homeTeam };
+  const teams = teamsOf(contest);
   const game = matchupLabel(teams);
 
-  if (contest.status !== 'verified' || contest.chainStartTime === '') {
+  if (contest.status === 'verified' && contest.chainStartTime === '') {
+    return answer([`${game} is not open for betting: its contest has no start time on-chain.`, NOTHING_PLACED]);
+  }
+  if (contest.status !== 'verified') {
     return answer([
       `${game} is not open for betting: its contest is ${contest.status === '' ? 'in an unknown state' : contest.status}.`,
       NOTHING_PLACED,
@@ -145,7 +177,15 @@ export async function prepareOrder(args: PrepareOrderArgs, ctx: ToolContext): Pr
   }
   const startsAt = formatEastern(contest.matchTime) ?? contest.matchTime;
   if (startMicros <= nowMicros) {
-    return answer([`${game} started ${startsAt}. Ospex takes no bets on a game under way.`, NOTHING_PLACED]);
+    // The contract would still fill a take after the start; it is this tool
+    // that prepares none.
+    return answer([`${game} started ${startsAt}. No order is prepared on a game under way.`, NOTHING_PLACED]);
+  }
+  if (startMicros - nowMicros <= TAKE_MARGIN_MICROS) {
+    return answer([
+      `${game} starts ${startsAt}, less than two minutes from now. That is too close to the start to prepare an order.`,
+      NOTHING_PLACED,
+    ]);
   }
 
   const resolved = resolveSide(args.side, args.market, teams);
@@ -209,12 +249,9 @@ export async function prepareOrder(args: PrepareOrderArgs, ctx: ToolContext): Pr
     return answer([`No quote is posted for ${backing} on ${game} right now.`, NOTHING_PLACED]);
   }
 
-  const funding = await fetchMakerBacking(
-    ctx.sb,
-    ctx.network,
-    [...new Set(candidates.map((quote) => quote.maker))],
-    ctx.nowMs,
-  );
+  // The quotes are best first, so the makers read are the best-priced ones.
+  const makers = [...new Set(candidates.map((quote) => quote.maker))].slice(0, MAX_FUNDING_MAKERS);
+  const funding = await fetchMakerBacking(ctx.sb, ctx.network, makers, ctx.nowMs);
   const choice = chooseQuote(candidates, amount.baseUnits, funding);
   if (!choice.ok) {
     if (choice.reason === 'too_small') {
@@ -237,11 +274,19 @@ export async function prepareOrder(args: PrepareOrderArgs, ctx: ToolContext): Pr
   const price = formatOddsTick(plan.takerOddsTick);
   const out: string[] = [
     `${backing} — ${game}, ${startsAt}.`,
-    `Risk ${formatUsdcCents(plan.takerRisk)} USDC to win ${formatUsdcCents(plan.takerProfit)} at ${price}.`,
+    // The win is rounded down, so the headline never promises more than the
+    // chain pays. The exact amounts follow whenever the two differ.
+    `Risk ${formatUsdcCents(plan.takerRisk)} USDC to win ${formatUsdcCentsDown(plan.takerProfit)} at ${price}.`,
   ];
   const push = pushSentence(line.market, line.lineTicks, teams);
   if (push !== null) out.push(push);
-  out.push(`Quote expires ${formatEastern(quote.expiry) ?? quote.expiry}.`);
+  // The contract does not look at the start, so a quote that expires after it
+  // could be taken with the game under way. The start is the deadline to give.
+  out.push(
+    quote.expiryMicros > startMicros
+      ? `Take it before the game starts, ${startsAt}. The quote itself expires later than that.`
+      : `Quote expires ${formatEastern(quote.expiry) ?? quote.expiry}.`,
+  );
   if (!isWholeCents(plan.takerRisk) || !isWholeCents(plan.takerProfit)) {
     out.push(
       `Exact amounts: you pay ${formatUsdcExact(plan.takerRisk)} USDC and win ${formatUsdcExact(plan.takerProfit)} USDC.`,
@@ -251,6 +296,18 @@ export async function prepareOrder(args: PrepareOrderArgs, ctx: ToolContext): Pr
     out.push(
       `This quote can take ${formatUsdcShort(plan.takerDesiredRisk)} USDC, not the ` +
         `${formatUsdcShort(plan.requestedTakerRisk)} asked for. The order is for ${formatUsdcShort(plan.takerDesiredRisk)}.`,
+    );
+  }
+  // One order takes one quote, so the better price is not this order's to
+  // have. Saying it is there lets the reader ask for the amount that fits.
+  //
+  // Two posted prices can show as one price at two decimals. A line that says
+  // "better" and names the price already shown is left out. The amount is
+  // rounded DOWN, so that asking for the amount named gets the price named.
+  if (choice.better !== undefined && takerOddsTick(choice.better.makerOddsTick) > plan.takerOddsTick) {
+    out.push(
+      `A better price, ${formatOddsTick(takerOddsTick(choice.better.makerOddsTick))}, is posted for up to ` +
+        `${formatUsdcCentsDown(choice.better.maxTakerRisk)} USDC.`,
     );
   }
   if (!choice.fundingConfirmed) {
@@ -264,12 +321,21 @@ export async function prepareOrder(args: PrepareOrderArgs, ctx: ToolContext): Pr
   out.push('');
   out.push(`Take link: ${link}`);
   out.push('Nothing has been placed. The order is placed only when you open the link and confirm in your wallet.');
+  // A fill by the same wallet on the same quote, from an earlier order, is
+  // what get_order_status would list for this one too. The time tells them
+  // apart, to the second, and a tie goes the safe way: an order cannot be
+  // confirmed and mined in the second it was prepared.
+  out.push(
+    `Prepared ${formatEasternMs(ctx.nowMs, true) ?? new Date(ctx.nowMs).toISOString()}. ` +
+      'A fill made at or before then is not this order.',
+  );
   out.push('');
   out.push(`contest_id: ${canonicalId}`);
   out.push(`commitment_hash: ${quote.commitmentHash}`);
   out.push(`market: ${line.market}`);
   if (line.market !== 'moneyline') out.push(`line: ${lineAsNamed(line.market, side, line.lineTicks)}`);
   out.push(`side: ${side}`);
+  if (side === 'away' || side === 'home') out.push(`team: ${side === 'away' ? teams.away : teams.home}`);
   out.push(`risk_usdc: ${formatUsdcShort(plan.takerDesiredRisk)}`);
   return answer(out);
 }

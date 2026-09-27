@@ -140,8 +140,6 @@ export interface TakePlan {
   takerProfit: bigint;
   /** True when the request was cut down to what the quote has left. */
   reduced: boolean;
-  /** Maker risk left on the quote after this take. */
-  remainingAfter: bigint;
   /** The taker's price, in ticks. Display only. */
   takerOddsTick: number;
 }
@@ -175,7 +173,6 @@ export function planTake(args: {
     takerRisk: moved.takerRisk,
     takerProfit: moved.fillMakerRisk,
     reduced,
-    remainingAfter: remainingMakerRisk - moved.fillMakerRisk,
     takerOddsTick: takerOddsTick(oddsTick),
   });
 
@@ -236,7 +233,8 @@ export function parseUsdc(input: string | number): ParsedAmount {
   const fraction = dot === -1 ? '' : text.slice(dot + 1);
   if (fraction.length > USDC_DECIMALS) return { ok: false, reason: 'too_many_decimals' };
   // Bound the digit count before BigInt sees it: the pattern admits a number
-  // of any length, and the cap below is a 13-digit value.
+  // of any length. Thirteen whole digits is generous, since the cap below has
+  // seven, and that cap is what does the refusing.
   if (whole.replace(/^0+/, '').length > 13) return { ok: false, reason: 'too_large' };
 
   const baseUnits = BigInt(whole) * USDC_UNIT + BigInt(fraction.padEnd(USDC_DECIMALS, '0'));
@@ -269,6 +267,15 @@ export function formatUsdcCents(baseUnits: bigint): string {
   const whole = cents / 100n;
   const fraction = (cents % 100n).toString().padStart(2, '0');
   return `${negative ? '-' : ''}${whole.toString()}.${fraction}`;
+}
+
+/**
+ * Base units rounded DOWN to cents, for an "up to" amount: a most that is
+ * rounded up names an amount that does not fit. Never below zero.
+ */
+export function formatUsdcCentsDown(baseUnits: bigint): string {
+  const magnitude = baseUnits < 0n ? 0n : baseUnits;
+  return formatUsdcCents(magnitude - (magnitude % 10_000n));
 }
 
 /** True when the cents form says exactly what the base-unit amount is. */

@@ -21,6 +21,7 @@ import {
   MIN_ODDS_TICK,
   formatOddsTick,
   formatUsdcCents,
+  formatUsdcCentsDown,
   formatUsdcExact,
   formatUsdcShort,
   isValidOddsTick,
@@ -184,29 +185,73 @@ describe('the range of a take on one quote', () => {
     expect(maxTakerRisk(100, 5_000_000n)).toBe(0n);
   });
 
+  it('maxTakerRisk is zero for a negative remaining amount, which only a row that is wrong can carry', () => {
+    // Zero cannot tell a checked amount from an unchecked one: the formula
+    // gives zero for it anyway. A whole negative lot can: unchecked, -100 gives
+    // -100 * 105 / 100 = -105.
+    expect(maxTakerRisk(205, -100n)).toBe(0n);
+    expect(maxTakerRisk(205, -1n)).toBe(0n);
+  });
+
+  it('maxTakerRisk is zero for a price outside the range, where the formula alone would not be', () => {
+    // At 100 the formula multiplies by zero, so that fixture cannot tell a
+    // checked price from an unchecked one. These can: unchecked, 50 gives
+    // 5_000_000 * -50 / 100 = -2_500_000, and 10_101 gives
+    // 5_000_000 * 10_001 / 100 = 500_050_000.
+    expect(maxTakerRisk(50, 5_000_000n)).toBe(0n);
+    expect(maxTakerRisk(10_101, 5_000_000n)).toBe(0n);
+    // The nearest prices that are taken, on each side.
+    expect(maxTakerRisk(101, 5_000_000n)).toBe(50_000n);
+    expect(maxTakerRisk(10_100, 5_000_000n)).toBe(500_000_000n);
+  });
+
+  it('minTakerRisk is zero for a price outside the range, where the formula alone would not be', () => {
+    // Unchecked, 100 gives 99 * 0 / 100 + 1 = 1, and 10_101 gives
+    // floor(99 * 10_001 / 100) + 1 = 9_901.
+    expect(minTakerRisk(100)).toBe(0n);
+    expect(minTakerRisk(10_101)).toBe(0n);
+    // The nearest prices that are taken, on each side.
+    expect(minTakerRisk(101)).toBe(1n);
+    expect(minTakerRisk(10_100)).toBe(9_901n);
+  });
+
+  it('both are zero for a price that is not a whole number of ticks', () => {
+    // 150.5 is inside the range, so only the whole-number half of the price
+    // check answers for it. The formula has no answer of its own: a fraction
+    // does not convert to the integer type the amounts are worked in.
+    expect(maxTakerRisk(150.5, 5_000_000n)).toBe(0n);
+    expect(minTakerRisk(150.5)).toBe(0n);
+    // The whole prices either side of it.
+    expect(maxTakerRisk(150, 5_000_000n)).toBe(2_500_000n);
+    expect(maxTakerRisk(151, 5_000_000n)).toBe(2_550_000n);
+    expect(minTakerRisk(150)).toBe(50n);
+    expect(minTakerRisk(151)).toBe(51n);
+  });
+
   it('minTakerRisk is the first amount that fills a lot, and one less does not', () => {
-    const cases: Array<[number, bigint]> = [
-      [101, 1n],
-      [150, 50n],
-      [191, 91n],
-      [200, 100n],
-      [205, 104n],
-      [250, 149n],
-      [10_100, 9_901n],
+    // At 1.01 the smallest is one base unit, so one less is a request of
+    // nothing, refused for that; at every other price one less fills no lot.
+    const cases: Array<[number, bigint, 'zero_desired' | 'zero_fill']> = [
+      [101, 1n, 'zero_desired'],
+      [150, 50n, 'zero_fill'],
+      [191, 91n, 'zero_fill'],
+      [200, 100n, 'zero_fill'],
+      [205, 104n, 'zero_fill'],
+      [250, 149n, 'zero_fill'],
+      [10_100, 9_901n, 'zero_fill'],
     ];
-    for (const [oddsTick, smallest] of cases) {
+    expect(cases).toHaveLength(7);
+    for (const [oddsTick, smallest, oneLess] of cases) {
       expect(minTakerRisk(oddsTick)).toBe(smallest);
       const base = { oddsTick, remainingMakerRisk: 1_000_000n };
       expect(simulateMatch({ ...base, takerDesiredRisk: smallest })).toMatchObject({
         accepted: true,
         fillMakerRisk: 100n,
       });
-      if (smallest > 1n) {
-        expect(simulateMatch({ ...base, takerDesiredRisk: smallest - 1n })).toEqual({
-          accepted: false,
-          reason: 'zero_fill',
-        });
-      }
+      expect(simulateMatch({ ...base, takerDesiredRisk: smallest - 1n })).toEqual({
+        accepted: false,
+        reason: oneLess,
+      });
     }
   });
 });
@@ -257,7 +302,6 @@ describe('planTake', () => {
         takerRisk: 1_999_935n,
         takerProfit: 1_904_700n,
         reduced: false,
-        remainingAfter: 3_095_300n,
         takerOddsTick: 195,
       },
     });
@@ -273,7 +317,6 @@ describe('planTake', () => {
         takerRisk: 5_250_000n,
         takerProfit: 5_000_000n,
         reduced: true,
-        remainingAfter: 0n,
         takerOddsTick: 195,
       },
     });
@@ -287,7 +330,8 @@ describe('planTake', () => {
         expect(result.ok).toBe(true);
         if (!result.ok) continue;
         expect(result.plan.reduced).toBe(true);
-        expect(result.plan.remainingAfter).toBe(0n);
+        // Every remaining amount above is whole lots, so a full take consumes all of it.
+        expect(result.plan.fillMakerRisk).toBe(remainingMakerRisk);
         expect(
           simulateMatch({ oddsTick, remainingMakerRisk, takerDesiredRisk: result.plan.takerDesiredRisk }),
         ).toEqual({
@@ -377,6 +421,22 @@ describe('parseUsdc', () => {
     expect(parseUsdc(0)).toEqual({ ok: false, reason: 'not_positive' });
   });
 
+  it('refuses a negative amount with a fraction as negative, not as malformed', () => {
+    expect(parseUsdc('-5.5')).toEqual({ ok: false, reason: 'not_positive' });
+    expect(parseUsdc(-0.25)).toEqual({ ok: false, reason: 'not_positive' });
+    // The same digits without the sign are an amount.
+    expect(parseUsdc('5.5')).toEqual({ ok: true, baseUnits: 5_500_000n });
+  });
+
+  it('does not count leading zeros towards the size of an amount', () => {
+    // Fifteen zeros in front of a whole part of one digit: the digits that
+    // carry a value are one, well inside the bound on their count.
+    expect(parseUsdc('0000000000000001.5')).toEqual({ ok: true, baseUnits: 1_500_000n });
+    expect(parseUsdc('000000000000000010')).toEqual({ ok: true, baseUnits: 10_000_000n });
+    // Zeros alone carry no value, and are refused for that and not for their count.
+    expect(parseUsdc('000000000000000000')).toEqual({ ok: false, reason: 'not_positive' });
+  });
+
   it('admits the largest request and refuses one base unit more', () => {
     expect(MAX_REQUEST_USDC).toBe(1_000_000_000_000n);
     expect(parseUsdc('1000000')).toEqual({ ok: true, baseUnits: 1_000_000_000_000n });
@@ -417,11 +477,90 @@ describe('amounts as text', () => {
     expect(formatUsdcCents(5_000n)).toBe('0.01');
   });
 
+  it('formatUsdcCentsDown rounds down to the cent', () => {
+    expect(formatUsdcCentsDown(4_995_300n)).toBe('4.99');
+    expect(formatUsdcCentsDown(5_250_000n)).toBe('5.25');
+    expect(formatUsdcCentsDown(9_999n)).toBe('0.00');
+    expect(formatUsdcCentsDown(10_000n)).toBe('0.01');
+    expect(formatUsdcCentsDown(19_999n)).toBe('0.01');
+    expect(formatUsdcCentsDown(0n)).toBe('0.00');
+    expect(formatUsdcCentsDown(9_999_990n)).toBe('9.99');
+  });
+
+  it('formatUsdcCentsDown never goes below zero', () => {
+    expect(formatUsdcCentsDown(-1n)).toBe('0.00');
+    expect(formatUsdcCentsDown(-10_000n)).toBe('0.00');
+    // A magnitude taken without its sign would read 1.50 here.
+    expect(formatUsdcCentsDown(-1_500_000n)).toBe('0.00');
+  });
+
+  it('formatUsdcCentsDown writes a large amount in full, past what a float holds exactly', () => {
+    expect(formatUsdcCentsDown(1_000_000_000_000n)).toBe('1000000.00');
+    expect(formatUsdcCentsDown(123_456_789_999_999n)).toBe('123456789.99');
+    // 9007199254740.993999 USDC: its base units are past 2^53.
+    expect(formatUsdcCentsDown(9_007_199_254_740_993_999n)).toBe('9007199254740.99');
+    // One base unit under a whole cent, past 2^53: the nearest float is over
+    // the cent, so an amount that passed through one would read 9007199254741.00.
+    expect(formatUsdcCentsDown(9_007_199_254_740_999_999n)).toBe('9007199254740.99');
+    expect(formatUsdcCents(9_007_199_254_740_999_999n)).toBe('9007199254741.00');
+  });
+
+  it('formatUsdcCentsDown is a cent lower than formatUsdcCents where that one rounds up, and the same where it does not', () => {
+    // Half a cent and more rounds up in the other; here it does not.
+    expect(formatUsdcCents(4_995_300n)).toBe('5.00');
+    expect(formatUsdcCents(9_999n)).toBe('0.01');
+    expect(formatUsdcCents(9_525_000n)).toBe('9.53');
+    expect(formatUsdcCentsDown(9_525_000n)).toBe('9.52');
+    // Under half a cent both give the lower cent, the same text.
+    expect(formatUsdcCents(9_524_999n)).toBe('9.52');
+    expect(formatUsdcCentsDown(9_524_999n)).toBe('9.52');
+  });
+
+  it('formatUsdcCentsDown names at most the amount and less than a cent under it, over a sweep', () => {
+    // Every amount from 0 to 3 cents in steps of 7 base units, and a spread of
+    // larger ones. The text is read back as a count of cents here, by hand.
+    const amounts: bigint[] = [];
+    for (let units = 0n; units <= 30_000n; units += 7n) amounts.push(units);
+    for (const units of [4_995_300n, 5_249_999n, 5_250_000n, 5_250_001n, 999_999_999n, 1_000_000_009_999n]) amounts.push(units);
+    for (const units of amounts) {
+      const text = formatUsdcCentsDown(units);
+      expect(text).toMatch(/^\d+\.\d{2}$/);
+      const cents = BigInt(text.replace('.', ''));
+      expect(cents * 10_000n <= units && units < (cents + 1n) * 10_000n).toBe(true);
+    }
+    expect(amounts.length).toBe(4_292);
+  });
+
   it('isWholeCents says when the cents form is the whole truth', () => {
     expect(isWholeCents(10_000_000n)).toBe(true);
     expect(isWholeCents(5_250_000n)).toBe(true);
     expect(isWholeCents(9_999_990n)).toBe(false);
     expect(isWholeCents(9_523_800n)).toBe(false);
+  });
+
+  it('isWholeCents refuses an amount on the tenth-of-a-cent grid', () => {
+    // A cent is 10_000 base units. These two are multiples of 1_000 and not of
+    // 10_000, so they separate the cent grid from the next finer one, which
+    // the amounts above cannot: none of those is a multiple of 1_000 either.
+    expect(isWholeCents(1_905_000n)).toBe(false);
+    expect(isWholeCents(9_525_000n)).toBe(false);
+    // Half a cent less is a whole number of cents.
+    expect(isWholeCents(1_900_000n)).toBe(true);
+    expect(isWholeCents(9_520_000n)).toBe(true);
+  });
+
+  it('writes a negative amount with one sign, in front', () => {
+    // Without the sign handling the remainder carries a sign of its own and
+    // lands in the middle of the text.
+    expect(formatUsdcExact(-1_500_000n)).toBe('-1.500000');
+    expect(formatUsdcExact(-1n)).toBe('-0.000001');
+    expect(formatUsdcShort(-5_250_000n)).toBe('-5.25');
+    expect(formatUsdcCents(-1_500_000n)).toBe('-1.50');
+    expect(formatUsdcCents(-9_525_000n)).toBe('-9.53');
+    // The same magnitudes without the sign.
+    expect(formatUsdcExact(1_500_000n)).toBe('1.500000');
+    expect(formatUsdcShort(5_250_000n)).toBe('5.25');
+    expect(formatUsdcCents(1_500_000n)).toBe('1.50');
   });
 
   it('formatOddsTick writes a price with two places', () => {
@@ -430,5 +569,16 @@ describe('amounts as text', () => {
     expect(formatOddsTick(205)).toBe('2.05');
     expect(formatOddsTick(10_100)).toBe('101.00');
     expect(formatOddsTick(101)).toBe('1.01');
+  });
+
+  it('formatOddsTick throws on a negative tick and on a fraction, and takes zero', () => {
+    expect(() => formatOddsTick(-5)).toThrow(RangeError);
+    expect(() => formatOddsTick(-1)).toThrow(RangeError);
+    expect(() => formatOddsTick(1.5)).toThrow(RangeError);
+    expect(() => formatOddsTick(195.5)).toThrow(RangeError);
+    expect(() => formatOddsTick(Number.NaN)).toThrow(RangeError);
+    // Zero is the smallest tick that is written, and 1 the next.
+    expect(formatOddsTick(0)).toBe('0.00');
+    expect(formatOddsTick(1)).toBe('0.01');
   });
 });

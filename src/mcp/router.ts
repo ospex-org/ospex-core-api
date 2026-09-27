@@ -1,11 +1,14 @@
 /**
  * `/mcp` — the connector endpoint: MCP over Streamable HTTP.
  *
- * No sign-in, no sessions, no stored state. A client POSTs a JSON-RPC message
+ * No sign-in, no sessions, no stored state. A client POSTs one JSON-RPC message
  * and gets one JSON response back.
  *
- *   POST /mcp     a JSON-RPC request, notification or batch
- *   anything else 405
+ *   POST /mcp                  one JSON-RPC request or notification, as an object
+ *   any other method on /mcp   405
+ *
+ * A path under `/mcp` is not served here. It falls through to the app, which
+ * answers it as it answers any path nobody serves.
  *
  * ## Why GET is refused here and not handed to the transport
  *
@@ -16,10 +19,24 @@
  *
  * ## Why this route sits ahead of the app's JSON parser
  *
- * The transport reads the body itself. Behind the app's parser a malformed
- * body would be answered by the app's error handler, in the REST error shape
- * with a 500; read here it is a JSON-RPC parse error with a 400, and a body
- * over {@link MCP_MAX_BODY_BYTES} is a 413.
+ * Behind the app's parser a malformed body would be answered by the app's
+ * error handler, in the REST error shape with a 500. This route reads the body
+ * with a parser of its own and answers for it in the protocol's shape: a
+ * JSON-RPC parse error with a 400, a 413 for a body over
+ * {@link MCP_MAX_BODY_BYTES}, and a 415 for a body that was compressed.
+ *
+ * ## Why a compressed body is refused
+ *
+ * A few bytes can inflate to the whole of the limit, so a parser that inflates
+ * does a megabyte of work for a request that cost its sender nothing. No
+ * client of this protocol compresses what it sends.
+ *
+ * ## Why a body over the limit is refused before it has all arrived
+ *
+ * The parser reads a body to its end before it says the body was too large.
+ * A sender that never stops would never be answered. The bytes are counted
+ * here as they arrive, and the refusal is sent when the count passes the
+ * limit.
  *
  * ## Why this route never answers 401
  *
@@ -31,18 +48,24 @@
  * The transport refuses a second request, and it does so by answering an empty
  * 500 rather than by throwing, so reuse would fail without a trace.
  *
- * ## One tool call per request
+ * ## One message per request
  *
- * A request may carry a batch of up to a hundred messages, and the transport
- * starts every one of them at once. The rate limit counts requests, so a batch
- * of tool calls would be a hundred calls for the price of one. The first tool
- * call in a request is served and any after it is answered with an error.
- * Later versions of the protocol have no batches at all.
+ * An early version of the protocol let a request carry a batch of messages,
+ * and the transport serves up to a hundred of them at once. The rate limit
+ * counts requests, so a batch is a hundred messages for the price of one. A
+ * batch of a hundred was measured at five to twelve times the cost of a request
+ * carrying one message, depending on what it is compared with, and it needs no
+ * database read to cost that. Later versions of the protocol have no batches.
+ *
+ * So a body that is a JSON list is refused, whatever its length, before
+ * anything is built to serve it. A list of one is refused too: the protocol
+ * answers a list with a list, and this endpoint answers with one object.
  */
 
-import { Router, type Request, type Response } from 'express';
+import express, { Router, type NextFunction, type Request, type Response } from 'express';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { isJsonContentType } from '@modelcontextprotocol/sdk/shared/mediaType.js';
 import { isJSONRPCRequest } from '@modelcontextprotocol/sdk/types.js';
 import { formatError, logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
@@ -53,8 +76,6 @@ import { buildMcpServer } from './server.js';
 
 /** The largest request body read: 1 MiB, the limit the rest of the API applies. */
 export const MCP_MAX_BODY_BYTES = 1024 * 1024;
-/** Tool calls served from one request. */
-export const MCP_MAX_TOOL_CALLS_PER_REQUEST = 1;
 
 export interface McpRouterConfig {
   network: string;
@@ -68,15 +89,13 @@ interface JsonRpcError {
   id: null;
 }
 
+function refuse(res: Response, status: number, code: number, message: string): void {
+  res.status(status).json({ jsonrpc: '2.0', error: { code, message }, id: null } satisfies JsonRpcError);
+}
+
 function methodNotAllowed(_req: Request, res: Response): void {
-  res
-    .status(405)
-    .set('Allow', 'POST')
-    .json({
-      jsonrpc: '2.0',
-      error: { code: -32000, message: 'Method not allowed. This endpoint takes POST.' },
-      id: null,
-    } satisfies JsonRpcError);
+  res.set('Allow', 'POST');
+  refuse(res, 405, -32000, 'Method not allowed. This endpoint takes POST.');
 }
 
 /** The first header value, cut to a length safe to log. */
@@ -86,11 +105,17 @@ function header(req: Request, name: string): string | undefined {
   return first === undefined ? undefined : first.slice(0, 120);
 }
 
+interface Described {
+  method?: string;
+  client?: string;
+  asked?: string;
+}
+
 /** What one JSON-RPC message says about itself, for the log. Arguments are never read. */
-function describeMessage(message: unknown): { method?: string; client?: string; asked?: string } {
+function describeMessage(message: unknown): Described {
   if (typeof message !== 'object' || message === null) return {};
   const record = message as Record<string, unknown>;
-  const out: { method?: string; client?: string; asked?: string } = {};
+  const out: Described = {};
   if (typeof record['method'] === 'string') out.method = record['method'].slice(0, 60);
   const params = record['params'];
   if (out.method === 'initialize' && typeof params === 'object' && params !== null) {
@@ -105,6 +130,89 @@ function describeMessage(message: unknown): { method?: string; client?: string; 
   return out;
 }
 
+/**
+ * Any JSON value, not only an object or a list: what is not a JSON-RPC message
+ * is for the transport to say, in the words it has for it. Nothing is inflated.
+ *
+ * Which bodies are read is decided by the transport's own test of the
+ * Content-Type, because the parser's own test throws on some malformed headers,
+ * which would have answered 500. The two still read the header differently
+ * when it is sent more than once: Node keeps the first copy, and the transport
+ * tests every copy joined. So a body this parser leaves alone can be one the
+ * transport would accept, and the handler below never lets the transport read
+ * a body for itself.
+ */
+const readBody = express.json({
+  limit: MCP_MAX_BODY_BYTES,
+  strict: false,
+  inflate: false,
+  type: (req) => isJsonContentType(req.headers['content-type']),
+});
+
+function refuseTooLarge(res: Response): void {
+  logger.warn({ type: 'entity.too.large' }, 'mcp: request body refused');
+  refuse(res, 413, -32000, `Payload Too Large: Request body must not exceed ${String(MCP_MAX_BODY_BYTES)} bytes`);
+}
+
+/** Refuse a body over the limit as soon as it is known to be over, not once it has ended. */
+function refuseOversize(req: Request, res: Response, next: NextFunction): void {
+  if (Number(req.headers['content-length']) > MCP_MAX_BODY_BYTES) {
+    refuseTooLarge(res);
+    return;
+  }
+  let read = 0;
+  req.on('data', (chunk: Buffer) => {
+    read += chunk.length;
+    if (read > MCP_MAX_BODY_BYTES && !res.headersSent) refuseTooLarge(res);
+  });
+  next();
+}
+
+/**
+ * A body the parser turned away, answered in the protocol's shape. Nothing
+ * raised on this route goes on to the app's own error handler, which answers
+ * in another shape.
+ */
+function bodyRefused(err: unknown, _req: Request, res: Response, next: NextFunction): void {
+  const record = typeof err === 'object' && err !== null ? (err as Record<string, unknown>) : {};
+  const type = record['type'];
+  if (res.headersSent) {
+    // Already answered, by the count above or by the transport.
+    if (type !== 'entity.too.large') next(err);
+    return;
+  }
+  if (typeof type !== 'string') {
+    logger.error({ err: formatError(err) }, 'mcp: request failed');
+    refuse(res, 500, -32603, 'Internal error');
+    return;
+  }
+  if (type === 'entity.too.large') {
+    refuseTooLarge(res);
+    return;
+  }
+  logger.warn({ type }, 'mcp: request body refused');
+  if (type === 'entity.parse.failed') {
+    refuse(res, 400, -32700, 'Parse error: Invalid JSON');
+    return;
+  }
+  if (type === 'encoding.unsupported') {
+    refuse(res, 415, -32000, 'Unsupported Media Type: send the body as it is, with no Content-Encoding');
+    return;
+  }
+  if (type === 'charset.unsupported') {
+    // The parser takes the UTF encodings JSON allows, and refuses the rest.
+    refuse(res, 415, -32000, 'Unsupported Media Type: send the body in UTF-8');
+    return;
+  }
+  const status = record['status'];
+  refuse(
+    res,
+    typeof status === 'number' && status >= 400 && status < 500 ? status : 400,
+    -32000,
+    'The request body could not be read.',
+  );
+}
+
 export function createMcpRouter(config: McpRouterConfig): Router {
   const router = Router();
   router.use(mcpRateLimit);
@@ -117,25 +225,15 @@ export function createMcpRouter(config: McpRouterConfig): Router {
     nowMs: Date.now(),
   });
 
-  router.post('/', (req: Request, res: Response): void => {
+  /** The messages a request carried, as the handler saw them. Filled in as they are served. */
+  const seenBy = new WeakMap<Response, Described[]>();
+
+  // One line for every POST, however it ends. Registered before the body is
+  // read, so a body that is refused is a request in the log all the same.
+  const noteRequest = (req: Request, res: Response, next: NextFunction): void => {
     const startedAt = Date.now();
-    const seen: Array<{ method?: string; client?: string; asked?: string }> = [];
-    let toolCalls = 0;
-    const server = buildMcpServer(context);
-    const transport = new StreamableHTTPServerTransport({
-      enableJsonResponse: true,
-      maxRequestBodySize: MCP_MAX_BODY_BYTES,
-    });
-
-    // A request the transport turns away (a missing Accept header, a body that
-    // is not JSON-RPC) is the client's doing. It is worth a line, not an alarm.
-    transport.onerror = (error: Error): void => {
-      logger.warn({ err: error.message }, 'mcp: request refused by the transport');
-    };
-
-    // Registered before the request is handled. In JSON mode the handling does
-    // not return until the response is written, so a listener added afterwards
-    // would miss the close of a client that left early.
+    const seen: Described[] = [];
+    seenBy.set(res, seen);
     res.on('close', () => {
       logger.info(
         {
@@ -152,6 +250,38 @@ export function createMcpRouter(config: McpRouterConfig): Router {
         },
         'mcp: request',
       );
+    });
+    next();
+  };
+
+  const serve = (req: Request, res: Response): void => {
+    // `undefined` when the parser left the body alone: for a content type that
+    // is not JSON, which the transport answers with 415, and for a request that
+    // has no body.
+    const body: unknown = req.body;
+    if (Array.isArray(body)) {
+      logger.warn({ messages: body.length }, 'mcp: batch refused');
+      refuse(res, 400, -32600, 'One message per request, sent as an object and not as a list.');
+      return;
+    }
+
+    const seen = seenBy.get(res) ?? [];
+    const server = buildMcpServer(context);
+    const transport = new StreamableHTTPServerTransport({
+      enableJsonResponse: true,
+      maxRequestBodySize: MCP_MAX_BODY_BYTES,
+    });
+
+    // A request the transport turns away (a missing Accept header, a body that
+    // is not JSON-RPC) is the client's doing. It is worth a line, not an alarm.
+    transport.onerror = (error: Error): void => {
+      logger.warn({ err: error.message }, 'mcp: request refused by the transport');
+    };
+
+    // Registered before the request is handled. In JSON mode the handling does
+    // not return until the response is written, so a listener added afterwards
+    // would miss the close of a client that left early.
+    res.on('close', () => {
       void transport.close();
       void server.close();
     });
@@ -165,21 +295,6 @@ export function createMcpRouter(config: McpRouterConfig): Router {
         transport.onmessage = (message, extra): void => {
           if (seen.length < 8) seen.push(describeMessage(message));
           if (isJSONRPCRequest(message) && message.method === 'tools/call') {
-            toolCalls += 1;
-            if (toolCalls > MCP_MAX_TOOL_CALLS_PER_REQUEST) {
-              // Answered, not dropped: the response to a batch is not written
-              // until every request in it has one.
-              transport
-                .send({
-                  jsonrpc: '2.0',
-                  id: message.id,
-                  error: { code: -32600, message: 'One tool call per request. Send this one on its own.' },
-                })
-                .catch((err: unknown) => {
-                  logger.warn({ err: formatError(err) }, 'mcp: could not answer a refused tool call');
-                });
-              return;
-            }
             // A call may leave `arguments` out, and the server then validates
             // nothing at all against the tool's schema and refuses it, even
             // when every argument is optional. No arguments is no arguments.
@@ -188,20 +303,20 @@ export function createMcpRouter(config: McpRouterConfig): Router {
           }
           deliver?.(message, extra);
         };
-        return transport.handleRequest(req, res);
+        // Handed no body, the transport reads the request itself, and what it
+        // reads has not been through the check for a list above. Handed null,
+        // it refuses the request as carrying no message, once the Accept and
+        // Content-Type headers have passed its own tests.
+        return transport.handleRequest(req, res, body ?? null);
       })
       .catch((err: unknown) => {
         logger.error({ err: formatError(err) }, 'mcp: request failed');
-        if (!res.headersSent) {
-          res.status(500).json({
-            jsonrpc: '2.0',
-            error: { code: -32603, message: 'Internal error' },
-            id: null,
-          } satisfies JsonRpcError);
-        }
+        if (!res.headersSent) refuse(res, 500, -32603, 'Internal error');
       });
-  });
+  };
 
+  router.post('/', noteRequest, refuseOversize, readBody, serve);
   router.all('/', methodNotAllowed);
+  router.use(bodyRefused);
   return router;
 }

@@ -318,7 +318,17 @@ const LOOPBACK_ORIGIN = /^http:\/\/(localhost|127\.0\.0\.1)(:\d{1,5})?$/i;
  * trailing slash, so appending `/take/...` cannot land anywhere unexpected.
  */
 export function isTakeLinkOrigin(value: string): boolean {
-  return HTTPS_ORIGIN.test(value) || LOOPBACK_ORIGIN.test(value);
+  if (!HTTPS_ORIGIN.test(value) && !LOOPBACK_ORIGIN.test(value)) return false;
+  // The pattern fixes the shape; the URL parser settles what it cannot, such
+  // as a port past 65535. Every label of the host has a character in it and
+  // neither starts nor ends with a hyphen.
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  return url.hostname.split('.').every((label) => label !== '' && !label.startsWith('-') && !label.endsWith('-'));
 }
 
 let cached: Config | undefined;
@@ -520,8 +530,10 @@ export function loadConfig(): Config {
 
   const mcpTakeLinkBaseUrl = optionalEnv('MCP_TAKE_LINK_BASE_URL') ?? DEFAULT_TAKE_LINK_BASE_URL;
   if (!isTakeLinkOrigin(mcpTakeLinkBaseUrl)) {
+    // The value is not logged. One shape this refuses is a URL carrying a
+    // name and password, and the operator who set it can read it.
     logger.fatal(
-      { var: 'MCP_TAKE_LINK_BASE_URL', value: mcpTakeLinkBaseUrl },
+      { var: 'MCP_TAKE_LINK_BASE_URL' },
       'MCP_TAKE_LINK_BASE_URL must be an origin with no path: https://host, or http:// for localhost',
     );
     process.exit(1);

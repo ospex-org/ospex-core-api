@@ -43,24 +43,6 @@ export function sideOf(market: MarketType, positionType: 0 | 1): Side {
   return positionType === 0 ? 'away' : 'home';
 }
 
-/** The position type a side is. */
-export function positionTypeOf(side: Side): 0 | 1 {
-  return side === 'away' || side === 'over' ? 0 : 1;
-}
-
-export function oppositeSide(side: Side): Side {
-  switch (side) {
-    case 'away':
-      return 'home';
-    case 'home':
-      return 'away';
-    case 'over':
-      return 'under';
-    case 'under':
-      return 'over';
-  }
-}
-
 /** The two sides of a market, Upper first. */
 export function sidesOf(market: MarketType): readonly [Side, Side] {
   return market === 'total' ? ['over', 'under'] : ['away', 'home'];
@@ -107,6 +89,39 @@ export function parseLine(input: number): ParsedLine {
 
 // ── labels ─────────────────────────────────────────────────────────────
 
+const NAME_MAX_LENGTH = 80;
+
+/**
+ * A team's name as one line of plain text. Names are the only text a person
+ * wrote that the tools print from the database; the rest comes from typed
+ * columns written from chain data: addresses, hashes, amounts, times and
+ * statuses. An answer is read
+ * line by line, and a name holding a line break could put a line of its own
+ * into one.
+ *
+ * Characters that print as nothing (zero-width ones, direction marks, tags)
+ * and halves of a character are dropped, not turned into a space. The cut is
+ * made on characters, and the end is trimmed again because the cut can land
+ * on a space.
+ */
+export function cleanName(name: string): string {
+  const oneLine = name
+    .replace(/[\p{Cf}\p{Cs}]/gu, '')
+    .replace(/[\s\p{Cc}]+/gu, ' ')
+    .trim();
+  return [...oneLine].slice(0, NAME_MAX_LENGTH).join('').trimEnd();
+}
+
+/**
+ * The two teams of a game, named as they are printed. A name that is empty
+ * once cleaned is printed as its role, so no label is left with a blank in it.
+ */
+export function teamsOf(contest: { awayTeam: string; homeTeam: string }): Teams {
+  const away = cleanName(contest.awayTeam);
+  const home = cleanName(contest.homeTeam);
+  return { away: away === '' ? 'Away team' : away, home: home === '' ? 'Home team' : home };
+}
+
 export function matchupLabel(teams: Teams): string {
   return `${teams.away} @ ${teams.home}`;
 }
@@ -140,6 +155,8 @@ export function lineHeading(market: MarketType, lineTicks: number): string {
   return 'Spread';
 }
 
+const PUSH_RETURNS = 'the stake is returned.';
+
 /**
  * The sentence that says when this bet is a push, or `null` when it cannot be
  * one. Follows the scorer contracts:
@@ -148,18 +165,19 @@ export function lineHeading(market: MarketType, lineTicks: number): string {
  *     spread      push when away score + line equals home score
  *     total       push when the combined score equals the line
  *
- * A spread or total on a half point has no score that lands on it.
+ * A spread or total on a half point has no score that lands on it. Every
+ * sentence says what a push does, for a reader who has not met the word.
  */
 export function pushSentence(market: MarketType, lineTicks: number, teams: Teams): string | null {
-  if (market === 'moneyline') return 'A tie is a push.';
+  if (market === 'moneyline') return `A tie is a push: ${PUSH_RETURNS}`;
   if (lineTicks % 10 !== 0) return null;
   const points = Math.abs(lineTicks) / 10;
-  if (market === 'total') return `Exactly ${String(points)} is a push.`;
-  if (lineTicks === 0) return 'A tie is a push.';
+  if (market === 'total') return `A combined score of exactly ${String(points)} is a push: ${PUSH_RETURNS}`;
+  if (lineTicks === 0) return `A tie is a push: ${PUSH_RETURNS}`;
   // The line is added to the away score. Negative: the away team gives points
   // and pushes by winning by exactly that many. Positive: the home team does.
   const giver = lineTicks < 0 ? teams.away : teams.home;
-  return `${giver} winning by exactly ${String(points)} is a push.`;
+  return `${giver} winning by exactly ${String(points)} is a push: ${PUSH_RETURNS}`;
 }
 
 // ── which side did the caller mean ─────────────────────────────────────
@@ -222,16 +240,22 @@ const EASTERN = new Intl.DateTimeFormat('en-US', {
   day: 'numeric',
   hour: 'numeric',
   minute: '2-digit',
+  second: '2-digit',
   hour12: true,
 });
 
 /**
- * An instant as US Eastern wall-clock time: `Sun Sep 27, 3:05 pm ET`.
+ * An instant as US Eastern wall-clock time: `Sun Sep 27, 3:05 pm ET`, or with
+ * `seconds`, `Sun Sep 27, 3:05:09 pm ET`.
+ *
+ * Seconds are for the two times a reader compares with each other: when an
+ * order was prepared and when a fill was made. To the minute, a fill made
+ * earlier in the same minute could not be told from the order.
  *
  * Assembled from the formatter's parts, not its finished string, because the
  * separators in that string differ between runtime versions.
  */
-export function formatEasternMs(epochMs: number): string | null {
+export function formatEasternMs(epochMs: number, seconds = false): string | null {
   if (!Number.isFinite(epochMs)) return null;
   const parts = new Map<string, string>();
   for (const part of EASTERN.formatToParts(new Date(epochMs))) parts.set(part.type, part.value);
@@ -240,19 +264,16 @@ export function formatEasternMs(epochMs: number): string | null {
   const day = parts.get('day');
   const hour = parts.get('hour');
   const minute = parts.get('minute');
+  const second = parts.get('second');
   const period = parts.get('dayPeriod');
-  if (!weekday || !month || !day || !hour || !minute || !period) return null;
-  return `${weekday} ${month} ${day}, ${hour}:${minute} ${period.toLowerCase()} ET`;
+  if (!weekday || !month || !day || !hour || !minute || !second || !period) return null;
+  const clock = seconds ? `${hour}:${minute}:${second}` : `${hour}:${minute}`;
+  return `${weekday} ${month} ${day}, ${clock} ${period.toLowerCase()} ET`;
 }
 
 /** A database timestamp as US Eastern wall-clock time, or `null` when it cannot be read. */
-export function formatEastern(timestamp: string): string | null {
+export function formatEastern(timestamp: string, seconds = false): string | null {
   const micros = parseTimestampMicros(timestamp);
   if (micros === null) return null;
-  return formatEasternMs(Number(micros / 1000n));
-}
-
-/** An address or hash shortened for reading: `0x1234…abcd`. */
-export function shorten(hex: string): string {
-  return hex.length <= 12 ? hex : `${hex.slice(0, 6)}…${hex.slice(-4)}`;
+  return formatEasternMs(Number(micros / 1000n), seconds);
 }

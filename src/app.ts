@@ -74,9 +74,9 @@ export function buildApp(config: ReturnType<typeof loadConfig>): express.Express
     }),
   );
 
-  // The connector endpoint. Mounted AHEAD of the JSON parser on purpose: its
-  // transport reads the request body itself, so a body it cannot read is
-  // answered in the protocol's own error shape. See mcp/router.ts.
+  // The connector endpoint. Mounted AHEAD of the JSON parser on purpose: it
+  // reads the request body with a parser of its own, so a body that cannot be
+  // read is answered in the protocol's own error shape. See mcp/router.ts.
   app.use(
     '/mcp',
     createMcpRouter({

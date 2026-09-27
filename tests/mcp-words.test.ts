@@ -10,6 +10,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   backingLabel,
+  cleanName,
   formatEastern,
   formatEasternMs,
   formatHandicap,
@@ -17,15 +18,13 @@ import {
   handicapFor,
   lineHeading,
   matchupLabel,
-  oppositeSide,
   parseLine,
-  positionTypeOf,
   pushSentence,
   resolveSide,
-  shorten,
   sideOf,
   sidesOf,
   teamLabel,
+  teamsOf,
 } from '../src/mcp/words.js';
 
 const TEAMS = { away: 'Tampa Bay Rays', home: 'Philadelphia Phillies' };
@@ -38,20 +37,6 @@ describe('sides', () => {
     expect(sideOf('spread', 1)).toBe('home');
     expect(sideOf('total', 0)).toBe('over');
     expect(sideOf('total', 1)).toBe('under');
-  });
-
-  it('gives a side its position type', () => {
-    expect(positionTypeOf('away')).toBe(0);
-    expect(positionTypeOf('over')).toBe(0);
-    expect(positionTypeOf('home')).toBe(1);
-    expect(positionTypeOf('under')).toBe(1);
-  });
-
-  it('pairs each side with the one across from it', () => {
-    expect(oppositeSide('away')).toBe('home');
-    expect(oppositeSide('home')).toBe('away');
-    expect(oppositeSide('over')).toBe('under');
-    expect(oppositeSide('under')).toBe('over');
   });
 
   it('lists a market\'s two sides, upper first', () => {
@@ -100,6 +85,12 @@ describe('lines', () => {
     expect(parseLine(1234567)).toEqual({ ok: false });
   });
 
+  it('reads a line of six whole digits, the most it takes', () => {
+    // Nearest acceptance to the seven-digit refusal above.
+    expect(parseLine(999999.5)).toEqual({ ok: true, ticks: 9999995 });
+    expect(parseLine(-123456)).toEqual({ ok: true, ticks: -1234560 });
+  });
+
   it('parses negative zero as zero', () => {
     const parsed = parseLine(-0);
     expect(parsed.ok && Object.is(parsed.ticks, 0)).toBe(true);
@@ -139,28 +130,329 @@ describe('labels', () => {
   });
 });
 
+describe('cleanName', () => {
+  // Eighty characters, in tens, each ten ending in its own number.
+  const EIGHTY =
+    'aaaaaaaaa1' +
+    'bbbbbbbbb2' +
+    'ccccccccc3' +
+    'ddddddddd4' +
+    'eeeeeeeee5' +
+    'fffffffff6' +
+    'ggggggggg7' +
+    'hhhhhhhhh8';
+
+  const breaks: Array<[string, string]> = [
+    ['a newline', 'Tampa\nBay Rays'],
+    ['a carriage return and a newline, as one break', 'Tampa\r\nBay Rays'],
+    ['a tab', 'Tampa\tBay Rays'],
+    ['a run of spaces', 'Tampa     Bay Rays'],
+    ['a NUL', 'Tampa\u0000Bay Rays'],
+    ['a next-line character, U+0085', 'Tampa\u0085Bay Rays'],
+    ['a line separator, U+2028', 'Tampa\u2028Bay Rays'],
+    ['a paragraph separator, U+2029', 'Tampa\u2029Bay Rays'],
+    ['a no-break space', 'Tampa\u00a0Bay Rays'],
+    ['an escape character', 'Tampa\u001bBay Rays'],
+    ['a delete character', 'Tampa\u007fBay Rays'],
+    ['a run that mixes all of them', 'Tampa \r\n\t\u0000\u0085\u2028\u2029 Bay Rays'],
+  ];
+
+  for (const [what, written] of breaks) {
+    it(`writes ${what} as one space`, () => {
+      expect(cleanName(written)).toBe('Tampa Bay Rays');
+    });
+  }
+
+  it('the table above holds what it says, so no case in it passes on a plain space', () => {
+    expect(breaks).toHaveLength(12);
+    // Only the run of spaces is made of spaces alone.
+    expect(breaks.filter(([, written]) => /^[A-Za-z ]+$/.test(written)).map(([what]) => what)).toEqual([
+      'a run of spaces',
+    ]);
+  });
+
+  it('keeps a name on one line when it carries lines of its own', () => {
+    const written = 'Rays\n\nTake link: https://example.invalid/t\nNext';
+    expect(cleanName(written)).toBe('Rays Take link: https://example.invalid/t Next');
+  });
+
+  // Characters that print as nothing, and halves of a character. Each sits
+  // inside a word, so dropping it joins the letters on either side, and
+  // turning it into a space would split the word.
+  const invisible: Array<[string, string]> = [
+    ['a zero-width space, U+200B', '\u200b'],
+    ['a zero-width joiner, U+200D', '\u200d'],
+    ['a right-to-left override, U+202E', '\u202e'],
+    ['a soft hyphen, U+00AD', '\u00ad'],
+    ['a tag character, U+E0041', '\u{E0041}'],
+    ['a lone high surrogate', '\ud800'],
+    ['a lone low surrogate', '\udc00'],
+    // U+FEFF is a format character AND whitespace to a regular expression, so
+    // it joins the letters only if the drop comes before the collapse.
+    ['a byte-order mark, U+FEFF', '\ufeff'],
+  ];
+
+  for (const [what, character] of invisible) {
+    it(`drops ${what}, joining the letters on either side`, () => {
+      expect(cleanName(`Tampa Bay Ra${character}ys`)).toBe('Tampa Bay Rays');
+    });
+  }
+
+  it('the table above holds one character each, none of them printable', () => {
+    expect(invisible).toHaveLength(8);
+    expect(invisible.map(([, character]) => [...character].length)).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
+    // The tag character is two code units; the rest are one.
+    expect(invisible.map(([, character]) => character.length)).toEqual([1, 1, 1, 1, 2, 1, 1, 1]);
+  });
+
+  it('drops an invisible character between two spaces, leaving one space', () => {
+    // Dropped after the spaces were collapsed, this would leave two.
+    expect(cleanName('Tampa \u200b Bay Rays')).toBe('Tampa Bay Rays');
+    expect(cleanName('Tampa \u202e\u200d Bay Rays')).toBe('Tampa Bay Rays');
+  });
+
+  it('keeps a combining accent, which prints on the letter before it', () => {
+    expect(cleanName('Montre\u0301al Canadiens')).toBe('Montre\u0301al Canadiens');
+  });
+
+  it('cuts on characters, so an emoji at the edge is kept or dropped whole', () => {
+    // 79 letters, an emoji, then more: the emoji is the 80th character and
+    // two code units, the 80th and 81st.
+    const seventyNine = EIGHTY.slice(0, 79);
+    const kept = cleanName(`${seventyNine}\u{1F600}XYZ`);
+    expect(kept).toBe(`${seventyNine}\u{1F600}`);
+    expect([...kept]).toHaveLength(80);
+    expect(kept).toHaveLength(81);
+    // 80 letters, then the emoji as the 81st character: dropped whole.
+    expect(cleanName(`${EIGHTY}\u{1F600}`)).toBe(EIGHTY);
+    // Nothing that is left is half a character.
+    expect(/[\ud800-\udfff]/u.test(kept.replace(/\u{1F600}/gu, ''))).toBe(false);
+  });
+
+  it('counts an emoji as one character towards the 80', () => {
+    // Ten emoji and 70 letters are 80 characters and 90 code units.
+    const written = `${'\u{1F600}'.repeat(10)}${EIGHTY.slice(0, 70)}`;
+    expect(written).toHaveLength(90);
+    expect(cleanName(`${written}XYZ`)).toBe(written);
+  });
+
+  it('does not leave a space where the cut lands on one', () => {
+    const seventyNine = EIGHTY.slice(0, 79);
+    // The 80th character is a space.
+    expect(cleanName(`${seventyNine} more`)).toBe(seventyNine);
+    // Nearest acceptance: with a letter there, the cut keeps it.
+    expect(cleanName(`${seventyNine}Z more`)).toBe(`${seventyNine}Z`);
+  });
+
+  it('answers an empty name for one made only of invisible characters', () => {
+    expect(cleanName('\u200b\u200d\u202e\u00ad')).toBe('');
+    expect(cleanName(' \u200b \u{E0041} ')).toBe('');
+  });
+
+  it('trims both ends', () => {
+    expect(cleanName('  Tampa Bay Rays  ')).toBe('Tampa Bay Rays');
+    expect(cleanName('\n\tTampa Bay Rays\r\n')).toBe('Tampa Bay Rays');
+    expect(cleanName('\u0000Tampa Bay Rays\u0000')).toBe('Tampa Bay Rays');
+  });
+
+  it('keeps a name of exactly 80 characters and cuts one of 81', () => {
+    expect(EIGHTY).toHaveLength(80);
+    expect(cleanName(EIGHTY)).toBe(EIGHTY);
+    expect(cleanName(`${EIGHTY}X`)).toBe(EIGHTY);
+    expect(cleanName(EIGHTY.slice(0, 79))).toBe(
+      'aaaaaaaaa1bbbbbbbbb2ccccccccc3ddddddddd4eeeeeeeee5fffffffff6ggggggggg7hhhhhhhhh',
+    );
+  });
+
+  it('counts the 80 characters after trimming, so space in front costs the name nothing', () => {
+    // Cut first and trimmed second, this would lose the last three characters.
+    expect(cleanName(`   ${EIGHTY}`)).toBe(EIGHTY);
+  });
+
+  it('counts a collapsed run as the one space it becomes', () => {
+    // 'ab', five spaces, then 77 more: 80 once the run is one space.
+    const written = `ab     ${EIGHTY.slice(3)}`;
+    expect(written).toHaveLength(84);
+    expect(cleanName(written)).toBe(
+      'ab aaaaaa1bbbbbbbbb2ccccccccc3ddddddddd4eeeeeeeee5fffffffff6ggggggggg7hhhhhhhhh8',
+    );
+  });
+
+  it('answers an empty name for an empty name and for one that is only whitespace', () => {
+    expect(cleanName('')).toBe('');
+    expect(cleanName(' ')).toBe('');
+    expect(cleanName(' \r\n\t\u0000\u2028 ')).toBe('');
+  });
+
+  it('leaves an ordinary name as it is written', () => {
+    for (const name of [
+      'Tampa Bay Rays',
+      "Hawai'i Rainbow Warriors",
+      "St. John's Red Storm",
+      'Montréal Canadiens',
+      'Philadelphia 76ers',
+      'Texas A&M-Corpus Christi',
+    ]) {
+      expect(cleanName(name)).toBe(name);
+    }
+  });
+});
+
+describe('teamsOf', () => {
+  it('names each team from its own column, cleaned', () => {
+    expect(teamsOf({ awayTeam: ' Tampa\nBay  Rays ', homeTeam: 'Philadelphia\tPhillies\u0000' })).toEqual({
+      away: 'Tampa Bay Rays',
+      home: 'Philadelphia Phillies',
+    });
+  });
+
+  it('leaves two ordinary names as they are', () => {
+    expect(teamsOf({ awayTeam: 'Tampa Bay Rays', homeTeam: 'Philadelphia Phillies' })).toEqual({
+      away: 'Tampa Bay Rays',
+      home: 'Philadelphia Phillies',
+    });
+  });
+
+  it('cuts each name to 80 characters by itself', () => {
+    const teams = teamsOf({ awayTeam: 'a'.repeat(81), homeTeam: 'h'.repeat(79) });
+    expect(teams.away).toBe(
+      'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    );
+    expect(teams.away).toHaveLength(80);
+    expect(teams.home).toBe(
+      'hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh',
+    );
+    expect(teams.home).toHaveLength(79);
+  });
+
+  const blank: Array<[string, string]> = [
+    ['empty', ''],
+    ['only spaces', '   '],
+    ['only line breaks and controls', '\r\n\t\u0000'],
+    ['only invisible characters', '​‮\u{E0041}'],
+  ];
+
+  for (const [what, name] of blank) {
+    it(`names a team by its role when its name is ${what}`, () => {
+      expect(teamsOf({ awayTeam: name, homeTeam: 'Philadelphia Phillies' })).toEqual({
+        away: 'Away team',
+        home: 'Philadelphia Phillies',
+      });
+      expect(teamsOf({ awayTeam: 'Tampa Bay Rays', homeTeam: name })).toEqual({
+        away: 'Tampa Bay Rays',
+        home: 'Home team',
+      });
+      expect(teamsOf({ awayTeam: name, homeTeam: name })).toEqual({ away: 'Away team', home: 'Home team' });
+    });
+  }
+
+  it('keeps a name of one character, which is not empty', () => {
+    expect(teamsOf({ awayTeam: 'A', homeTeam: ' B ' })).toEqual({ away: 'A', home: 'B' });
+  });
+});
+
 describe('pushSentence', () => {
+  // A second pair of teams, so a name in a sentence is shown to come from the
+  // teams passed in.
+  const OTHERS = { away: 'Boston Red Sox', home: 'Chicago Cubs' };
+
   it('a moneyline pushes on a tie', () => {
-    expect(pushSentence('moneyline', 0, TEAMS)).toBe('A tie is a push.');
+    expect(pushSentence('moneyline', 0, TEAMS)).toBe('A tie is a push: the stake is returned.');
+    expect(pushSentence('moneyline', 0, OTHERS)).toBe('A tie is a push: the stake is returned.');
   });
 
-  it('a total on a whole number pushes on exactly that number', () => {
-    expect(pushSentence('total', 70, TEAMS)).toBe('Exactly 7 is a push.');
-    expect(pushSentence('total', 2200, TEAMS)).toBe('Exactly 220 is a push.');
+  it('a moneyline has no line, and whatever is passed as one is not read', () => {
+    // 15 would answer null if it were read as a half point, and 20 would name
+    // a team winning by two.
+    expect(pushSentence('moneyline', 15, TEAMS)).toBe('A tie is a push: the stake is returned.');
+    expect(pushSentence('moneyline', 20, TEAMS)).toBe('A tie is a push: the stake is returned.');
+    expect(pushSentence('moneyline', -20, TEAMS)).toBe('A tie is a push: the stake is returned.');
   });
 
-  it('a total or spread on a half point cannot push', () => {
+  it('a total on a whole number pushes on a combined score of exactly that number', () => {
+    expect(pushSentence('total', 70, TEAMS)).toBe(
+      'A combined score of exactly 7 is a push: the stake is returned.',
+    );
+    expect(pushSentence('total', 80, TEAMS)).toBe(
+      'A combined score of exactly 8 is a push: the stake is returned.',
+    );
+    expect(pushSentence('total', 100, TEAMS)).toBe(
+      'A combined score of exactly 10 is a push: the stake is returned.',
+    );
+    expect(pushSentence('total', 2200, TEAMS)).toBe(
+      'A combined score of exactly 220 is a push: the stake is returned.',
+    );
+  });
+
+  it('a total names no team', () => {
+    expect(pushSentence('total', 70, OTHERS)).toBe(
+      'A combined score of exactly 7 is a push: the stake is returned.',
+    );
+  });
+
+  it('a total is read by its size, as its heading and its backing are', () => {
+    expect(lineHeading('total', -70)).toBe('Total 7.0');
+    expect(backingLabel('total', 'under', -70, TEAMS)).toBe('Under 7.0');
+    expect(backingLabel('total', 'over', -75, TEAMS)).toBe('Over 7.5');
+    expect(pushSentence('total', -70, TEAMS)).toBe(
+      'A combined score of exactly 7 is a push: the stake is returned.',
+    );
+  });
+
+  it('a total on a half point cannot push', () => {
     expect(pushSentence('total', 75, TEAMS)).toBeNull();
-    expect(pushSentence('spread', -15, TEAMS)).toBeNull();
-    expect(pushSentence('spread', 35, TEAMS)).toBeNull();
+    expect(pushSentence('total', 85, TEAMS)).toBeNull();
+    expect(pushSentence('total', 5, TEAMS)).toBeNull();
+    expect(pushSentence('total', 2205, TEAMS)).toBeNull();
   });
 
-  it('a spread on a whole number pushes when the team giving points wins by exactly that many', () => {
-    // Stored -20: away score - 2 == home score, so the away team won by two.
-    expect(pushSentence('spread', -20, TEAMS)).toBe('Tampa Bay Rays winning by exactly 2 is a push.');
-    // Stored +30: away score + 3 == home score, so the home team won by three.
-    expect(pushSentence('spread', 30, TEAMS)).toBe('Philadelphia Phillies winning by exactly 3 is a push.');
-    expect(pushSentence('spread', 0, TEAMS)).toBe('A tie is a push.');
+  it('a spread on a half point cannot push, whichever team gives the points', () => {
+    expect(pushSentence('spread', -15, TEAMS)).toBeNull();
+    expect(pushSentence('spread', 15, TEAMS)).toBeNull();
+    expect(pushSentence('spread', -5, TEAMS)).toBeNull();
+    expect(pushSentence('spread', 5, TEAMS)).toBeNull();
+    expect(pushSentence('spread', 35, TEAMS)).toBeNull();
+    expect(pushSentence('spread', -105, TEAMS)).toBeNull();
+  });
+
+  it('a negative whole spread pushes when the AWAY team wins by exactly that many', () => {
+    // The stored line is added to the away score. Stored -20: away - 2 equals
+    // home, so the away team gave two and won by two.
+    expect(backingLabel('spread', 'away', -20, TEAMS)).toBe('Tampa Bay Rays (away) -2.0');
+    expect(pushSentence('spread', -20, TEAMS)).toBe(
+      'Tampa Bay Rays winning by exactly 2 is a push: the stake is returned.',
+    );
+    expect(pushSentence('spread', -10, TEAMS)).toBe(
+      'Tampa Bay Rays winning by exactly 1 is a push: the stake is returned.',
+    );
+    expect(pushSentence('spread', -100, TEAMS)).toBe(
+      'Tampa Bay Rays winning by exactly 10 is a push: the stake is returned.',
+    );
+    expect(pushSentence('spread', -20, OTHERS)).toBe(
+      'Boston Red Sox winning by exactly 2 is a push: the stake is returned.',
+    );
+  });
+
+  it('a positive whole spread pushes when the HOME team wins by exactly that many', () => {
+    // Stored +30: away + 3 equals home, so the home team gave three and won by three.
+    expect(backingLabel('spread', 'home', 30, TEAMS)).toBe('Philadelphia Phillies (home) -3.0');
+    expect(pushSentence('spread', 30, TEAMS)).toBe(
+      'Philadelphia Phillies winning by exactly 3 is a push: the stake is returned.',
+    );
+    expect(pushSentence('spread', 10, TEAMS)).toBe(
+      'Philadelphia Phillies winning by exactly 1 is a push: the stake is returned.',
+    );
+    expect(pushSentence('spread', 100, TEAMS)).toBe(
+      'Philadelphia Phillies winning by exactly 10 is a push: the stake is returned.',
+    );
+    expect(pushSentence('spread', 30, OTHERS)).toBe(
+      'Chicago Cubs winning by exactly 3 is a push: the stake is returned.',
+    );
+  });
+
+  it('a spread of zero pushes on a tie and names nobody', () => {
+    expect(pushSentence('spread', 0, TEAMS)).toBe('A tie is a push: the stake is returned.');
+    expect(pushSentence('spread', -0, TEAMS)).toBe('A tie is a push: the stake is returned.');
   });
 });
 
@@ -200,6 +492,13 @@ describe('resolveSide', () => {
   it('drops a leading "the" and nothing else', () => {
     expect(resolveSide('the', 'moneyline', TEAMS)).toEqual({ ok: false, reason: 'no_team_matches' });
     expect(resolveSide('go Rays', 'moneyline', TEAMS)).toEqual({ ok: false, reason: 'no_team_matches' });
+  });
+
+  it('drops "the" only when a name follows it, so "the" alone is looked up as a word', () => {
+    const article = { away: 'The Citadel Bulldogs', home: 'Furman Paladins' };
+    expect(resolveSide('the', 'moneyline', article)).toEqual({ ok: true, side: 'away' });
+    expect(resolveSide('the Paladins', 'moneyline', article)).toEqual({ ok: true, side: 'home' });
+    expect(resolveSide('the Citadel', 'moneyline', article)).toEqual({ ok: true, side: 'away' });
   });
 
   it('does not match part of a word, or words out of order', () => {
@@ -271,9 +570,58 @@ describe('times', () => {
   });
 });
 
-describe('shorten', () => {
-  it('keeps both ends of a long value and all of a short one', () => {
-    expect(shorten('0x1234567890abcdef1234567890abcdef12345678')).toBe('0x1234…5678');
-    expect(shorten('0x1234')).toBe('0x1234');
+describe('times with seconds', () => {
+  it('writes the seconds, two digits of them, when asked', () => {
+    expect(formatEasternMs(Date.UTC(2026, 8, 27, 12, 0, 0), true)).toBe('Sun Sep 27, 8:00:00 am ET');
+    expect(formatEasternMs(Date.UTC(2026, 8, 27, 19, 5, 9), true)).toBe('Sun Sep 27, 3:05:09 pm ET');
+    expect(formatEastern('2026-09-27T12:00:00Z', true)).toBe('Sun Sep 27, 8:00:00 am ET');
+    expect(formatEastern('2026-09-27T19:05:09+00:00', true)).toBe('Sun Sep 27, 3:05:09 pm ET');
+    expect(formatEastern('2026-09-27T19:05:41+00:00', true)).toBe('Sun Sep 27, 3:05:41 pm ET');
+  });
+
+  it('writes the same instants to the minute when seconds are left out or false', () => {
+    // Nearest to the case above: the same instants, and no seconds in the text.
+    expect(formatEasternMs(Date.UTC(2026, 8, 27, 19, 5, 9))).toBe('Sun Sep 27, 3:05 pm ET');
+    expect(formatEasternMs(Date.UTC(2026, 8, 27, 19, 5, 9), false)).toBe('Sun Sep 27, 3:05 pm ET');
+    expect(formatEastern('2026-09-27T19:05:09+00:00')).toBe('Sun Sep 27, 3:05 pm ET');
+    expect(formatEastern('2026-09-27T19:05:09+00:00', false)).toBe('Sun Sep 27, 3:05 pm ET');
+    expect(formatEastern('2026-09-27T12:00:00Z')).toBe('Sun Sep 27, 8:00 am ET');
+  });
+
+  it('writes midnight and noon with seconds', () => {
+    expect(formatEastern('2026-09-27T04:00:00+00:00', true)).toBe('Sun Sep 27, 12:00:00 am ET');
+    expect(formatEastern('2026-09-27T04:00:07+00:00', true)).toBe('Sun Sep 27, 12:00:07 am ET');
+    expect(formatEastern('2026-09-27T16:00:00+00:00', true)).toBe('Sun Sep 27, 12:00:00 pm ET');
+    expect(formatEastern('2026-09-27T16:00:30+00:00', true)).toBe('Sun Sep 27, 12:00:30 pm ET');
+  });
+
+  it('crosses the autumn change: one second on, the clock reads an hour earlier', () => {
+    // Daylight time ends at 2:00 am Eastern on Sunday 1 November 2026, when the
+    // clock goes back to 1:00 am. 05:59:59 UTC is 1:59:59 am daylight time, and
+    // 06:00:00 UTC is 1:00:00 am standard time.
+    expect(formatEastern('2026-11-01T05:59:59+00:00', true)).toBe('Sun Nov 1, 1:59:59 am ET');
+    expect(formatEastern('2026-11-01T06:00:00+00:00', true)).toBe('Sun Nov 1, 1:00:00 am ET');
+    expect(formatEastern('2026-11-01T07:00:01+00:00', true)).toBe('Sun Nov 1, 2:00:01 am ET');
+    // The day before the change is still four hours behind.
+    expect(formatEasternMs(Date.UTC(2026, 9, 31, 5, 59, 59), true)).toBe('Sat Oct 31, 1:59:59 am ET');
+  });
+
+  it('keeps the second a timestamp with microseconds falls in, never the next one', () => {
+    expect(formatEastern('2026-09-27T12:00:59.999999Z', true)).toBe('Sun Sep 27, 8:00:59 am ET');
+    expect(formatEastern('2026-09-27T12:00:59.9995+00:00', true)).toBe('Sun Sep 27, 8:00:59 am ET');
+    expect(formatEastern('2026-09-27T12:59:59.999999+00:00', true)).toBe('Sun Sep 27, 8:59:59 am ET');
+    expect(formatEasternMs(Date.UTC(2026, 8, 27, 12, 0, 59, 999), true)).toBe('Sun Sep 27, 8:00:59 am ET');
+    // Nearest acceptance: one microsecond later is the next second.
+    expect(formatEastern('2026-09-27T12:01:00Z', true)).toBe('Sun Sep 27, 8:01:00 am ET');
+  });
+
+  it('answers null for a timestamp it cannot read, with seconds or without', () => {
+    for (const unreadable of ['', 'not a time', '2026-02-30T00:00:00Z', '2026-09-27T19:05:00']) {
+      expect(formatEastern(unreadable, true)).toBeNull();
+      expect(formatEastern(unreadable, false)).toBeNull();
+    }
+    expect(formatEasternMs(Number.NaN, true)).toBeNull();
+    expect(formatEasternMs(Number.POSITIVE_INFINITY, true)).toBeNull();
+    expect(formatEasternMs(Number.POSITIVE_INFINITY, false)).toBeNull();
   });
 });
