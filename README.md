@@ -1,6 +1,6 @@
 # ospex-core-api
 
-Public REST read API, signed-write relay, and SSE push layer for the Ospex protocol — a zero-vig peer-to-peer sports prediction protocol on Polygon. Reads on-chain state mirrored into Supabase by the protocol indexer and exposes it as a versioned API at `/v1/*`.
+Public REST read API, signed-write relay, and SSE push layer for the Ospex protocol — a zero-vig peer-to-peer sports prediction protocol on Polygon. Reads on-chain state mirrored into Supabase by the protocol indexer and exposes it as a versioned API at `/v1/*`, and to AI assistants as a read-only connector at `/mcp`.
 
 **Where the trust sits.** Settlement, custody, matching validity, cancellation, and nonce floors are all enforced on-chain by the protocol's verified contracts. This service holds no signing key, submits no transactions, and holds no user funds — it cannot forge or alter an on-chain fill. What it *can* do is decide what the public orderbook shows and which signed commitments it relays onward, and it serves reads from a database mirror of chain state rather than from the chain directly. So this repo is the code you read to check that it doesn't play games with any of that. See "Hidden-row redaction" and [`docs/CANCEL_FLOW.md`](./docs/CANCEL_FLOW.md) for where it matters most.
 
@@ -9,6 +9,7 @@ Public REST read API, signed-write relay, and SSE push layer for the Ospex proto
 Live on Polygon mainnet. The API surface today:
 
 - `/healthz` (liveness), `/readyz` (readiness)
+- **Connector:** `POST /mcp` — the order book as three read-only tools for AI assistants (`list_markets`, `prepare_order`, `get_order_status`), over the Model Context Protocol. No sign-in, no stored state, nothing placed. See "MCP endpoint" below.
 - `POST /v1/commitments` — EIP-712 commitment relay
 - `GET /v1/commitments` — list with filters / pagination
 - `GET /v1/contests`, `GET /v1/contests/:contestId` — contest list / detail (renamed from `/v1/markets/*`). Carries six start-time fields: `matchTime` (the current conservative start-time safety bound — gate on this), `chainStartTime` (the immutable on-chain value), `gameMatchTime` (the odds-feed schedule), `gameEarliestMatchTime` (the game's retained safety floor), and `gameRundownMatchTime` / `gameSportspageMatchTime` (the enrichment providers' start-time snapshots, admitted into the minimum only within a one-hour freshness window). See "Contest start times" below. Every list row also carries the linked game's canonical identity (`gameId` / `jsonoddsId` — see "Game identity on list rows" below)
@@ -48,6 +49,7 @@ Not ported (no analog in the current protocol — see "Position helpers" section
 - Supabase (`@supabase/supabase-js`) — the only data layer. **No Firebase.**
 - ethers v6 — EIP-712 typed-data hashing / signature recovery
 - pino for logs
+- `@modelcontextprotocol/sdk` — the `/mcp` endpoint. zod comes with it, for the tools' argument schemas, and is used for nothing else here
 
 ## Run locally
 
@@ -72,7 +74,7 @@ curl http://localhost:3000/readyz    # readiness — 200 when always-required de
 
 ## Endpoints
 
-Most read endpoints share `readRateLimit` (600 req/min per IP); the write endpoint has its own tighter limit. The SSE stream endpoints (`/v1/stream/*`) are intentionally exempt — a stream is one long-lived request, not a burst — and are bounded by a concurrent-connection cap instead (see "SSE streams").
+Most read endpoints share `readRateLimit` (600 req/min per IP); the write endpoint has its own tighter limit. The SSE stream endpoints (`/v1/stream/*`) are intentionally exempt — a stream is one long-lived request, not a burst — and are bounded by a concurrent-connection cap instead (see "SSE streams"). `/mcp` has a limit of its own, the same size as the read limit and counted apart from it (see "MCP endpoint").
 
 ### `POST /v1/commitments`
 
@@ -844,6 +846,167 @@ Operational counters for the SSE subsystem, surfaced as JSON. Kept separate from
 
 All counters are **process-local and cumulative since process start** (reset on restart) — on a multi-dyno deploy, scrape each dyno rather than going through the load balancer. `connections.maxTotal` / `maxPerIp` echo the active caps (defaults, or the `MAX_STREAM_CONNECTIONS_*` overrides).
 
+## MCP endpoint
+
+`POST /mcp` offers the order book to AI assistants as three read-only tools, over the [Model Context Protocol](https://modelcontextprotocol.io). An assistant that has the endpoint added as a connector can list the games, prepare an order against a posted quote, and look up whether a quote was taken.
+
+```
+https://api.ospex.org/mcp
+```
+
+**What it does not do.** It places nothing, signs nothing and stores nothing. `prepare_order` answers with a preview and a link; the order is placed when a person opens that link and confirms a transaction in their own wallet, and at no point before. The sentence in the introduction holds for this endpoint as it does for the rest of the service: no signing key, no transactions, no user funds.
+
+### Connecting
+
+Streamable HTTP, stateless, no sign-in. There are no sessions: every request is served by itself, and a tool call works whether or not a handshake came before it. Responses are plain JSON, not an event stream.
+
+| Request | Answer |
+|---|---|
+| `POST /mcp` with a JSON-RPC request | `200`, `application/json` |
+| `POST /mcp` with a notification only | `202`, no body |
+| `GET`, `DELETE` or any other method on `/mcp` | `405`, `Allow: POST` |
+
+A client must send `Content-Type: application/json` and an `Accept` header naming both `application/json` and `text/event-stream`, or the request is refused with `415` or `406`. That is the protocol's rule, and it bites hand-written `curl` more than it bites clients.
+
+The protocol versions served are the ones the MCP SDK in `package.json` implements. A client that asks for a newer one is answered with the newest this server has.
+
+The endpoint offers no sign-in and nothing for a client to discover one from: the OAuth discovery paths answer `404` like any other path this service does not serve.
+
+### Tools
+
+| Tool | Arguments | Answers with |
+|---|---|---|
+| `list_markets` | `window_hours` (1 to 168, default 48), `sport` (optional) | The verified games starting in the window, the lines that exist on-chain for each, and the prices posted on both sides of every line |
+| `prepare_order` | `contest_id`, `market`, `side`, `risk_usdc`, `line` (optional) | A preview of the order, a take link, and the identifiers `get_order_status` takes |
+| `get_order_status` | `commitment_hash`, `taker_address` (optional) | The quote's status, what has been taken from it, and its fills |
+
+Every tool answers with one block of text and no structured content. Every tool is annotated read-only.
+
+**Prices are the taker's.** A quote records the price its maker posted. The person taking it gets the complement: a quote posted at 2.05 pays its taker 205/105, shown as 1.95. A lower posted price is a better price for the taker.
+
+**Sides are the taker's too.** A quote records the side its maker holds, and taking it puts the taker on the other one. So the quotes listed under "Under 7.0" are the ones whose makers hold the Over.
+
+**`side`** is `over` or `under` for a total. For a moneyline or a spread it is a team's name, or `away` or `home`. A name is matched on whole words and has to fit exactly one of the two teams.
+
+**`line`** is needed only when a game has more than one line in the market with a quote on that side. A total is named by its number of points. A spread is named by the handicap of the side being backed, so the home team's `+1.5` and the away team's `-1.5` are the same line.
+
+### What `prepare_order` checks
+
+In this order, stopping at the first that fails:
+
+1. The amount is more than zero, has at most six decimal places, and is at most 1,000,000 USDC.
+2. The contest exists and its status is `verified`.
+3. The contest has not started. The start is `matchTime`, the conservative start bound the contest endpoints serve. A contest whose start cannot be read is refused, not treated as upcoming.
+4. The side named is a side of the market.
+5. The market has an open line on-chain. A quote on a line that has no speculation yet is never offered: taking it would create the line, and creating a line costs both parties a fee.
+6. The line, if one was named, is one of those lines.
+7. A quote can be taken on that side.
+
+Checks 2 and 3 are made here because the chain does not make them when a quote is taken on an existing line. A quote's own expiry is the only guard against time that the contract applies.
+
+A quote is offered when it is open, visible on the book, not invalidated by its maker's nonce floor, carries its signature and every signed field, has at least one whole lot of maker risk left, and has more than two minutes before it expires.
+
+**Which quote.** Among the quotes that can fill the whole amount, the one with the best price. If none can, the one that fills the most of it. The first rule is why the best-priced quote is not always chosen: a few cents left at a better price would otherwise take every order and fill almost none of it.
+
+**When no quote can fill the amount**, the order is prepared for the most one quote can take, the preview says so, and the link carries the smaller amount. The contract refuses a request larger than a quote has left instead of filling part of it, so a link carrying the larger amount would fail.
+
+**Maker funding** is read from the funding snapshot the `fillability` field uses. A quote whose maker is known to be short of the fill is passed over. When the snapshot is missing or more than two minutes old, the quote is offered and the preview says the funds were not confirmed.
+
+### The amounts
+
+The amounts in a preview are computed by the contract's own rule, in USDC base units, with no floating point:
+
+```
+profit ticks  = posted price in ticks - 100
+maker risk    = ceil(asked * 100 / profit ticks), rounded DOWN to a multiple of 100 base units
+taker pays    = floor(maker risk * profit ticks / 100), and never more than asked
+taker wins    = maker risk
+```
+
+So a taker can pay slightly less than they asked to risk, and never more. Asked to risk 2 USDC against a quote posted at 2.05, the fill is 1.904700, the taker pays 1.999935 and wins 1.904700.
+
+A preview shows the amounts to the cent, and the exact amounts beside them whenever the two differ. The displayed price is rounded to two decimals and is a label: nothing is computed from it.
+
+`tests/fixtures/take-math-vectors.json` holds 367 worked cases, produced by the match preview builder in `@ospex/sdk`. The arithmetic here is tested against them, and against 211,263 more from the same builder when it was written, with no disagreement.
+
+### The take link
+
+```
+<origin>/take/<commitmentHash>?risk=<usdc>
+```
+
+`risk` is the amount to pass to `matchCommitment` as `takerDesiredRisk`: the amount asked, or the reduced amount when the quote could not fill it. The chain charges that amount or slightly less. `<origin>` is `MCP_TAKE_LINK_BASE_URL`, `https://ospex.org` unless set.
+
+The link carries the whole order. Nothing about it is kept on this side, so a link stays usable for as long as its quote does and no longer.
+
+### What a preview cannot promise
+
+A preview is built from this service's database, which mirrors the chain a few seconds behind it. Between the preview and the transaction a quote can be taken by someone else, cancelled, or expire, and the maker's funds can move. Any of those makes the transaction fail. It costs gas and nothing else: the contract either fills at the posted price or reverts.
+
+The page behind the link is where the chain is read directly, and where the taker's own balance and allowance are checked. This endpoint does not know who the taker is.
+
+### Limits
+
+| Limit | Value |
+|---|---|
+| Requests | 600 a minute for each caller address, counted apart from the REST read limit |
+| Tool calls in one request | 1. Any more in a batch are answered with a JSON-RPC error |
+| Request body | 1 MiB. Larger is refused with `413` |
+| Messages in a batch | 100. More is refused with `400` |
+| Time for one tool call | 20 seconds, then it is answered with an error |
+| Games listed by `list_markets` | 25 by start time. When the window holds more, the answer says how many |
+| Prices shown for one side | 3, best first |
+| Fills listed by `get_order_status` | 1,000. At that number the answer says there may be more |
+
+The request limit is keyed on the caller's address. A hosted assistant calls from its provider's servers, so everyone using the connector through one provider shares the limit for each address that provider calls from. There is no sign-in, so there is nothing narrower to key on.
+
+### What one call costs
+
+| Call | Database reads | Grows with |
+|---|---|---|
+| Handshake, tool list | 0 | nothing |
+| `list_markets` | 3: the contests in the window, the lines under them, the open quotes on them | games in the window, up to 25 |
+| `prepare_order` | 4: the contest, its lines, its open quotes, the funding of the makers on one side | open quotes on one contest |
+| `get_order_status` | 3: the quote, its fills, its contest | fills on one quote, up to 1,000 |
+
+None of them grows with how much history the database holds. The open-quote read is paged: one read for every 999 open quotes on the contests asked for, up to 8, and an answer that ran out of pages says the book is incomplete instead of showing part of it as all of it.
+
+### Errors
+
+A failure reaches a client in one of three shapes, depending on where it happened.
+
+| Where | Shape |
+|---|---|
+| In a tool: bad arguments, a read that failed, a call past its deadline | `200`, a tool result with `isError: true` and a sentence saying what to do |
+| In the protocol: a body that is not JSON-RPC, a missing header, a batch too long | `4xx`, a JSON-RPC error with `id: null` |
+| Before the endpoint: the request limit | `429`, a JSON-RPC error with `id: null` |
+
+A tool that has nothing to offer has not failed. "No game in the window", "no quote on that side" and "that game has started" are answers, and come back without `isError`.
+
+What went wrong inside the service is written to the log and not to the client. A failed read is answered with the same fixed sentence whatever its cause.
+
+### Logging
+
+One line for each request, written when the response closes: the status, whether the client was answered before it left, how long it took, the JSON-RPC methods the request carried, and the protocol version and user agent the client sent. On a handshake, also the client's name and the protocol version it asked for. One line for each tool call: the tool, whether it answered with an error, and how long it took.
+
+Arguments are not logged. A contest id, a commitment hash or a wallet address a caller passes in does not reach the log.
+
+### Trying it
+
+```bash
+# The tools
+curl -s -X POST http://localhost:3000/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+
+# The book
+curl -s -X POST http://localhost:3000/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_markets","arguments":{}}}'
+```
+
 ## Scripts
 
 | Script | What it does |
@@ -888,6 +1051,7 @@ See `.env.example`. Required values are validated at boot — missing vars exit 
 | `BENCHMARK_HEADLINE_BASIS` | no | Which of the four published CLV figures the standings payload names as its `headline`. One of `marginAdjusted.gameLevel` (default), `marginAdjusted.perPick`, `economic.gameLevel`, `economic.perPick`; boot-fatal otherwise. All four are always served — this names the one the front end renders large. |
 | `BENCHMARK_STANDINGS_WINDOW_DAYS` | no | Cohort-days the standings aggregate spans, most recent first. Default 60; boot-fatal outside [1, 400]. |
 | `BENCHMARK_STATS_MAX_AGE_SECONDS` | no | Age past which `/v1/benchmark/stats` nulls its counters and sets `stale`. Default 172800 (48h); boot-fatal outside [3600, 2592000]. |
+| `MCP_TAKE_LINK_BASE_URL` | no | Origin the take links from `prepare_order` point at. Defaults to `https://ospex.org`. An origin only: `https://host`, or `http://` for `localhost` / `127.0.0.1`, an optional port, and nothing after it. Boot-fatal on anything else. |
 | `RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER` | no | Of the per-IP budget, slots reserved for the owner-auth own-state stream — anonymous streams may use at most `(PER_IP - this)`; own-state may use the full `PER_IP`. **Non-negative integer (`0` is allowed** = no reserve / original single shared pool, anon + own-state share the full `PER_IP`); defaults to 3. Surfaced on `/v1/metrics`. |
 
 ## Deployment
@@ -926,6 +1090,7 @@ Set via `heroku config:set <var>=<value> --app ospex-core-api`. Mirrors `.env.ex
 - `BENCHMARK_HEADLINE_BASIS` — optional, default `marginAdjusted.gameLevel`. Which CLV figure the standings payload names as its headline; one of `marginAdjusted.gameLevel` / `marginAdjusted.perPick` / `economic.gameLevel` / `economic.perPick`, boot-fatal otherwise. All four ship regardless
 - `BENCHMARK_STANDINGS_WINDOW_DAYS` — optional, default `60`; **boot-fatal outside [1, 400]**
 - `BENCHMARK_STATS_MAX_AGE_SECONDS` — optional, default `172800` (48h); **boot-fatal outside [3600, 2592000]**
+- `MCP_TAKE_LINK_BASE_URL` — optional, default `https://ospex.org`. The origin `prepare_order` builds its take links on; **boot-fatal unless it is an `https` origin with no path** (or `http` on `localhost` / `127.0.0.1`). `/mcp` needs no other setting, but it reads lines and quotes through the scorer addresses above and answers "not configured" without them
 - `OWN_STATE_SNAPSHOT_MAX_COMMITMENTS` — optional, default `5000`. Per-page commitments cap for `GET /v1/own-state/snapshot`; **boot-fatal outside [100, 50000]**. SDK pages with `?cursor=` until the response carries `truncated: false`
 
 The stream-auth challenge store is **in-memory, per-process**. A challenge minted on one dyno cannot be consumed on another — fine for the current single-dyno Heroku deployment, but horizontal scale-out requires moving challenges to Redis/Postgres or running with sticky routing first. The endpoint-level `503 NOT_READY` checks are deliberately separate from `/readyz` (next section) — `/readyz` keeps the meaning "the always-required dependencies are reachable", and stream-auth is opt-in at the operator level.
@@ -940,6 +1105,9 @@ curl -s "$URL/healthz"            # 200 + service / network / chainId
 curl -s "$URL/readyz"              # 200 only when supabase.connected, contestsView.present and commitments.configured
 curl -s "$URL/v1/protocol/info"    # mainnet contract addresses
 curl -s "$URL/v1/contests"         # paginated list (empty until indexer ingests data)
+curl -s -o /dev/null -w '%{http_code}
+' "$URL/mcp"   # 405: the connector is mounted and takes POST
+curl -s -X POST "$URL/mcp" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \n  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'   # three tools
 ```
 
 `/readyz` checks the always-required dependencies: Supabase reachability, presence of the `contests_effective` view, and EIP-712 relay env config for `POST /v1/commitments`. The view is reported as its own `contestsView: { present, error? }` block rather than folded into `supabase` — it is created by a migration in the protocol indexer's schema, so it can be missing while Postgres is perfectly healthy, and every contest-shaped read depends on it. A PostgREST "relation not found" response therefore reports `supabase.connected: true` and `contestsView.present: false`, and readiness fails on the second term.
@@ -958,7 +1126,16 @@ The view probe is a row-less **GET**, and it treats only a returned rows array a
 
 ```
 src/
-  server.ts            # Express app + boot
+  server.ts            # boot: load config, build the app, listen
+  app.ts               # the Express app: middleware, /mcp, /healthz, /readyz, /v1, 404
+  mcp/                 # POST /mcp — the connector
+    router.ts          #   the route: one server and transport per request, 405 for the rest
+    server.ts          #   the three tools, their schemas, the per-call deadline
+    tools/             #   list_markets, prepare_order, get_order_status
+    book.ts            #   which quotes can be taken, and which one to take (pure)
+    takeMath.ts        #   the contract's fill arithmetic, and amounts as text (pure)
+    words.ts           #   sides, lines, push rules, times (pure)
+    context.ts         #   what a tool is handed and hands back
   lib/
     env.ts             # boot-time env validation, typed Config
     supabase.ts        # lazy-init Supabase client

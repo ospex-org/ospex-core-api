@@ -7,6 +7,7 @@ import { checkDependencies, isReady } from './lib/readiness.js';
 import type { ContestsViewReadiness, SupabaseReadiness } from './lib/readiness.js';
 import { asyncHandler } from './middleware/asyncHandler.js';
 import { errorHandler } from './middleware/errorHandler.js';
+import { createMcpRouter } from './mcp/router.js';
 import { v1Router } from './v1/router.js';
 
 /**
@@ -70,6 +71,18 @@ export function buildApp(config: ReturnType<typeof loadConfig>): express.Express
         if (typeof ct === 'string' && ct.includes('text/event-stream')) return false;
         return compression.filter(req, res);
       },
+    }),
+  );
+
+  // The connector endpoint. Mounted AHEAD of the JSON parser on purpose: its
+  // transport reads the request body itself, so a body it cannot read is
+  // answered in the protocol's own error shape. See mcp/router.ts.
+  app.use(
+    '/mcp',
+    createMcpRouter({
+      network: config.network,
+      scorers: config.scorers,
+      takeLinkBaseUrl: config.mcpTakeLinkBaseUrl,
     }),
   );
 

@@ -54,6 +54,37 @@ export const benchmarkRateLimit = rateLimit({
   },
 });
 
+/**
+ * Rate limiter for `/mcp`.
+ *
+ * Its own counter, so connector traffic and REST reads do not spend one
+ * budget. The same size as the read budget, for the same reason: a tool call
+ * is a handful of reads.
+ *
+ * The key is the caller's address, and for a hosted assistant that is the
+ * assistant provider's address, not the person's. Everyone using the connector
+ * through one provider shares this budget per provider address. There is no
+ * sign-in on the endpoint, so there is nothing narrower to key on.
+ *
+ * What counts against it: every request to the endpoint, including the
+ * handshake a client makes before its first tool call and the 405 a probing
+ * GET receives. One session of connect, list the tools, call one, measured
+ * five requests with the reference client.
+ *
+ * The body is JSON-RPC, like everything else this endpoint answers.
+ */
+export const mcpRateLimit = rateLimit({
+  windowMs: 60_000,
+  limit: 600,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: {
+    jsonrpc: '2.0',
+    error: { code: -32000, message: 'Too many requests from this address, please slow down.' },
+    id: null,
+  },
+});
+
 export const readRateLimit = rateLimit({
   windowMs: 60_000,
   limit: 600,

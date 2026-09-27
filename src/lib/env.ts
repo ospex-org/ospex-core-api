@@ -193,6 +193,18 @@ export interface Config {
    * the counters are null and `stale` is true.
    */
   benchmarkStatsMaxAgeSeconds: number;
+  /**
+   * Origin the connector's take links point at (`MCP_TAKE_LINK_BASE_URL`).
+   * Default `https://ospex.org`. `prepare_order` answers with
+   * `<origin>/take/<commitmentHash>?risk=<usdc>`, and the page there is what
+   * builds the transaction; this service never does.
+   *
+   * An origin only: scheme and host, no path and no trailing slash. `https`,
+   * or `http` for a loopback host so a page under development can be linked
+   * to. Boot-fatal on anything else: a link is something a person is asked to
+   * open with their wallet, so a typo here must not start.
+   */
+  mcpTakeLinkBaseUrl: string;
   herokuBuildCommit?: string;
   herokuSlugCommit?: string;
   herokuReleaseVersion?: string;
@@ -293,6 +305,20 @@ function parseBoolEnv(name: string, defaultValue: boolean): boolean {
   if (s === 'false' || s === '0') return false;
   logger.fatal({ var: name, value: raw }, `${name} must be true|false|1|0`);
   process.exit(1);
+}
+
+export const DEFAULT_TAKE_LINK_BASE_URL = 'https://ospex.org';
+
+const HTTPS_ORIGIN = /^https:\/\/[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:\d{1,5})?$/i;
+const LOOPBACK_ORIGIN = /^http:\/\/(localhost|127\.0\.0\.1)(:\d{1,5})?$/i;
+
+/**
+ * True for an origin a take link may be built on: scheme and host, an optional
+ * port, and nothing after it. No path, query, fragment, credentials or
+ * trailing slash, so appending `/take/...` cannot land anywhere unexpected.
+ */
+export function isTakeLinkOrigin(value: string): boolean {
+  return HTTPS_ORIGIN.test(value) || LOOPBACK_ORIGIN.test(value);
 }
 
 let cached: Config | undefined;
@@ -492,6 +518,15 @@ export function loadConfig(): Config {
     process.exit(1);
   }
 
+  const mcpTakeLinkBaseUrl = optionalEnv('MCP_TAKE_LINK_BASE_URL') ?? DEFAULT_TAKE_LINK_BASE_URL;
+  if (!isTakeLinkOrigin(mcpTakeLinkBaseUrl)) {
+    logger.fatal(
+      { var: 'MCP_TAKE_LINK_BASE_URL', value: mcpTakeLinkBaseUrl },
+      'MCP_TAKE_LINK_BASE_URL must be an origin with no path: https://host, or http:// for localhost',
+    );
+    process.exit(1);
+  }
+
   cached = {
     port,
     nodeEnv,
@@ -506,6 +541,7 @@ export function loadConfig(): Config {
     benchmarkHeadlineBasis,
     benchmarkStandingsWindowDays,
     benchmarkStatsMaxAgeSeconds,
+    mcpTakeLinkBaseUrl,
     ...(supabaseAnonKey !== undefined ? { supabaseAnonKey } : {}),
     ...(benchmarkPublicMinSlateDate !== undefined ? { benchmarkPublicMinSlateDate } : {}),
     ...(alchemyRpcUrl !== undefined ? { alchemyRpcUrl } : {}),
