@@ -19,7 +19,7 @@ import { loadConfig } from '../lib/env.js';
 import { logger } from '../lib/logger.js';
 import { getSupabase } from '../lib/supabase.js';
 import { wei6ToUSDC } from '../lib/sanitize.js';
-import type { CursorableRow } from '../lib/cursor.js';
+import type { CursorableRow, StreamCursor } from '../lib/cursor.js';
 import { nextCursor, parseRecovery, recoveryKeysetExpr } from '../lib/recovery.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 
@@ -152,27 +152,60 @@ export async function getFillsHandler(req: Request, res: Response): Promise<void
     commitmentHash = raw.toLowerCase();
   }
 
-  let q = sb.from('position_fills').select(FILL_COLUMNS).eq('network', config.network);
-  if (maker !== undefined) q = q.eq('maker_address', maker);
-  if (taker !== undefined) q = q.eq('taker_address', taker);
-  if (speculationId !== undefined) q = q.eq('speculation_id', speculationId);
-  if (contestId !== undefined) q = q.eq('contest_id', contestId);
-  if (commitmentHash !== undefined) q = q.eq('commitment_hash', commitmentHash);
-  if (recovery.cursor) q = q.or(recoveryKeysetExpr(recovery.cursor));
-  q = q.order('row_updated_at', { ascending: true }).order('id', { ascending: true }).limit(recovery.limit);
-
-  const { data, error } = await q;
-  if (error) {
-    logger.error({ err: error.message }, 'fills: recovery query failed');
+  const read = await fetchFillRows(
+    sb,
+    config.network,
+    { maker, taker, speculationId, contestId, commitmentHash },
+    { cursor: recovery.cursor, limit: recovery.limit },
+  );
+  if (read.error !== null) {
+    logger.error({ err: read.error }, 'fills: recovery query failed');
     res.status(500).json({ error: 'Failed to fetch fills.', code: 'INTERNAL_ERROR' } satisfies ApiError);
     return;
   }
 
-  const rows = (data ?? []) as unknown as FillRow[];
+  const rows = read.rows;
   const last = rows.length > 0 ? rows[rows.length - 1] : undefined;
   res.status(200).json({
     fills: rows.map(rowToBody),
     nextCursor: nextCursor('fills', last, recovery.sinceRaw),
     hasMore: rows.length === recovery.limit,
   });
+}
+
+/** Identity filters for a fills read. Every value must already be validated and lowercased. */
+export interface FillFilters {
+  maker?: string | undefined;
+  taker?: string | undefined;
+  speculationId?: string | undefined;
+  contestId?: string | undefined;
+  commitmentHash?: string | undefined;
+}
+
+/**
+ * The read behind `GET /v1/fills`, for callers that are not a request handler.
+ * Oldest first, by `(row_updated_at, id)`. Rows are returned rather than bodies
+ * because a caller that pages needs the last row's cursor columns, which the
+ * wire body does not carry.
+ *
+ * A page of exactly `limit` rows may not be the last one.
+ */
+export async function fetchFillRows(
+  sb: ReturnType<typeof getSupabase>,
+  network: string,
+  filters: FillFilters,
+  page: { cursor: StreamCursor | null; limit: number },
+): Promise<{ rows: FillRow[]; error: null } | { rows: null; error: string }> {
+  let q = sb.from('position_fills').select(FILL_COLUMNS).eq('network', network);
+  if (filters.maker !== undefined) q = q.eq('maker_address', filters.maker);
+  if (filters.taker !== undefined) q = q.eq('taker_address', filters.taker);
+  if (filters.speculationId !== undefined) q = q.eq('speculation_id', filters.speculationId);
+  if (filters.contestId !== undefined) q = q.eq('contest_id', filters.contestId);
+  if (filters.commitmentHash !== undefined) q = q.eq('commitment_hash', filters.commitmentHash);
+  if (page.cursor) q = q.or(recoveryKeysetExpr(page.cursor));
+  q = q.order('row_updated_at', { ascending: true }).order('id', { ascending: true }).limit(page.limit);
+
+  const { data, error } = await q;
+  if (error) return { rows: null, error: error.message };
+  return { rows: (data ?? []) as unknown as FillRow[], error: null };
 }

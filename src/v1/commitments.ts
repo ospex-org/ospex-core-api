@@ -531,6 +531,144 @@ export async function fetchOpenCommitmentsByContestId(
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Open book across several contests, drained
+//
+// `fetchOpenCommitmentsByContestId` answers one contest with one request capped
+// at the server's row ceiling and no ordering, so past that ceiling it returns
+// an arbitrary subset and says nothing. That is acceptable for a display; it is
+// not for a caller that has to find the BEST quote, where a row that silently
+// failed to come back can be the one that mattered.
+//
+// This reader pages by `commitment_hash` until a short page, within a fixed
+// budget of requests, and reports whether it reached the end. It applies the
+// same four-term open-book filter and the same public mapper.
+// ────────────────────────────────────────────────────────────────────────
+
+/**
+ * Rows asked for per request. One below the server's ceiling on purpose: a
+ * page of exactly this many rows is then a full page by OUR limit, and cannot
+ * be a response the server cut short.
+ */
+export const OPEN_BOOK_PAGE_ROWS = 999;
+/** Requests one drain may issue. 8 pages is 7,992 open quotes. */
+export const OPEN_BOOK_MAX_PAGES = 8;
+/** Contest ids one drain accepts. Bounds the length of the `IN` list. */
+export const OPEN_BOOK_MAX_CONTESTS = 100;
+
+export type OpenBookRead =
+  | {
+      ok: true;
+      /** Visible open quotes only; a row the public mapper redacts is dropped. */
+      commitments: CommitmentBody[];
+      /** False when the page budget ran out before the end was reached. */
+      complete: boolean;
+    }
+  | { ok: false; error: string };
+
+/**
+ * Every open, visible, unexpired quote on the given contests.
+ *
+ * `contestIds` must be canonical decimal strings. `nowMs` is the caller's one
+ * captured clock reading, shared with whatever else it compares against time.
+ *
+ * Cost: one request per 999 open quotes across the contests asked for, at
+ * most {@link OPEN_BOOK_MAX_PAGES}. It tracks how many quotes are OPEN on those
+ * contests, not how many were ever posted.
+ */
+export async function fetchOpenBook(
+  sb: ReturnType<typeof getSupabase>,
+  network: string,
+  contestIds: readonly string[],
+  nowMs: number,
+): Promise<OpenBookRead> {
+  if (contestIds.length === 0) return { ok: true, commitments: [], complete: true };
+  if (contestIds.length > OPEN_BOOK_MAX_CONTESTS) {
+    return { ok: false, error: `open book read refused: ${String(contestIds.length)} contests in one call` };
+  }
+
+  const nowIso = new Date(nowMs).toISOString();
+  const commitments: CommitmentBody[] = [];
+  let afterHash: string | undefined;
+
+  for (let page = 0; page < OPEN_BOOK_MAX_PAGES; page += 1) {
+    let query = sb
+      .from('commitments')
+      .select(COMMITMENT_COLUMNS)
+      .eq('network', network)
+      .in('contest_id', [...contestIds])
+      .in('status', ['open', 'partially_filled'])
+      .eq('book_visible', true)
+      .eq('nonce_invalidated', false)
+      .gt('expiry', nowIso);
+    if (afterHash !== undefined) query = query.gt('commitment_hash', afterHash);
+    const { data, error } = await query
+      .order('commitment_hash', { ascending: true })
+      .limit(OPEN_BOOK_PAGE_ROWS);
+
+    if (error) return { ok: false, error: error.message };
+    // A short page is a claim that the end was reached, so an answer that is
+    // not a list cannot be read as an empty one.
+    if (!Array.isArray(data)) return { ok: false, error: 'open book read did not answer a list' };
+    const rows = data as unknown as CommitmentRow[];
+    if (rows.length > OPEN_BOOK_PAGE_ROWS) return { ok: false, error: 'open book read answered an oversized page' };
+
+    for (const row of rows) {
+      if (typeof row.commitment_hash !== 'string' || row.commitment_hash === '') {
+        return { ok: false, error: 'open book read answered a row with no hash' };
+      }
+      // Strictly ascending, or the cursor cannot be trusted to have covered
+      // everything behind it.
+      if (afterHash !== undefined && row.commitment_hash <= afterHash) {
+        return { ok: false, error: 'open book read answered a page that does not advance' };
+      }
+      afterHash = row.commitment_hash;
+
+      const body = commitmentRowToPublicBody(row, nowMs);
+      if ('redacted' in body) {
+        logger.warn(
+          { commitmentHash: body.commitmentHash },
+          'commitments: hidden row reached the open book drain — dropped',
+        );
+        continue;
+      }
+      commitments.push(body);
+    }
+
+    if (rows.length < OPEN_BOOK_PAGE_ROWS) return { ok: true, commitments, complete: true };
+  }
+
+  logger.warn(
+    { network, contests: contestIds.length, rows: commitments.length },
+    'commitments: open book drain ran out of pages, book is incomplete',
+  );
+  return { ok: true, commitments, complete: false };
+}
+
+/**
+ * Funding snapshots for a set of makers, keyed by lowercased address. The read
+ * behind the advisory `fillability` field, for callers that are not the list
+ * handler. A failed read answers an empty map: funding is then unknown for
+ * every maker, never assumed present.
+ */
+export async function fetchMakerBacking(
+  sb: ReturnType<typeof getSupabase>,
+  network: string,
+  makers: string[],
+  nowMs: number,
+): Promise<Map<string, { backing: bigint; fresh: boolean }>> {
+  const snapshots = await fetchMakerFunding(sb, network, makers);
+  const out = new Map<string, { backing: bigint; fresh: boolean }>();
+  for (const [maker, snapshot] of snapshots) {
+    const ageMs = nowMs - snapshot.updatedAtMs;
+    out.set(maker, {
+      backing: snapshot.backingWei6,
+      fresh: Number.isFinite(ageMs) && ageMs <= FILLABILITY_STALE_MS,
+    });
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // POST /v1/commitments
 // ────────────────────────────────────────────────────────────────────────
 
@@ -1158,7 +1296,7 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
 // GET /v1/commitments/:hash
 // ────────────────────────────────────────────────────────────────────────
 
-const HASH_PATTERN = /^0x[0-9a-f]{64}$/i;
+export const HASH_PATTERN = /^0x[0-9a-f]{64}$/i;
 
 /**
  * Single-row lookup by EIP-712 commitment hash. Returns the canonical
@@ -1183,19 +1321,14 @@ export async function getCommitmentByHashHandler(req: Request, res: Response): P
   }
   const hash = raw.toLowerCase();
 
-  const { data, error } = await sb
-    .from('commitments')
-    .select(COMMITMENT_COLUMNS)
-    .eq('network', config.network)
-    .eq('commitment_hash', hash)
-    .maybeSingle();
+  const found = await fetchPublicCommitmentByHash(sb, config.network, hash, nowMs);
 
-  if (error) {
-    logger.error({ err: error.message }, 'commitments: get-by-hash query failed');
+  if (found.error !== null) {
+    logger.error({ err: found.error }, 'commitments: get-by-hash query failed');
     res.status(500).json({ error: 'Failed to fetch commitment.', code: 'INTERNAL_ERROR' } satisfies ApiError);
     return;
   }
-  if (!data) {
+  if (found.commitment === null) {
     res.status(404).json({
       error: `Commitment ${hash} not found.`,
       code: 'NOT_FOUND',
@@ -1203,7 +1336,38 @@ export async function getCommitmentByHashHandler(req: Request, res: Response): P
     return;
   }
 
-  res.status(200).json(commitmentRowToPublicBody(data as unknown as CommitmentRow, nowMs));
+  res.status(200).json(found.commitment);
+}
+
+/**
+ * One commitment by hash, as an anonymous reader may see it: the full body for
+ * a visible row, the allow-list projection for a hidden one, `null` when no row
+ * exists. The read `GET /v1/commitments/:hash` serves, for callers that are not
+ * a request handler.
+ *
+ * `hash` must already be validated and lowercased. There is no status,
+ * visibility or expiry filter: a filled or expired row is returned, and says so
+ * in `status`.
+ */
+export async function fetchPublicCommitmentByHash(
+  sb: ReturnType<typeof getSupabase>,
+  network: string,
+  hash: string,
+  nowMs: number,
+): Promise<
+  | { commitment: CommitmentBody | CommitmentHiddenBody | null; error: null }
+  | { commitment: null; error: string }
+> {
+  const { data, error } = await sb
+    .from('commitments')
+    .select(COMMITMENT_COLUMNS)
+    .eq('network', network)
+    .eq('commitment_hash', hash)
+    .maybeSingle();
+
+  if (error) return { commitment: null, error: error.message };
+  if (!data) return { commitment: null, error: null };
+  return { commitment: commitmentRowToPublicBody(data as unknown as CommitmentRow, nowMs), error: null };
 }
 
 // ────────────────────────────────────────────────────────────────────────

@@ -183,6 +183,7 @@ import { getSupabase } from '../lib/supabase.js';
 import { CONTESTS_VIEW } from '../lib/tables.js';
 import { deriveSpeculationKey } from '../lib/eip712.js';
 import { SPORTS as VALID_SPORTS, isSport } from '../lib/sports.js';
+import type { ScorerAddresses } from '../lib/speculation.js';
 import { resolveTeamIdsForContest } from '../lib/teamIds.js';
 import type { ApiError } from '../middleware/errorHandler.js';
 import { fetchOpenCommitmentsByContestId, type CommitmentBody } from './commitments.js';
@@ -209,7 +210,7 @@ const MAX_WINDOW_HOURS = 168;
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 200;
 
-interface ContestBody {
+export interface ContestBody {
   contestId: string;
   awayTeam: string;
   homeTeam: string;
@@ -237,7 +238,7 @@ interface ContestBody {
   status: string;
 }
 
-interface ContestListItem extends ContestBody {
+export interface ContestListItem extends ContestBody {
   /** Canonical identity of the linked game, served on BOTH list modes: the
    *  contest's JSONOdds linkage (`contests.jsonodds_id`), the same string
    *  `/v1/games` serves as its `gameId` — the games table has no surrogate
@@ -310,7 +311,7 @@ interface ContestDetail extends ContestBody {
 }
 
 /** Explicit row shape for the list query (see the cast in getContestsHandler). */
-interface ContestListRow {
+export interface ContestListRow {
   contest_id: string | number;
   /** The contest's JSONOdds linkage, selected in BOTH list modes: served on
    *  every list row as `gameId` / `jsonoddsId` (see the file header's game
@@ -671,80 +672,34 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
   }
 
   const sb = getSupabase();
-  const now = new Date().toISOString();
-  const upper = new Date(Date.now() + windowHours * 3600_000).toISOString();
-
-  // The window filter + ordering run on `effective_start_time`, the same value
-  // served as `matchTime`, so the endpoint never returns a row whose served
-  // start falls outside its own window. Consequence for a moved-up contest: it
-  // drops out of the listing at the EARLIER time and a run-loop consumer
-  // untracks it, rather than keeping it listed until the frozen chain time.
-  //
-  // `.not('start_time', 'is', null)` preserves a pre-existing behaviour that
-  // would otherwise silently change: `.gte('start_time', now)` excluded rows
-  // with a NULL `start_time` (an unverified contest), and
-  // `effective_start_time` is non-null whenever a games row exists — so
-  // without this, unverified contests would newly appear in the list.
-  // Dated mode keeps the same eligibility rule for the same reason — the day
-  // window is a different bound, not a different listing.
-  //
-  // The dated window is HALF-OPEN — `.lt`, not `.lte` — so a start at exactly
-  // `date+1 00:00:00Z` belongs to the next day and each contest lands in
-  // exactly one day. The bound comparison happens in Postgres at full
-  // `timestamptz` precision; nothing here parses a served timestamp.
-  let q = sb
-    .from(CONTESTS_VIEW)
-    .select(CONTEST_LIST_COLUMNS, { count: 'exact' })
-    .eq('network', config.network)
-    .not('start_time', 'is', null);
-  q =
-    datedDay === null
-      ? q.gte('effective_start_time', now).lte('effective_start_time', upper)
-      : q.gte('effective_start_time', datedDay.gte).lt('effective_start_time', datedDay.lt);
-  q = q.order('effective_start_time', { ascending: true });
-  // Dated mode exists to enumerate a whole day COMPLETELY, and slates
-  // cluster on shared start instants — so ties are routine and an
-  // order-by without a unique key makes offset pagination able to skip or
-  // repeat a tied row between pages. `contest_id` is unique within the
-  // `.eq('network', …)` scope. The forward listing shares the tie hazard
-  // but is left untouched here to keep the no-date path unchanged;
-  // aligning it is a follow-up decision.
-  if (datedDay !== null) q = q.order('contest_id', { ascending: true });
-  q = q.range(offset, offset + limit - 1);
-
-  if (sportFilter) q = q.eq('sport_slug', sportFilter);
-  if (statusFilter) q = q.eq('contest_status', statusFilter);
-
-  const contestsRes = await q;
-  if (contestsRes.error) {
-    logger.error({ err: contestsRes.error.message }, 'contests: list query failed');
-    res.status(500).json({ error: 'Failed to list contests.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+  const read = await fetchContestListRows(sb, config.network, {
+    nowMs: Date.now(),
+    windowHours,
+    sport: sportFilter,
+    status: statusFilter,
+    limit,
+    offset,
+    datedDay,
+    tiebreakByContestId: false,
+  });
+  if (!read.ok) {
+    if (read.stage === 'contests') {
+      logger.error({ err: read.message }, 'contests: list query failed');
+      res.status(500).json({ error: 'Failed to list contests.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+    } else {
+      logger.error({ err: read.message }, 'contests: speculation query failed');
+      res.status(500).json({ error: 'Failed to list speculations.', code: 'INTERNAL_ERROR' } satisfies ApiError);
+    }
     return;
   }
 
-  // Supabase's select-string inference gives up at this column count and
-  // falls back to `GenericStringError`, so narrow with an explicit row shape
-  // at the consumer — same pattern as `ContestDetailRow` below.
-  const contests = (contestsRes.data ?? []) as unknown as ContestListRow[];
-  const total = contestsRes.count ?? 0;
+  const contests = read.rows;
+  const total = read.total;
   if (contests.length === 0) {
     res.status(200).json({
       contests: [],
       pagination: { limit, offset, total, hasMore: false },
     });
-    return;
-  }
-
-  const contestIds = contests.map((c) => c.contest_id);
-  const specsRes = await sb
-    .from('speculations')
-    .select(SPECULATION_COLUMNS)
-    .eq('network', config.network)
-    .in('contest_id', contestIds);
-
-  if (specsRes.error) {
-    logger.error({ err: specsRes.error.message }, 'contests: speculation query failed');
-    res.status(500).json({ error: 'Failed to list speculations.', code: 'INTERNAL_ERROR' } satisfies ApiError);
     return;
   }
 
@@ -786,9 +741,131 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
     }
   }
 
+  const contestsList = buildContestListItems(contests, read.specRows, scorers, finalTypeByJsonoddsId);
+
+  res.status(200).json({
+    contests: contestsList,
+    pagination: { limit, offset, total, hasMore: offset + contests.length < total },
+  });
+}
+
+/** What a contest-list read is asked for. Every value must already be validated. */
+export interface ContestListQuery {
+  /** The caller's one captured clock reading. Both window bounds are derived from it. */
+  nowMs: number;
+  /** Forward window in hours. Ignored when `datedDay` is set. */
+  windowHours: number;
+  sport: string | null;
+  status: string | null;
+  limit: number;
+  offset: number;
+  /** A UTC day, replacing the forward window. */
+  datedDay: { gte: string; lt: string } | null;
+  /**
+   * Order ties on `contest_id` in the forward window too. Dated mode always
+   * does. `GET /v1/contests` passes false, which leaves its forward listing
+   * ordered exactly as before.
+   */
+  tiebreakByContestId: boolean;
+}
+
+export type ContestListRead =
+  | { ok: true; rows: ContestListRow[]; specRows: SpeculationRow[]; total: number }
+  | { ok: false; stage: 'contests' | 'speculations'; message: string };
+
+/**
+ * The two reads behind the contest listing: the contests in the window, then
+ * every speculation under them. For `GET /v1/contests` and for callers that
+ * are not a request handler.
+ *
+ * No speculation read is issued when no contest matched.
+ */
+export async function fetchContestListRows(
+  sb: ReturnType<typeof getSupabase>,
+  network: string,
+  query: ContestListQuery,
+): Promise<ContestListRead> {
+  const { datedDay } = query;
+  const now = new Date(query.nowMs).toISOString();
+  const upper = new Date(query.nowMs + query.windowHours * 3600_000).toISOString();
+
+  // The window filter + ordering run on `effective_start_time`, the same value
+  // served as `matchTime`, so the endpoint never returns a row whose served
+  // start falls outside its own window. Consequence for a moved-up contest: it
+  // drops out of the listing at the EARLIER time and a run-loop consumer
+  // untracks it, rather than keeping it listed until the frozen chain time.
+  //
+  // `.not('start_time', 'is', null)` preserves a pre-existing behaviour that
+  // would otherwise silently change: `.gte('start_time', now)` excluded rows
+  // with a NULL `start_time` (an unverified contest), and
+  // `effective_start_time` is non-null whenever a games row exists — so
+  // without this, unverified contests would newly appear in the list.
+  // Dated mode keeps the same eligibility rule for the same reason — the day
+  // window is a different bound, not a different listing.
+  //
+  // The dated window is HALF-OPEN — `.lt`, not `.lte` — so a start at exactly
+  // `date+1 00:00:00Z` belongs to the next day and each contest lands in
+  // exactly one day. The bound comparison happens in Postgres at full
+  // `timestamptz` precision; nothing here parses a served timestamp.
+  let q = sb
+    .from(CONTESTS_VIEW)
+    .select(CONTEST_LIST_COLUMNS, { count: 'exact' })
+    .eq('network', network)
+    .not('start_time', 'is', null);
+  q =
+    datedDay === null
+      ? q.gte('effective_start_time', now).lte('effective_start_time', upper)
+      : q.gte('effective_start_time', datedDay.gte).lt('effective_start_time', datedDay.lt);
+  q = q.order('effective_start_time', { ascending: true });
+  // Dated mode exists to enumerate a whole day COMPLETELY, and slates
+  // cluster on shared start instants — so ties are routine and an
+  // order-by without a unique key makes offset pagination able to skip or
+  // repeat a tied row between pages. `contest_id` is unique within the
+  // `.eq('network', …)` scope. The forward listing shares the tie hazard
+  // but is left untouched here to keep the no-date path unchanged;
+  // aligning it is a follow-up decision.
+  if (datedDay !== null || query.tiebreakByContestId) q = q.order('contest_id', { ascending: true });
+  q = q.range(query.offset, query.offset + query.limit - 1);
+
+  if (query.sport) q = q.eq('sport_slug', query.sport);
+  if (query.status) q = q.eq('contest_status', query.status);
+
+  const contestsRes = await q;
+  if (contestsRes.error) return { ok: false, stage: 'contests', message: contestsRes.error.message };
+
+  // Supabase's select-string inference gives up at this column count and
+  // falls back to `GenericStringError`, so narrow with an explicit row shape
+  // at the consumer — same pattern as `ContestDetailRow` below.
+  const rows = (contestsRes.data ?? []) as unknown as ContestListRow[];
+  const total = contestsRes.count ?? 0;
+  if (rows.length === 0) return { ok: true, rows, specRows: [], total };
+
+  const contestIds = rows.map((c) => c.contest_id);
+  const specsRes = await sb
+    .from('speculations')
+    .select(SPECULATION_COLUMNS)
+    .eq('network', network)
+    .in('contest_id', contestIds);
+
+  if (specsRes.error) return { ok: false, stage: 'speculations', message: specsRes.error.message };
+  return { ok: true, rows, specRows: (specsRes.data ?? []) as unknown as SpeculationRow[], total };
+}
+
+/**
+ * Contest rows and their speculation rows, as list items. Pure.
+ *
+ * `finalTypeByJsonoddsId` is the dated-mode finality map; `null` leaves the
+ * `gameFinalType` key off every item.
+ */
+export function buildContestListItems(
+  contests: ContestListRow[],
+  specRows: SpeculationRow[],
+  scorers: ScorerAddresses,
+  finalTypeByJsonoddsId: Map<string, string> | null,
+): ContestListItem[] {
   const specsByContest = new Map<string, Speculation[]>();
-  for (const s of specsRes.data ?? []) {
-    const ms = specRowToSpeculationViaScorer(s as SpeculationRow, scorers);
+  for (const s of specRows) {
+    const ms = specRowToSpeculationViaScorer(s, scorers);
     if (!ms) continue;
     const key = String(s.contest_id);
     const list = specsByContest.get(key) ?? [];
@@ -796,7 +873,7 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
     specsByContest.set(key, list);
   }
 
-  const contestsList: ContestListItem[] = contests.map((c) => {
+  return contests.map((c) => {
     const item: ContestListItem = {
       contestId: String(c.contest_id),
       // Game identity, both modes, always-present keys (see the file
@@ -832,11 +909,59 @@ export async function getContestsHandler(req: Request, res: Response): Promise<v
     }
     return item;
   });
+}
 
-  res.status(200).json({
-    contests: contestsList,
-    pagination: { limit, offset, total, hasMore: offset + contests.length < total },
-  });
+export type ContestItemRead =
+  | { ok: true; contest: ContestListItem | null }
+  | { ok: false; stage: 'contests' | 'speculations'; message: string };
+
+/**
+ * One contest as a list item, with its speculations and without orderbooks,
+ * whatever its status and whenever it starts. `null` when no such contest
+ * exists. For callers that are not a request handler.
+ *
+ * Unlike the listing this applies no eligibility rule, so an unverified,
+ * started or scored contest is returned and it is the caller's job to read
+ * `status` and `matchTime`. `contestId` must be a canonical decimal string.
+ *
+ * `withSpeculations: false` skips the second read and answers with an empty
+ * `speculations`, for a caller that wants the contest's names and times only.
+ */
+export async function fetchContestListItem(
+  sb: ReturnType<typeof getSupabase>,
+  network: string,
+  contestId: string,
+  scorers: ScorerAddresses,
+  withSpeculations: boolean = true,
+): Promise<ContestItemRead> {
+  const contestRes = await sb
+    .from(CONTESTS_VIEW)
+    .select(CONTEST_LIST_COLUMNS)
+    .eq('network', network)
+    .eq('contest_id', contestId)
+    .maybeSingle();
+  if (contestRes.error) return { ok: false, stage: 'contests', message: contestRes.error.message };
+  if (!contestRes.data) return { ok: true, contest: null };
+  const row = contestRes.data as unknown as ContestListRow;
+  if (!withSpeculations) {
+    const [named] = buildContestListItems([row], [], scorers, null);
+    return { ok: true, contest: named ?? null };
+  }
+
+  const specsRes = await sb
+    .from('speculations')
+    .select(SPECULATION_COLUMNS)
+    .eq('network', network)
+    .eq('contest_id', contestId);
+  if (specsRes.error) return { ok: false, stage: 'speculations', message: specsRes.error.message };
+
+  const [contest] = buildContestListItems(
+    [row],
+    (specsRes.data ?? []) as unknown as SpeculationRow[],
+    scorers,
+    null,
+  );
+  return { ok: true, contest: contest ?? null };
 }
 
 // ── GET /v1/contests/:contestId ─────────────────────────────────────────
