@@ -1,0 +1,142 @@
+import express, { type Request, type Response } from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import compression from 'compression';
+import type { loadConfig } from './lib/env.js';
+import { checkDependencies, isReady } from './lib/readiness.js';
+import type { ContestsViewReadiness, SupabaseReadiness } from './lib/readiness.js';
+import { asyncHandler } from './middleware/asyncHandler.js';
+import { errorHandler } from './middleware/errorHandler.js';
+import { createMcpRouter } from './mcp/router.js';
+import { v1Router } from './v1/router.js';
+
+/**
+ * The Express app, separate from the process that listens on it.
+ *
+ * `server.ts` builds this and starts listening. It lives in a module of its
+ * own so the app a test starts is this one, with this middleware in this
+ * order, and not a copy of it.
+ */
+
+interface LivenessResponse {
+  ok: true;
+  service: 'ospex-core-api';
+  network: 'polygon' | 'amoy';
+  chainId: 137 | 80002;
+  uptimeSeconds: number;
+  timestamp: string;
+}
+
+interface ReadinessResponse {
+  ok: boolean;
+  service: 'ospex-core-api';
+  network: 'polygon' | 'amoy';
+  chainId: 137 | 80002;
+  supabase: SupabaseReadiness;
+  /**
+   * Presence of the `contests_effective` view. Reported separately from
+   * `supabase.connected` because the view is created by an indexer migration
+   * and can be absent while Postgres is healthy — see lib/readiness.ts.
+   */
+  contestsView: ContestsViewReadiness;
+  commitments: { configured: boolean; missing?: string[] };
+  uptimeSeconds: number;
+  timestamp: string;
+}
+
+function checkCommitmentsConfig(
+  config: ReturnType<typeof loadConfig>,
+): { configured: boolean; missing?: string[] } {
+  const missing: string[] = [];
+  if (!config.matchingModuleAddress) missing.push('MATCHING_MODULE_ADDRESS');
+  if (!config.scorers) missing.push('SCORER_*_ADDRESS');
+  if (missing.length === 0) return { configured: true };
+  return { configured: false, missing };
+}
+
+export function buildApp(config: ReturnType<typeof loadConfig>): express.Express {
+  const app = express();
+  app.disable('x-powered-by');
+  app.set('trust proxy', 1);
+
+  app.use(helmet());
+  app.use(cors());
+  app.use(
+    compression({
+      // Never compress SSE — buffering/transforming an event stream defeats
+      // its purpose. The stream handler sets `Content-Type: text/event-stream`
+      // before the first write, so the filter sees it here.
+      filter: (req, res) => {
+        const ct = res.getHeader('Content-Type');
+        if (typeof ct === 'string' && ct.includes('text/event-stream')) return false;
+        return compression.filter(req, res);
+      },
+    }),
+  );
+
+  // The connector endpoint. Mounted AHEAD of the JSON parser on purpose: it
+  // reads the request body with a parser of its own, so a body that cannot be
+  // read is answered in the protocol's own error shape. See mcp/router.ts.
+  app.use(
+    '/mcp',
+    createMcpRouter({
+      network: config.network,
+      scorers: config.scorers,
+      takeLinkBaseUrl: config.mcpTakeLinkBaseUrl,
+    }),
+  );
+
+  app.use(express.json({ limit: '1mb' }));
+
+  // Liveness — process is up. No dependency checks. Always 200 while the
+  // event loop can answer. Heroku/uptime monitors should hit this; restarting
+  // the dyno doesn't fix Supabase, so we don't fail liveness when Supabase is
+  // down.
+  app.get('/healthz', (_req: Request, res: Response) => {
+    const body: LivenessResponse = {
+      ok: true,
+      service: 'ospex-core-api',
+      network: config.network,
+      chainId: config.chainId,
+      uptimeSeconds: Math.round(process.uptime()),
+      timestamp: new Date().toISOString(),
+    };
+    res.status(200).json(body);
+  });
+
+  // Readiness — process is up AND its required dependencies are reachable
+  // AND its mounted endpoints have the env they need. Returns 503 if any
+  // of those is missing so traffic routers / smoke tests can avoid sending
+  // requests that would fail.
+  app.get(
+    '/readyz',
+    asyncHandler(async (_req: Request, res: Response) => {
+      const deps = await checkDependencies();
+      const { supabase, contestsView } = deps;
+      const commitments = checkCommitmentsConfig(config);
+      const ok = isReady(deps, commitments);
+      const body: ReadinessResponse = {
+        ok,
+        service: 'ospex-core-api',
+        network: config.network,
+        chainId: config.chainId,
+        supabase,
+        contestsView,
+        commitments,
+        uptimeSeconds: Math.round(process.uptime()),
+        timestamp: new Date().toISOString(),
+      };
+      res.status(ok ? 200 : 503).json(body);
+    }),
+  );
+
+  app.use('/v1', v1Router);
+
+  app.use((_req: Request, res: Response) => {
+    res.status(404).json({ error: 'not_found', code: 'NOT_FOUND' });
+  });
+
+  app.use(errorHandler);
+
+  return app;
+}

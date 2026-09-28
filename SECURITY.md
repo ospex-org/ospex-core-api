@@ -15,12 +15,13 @@ When reporting, please include:
 
 ## Scope
 
-This repository is the protocol's public read API, signed-write relay, and SSE push layer. In-scope concerns include (non-exhaustive):
+This repository is the protocol's public read API, signed-write relay, SSE push layer, and read-only connector for AI assistants (`/mcp`). In-scope concerns include (non-exhaustive):
 
 - **Redaction bypass.** Any path by which an anonymous reader can obtain a book-hidden commitment's payload — the signature, nonce, `oddsTick`, `riskAmount`, `lineTicks`, `scorer`, or `speculationKey` — or otherwise enumerate a maker's hidden book. See "Hidden-row redaction" in the README for the intended guarantee.
 - **Relay integrity.** Anything that lets a caller get a commitment accepted that the on-chain `MatchingModule` would reject, get another maker's commitment accepted or cancelled, or cause a validly signed commitment to be silently dropped or altered.
 - **Stream-auth weaknesses.** Bearer-token forgery, replay across audiences or chains, challenge replay or fixation, scope escalation, or any way to read another address's owner-authenticated own-state stream or snapshot.
 - **Off-chain cancel authorization.** Any way to hide a commitment you do not control.
+- **Connector integrity.** Any way to make `/mcp` hand out a take link for a quote the public book would not show, for a contest that is not verified or is within two minutes of its start, or with amounts that differ from what the on-chain `MatchingModule` would move; to make it report an order as placed, or a quote as one that can be taken, when it is not; or to make it write, sign or store anything. See "MCP endpoint" in the README for the intended behaviour, including what a preview cannot promise.
 - **Resource exhaustion** disproportionate to the documented rate limits and SSE connection caps.
 - Dependency vulnerabilities surfaced by the lockfile.
 

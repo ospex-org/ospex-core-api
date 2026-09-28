@@ -52,6 +52,11 @@ export interface FakeReply {
   body?: unknown;
   /** `Content-Range` value, e.g. `0-999/1299`. Needed for `count: 'exact'`. */
   contentRange?: string;
+  /**
+   * Never answer. The request is captured and the socket is left open, which is
+   * what a database that has stopped responding looks like from the client.
+   */
+  hang?: boolean;
 }
 
 export type Responder = (req: CapturedRequest, index: number) => FakeReply;
@@ -209,6 +214,8 @@ export async function startFakePostgrest(respond: Responder): Promise<FakePostgr
       return;
     }
 
+    if (reply.hang === true) return;
+
     const status = reply.status ?? 200;
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (reply.contentRange !== undefined) headers['content-range'] = reply.contentRange;
@@ -238,6 +245,9 @@ export async function startFakePostgrest(respond: Responder): Promise<FakePostgr
       }),
     close: () =>
       new Promise<void>((resolve) => {
+        // A request left hanging holds its connection open, and `close` waits
+        // for every connection. End them first.
+        server.closeAllConnections();
         server.close(() => resolve());
       }),
   };

@@ -255,6 +255,56 @@ describe('fills', () => {
     expect(body.hasMore).toBe(true);
   });
 
+  // The equality filters a read asked for, by column name. Sorted so the order
+  // the reader happens to add them in does not matter; not collapsed into a
+  // map, so a column filtered twice still shows twice.
+  function eqFilters(calls: RecordedCall[]): unknown[][] {
+    return calls
+      .filter((c) => c.method === 'eq')
+      .map((c) => c.args)
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+  }
+
+  it('filters on every identity it is given, each on its own column, with the canonical value', async () => {
+    // Five identities with five different values, so a filter placed on its
+    // neighbour's column, or left off, shows. The ids arrive with leading zeros
+    // and the hash in capitals, and are asked for canonical.
+    const { client, calls } = makeSupabase({ data: [], error: null });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await getFillsHandler(
+      makeReq({
+        maker: '0x1111111111111111111111111111111111111111',
+        taker: '0x3333333333333333333333333333333333333333',
+        speculationId: '0005',
+        contestId: '012',
+        commitmentHash: `0x${'B'.repeat(64)}`,
+      }),
+      res as unknown as Response,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(eqFilters(calls)).toEqual([
+      ['commitment_hash', `0x${'b'.repeat(64)}`],
+      ['contest_id', '12'],
+      ['maker_address', '0x1111111111111111111111111111111111111111'],
+      ['network', 'polygon'],
+      ['speculation_id', '5'],
+      ['taker_address', '0x3333333333333333333333333333333333333333'],
+    ]);
+  });
+
+  it('asks for no identity it was not given', async () => {
+    const { client, calls } = makeSupabase({ data: [], error: null });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await getFillsHandler(makeReq({ speculationId: '5' }), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    expect(eqFilters(calls)).toEqual([
+      ['network', 'polygon'],
+      ['speculation_id', '5'],
+    ]);
+  });
+
   it('rejects a bad maker address with 400', async () => {
     const res = makeRes();
     await getFillsHandler(makeReq({ maker: 'nope' }), res as unknown as Response);
