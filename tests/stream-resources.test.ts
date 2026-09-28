@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Request } from 'express';
 
 // `STREAM_RESOURCES.commitments.toBody` routes through `commitmentRowToPublicBody`,
@@ -11,6 +11,7 @@ vi.mock('../src/lib/env.js', () => envMock);
 
 const { STREAM_RESOURCES, isStreamResource, matchesRow } = await import('../src/v1/stream/resources.js');
 type StreamRow = import('../src/v1/stream/resources.js').StreamRow;
+const { logger } = await import('../src/lib/logger.js');
 
 function req(query: Record<string, string>): Request {
   return { query } as unknown as Request;
@@ -115,14 +116,15 @@ describe('toBody', () => {
     expect(body).toMatchObject({ status: 'filled', storedStatus: 'filled' });
   });
 
-  it('commitments: drops (null) a row whose amount did not arrive exact, and serves the same row inside the bound', () => {
+  describe('commitments: amounts and nonce past 2^53 - 1', () => {
+    // A row as the stream's read delivers it: the three columns arrive as text.
     const row = {
       commitment_hash: `0x${'a'.repeat(64)}`,
       maker: '0x1111111111111111111111111111111111111111',
       contest_id: 1,
-      risk_amount: 1e21,
+      risk_amount: '1000000000000000000000',
       filled_risk_amount: '0',
-      nonce: '1',
+      nonce: '1000000000000000000000000000000',
       expiry: '2026-05-21T00:00:00.000Z',
       status: 'open',
       source: 'agent',
@@ -132,10 +134,33 @@ describe('toBody', () => {
       id: 1,
       row_updated_at: 't',
     };
-    expect(STREAM_RESOURCES.commitments.toBody(row as unknown as StreamRow)).toBeNull();
-    expect(
-      STREAM_RESOURCES.commitments.toBody({ ...row, risk_amount: 9007199254740991 } as unknown as StreamRow),
-    ).toMatchObject({ riskAmount: '9007199254740991' });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('are emitted exactly, not dropped', () => {
+      expect(STREAM_RESOURCES.commitments.toBody(row as unknown as StreamRow)).toMatchObject({
+        commitmentHash: row.commitment_hash,
+        riskAmount: '1000000000000000000000',
+        nonce: '1000000000000000000000000000000',
+      });
+    });
+
+    it('a value that cannot be read even as text is dropped (null) and logged', () => {
+      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+      // A JSON number past 2^53: what a read without the text cast would deliver.
+      expect(STREAM_RESOURCES.commitments.toBody({ ...row, risk_amount: 1e21 } as unknown as StreamRow)).toBeNull();
+      expect(warn.mock.calls.map((c) => (c[0] as { commitmentHash: string }).commitmentHash)).toEqual([
+        row.commitment_hash,
+      ]);
+    });
+
+    it('the stream reads the three columns as text', () => {
+      for (const column of ['risk_amount', 'filled_risk_amount', 'nonce']) {
+        expect(STREAM_RESOURCES.commitments.columns).toContain(`${column}::text`);
+      }
+    });
   });
 
   it('speculations: returns null for an unenriched (null market_type) row', () => {

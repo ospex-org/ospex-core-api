@@ -101,11 +101,13 @@ function err(error: string, code: string): ApiError {
 }
 
 /**
- * Largest riskAmount or nonce a posted quote may carry: 2^53 - 1. The database
- * hands these columns back as JSON numbers, which keep every digit only up to
- * this value, so a larger one could be stored but not listed. For riskAmount it
- * is about 9.0 billion USDC at 6 decimals; SDK nonces count unix seconds, far
- * below it.
+ * Largest riskAmount or nonce a posted quote may carry: 2^53 - 1, the largest
+ * safe JavaScript integer. This is relay policy, not a storage limit: the
+ * columns hold up to 78 digits and the listings read them as text. It keeps
+ * every accepted value exact for a client that parses these fields as JSON
+ * numbers. For riskAmount it is about 9.0 billion USDC at 6 decimals. The SDK's
+ * default nonce is max(floor, last + 1, unix seconds), well below the bound
+ * unless a maker has raised their own on-chain floor past it.
  */
 export const MAX_QUOTE_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
 

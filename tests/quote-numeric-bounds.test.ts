@@ -1,7 +1,8 @@
 /**
- * The relay's bound on `riskAmount` and `nonce` for a posted quote. The bound
- * is the largest integer the database's JSON numbers carry exactly (2^53 - 1),
- * so anything the relay stores can also be listed.
+ * The relay's bound on `riskAmount` and `nonce` for a posted quote: 2^53 - 1, the
+ * largest safe JavaScript integer. It is relay policy, so what these cases pin
+ * is what a maker sees: the status and message for a quote past the bound, and
+ * that a quote at the bound gets through validation.
  *
  * Runs the real `eip712Auth('OspexCommitment')` middleware. Validation comes
  * before signature recovery, so a quote inside the bound is proven to have
@@ -21,7 +22,7 @@ const envMock = vi.hoisted(() => ({
 }));
 vi.mock('../src/lib/env.js', () => envMock);
 
-const { eip712Auth, MAX_QUOTE_INTEGER } = await import('../src/middleware/eip712Auth.js');
+const { eip712Auth } = await import('../src/middleware/eip712Auth.js');
 
 interface FakeRes {
   statusCode?: number;
@@ -75,10 +76,6 @@ const RISK_MESSAGE = 'riskAmount is too large: a quote may risk at most 90071992
 const NONCE_MESSAGE = 'nonce is too large: the highest nonce accepted is 9007199254740991.';
 
 describe('posted quote: riskAmount and nonce bound', () => {
-  it('the bound is 2^53 - 1', () => {
-    expect(MAX_QUOTE_INTEGER).toBe(9007199254740991n);
-  });
-
   it.each([
     ['10^21 as a string', '1000000000000000000000'],
     ['10^21 as a JSON number', 1e21],
