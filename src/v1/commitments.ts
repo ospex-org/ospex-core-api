@@ -82,9 +82,13 @@ export interface CommitmentBody {
   fillability?: CommitmentFillability;
 }
 
+// `risk_amount`, `filled_risk_amount` and `nonce` are `numeric(78,0)`, which the
+// database returns as JSON numbers: exact up to 2^53 - 1 and rounded past it, and
+// from 10^21 up a number no longer prints as digits. The `::text` cast keeps the
+// column's name and returns every digit as a string.
 export const COMMITMENT_COLUMNS =
   'commitment_hash, maker, contest_id, scorer, line_ticks, position_type, ' +
-  'odds_tick, market_type, risk_amount, filled_risk_amount, nonce, expiry, ' +
+  'odds_tick, market_type, risk_amount::text, filled_risk_amount::text, nonce::text, expiry, ' +
   'speculation_key, signature, status, source, network, nonce_invalidated, ' +
   'book_visible, created_at';
 
@@ -525,7 +529,9 @@ export async function fetchOpenCommitmentsByContestId(
   // clause is no longer the sole guard. (Consumers handle the union — a redacted
   // row has no `speculationKey` to group on; see the contest detail handler.)
   return {
-    commitments: (data ?? []).map((r) => commitmentRowToPublicBody(r as unknown as CommitmentRow, nowMs)),
+    commitments: listableCommitmentRows((data ?? []) as unknown as CommitmentRow[]).map((r) =>
+      commitmentRowToPublicBody(r, nowMs),
+    ),
     error: null,
   };
 }
@@ -558,15 +564,46 @@ export const OPEN_BOOK_MAX_CONTESTS = 100;
 /**
  * True when a numeric column arrived holding every one of its digits.
  *
- * The database answers these columns as JSON numbers. A number is exact up to
- * 2^53, and past that it has already been rounded on the way in. A quote is
- * signed over the exact amount and nonce, so one that arrived rounded is not a
- * quote this reader can describe.
+ * The reads cast these columns to text, so a value of any size arrives as a
+ * string of digits. A JSON number is accepted only when it is a safe integer:
+ * past 2^53 it has already been rounded, and a quote is signed over the exact
+ * amount and nonce. So what fails here is a number from a read that lacks the
+ * cast, or a string that is not digits: a value that cannot be parsed even as
+ * text.
  */
 function arrivedExact(value: unknown): boolean {
   if (value === null || value === undefined) return true;
   if (typeof value === 'number') return Number.isSafeInteger(value) && value >= 0;
   return typeof value === 'string' && /^\d+$/.test(value);
+}
+
+/**
+ * True when a row's amounts and nonce all arrived exact. The nonce counts with
+ * the amounts because it is signed with them. A row that fails this cannot be
+ * described, and `rowToBody` would throw on it. With the text reads, an
+ * oversized value passes: only an unparseable one fails.
+ */
+export function commitmentRowIsExact(row: CommitmentRow): boolean {
+  return arrivedExact(row.risk_amount) && arrivedExact(row.filled_risk_amount) && arrivedExact(row.nonce);
+}
+
+/**
+ * The rows of a page that a public listing can describe. A row that fails
+ * {@link commitmentRowIsExact} is skipped and logged, so it costs the listing
+ * that one row rather than the call. This is the backstop for a value that
+ * cannot be read even as text; it is not how an oversized value is handled,
+ * which renders exactly. Callers keep the unfiltered page for their
+ * pagination and cursor arithmetic.
+ */
+export function listableCommitmentRows<R extends CommitmentRow>(rows: readonly R[]): R[] {
+  return rows.filter((row) => {
+    if (commitmentRowIsExact(row)) return true;
+    logger.warn(
+      { commitmentHash: row.commitment_hash },
+      'commitments: row carries an amount or nonce that could not be read exactly — skipped from the listing',
+    );
+    return false;
+  });
 }
 
 export type OpenBookRead =
@@ -643,7 +680,7 @@ export async function fetchOpenBook(
       // Dropped, not fatal: the rest of the book is still served. The nonce is
       // checked with the amounts because it is signed with them, and a take
       // built from a rounded nonce fails.
-      if (!arrivedExact(row.risk_amount) || !arrivedExact(row.filled_risk_amount) || !arrivedExact(row.nonce)) {
+      if (!commitmentRowIsExact(row)) {
         logger.warn(
           { commitmentHash: row.commitment_hash },
           'commitments: open book row carries a number that did not arrive exact — dropped',
@@ -1026,7 +1063,9 @@ async function getCommitmentsRecovery(req: Request, res: Response): Promise<void
   // convergence wins, and the allow-list projection already withholds the
   // payload.)
   res.status(200).json({
-    commitments: rows.map((r) => commitmentRowToPublicBody(r as unknown as CommitmentRow, nowMs)),
+    // The cursor and `hasMore` come from the whole page, so a skipped row is
+    // stepped over rather than stalling the client on it.
+    commitments: listableCommitmentRows(rows).map((r) => commitmentRowToPublicBody(r, nowMs)),
     nextCursor: nextCursor('commitments', last, recovery.sinceRaw),
     hasMore: rows.length === recovery.limit,
   });
@@ -1297,7 +1336,8 @@ export async function getCommitmentsHandler(req: Request, res: Response): Promis
   }
 
   const body: ListResponse = {
-    commitments: rows.map((r) => {
+    // `total` and `hasMore` count the whole page, skipped rows included.
+    commitments: listableCommitmentRows(rows).map((r) => {
       const cb = commitmentRowToPublicBody(r, nowMs);
       // The upstream filter guarantees `cb` is a full `CommitmentBody`. The
       // narrow handles the impossible-but-defended hidden case: log + emit

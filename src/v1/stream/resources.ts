@@ -21,6 +21,7 @@ import { CONTESTS_VIEW } from '../../lib/tables.js';
 
 import {
   commitmentRowToPublicBody,
+  listableCommitmentRows,
   COMMITMENT_RECOVERY_COLUMNS,
   type CommitmentRow,
 } from '../commitments.js';
@@ -116,8 +117,14 @@ export const STREAM_RESOURCES: Record<StreamResourceName, StreamResource> = {
     table: 'commitments',
     columns: COMMITMENT_RECOVERY_COLUMNS,
     // Anonymous SSE catchup + live deltas route through the public-body router
-    // so hidden rows emit the redacted allow-list projection.
-    toBody: (row) => commitmentRowToPublicBody(row as unknown as CommitmentRow, Date.now()),
+    // so hidden rows emit the redacted allow-list projection. A row whose
+    // amounts or nonce did not arrive exact is dropped (`null`) and logged.
+    toBody: (row) => {
+      const commitment = row as unknown as CommitmentRow;
+      return listableCommitmentRows([commitment]).length === 0
+        ? null
+        : commitmentRowToPublicBody(commitment, Date.now());
+    },
     parseFilters: (req) =>
       collect([
         ['maker', 'maker', vAddress(req.query.maker)],

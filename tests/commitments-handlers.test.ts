@@ -26,8 +26,17 @@ const envMock = vi.hoisted(() => ({
 vi.mock('../src/lib/supabase.js', () => supabaseMock);
 vi.mock('../src/lib/env.js', () => envMock);
 
-const { rowToBody, getCommitmentByHashHandler, getCommitmentsHandler, deleteCommitmentHandler, computeFillability } =
-  await import('../src/v1/commitments.js');
+const {
+  rowToBody,
+  getCommitmentByHashHandler,
+  getCommitmentsHandler,
+  deleteCommitmentHandler,
+  computeFillability,
+  fetchOpenCommitmentsByContestId,
+  COMMITMENT_COLUMNS,
+  COMMITMENT_RECOVERY_COLUMNS,
+} = await import('../src/v1/commitments.js');
+const { logger } = await import('../src/lib/logger.js');
 
 // ── test doubles ────────────────────────────────────────────────────────
 interface FakeRes {
@@ -289,6 +298,96 @@ describe('GET /v1/commitments list', () => {
     await getCommitmentsHandler(makeReq(), res as unknown as Response);
     expect(res.statusCode).toBe(200);
     expect(calls).toContainEqual({ method: 'eq', args: ['book_visible', true] });
+  });
+});
+
+// ── oversized amounts and nonce ────────────────────────────────────────────
+// The database returns `risk_amount`, `filled_risk_amount` and `nonce` as JSON
+// numbers, which lose digits past 2^53 - 1 and stop printing as digits at 10^21.
+// Every read therefore casts them to text, and the rows below are shaped the way
+// that read delivers them: strings of digits. A mocked client cannot show what
+// the database returns, so the last case pins the select strings that ask for
+// the text.
+
+describe('listings: oversized amounts and nonce', () => {
+  const H = (c: string): string => `0x${c.repeat(64)}`;
+  const BIG = '1000000000000000000000'; // 10^21
+  const HUGE_NONCE = '1000000000000000000000000000000'; // 10^30
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('GET /v1/commitments renders an oversized row exactly, and the page keeps every row', async () => {
+    const rows = [
+      row({ commitment_hash: H('1') }),
+      row({
+        commitment_hash: H('2'),
+        risk_amount: BIG,
+        filled_risk_amount: '400000000000000000000',
+        nonce: HUGE_NONCE,
+      }),
+      row({ commitment_hash: H('3'), risk_amount: '9007199254740991', nonce: '9007199254740991' }),
+    ];
+    const { client, calls } = makeSupabase({ data: rows, error: null, count: 3 });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await getCommitmentsHandler(makeReq(), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    expect(calls).toContainEqual({ method: 'select', args: [COMMITMENT_COLUMNS, { count: 'exact' }] });
+    const body = res.body as { commitments: Array<Record<string, unknown>>; pagination: unknown };
+    expect(body.commitments.map((c) => c['commitmentHash'])).toEqual([H('1'), H('2'), H('3')]);
+    expect(body.commitments[1]).toMatchObject({
+      riskAmount: BIG,
+      filledRiskAmount: '400000000000000000000',
+      remainingRiskAmount: '600000000000000000000',
+      nonce: HUGE_NONCE,
+    });
+    expect(body.commitments[2]).toMatchObject({ riskAmount: '9007199254740991', nonce: '9007199254740991' });
+    expect(body.pagination).toEqual({ limit: 100, offset: 0, total: 3, hasMore: false });
+  });
+
+  it('GET /v1/commitments skips and logs a value that cannot be read even as text; the rest of the page stays', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const rows = [
+      row({ commitment_hash: H('1') }),
+      // A JSON number past 2^53: what a read without the text cast would deliver.
+      row({ commitment_hash: H('2'), risk_amount: 1e21 }),
+      row({ commitment_hash: H('3'), nonce: 'not-a-number' }),
+      row({ commitment_hash: H('4') }),
+    ];
+    const { client } = makeSupabase({ data: rows, error: null, count: 4 });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await getCommitmentsHandler(makeReq(), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { commitments: Array<Record<string, unknown>>; pagination: unknown };
+    expect(body.commitments.map((c) => c['commitmentHash'])).toEqual([H('1'), H('4')]);
+    expect(body.pagination).toEqual({ limit: 100, offset: 0, total: 4, hasMore: false });
+    expect(warn.mock.calls.map((c) => (c[0] as { commitmentHash: string }).commitmentHash)).toEqual([H('2'), H('3')]);
+  });
+
+  it('the open book on one contest renders an oversized row exactly and skips and logs an unreadable one', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const rows = [
+      row({ commitment_hash: H('1'), risk_amount: BIG, nonce: HUGE_NONCE }),
+      row({ commitment_hash: H('2'), filled_risk_amount: 'not-a-number' }),
+    ];
+    const { client } = makeSupabase({ data: rows, error: null });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const out = await fetchOpenCommitmentsByContestId('1', NOW);
+    expect(out.error).toBeNull();
+    expect(out.commitments).toHaveLength(1);
+    expect(out.commitments?.[0]).toMatchObject({ commitmentHash: H('1'), riskAmount: BIG, nonce: HUGE_NONCE });
+    expect(warn.mock.calls.map((c) => (c[0] as { commitmentHash: string }).commitmentHash)).toEqual([H('2')]);
+  });
+
+  it('every commitment read asks the database for the three columns as text', () => {
+    for (const columns of [COMMITMENT_COLUMNS, COMMITMENT_RECOVERY_COLUMNS]) {
+      for (const column of ['risk_amount', 'filled_risk_amount', 'nonce']) {
+        expect(columns).toContain(`${column}::text`);
+      }
+    }
   });
 });
 

@@ -104,6 +104,7 @@ Notes:
 - 9 fields, in the exact order the contract's `COMMITMENT_TYPEHASH` declares them. A signer producing a different field set will fail verification on-chain.
 - `verifyingContract` of the EIP-712 domain is the **MatchingModule**, not OspexCore.
 - `riskAmount` must be a multiple of 100 (lot-size aligned).
+- The relay does not accept a `nonce` or `riskAmount` above 2^53 − 1 (9007199254740991), although the contract permits larger values; such a quote is refused with `400 INVALID_PARAM`.
 - `oddsTick` ∈ [101, 10100].
 - `expiry` is unix seconds; must be in the future and within ~1 year of now (the upper bound prevents JS `Date` overflow on pathological values).
 - `positionType`: 0 = upper (away/over), 1 = lower (home/under).
