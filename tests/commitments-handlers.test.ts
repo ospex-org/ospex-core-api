@@ -26,8 +26,15 @@ const envMock = vi.hoisted(() => ({
 vi.mock('../src/lib/supabase.js', () => supabaseMock);
 vi.mock('../src/lib/env.js', () => envMock);
 
-const { rowToBody, getCommitmentByHashHandler, getCommitmentsHandler, deleteCommitmentHandler, computeFillability } =
-  await import('../src/v1/commitments.js');
+const {
+  rowToBody,
+  getCommitmentByHashHandler,
+  getCommitmentsHandler,
+  deleteCommitmentHandler,
+  computeFillability,
+  fetchOpenCommitmentsByContestId,
+} = await import('../src/v1/commitments.js');
+const { logger } = await import('../src/lib/logger.js');
 
 // ── test doubles ────────────────────────────────────────────────────────
 interface FakeRes {
@@ -289,6 +296,54 @@ describe('GET /v1/commitments list', () => {
     await getCommitmentsHandler(makeReq(), res as unknown as Response);
     expect(res.statusCode).toBe(200);
     expect(calls).toContainEqual({ method: 'eq', args: ['book_visible', true] });
+  });
+});
+
+// ── a row whose numbers did not arrive exact ───────────────────────────────
+// The database returns `risk_amount`, `filled_risk_amount` and `nonce` as JSON
+// numbers, so a stored value from 10^21 up reaches the mapper as `1e+21`, which
+// `BigInt` refuses. Such a row is skipped and logged; the listing still answers.
+
+describe('listings: a row whose numbers did not arrive exact', () => {
+  const H = (c: string): string => `0x${c.repeat(64)}`;
+
+  it('GET /v1/commitments skips and logs it; the other rows and the pagination are unchanged', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const rows = [
+      row({ commitment_hash: H('1') }),
+      row({ commitment_hash: H('2'), risk_amount: 1e21 }),
+      row({ commitment_hash: H('3'), nonce: 1e30 }),
+      row({ commitment_hash: H('4'), filled_risk_amount: 1e21 }),
+      // Control: the largest number that does arrive exact is still served.
+      row({ commitment_hash: H('5'), risk_amount: 9007199254740991 }),
+    ];
+    const { client } = makeSupabase({ data: rows, error: null, count: 5 });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const res = makeRes();
+    await getCommitmentsHandler(makeReq(), res as unknown as Response);
+    expect(res.statusCode).toBe(200);
+    const body = res.body as {
+      commitments: Array<{ commitmentHash: string; riskAmount: string }>;
+      pagination: { total: number; hasMore: boolean };
+    };
+    expect(body.commitments.map((c) => c.commitmentHash)).toEqual([H('1'), H('5')]);
+    expect(body.commitments[1]?.riskAmount).toBe('9007199254740991');
+    expect(body.pagination).toMatchObject({ total: 5, hasMore: false });
+    expect(warn.mock.calls.map((c) => (c[0] as { commitmentHash: string }).commitmentHash)).toEqual([
+      H('2'),
+      H('3'),
+      H('4'),
+    ]);
+  });
+
+  it('the open book on one contest skips it too', async () => {
+    vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const rows = [row({ commitment_hash: H('1'), risk_amount: 1e21 }), row({ commitment_hash: H('2') })];
+    const { client } = makeSupabase({ data: rows, error: null });
+    supabaseMock.getSupabase.mockReturnValue(client);
+    const out = await fetchOpenCommitmentsByContestId('1', NOW);
+    expect(out.error).toBeNull();
+    expect(out.commitments?.map((c) => c.commitmentHash)).toEqual([H('2')]);
   });
 });
 

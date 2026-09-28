@@ -32,6 +32,7 @@ import {
   COMMITMENT_COLUMNS,
   OPEN_BOOK_MAX_ROWS,
   commitmentRowToPublicBody,
+  listableCommitmentRows,
   type CommitmentBody,
   type CommitmentHiddenBody,
   type CommitmentRow,
@@ -416,7 +417,9 @@ export async function getSpeculationByIdHandler(req: Request, res: Response): Pr
     // the `book_visible=true` filter): a hidden row that ever slips past the
     // filter surfaces REDACTED in the flat orderbook (matching the list /
     // recovery paths), never as the full signed payload.
-    orderbook = (obRes.data ?? []).map((r) => commitmentRowToPublicBody(r as unknown as CommitmentRow, nowMs));
+    orderbook = listableCommitmentRows((obRes.data ?? []) as unknown as CommitmentRow[]).map((r) =>
+      commitmentRowToPublicBody(r, nowMs),
+    );
   }
 
   const body: SpeculationDetail = { ...speculation, orderbook, contest };

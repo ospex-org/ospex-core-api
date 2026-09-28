@@ -100,6 +100,15 @@ function err(error: string, code: string): ApiError {
   return { error, code };
 }
 
+/**
+ * Largest riskAmount or nonce a posted quote may carry: 2^53 - 1. The database
+ * hands these columns back as JSON numbers, which keep every digit only up to
+ * this value, so a larger one could be stored but not listed. For riskAmount it
+ * is about 9.0 billion USDC at 6 decimals; SDK nonces count unix seconds, far
+ * below it.
+ */
+export const MAX_QUOTE_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
+
 function validateOspexCommitment(raw: Record<string, unknown>): ReturnType<ActionValidator> {
   // maker
   let maker: string;
@@ -153,6 +162,16 @@ function validateOspexCommitment(raw: Record<string, unknown>): ReturnType<Actio
   if (riskAmount <= 0n) {
     return { ok: false, status: 400, error: err('riskAmount must be positive.', 'INVALID_PARAM') };
   }
+  if (riskAmount > MAX_QUOTE_INTEGER) {
+    return {
+      ok: false,
+      status: 400,
+      error: err(
+        `riskAmount is too large: a quote may risk at most ${MAX_QUOTE_INTEGER.toString()} (about 9 billion USDC).`,
+        'INVALID_PARAM',
+      ),
+    };
+  }
   if (riskAmount % 100n !== 0n) {
     return {
       ok: false,
@@ -169,6 +188,13 @@ function validateOspexCommitment(raw: Record<string, unknown>): ReturnType<Actio
   }
   if (nonce < 0n) {
     return { ok: false, status: 400, error: err('nonce must be non-negative.', 'INVALID_PARAM') };
+  }
+  if (nonce > MAX_QUOTE_INTEGER) {
+    return {
+      ok: false,
+      status: 400,
+      error: err(`nonce is too large: the highest nonce accepted is ${MAX_QUOTE_INTEGER.toString()}.`, 'INVALID_PARAM'),
+    };
   }
   // expiry — unix seconds; must be in the future, but bounded above so a
   // signed 2^255-1 (or anything beyond JS Date / Postgres timestamptz range)

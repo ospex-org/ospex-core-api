@@ -115,6 +115,29 @@ describe('toBody', () => {
     expect(body).toMatchObject({ status: 'filled', storedStatus: 'filled' });
   });
 
+  it('commitments: drops (null) a row whose amount did not arrive exact, and serves the same row inside the bound', () => {
+    const row = {
+      commitment_hash: `0x${'a'.repeat(64)}`,
+      maker: '0x1111111111111111111111111111111111111111',
+      contest_id: 1,
+      risk_amount: 1e21,
+      filled_risk_amount: '0',
+      nonce: '1',
+      expiry: '2026-05-21T00:00:00.000Z',
+      status: 'open',
+      source: 'agent',
+      network: 'polygon',
+      nonce_invalidated: false,
+      created_at: '2026-05-20T10:00:00.000Z',
+      id: 1,
+      row_updated_at: 't',
+    };
+    expect(STREAM_RESOURCES.commitments.toBody(row as unknown as StreamRow)).toBeNull();
+    expect(
+      STREAM_RESOURCES.commitments.toBody({ ...row, risk_amount: 9007199254740991 } as unknown as StreamRow),
+    ).toMatchObject({ riskAmount: '9007199254740991' });
+  });
+
   it('speculations: returns null for an unenriched (null market_type) row', () => {
     const body = STREAM_RESOURCES.speculations.toBody({
       speculation_id: 1,
