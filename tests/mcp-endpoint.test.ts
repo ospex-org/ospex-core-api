@@ -907,7 +907,7 @@ describe('/mcp: calling tools', () => {
       expect([digits, result.content[0]?.text]).toEqual([
         digits,
         'MCP error -32602: Input validation error: Invalid arguments for tool prepare_order: ' +
-          'Expected string, received number at contest_id',
+          'Invalid input: expected string, received number at contest_id',
       ]);
       expect([digits, running.fake.requests.length]).toEqual([digits, 0]);
     }
@@ -944,7 +944,7 @@ describe('/mcp: calling tools', () => {
       expect([name, result.isError]).toEqual([name, true]);
       expect(textOf(result)).toBe(
         `MCP error -32602: Input validation error: Invalid arguments for tool ${name}: ` +
-          `Unrecognized key(s) in object: '${key}'`,
+          `Unrecognized key: "${key}"`,
       );
     }
     expect(running.fake.requests).toHaveLength(0);
