@@ -12,21 +12,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # Node 20.19 is this repo's Node floor - the strictest engines.node
-      # requirement in the lockfile-pinned tree (vite 7.x needs
-      # '^20.19.0 || >=22.12.0') - and it is the floor rather than the
-      # deployed version on purpose: the dyno runs a newer Node, so testing
-      # the MINIMUM is what catches a dependency that quietly needs more
-      # than we promise to support.
-      #
-      # Example on this repo: @supabase/realtime-js still bundles 'ws', so
-      # Node 20 works today. If a future release drops it for native
-      # WebSocket (Node 22+), this run goes red at Install (yarn enforces
-      # dependency engines) instead of the floor silently going stale.
-      - name: Set up Node 20.19
+      # Node 24 is the major the app runs. package.json pins engines.node
+      # to 24.x, so the Heroku build picks a 24.x release, and yarn's
+      # install refuses any other major. CI runs the same major.
+      - name: Set up Node 24
         uses: actions/setup-node@v5
         with:
-          node-version: '20.19'
+          node-version: '24.x'
           cache: 'yarn'
 
       - name: Install
